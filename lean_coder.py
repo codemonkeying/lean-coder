@@ -220,9 +220,11 @@ AUTO_HANDOVER_INSTR = (
 # now"; a harsh nudge just makes the model stop mid-thought, which is what the hard
 # auto-handover is for. {used}/{limit}/{pct} are filled in at injection time.
 HANDOVER_NUDGE = (
-    "context {used}/{limit} ({pct}%) - getting fuller. No need to stop abruptly: "
-    "finish what you're doing, then look for a clean break point to wrap the current "
-    "step up, so an automatic handover can happen tidily rather than mid-task."
+    "context {used}/{limit} tokens ({pct}%). Heads-up: at {hard} tokens ({hard_pct}%) "
+    "an automatic handover is FORCED - your history gets compacted whether or not "
+    "you're at a clean point. You're not there yet, so DON'T drop what you're doing or "
+    "hand over now; just start steering toward a clean break for the current step so "
+    "the handover lands tidily instead of mid-task when it triggers."
 )
 
 # Editable prompts live as text files under the config dir. The built-in prompts
@@ -2273,7 +2275,7 @@ class Config:
                                      # branch /update fetches VERSION + lean_coder.py from.
     command_timeout: int = 300       # foreground run_command timeout (s); long tasks use ' &'
     bg_max_concurrent: int = 5       # max background tasks at once (0 = unlimited)
-    worker_max_concurrent: int = 2   # dispatch_worker: max worker agents alive at once (0 = unlimited)
+    worker_max_concurrent: int = 6   # dispatch_worker: max worker agents alive at once (0 = unlimited)
     worker_idle_timeout: int = 1800  # dispatch_worker: worker lease secs; unattended self-kill
     worker_max_iterations: int = 30  # dispatch_worker: agentic-loop cap per worker
     editor: str = ""                 # preferred editor for /prompt etc.; "" -> $EDITOR/nano
@@ -2462,6 +2464,11 @@ def load_config(args) -> Config:
     # Ollama backend. Ollama is now a real provider, so "" -> "ollama".
     if not cfg.provider:
         cfg.provider = "ollama"
+    # An explicit --provider overrides the config's active backend (used by --agent-run
+    # workers and anyone pinning a backend at launch). Validated against enabled set
+    # after providers_enabled is resolved below.
+    if getattr(args, "provider", None):
+        cfg.provider = args.provider.strip()
     # [providers.<name>] tables: each is that provider's saved model / window /
     # settings (thinking, effort, and any custom knobs). Kept verbatim so a
     # provider can persist things core doesn't need to understand.
@@ -5801,9 +5808,13 @@ class Agent:
             return ""
         self._last_nudge_turn = self._turn_count
         pct = int(used / limit * 100) if limit else 0
+        hard_frac = self.cfg.handover_for()["hard"]
+        hard = int(limit * hard_frac) if limit else 0
+        hard_pct = int(hard_frac * 100)
         tmpl = read_prompt("handover_nudge") or HANDOVER_NUDGE
         try:
-            return tmpl.format(used=f"{used:,}", limit=f"{limit:,}", pct=pct)
+            return tmpl.format(used=f"{used:,}", limit=f"{limit:,}", pct=pct,
+                               hard=f"{hard:,}", hard_pct=hard_pct)
         except (KeyError, IndexError, ValueError):
             # a user-edited nudge with a bad placeholder must not break the turn
             return tmpl
@@ -8956,6 +8967,22 @@ def run_agent_brief(args) -> int:
             return _fail(f"cannot attach to parent's remote {remote_host}: {e}")
         agent.set_remote(ws)
         print(dim(f"agent-run: tools attached to remote {remote_host} (cwd {ws.remote_cwd or rcwd})"))
+    # Grant's provider: if the dispatch tool pinned a backend (a `model` on a
+    # DIFFERENT enabled provider than the driver's), activate it first so the model
+    # switch below lands on the right client. Only switch if it's enabled + available;
+    # else keep the activated default and note it - a worker never dies on a bad grant.
+    want_provider = grant.get("provider")
+    if want_provider and want_provider != cfg.provider:
+        if want_provider in cfg.providers_enabled and want_provider in _providers:
+            try:
+                agent.activate_provider(want_provider)
+            except Exception as e:
+                print(yellow(f"agent-run: provider '{want_provider}' not activated ({e}); "
+                             f"using '{cfg.provider}'"))
+        else:
+            print(yellow(f"agent-run: provider '{want_provider}' not enabled here; "
+                         f"using '{cfg.provider}'"))
+
     # Grant's model: applied AFTER activation (active_model reads provider_settings,
     # not cfg.model). Only switch if it's actually available on this box; else keep
     # the activated default and note it - a worker must never die on a bad model name.
@@ -8978,11 +9005,62 @@ def run_agent_brief(args) -> int:
         f"wrapped between two {RESULT_MARK} markers, e.g.\n{RESULT_MARK}\n<your result>\n"
         f"{RESULT_MARK}\nNothing after the closing marker. There is no user to ask - if "
         "you get stuck, put what you found + what blocked you inside the result block. "
-        "Your leash is fixed; do not ask to raise it.\n\nTASK:\n" + brief)
+        "Your leash is fixed; do not ask to raise it.\n"
+        "IMPORTANT: do NOT put a tool call and your " + RESULT_MARK + " block in the same "
+        "message - a message that also calls a tool is NOT your final answer, and the "
+        f"{RESULT_MARK} would make the tool call be ignored (your action would not run). "
+        "Finish every tool call FIRST, wait for its result, confirm the change (re-read if "
+        f"you edited), and only THEN write the {RESULT_MARK} block on its own.\n\nTASK:\n"
+        + brief)
     try:
         agent.run_turn(preamble)
     except Exception as e:
         return _fail(f"worker run failed: {e}")
+
+    # Guard against the "act + finish in one message" trap: a worker that emits a tool
+    # call AND a ===RESULT=== in the same message ends the loop without running the
+    # call (the L2a text parser sees the RESULT prose and discards the call as a final
+    # answer), yet the RESULT claims success - the action silently never happened. We
+    # strip the RESULT block, re-parse the remainder (dodging the prose-slack guard);
+    # any tool call found there was NEVER executed, so nudge the worker to actually
+    # finish it. At most 2 corrective turns, then give up and report honestly.
+    def _final_asst_content():
+        for m in reversed(agent.messages):
+            if (m.get("role") == "assistant" and isinstance(m.get("content"), str)
+                    and m["content"].strip()):
+                return m["content"]
+        return ""
+
+    known = {(t.get("function") or t).get("name") for t in (agent.tool_defs or [])}
+    known.discard(None)
+    for _ in range(2):
+        content = _final_asst_content()
+        # Fire on ANY RESULT marker, not just a complete pair: a worker that emits a
+        # single UNCLOSED ===RESULT=== (opening marker + a bundled call, no close) would
+        # slip a pair-only check AND then the final harvest's `final.strip()` fallback
+        # returns the message verbatim - i.e. the unexecuted call reported as success.
+        if RESULT_MARK not in content:
+            break                                     # no RESULT yet -> loop ended normally
+        # Strip a complete RESULT pair if present, else everything from the last lone
+        # marker onward, so the remainder is just the pre-RESULT body we re-parse.
+        without_result = re.sub(
+            re.escape(RESULT_MARK) + r".*?" + re.escape(RESULT_MARK), "",
+            content, flags=re.S)
+        if RESULT_MARK in without_result:             # a lone/odd marker survived the pair strip
+            without_result = without_result[:without_result.rfind(RESULT_MARK)]
+        orphaned, _ = parse_text_tool_calls(without_result, known_names=known or None)
+        if not orphaned:
+            break                                     # RESULT with no bundled call -> clean
+        names = ", ".join((c.get("function") or {}).get("name", "?") for c in orphaned)
+        try:
+            agent.run_turn(
+                f"Your last message put a tool call ({names}) in the SAME message as your "
+                f"{RESULT_MARK} block, so the tool call did NOT run - your action was NOT "
+                f"applied. Make that tool call now, on its own (no {RESULT_MARK} in the same "
+                f"message). Wait for the result, confirm the change, and only then write the "
+                f"{RESULT_MARK} block alone.")
+        except Exception as e:
+            return _fail(f"worker corrective turn failed: {e}")
 
     # Harvest: the last assistant text -> its RESULT block, or the whole message.
     final = ""
@@ -9005,6 +9083,7 @@ def main():
         description="Lean terminal coding agent over Ollama native tool calling.")
     ap.add_argument("--host", help="Ollama base URL (env OLLAMA_HOST)")
     ap.add_argument("--model", help="model name (env LEANCODER_MODEL)")
+    ap.add_argument("--provider", help="active backend provider (must be enabled)")
     ap.add_argument("--num-ctx", type=int, dest="num_ctx",
                     help="context window (default 32768)")
     ap.add_argument("--keep-alive", dest="keep_alive",
