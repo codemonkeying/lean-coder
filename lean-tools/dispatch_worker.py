@@ -18,17 +18,20 @@ HOW (piggybacks the background-task machinery, adds no new transport):
   - the finished worker is surfaced via /worker (workers are deliberately hidden
     from /bg + the bg_status tool, so a session without this tool never sees them).
 
-PHASE 1 = READ-ONLY workers only: the grant leash is capped at 'r'. Write/exec
-workers (Phase 2) and parallel fan-out (Phase 3) come later. This is a driver_only
-tool: it spawns the worker process on the driver, so it is never pushed to / run
-on a remote executor.
+LEASH: the worker's grant is set by the driver (the main AI) via the `leash` arg
+and capped at the driver's OWN live leash - MIN(requested, parent), the leash
+principle: a grant is never above the grantor's authority (see _capped_leash).
+So read/write/exec workers are ALL supported; the default is 'r' (a scout), and a
+write/exec worker inherits approval=auto headless (nobody's there to confirm), so
+grant rw/rwe deliberately. This is a driver_only tool: it spawns the worker process
+on the driver, so it is never pushed to / run on a remote executor.
 
 WORKER CEILINGS (the cost lever) - each resolves in priority order:
   1. the env var (operator LOCKDOWN - still wins, a running session can't move it);
   2. else the live cfg value (editable in /settings, saved to config, usable at once);
   3. else the built-in default (shown below).
   cfg field              /settings + config      env var                          default
-  worker_max_concurrent  most workers at once     LEANCODER_WORKER_MAX_CONCURRENT   2
+  worker_max_concurrent  most workers at once     LEANCODER_WORKER_MAX_CONCURRENT   6
   worker_idle_timeout    lease secs; self-kill    LEANCODER_WORKER_IDLE_TIMEOUT     1800
   worker_max_iterations  agentic-loop cap/worker  LEANCODER_WORKER_MAX_ITER         30
   model_allowlist        (env only)               LEANCODER_WORKER_MODELS           any
@@ -40,7 +43,7 @@ import time
 from pathlib import Path
 
 # Built-in ceiling defaults (last resort: env var > live cfg > this - see docstring).
-_DEFAULTS = {"max_concurrent": 2, "idle_timeout": 1800, "max_iterations": 30}
+_DEFAULTS = {"max_concurrent": 6, "idle_timeout": 1800, "max_iterations": 30}
 _ENV = {"max_concurrent": "LEANCODER_WORKER_MAX_CONCURRENT",
         "idle_timeout": "LEANCODER_WORKER_IDLE_TIMEOUT",
         "max_iterations": "LEANCODER_WORKER_MAX_ITER"}
@@ -59,7 +62,20 @@ TOOL = {
                      "description": "Full self-contained instruction: what to do and exactly "
                                     "what to report back (the worker has no other context)."},
             "model": {"type": "string",
-                      "description": "Optional model (must be available here); defaults to current."},
+                      "description": "Optional model for the worker's brain - ANY model on an "
+                                     "ENABLED provider (see /models); its provider is inferred "
+                                     "automatically. Defaults to inheriting your current model."},
+            "provider": {"type": "string",
+                         "description": "Optional backend to run the worker's brain on (must be "
+                                        "enabled). Only needed to disambiguate when the same model "
+                                        "name exists on more than one enabled provider; otherwise "
+                                        "inferred from `model`."},
+            "brain_host": {"type": "string",
+                           "description": "Optional ollama endpoint (URL or a /machines alias) to "
+                                          "run the worker's BRAIN (inference) on - distinct from "
+                                          "`host` (which is where its TOOLS run). Defaults to the "
+                                          "driver's own ollama host. Use it to run the worker's "
+                                          "model on a different box than the driver (ollama only)."},
             "host": {"type": "string",
                      "description": "Optional box to run the worker's TOOLS on ([user@]host or a "
                                     "/connect name); defaults to this session's target. A password "
@@ -132,13 +148,20 @@ def _workers_dir():
     return Path(_H["CONFIG_DIR"]) / "workers"
 
 
-def _compose_brief(task, model, cwd, max_iter, leash="r"):
+def _compose_brief(task, model, cwd, max_iter, leash="r", provider="", brain_host=""):
     """Build the brief file text: the task wrapped in BRIEF markers + a GRANT header.
-    `leash` is the already-capped grant (see _capped_leash)."""
+    `leash` is the already-capped grant (see _capped_leash). `provider` (optional) is
+    the backend the worker must activate for `model`; absent = inherit the driver's.
+    `brain_host` (optional) is an ollama inference endpoint for the worker's BRAIN,
+    distinct from where its tools run; absent = the driver's own host."""
     B, G = _H["BRIEF_MARK"], _H["GRANT_MARK"]
     grant = [f"leash: {leash}", f"cwd: {cwd}", f"max_iterations: {max_iter}"]
     if model:
         grant.append(f"model: {model}")
+    if provider:
+        grant.append(f"provider: {provider}")
+    if brain_host:
+        grant.append(f"brain_host: {brain_host}")
     return (f"{B}\n{task.strip()}\n{B}\n{G}\n" + "\n".join(grant) + f"\n{G}\n")
 
 
@@ -166,16 +189,57 @@ def run(args, cwd):
         return (f"error: at the worker limit ({max_conc} running). Wait for one to "
                 f"finish (/worker) or raise LEANCODER_WORKER_MAX_CONCURRENT.")
 
-    # Model: default to the active one; validate against an allowlist + availability.
+    # Model + provider. Default: inherit the driver's current model+provider (both
+    # blank -> the worker keeps whatever it activates). A `model` may be ANY model on
+    # ANY enabled provider; we infer its provider from the enabled-provider->models
+    # map. An explicit `provider` disambiguates (same model name on two backends) or
+    # forces a backend. Validated against the worker allowlist + real availability so
+    # a bad name fails HERE (loud) rather than silently falling back inside the worker.
     model = (args.get("model") or "").strip()
-    allow = _model_allowlist()
-    if model and allow and model not in allow:
-        return f"error: model '{model}' is not in the worker allowlist ({', '.join(allow)})."
-    if model:
-        avail = _H.get("available_models", lambda: [])()
-        if avail and model not in avail:
-            return (f"error: model '{model}' is not available on this box. "
-                    f"available: {', '.join(avail) or '(unknown)'}")
+    provider = (args.get("provider") or "").strip()
+    brain_host = (args.get("brain_host") or "").strip()
+    # brain_host relocates INFERENCE to a different ollama endpoint. The model then
+    # lives on THAT box, not the driver's, so we can't validate it against the driver's
+    # enabled-provider models - it's implicitly the ollama provider on the remote
+    # endpoint. Resolve the alias and default provider to ollama.
+    if brain_host:
+        resolve = _H.get("resolve_host") or (lambda h, m=None: h)
+        machines = getattr(_H.get("cfg"), "machines", {}) or {}
+        brain_host = _H.get("_norm_host", lambda h: h)(resolve(brain_host, machines))
+        if not provider:
+            provider = "ollama"
+        if provider != "ollama":
+            return "error: brain_host is ollama-only (inference endpoints are ollama URLs)."
+    if (model or provider) and not brain_host:
+        pmodels = _H.get("enabled_provider_models", lambda: {})()
+        if provider and provider not in pmodels:
+            return (f"error: provider '{provider}' is not enabled. Enabled: "
+                    f"{', '.join(pmodels) or '(none)'}.")
+        if model:
+            allow = _model_allowlist()
+            if allow and model not in allow:
+                return f"error: model '{model}' is not in the worker allowlist ({', '.join(allow)})."
+            # Which enabled provider(s) offer this model?
+            hosts = [p for p, ms in pmodels.items() if model in (ms or [])]
+            if provider:
+                if model not in (pmodels.get(provider) or []):
+                    avail = ', '.join(pmodels.get(provider) or []) or '(unknown)'
+                    return (f"error: model '{model}' is not available on provider "
+                            f"'{provider}'. available there: {avail}")
+            elif len(hosts) == 1:
+                provider = hosts[0]                      # unambiguous -> infer it
+            elif len(hosts) > 1:
+                return (f"error: model '{model}' exists on multiple enabled providers "
+                        f"({', '.join(hosts)}); pass provider= to disambiguate.")
+            else:
+                allm = ', '.join(sorted({m for ms in pmodels.values() for m in ms})) or '(unknown)'
+                return (f"error: model '{model}' is not available on any enabled "
+                        f"provider. available: {allm}")
+    elif brain_host and model:
+        # Still honour the allowlist (operator lockdown) even for a remote-brain model.
+        allow = _model_allowlist()
+        if allow and model not in allow:
+            return f"error: model '{model}' is not in the worker allowlist ({', '.join(allow)})."
 
     # Where the worker's TOOLS run. Precedence:
     #   1. an explicit `host` arg -> run the worker's tools on THAT machine. We ensure a
@@ -237,7 +301,8 @@ def run(args, cwd):
     brief_file = wdir / f"{stamp}.brief"
     result_file = wdir / f"{stamp}.result"
     try:
-        brief_file.write_text(_compose_brief(task, model, wcwd, max_iter, leash=leash))
+        brief_file.write_text(_compose_brief(task, model, wcwd, max_iter, leash=leash,
+                                             provider=provider, brain_host=brain_host))
     except OSError as e:
         return f"error: cannot write brief file: {e}"
 
@@ -253,6 +318,10 @@ def run(args, cwd):
     if remote:
         cmd += (f" --remote-host {shlex.quote(remote['host'])} "
                 f"--remote-ctl {shlex.quote(remote['ctl'])}")
+    if brain_host:
+        # Point the worker's INFERENCE at a different ollama endpoint than the driver.
+        # (Distinct from --remote-host, which relocates the worker's TOOLS.)
+        cmd += f" --host {shlex.quote(brain_host)}"
     launched = _H["bg_launch"](cmd, cwd=launch_cwd, kind="worker", idle_timeout=idle_timeout)
     if "error" in launched:
         return f"error: could not launch worker: {launched['error']}"
@@ -365,6 +434,7 @@ def setup(lc, cfg):
     for k in ("bg_launch", "bg_list", "bg_status", "_extract_marked", "CONFIG_DIR",
               "BRIEF_MARK", "GRANT_MARK", "RESULT_MARK", "LEASH_LEVELS", "_norm_leash",
               "active_remote", "_ssh_master_alive", "ensure_worker_master",
+              "resolve_host", "_norm_host",
               "dim", "bold", "green", "cyan"):
         if k in lc:
             _H[k] = lc[k]
@@ -403,6 +473,21 @@ def setup(lc, cfg):
         except Exception:
             return []
     _H["available_models"] = _available_models
+
+    # Map every ENABLED provider -> its available models, so a worker `model` can be
+    # ANY model on any enabled backend (its provider inferred). Resolved lazily so it
+    # reflects the live registry. Returns an ordered dict {provider_name: [models]}.
+    def _enabled_provider_models():
+        get_provider = lc["get_provider"]
+        out = {}
+        for name in (cfg.providers_enabled or []):
+            try:
+                spec = get_provider(name)
+                out[name] = list(spec["list_models"]() or []) if spec else []
+            except Exception:
+                out[name] = []
+        return out
+    _H["enabled_provider_models"] = _enabled_provider_models
 
     lc["register_command"]("/worker", _worker_cmd,
                            "list dispatched worker agents (+ results); /worker <pid> "
