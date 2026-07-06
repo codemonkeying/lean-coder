@@ -1,0 +1,458 @@
+# Bundled BUILTIN tools - the core file-editing + command surface (read_file,
+# list_files, search_files, apply_diff, write_file, run_command). Extracted from
+# lean_coder.py so the core stays the contract (leash tiers, dispatch, confirm policy,
+# remote protocol) while the weight lives in the tool dir. This file is bundled
+# (shipped with the code), always-on, NOT toggleable in /tools.
+#
+# Shape mirrors providers/ollama.py: the module declares its data + impl, and a
+# helpers-only setup(lc, cfg) injects the stable core helpers this code resolves as
+# plain module-level names (see _INJECT). The Tools INSTANCE (held by core as
+# agent.tools) carries changed_files + the ignore matcher, exactly as before.
+#
+# Each entry in BUILTIN_TOOLS declares a `tier`:
+#   read  -> rides at /leash r+   (read-only, no side effects)
+#   write -> rides at /leash rw+  (edits files)
+#   exec  -> rides at /leash rwe  (runs commands)
+# Core DERIVES its SAFE_TOOLS / _WRITE_TIER / _EXEC_TIER / EXEC_TOOLS tuples from these.
+
+import os
+import re
+import time
+import subprocess
+from pathlib import Path
+
+# --- injected by setup() from core (resolved as plain names below) -----------
+# Stable core helpers/constants this module's code reaches for. setup() copies each
+# from the core module globals so the moved code runs unchanged. Mutable state is
+# never snapshotted here - everything below is a function or an immutable constant.
+_INJECT = (
+    "IgnoreMatcher", "resolve_in_project", "_parse_search_replace", "_confirm_action",
+    "_bg_running", "_bg_register", "_bg_status_items", "_bg_status_msg",
+    "READ_MAX_LINES", "READ_HEAD", "READ_TAIL", "TREE_DEFAULT_DEPTH", "TREE_MAX_ENTRIES",
+    "SEARCH_MAX_MATCHES", "SEARCH_LINE_MAX", "OUTPUT_MAX_CHARS", "OUTPUT_HEAD", "OUTPUT_TAIL",
+    "CONFIG_DIR",
+)
+
+
+class Tools:
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.ignore = IgnoreMatcher(cfg.cwd)
+        self.changed_files: set = set()
+
+    # --- read-only -------------------------------------------------------
+    def read_file(self, path: str, start=None, end=None, lines=None) -> str:
+        p = resolve_in_project(self.cfg, path)
+        if not p.is_file():
+            return f"error: no such file: {path}"
+        try:
+            text = p.read_text(errors="replace")
+        except Exception as e:
+            return f"error reading {path}: {e}"
+        alllines = text.splitlines()
+        n = len(alllines)
+        # tolerate a `lines=[start, end]` form (some models emit that)
+        if lines and isinstance(lines, (list, tuple)) and len(lines) == 2:
+            start, end = lines[0], lines[1]
+        # explicit line range (1-based, inclusive)
+        if start is not None or end is not None:
+            try:
+                s = max(1, int(start)) if start is not None else 1
+                e = min(n, int(end)) if end is not None else n
+            except (TypeError, ValueError):
+                return "error: start/end must be integers"
+            if s > e:
+                return f"error: start ({s}) > end ({e})"
+            note = ""
+            if e - s + 1 > READ_MAX_LINES:
+                e = s + READ_MAX_LINES - 1
+                note = f"\n…[range capped at {READ_MAX_LINES} lines; request a smaller range]…"
+            body = _number(alllines[s - 1:e], s)
+            return (body + note) if body else "(no lines in range)"
+        # whole file, head/tail truncated if very large
+        if n > READ_MAX_LINES:
+            head = _number(alllines[:READ_HEAD], 1)
+            tail = _number(alllines[-READ_TAIL:], n - READ_TAIL + 1)
+            return head + f"\n…[truncated {n - READ_HEAD - READ_TAIL} lines]…\n" + tail
+        return _number(alllines, 1) or "(empty file)"
+
+    def list_files(self, path: str = "") -> str:
+        base = resolve_in_project(self.cfg, path) if path else self.cfg.cwd
+        if not base.exists():
+            return f"error: no such path: {path}"
+        if base.is_file():
+            return path
+        out, count = [], 0
+        rootlen = len(self.cfg.cwd.resolve().as_posix())
+
+        def walk(d, depth: int):
+            nonlocal count
+            if depth > TREE_DEFAULT_DEPTH or count >= TREE_MAX_ENTRIES:
+                return
+            try:
+                entries = sorted(d.iterdir(), key=lambda x: (x.is_file(), x.name))
+            except PermissionError:
+                return
+            for e in entries:
+                if count >= TREE_MAX_ENTRIES:
+                    out.append("…[more entries truncated]…")
+                    return
+                if self.ignore.ignored(e):
+                    continue
+                rel = e.resolve().as_posix()[rootlen:].lstrip("/")
+                out.append(rel + ("/" if e.is_dir() else ""))
+                count += 1
+                if e.is_dir():
+                    walk(e, depth + 1)
+
+        walk(base, 1)
+        return "\n".join(out) if out else "(empty)"
+
+    def search_files(self, pattern: str, path: str = "") -> str:
+        try:
+            rx = re.compile(pattern)
+        except re.error as e:
+            return f"error: bad regex: {e}"
+        base = resolve_in_project(self.cfg, path) if path else self.cfg.cwd
+        hits, count = [], 0
+        files = [base] if base.is_file() else _iter_files(base, self.ignore)
+        for f in files:
+            if count >= SEARCH_MAX_MATCHES:
+                hits.append("…[more matches truncated]…")
+                break
+            try:
+                for i, line in enumerate(f.read_text(errors="replace").splitlines(), 1):
+                    if rx.search(line):
+                        # A file outside the project (e.g. searching /tmp while cwd
+                        # is elsewhere) has no path relative to cwd - relative_to
+                        # would raise and the broad except below would silently drop
+                        # every match. Fall back to the absolute path instead.
+                        fp = f.resolve()
+                        try:
+                            rel = fp.relative_to(self.cfg.cwd.resolve()).as_posix()
+                        except ValueError:
+                            rel = fp.as_posix()
+                        txt = line.strip()[:SEARCH_LINE_MAX]
+                        hits.append(f"{rel}:{i}: {txt}")
+                        count += 1
+                        if count >= SEARCH_MAX_MATCHES:
+                            break
+            except Exception:
+                continue
+        return "\n".join(hits) if hits else "(no matches)"
+
+    # --- mutating (gated by confirmation) --------------------------------
+    def apply_diff(self, path: str, diff: str) -> str:
+        p = resolve_in_project(self.cfg, path)
+        if not p.is_file():
+            return f"error: no such file: {path} (use write_file for new files)"
+        blocks, perr = _parse_search_replace(diff)
+        if perr:
+            return ("error: " + perr + "\nExpected one or more blocks:\n"
+                    "===SEARCH===\\n<old>\\n===DIVIDER===\\n<new>\\n===REPLACE===")
+        original = p.read_text(errors="replace")
+        new = original
+        applied = 0
+        for idx, (search, replace) in enumerate(blocks, 1):
+            cnt = new.count(search)
+            if cnt == 1:
+                new = new.replace(search, replace, 1)
+                applied += 1
+                continue
+            if cnt > 1:
+                return (f"error: block {idx} SEARCH text is ambiguous in {path} "
+                        f"(matched {cnt} times); no changes written. Add surrounding "
+                        f"lines to the SEARCH text so it matches exactly one place.")
+            # Exact match failed: try a whitespace-tolerant line match (small models
+            # rarely reproduce indentation/trailing space byte-for-byte). Never
+            # loosens uniqueness - we still require exactly one fuzzy hit.
+            fnew, ferr = _fuzzy_apply(new, search, replace, idx, path)
+            if ferr:
+                return ferr
+            new = fnew
+            applied += 1
+        if new == original:
+            return "no changes (result identical to original)"
+        if not _confirm_action(self.cfg, "write", path=path, original=original, new=new):
+            return "user declined the edit"
+        p.write_text(new)
+        self.changed_files.add(path)
+        return f"applied {applied} block(s) to {path}"
+
+    def write_file(self, path: str, content: str) -> str:
+        p = resolve_in_project(self.cfg, path)
+        original = p.read_text(errors="replace") if p.is_file() else None
+        if original == content:
+            return "no changes (content identical)"
+        if not _confirm_action(self.cfg, "write", path=path, original=original, new=content):
+            return "user declined the write"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(content)
+        self.changed_files.add(path)
+        verb = "overwrote" if original is not None else "created"
+        return f"{verb} {path} ({len(content.splitlines())} lines)"
+
+    def run_command(self, cmd: str) -> str:
+        bg = cmd.rstrip().endswith("&")        # trailing & = "background this"
+        if not _confirm_action(self.cfg, "exec", cmd=cmd):
+            return "user declined to run the command"
+        if bg:
+            return self._run_background(cmd.rstrip()[:-1].rstrip())
+        to = self.cfg.command_timeout
+        try:
+            # stdin=DEVNULL: never let a child read the live terminal. With the
+            # composer's reader thread on cbreak stdin, an inherited fd makes a
+            # subshell (or any stdin-reading command) hang fighting for keystrokes.
+            r = subprocess.run(cmd, shell=True, cwd=self.cfg.cwd,
+                               capture_output=True, text=True, timeout=to,
+                               stdin=subprocess.DEVNULL)
+        except subprocess.TimeoutExpired:
+            return (f"error: command timed out after {to}s (no output captured). For a "
+                    f"long-running or daemon process, end the command with ' &' to launch "
+                    f"it detached instead of blocking; or raise command_timeout in /settings.")
+        except Exception as e:
+            return f"error running command: {e}"
+        out = ""
+        if r.stdout:
+            out += r.stdout
+        if r.stderr:
+            out += ("\n[stderr]\n" if out else "") + r.stderr
+        out = _truncate_output(out.rstrip())
+        return f"exit {r.returncode}\n{out}" if out else f"exit {r.returncode} (no output)"
+
+    def _run_background(self, cmd: str, kind: str = "task", idle_timeout=None) -> str:
+        """Launch a detached background process and return immediately. Plain
+        run_command captures stdout/stderr, so a backgrounded child keeps the pipe
+        open until it dies and run_command would block until the 300s timeout - the
+        bug behind 'I told it to start a daemon and the turn froze'. Here we detach
+        (own session, no controlling tty), redirect output to a log, and hand back
+        the pid + log path so the model can track or stop it.
+
+        `idle_timeout` (seconds) arms a self-terminating LEASE: an in-band watchdog
+        kills the whole group if the '<log>.lease' file isn't bumped for that long
+        (the parent bumps it once per turn - see _bg_bump_session). Caps runaway
+        quota burn by a task whose parent dropped. None = no lease (runs to done)."""
+        if not cmd:
+            return "error: nothing to run in the background"
+        cap = self.cfg.bg_max_concurrent
+        if cap and len(_bg_running(kind=None)) >= cap:
+            return (f"error: at the background-task limit ({cap} running). Stop one first "
+                    f"(/bg to list + kill, or `kill <pid>`), or raise bg_max_concurrent "
+                    f"in /settings.")
+        try:
+            logdir = CONFIG_DIR / "bg"
+            logdir.mkdir(parents=True, exist_ok=True)
+            log = logdir / f"{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}.log"
+            exitf = str(log) + ".exit"
+            wrapped = self._bg_wrap(cmd, exitf, str(log) + ".lease", idle_timeout)
+            with open(log, "ab") as f:
+                p = subprocess.Popen(wrapped, shell=True, cwd=str(self.cfg.cwd),
+                                     stdout=f, stderr=subprocess.STDOUT,
+                                     stdin=subprocess.DEVNULL, start_new_session=True)
+        except Exception as e:
+            return f"error backgrounding command: {e}"
+        _bg_register(p.pid, cmd, log, kind=kind, idle_timeout=idle_timeout)
+        lease_note = (f"  ·  lease: self-terminates if unattended > {idle_timeout}s"
+                      if idle_timeout else "")
+        return (f"started in background: pid {p.pid} (detached; killed when you exit "
+                f"lean-coder)\noutput -> {log}\n"
+                f"track: bg_status  (exit code -> '{exitf}')  ·  list/stop: /bg  "
+                f"·  stop now: kill {p.pid}{lease_note}")
+
+    @staticmethod
+    def _bg_wrap(cmd: str, exitf: str, leasef: str, idle_timeout=None) -> str:
+        """Build the shell wrapper for a backgrounded command.
+
+        Base: run cmd in a SUBSHELL '( ... )' (contains the user's '&&'/pipes AND any
+        'exit' they run, so $? is still captured), then write the exit code to the
+        '<log>.exit' sidecar - completion + pass/fail become discoverable by READING
+        A FILE (survives an executor death / ssh reconnect; identical local/remote).
+
+        With idle_timeout: also run an in-band WATCHDOG that polls the lease file's
+        mtime; if it's gone unbumped for idle_timeout the watchdog writes the sidecar
+        (exit 137) and kills the whole process group ($$ is the detached session
+        leader => its pid is the pgid). All shell built-ins + `stat -c %Y` are
+        available on dash/bash/busybox/toybox; the `|| echo now` fallback means a
+        stat failure reads as 'just attended' (never a false kill)."""
+        # our own generated log path (no shell metachars) - safe to single-quote.
+        if not idle_timeout:
+            return f"( {cmd} ); __rc=$?; printf %s \"$__rc\" > '{exitf}'; exit $__rc"
+        try:
+            to = int(idle_timeout)
+        except (TypeError, ValueError):
+            to = 1800
+        chk = max(5, min(30, to // 4))          # poll cadence: a few checks per window
+        return (
+            f"touch '{leasef}'; __pg=$$; "
+            f"( {cmd} ) & __cpid=$!; "
+            f"( while kill -0 $__cpid 2>/dev/null; do "
+            f"now=$(date +%s); m=$(stat -c %Y '{leasef}' 2>/dev/null || echo $now); "
+            f"if [ $((now - m)) -ge {to} ]; then "
+            f"echo \"[lease expired: unattended > {to}s; terminated]\"; "
+            f"printf %s 137 > '{exitf}'; kill -KILL -$__pg 2>/dev/null; exit; fi; "
+            f"sleep {chk}; done ) & __wpid=$!; "
+            f"wait $__cpid; __rc=$?; kill $__wpid 2>/dev/null; "
+            f"[ -f '{exitf}' ] || printf %s \"$__rc\" > '{exitf}'; exit $__rc"
+        )
+
+    # --- read-only: check on backgrounded tasks ---------------------------
+    def bg_status(self, pid=None) -> str:
+        """Report on background tasks THIS session started (state / runtime / recent
+        output). No pid -> list them all; a pid -> just that one. Plain tasks only -
+        the filtering lives in the core helper."""
+        owner = os.getpid()
+        rows = _bg_status_items(owner)
+        if pid is not None:
+            try:
+                pid = int(pid)
+            except (TypeError, ValueError):
+                return "error: pid must be an integer"
+            rows = [r for r in rows if r.get("pid") == pid]
+        return _bg_status_msg(rows, pid=pid)
+
+
+# --- tool helpers (moved with the class; only the Tools methods use them) -----
+
+def _fuzzy_apply(text: str, search: str, replace: str, idx: int, path: str):
+    """Whitespace-tolerant fallback for apply_diff when an exact SEARCH match
+    fails. Small models rarely reproduce indentation/trailing whitespace
+    byte-for-byte, so match SEARCH against the file line-by-line ignoring each
+    line's leading/trailing whitespace. Uniqueness is still enforced (exactly one
+    window may match) so we never silently edit the wrong place; the REPLACE text
+    is re-indented to the file's actual indentation of the matched region.
+    Returns (new_text, None) on success, or (None, error_str) on failure."""
+    def norm(ln):
+        return ln.strip()
+    file_lines = text.split("\n")
+    s_lines = search.split("\n")
+    # drop a trailing empty line artifact from a trailing newline in SEARCH
+    if s_lines and s_lines[-1] == "":
+        s_lines = s_lines[:-1]
+    if not s_lines:
+        return None, (f"error: block {idx} SEARCH text not found in {path} "
+                      f"(matched 0 times); no changes written.")
+    s_norm = [norm(l) for l in s_lines]
+    w = len(s_norm)
+    hits = []
+    for i in range(0, len(file_lines) - w + 1):
+        if [norm(file_lines[i + k]) for k in range(w)] == s_norm:
+            hits.append(i)
+    if len(hits) == 0:
+        return None, (f"error: block {idx} SEARCH text not found in {path} "
+                      f"(matched 0 times, even ignoring whitespace); no changes "
+                      f"written. Re-read the file and copy the exact lines.")
+    if len(hits) > 1:
+        return None, (f"error: block {idx} SEARCH text is ambiguous in {path} "
+                      f"(matched {len(hits)} times ignoring whitespace); no changes "
+                      f"written. Add surrounding lines so it matches one place.")
+    at = hits[0]
+    # Re-indent REPLACE to the matched region: use the leading whitespace of the
+    # first matched file line as the base so the edit keeps the file's own style.
+    matched_indent = file_lines[at][:len(file_lines[at]) - len(file_lines[at].lstrip())]
+    r_lines = replace.split("\n")
+    if r_lines and r_lines[-1] == "":
+        r_lines = r_lines[:-1]
+    reindented = [(matched_indent + l.lstrip()) if l.strip() else l for l in r_lines]
+    new_lines = file_lines[:at] + reindented + file_lines[at + w:]
+    return "\n".join(new_lines), None
+
+
+def _number(lines, start: int) -> str:
+    width = len(str(start + len(lines) - 1))
+    return "\n".join(f"{str(start + i).rjust(width)}\t{ln}"
+                     for i, ln in enumerate(lines))
+
+
+def _iter_files(base, ignore):
+    stack = [base]
+    while stack:
+        d = stack.pop()
+        try:
+            for e in d.iterdir():
+                if ignore.ignored(e):
+                    continue
+                if e.is_dir():
+                    stack.append(e)
+                elif e.is_file():
+                    yield e
+        except (PermissionError, OSError):
+            continue
+
+
+def _truncate_output(s: str) -> str:
+    if len(s) <= OUTPUT_MAX_CHARS:
+        return s
+    dropped = len(s) - OUTPUT_HEAD - OUTPUT_TAIL
+    return (s[:OUTPUT_HEAD] + f"\n…[truncated {dropped} chars]…\n" + s[-OUTPUT_TAIL:])
+
+
+# --- the tool contract: schema + capability tier per builtin -----------------
+# (description text is the model-facing tool doc; kept verbatim from the old core
+#  TOOLS list. tier maps to the /leash ladder - see header.)
+BUILTIN_TOOLS = [
+    {"name": "read_file", "tier": "read",
+     "description": "Read a file (line-numbered); read before editing. start/end read a slice; large reads truncate.",
+     "parameters": {"type": "object",
+        "properties": {"path": {"type": "string", "description": "File path, relative to the project dir."},
+                       "start": {"type": "integer", "description": "First line to read (1-based, optional)."},
+                       "end": {"type": "integer", "description": "Last line to read, inclusive (optional)."}},
+        "required": ["path"]}},
+    {"name": "list_files", "tier": "read",
+     "description": "List a directory (shallow, ignore-aware) to discover structure. No path = project root.",
+     "parameters": {"type": "object",
+        "properties": {"path": {"type": "string", "description": "Directory to list (optional; defaults to project root)."}},
+        "required": []}},
+    {"name": "search_files", "tier": "read",
+     "description": "Find text across files by regex; returns file:line matches (capped). Locate where something is defined/used.",
+     "parameters": {"type": "object",
+        "properties": {"pattern": {"type": "string", "description": "Regex to search for."},
+                       "path": {"type": "string", "description": "File or directory to search (optional; defaults to project root)."}},
+        "required": ["pattern"]}},
+    {"name": "apply_diff", "tier": "write",
+     "description": ("Preferred way to edit a file: replace exact spans via SEARCH/REPLACE blocks. SEARCH must "
+                     "match verbatim (read_file first); on mismatch nothing is written - re-read and retry. "
+                     "Format per block: '===SEARCH===', old text, '===DIVIDER===', new text, '===REPLACE==='. "
+                     "Multiple blocks applied in order."),
+     "parameters": {"type": "object",
+        "properties": {"path": {"type": "string", "description": "File to edit (must already exist)."},
+                       "diff": {"type": "string", "description": "One or more SEARCH/REPLACE blocks."}},
+        "required": ["path", "diff"]}},
+    {"name": "write_file", "tier": "write",
+     "description": "Create or overwrite a whole file. Use for NEW files or a full rewrite; to change an existing file prefer apply_diff.",
+     "parameters": {"type": "object",
+        "properties": {"path": {"type": "string", "description": "File path to create or overwrite."},
+                       "content": {"type": "string", "description": "Full new contents of the file."}},
+        "required": ["path", "content"]}},
+    {"name": "run_command", "tier": "exec",
+     "description": "Run a non-interactive shell command (builds, tests, git, file ops); returns truncated stdout/stderr. Fresh shell each call - cd/env don't persist, chain with '&&'. For sudo/password/interactive use ask_user_to_run; for a shell that stays open use shell_session.",
+     "parameters": {"type": "object",
+        "properties": {"cmd": {"type": "string", "description": "The shell command to run."}},
+        "required": ["cmd"]}},
+    {"name": "bg_status", "tier": "read",
+     "description": "Poll background tasks (started with a trailing ' &' on run_command): state, runtime, last output. No pid = all; a pid = just that one.",
+     "parameters": {"type": "object",
+        "properties": {"pid": {"type": "integer", "description": "A specific task's pid (optional; omit to list all)."}},
+        "required": []}},
+]
+
+
+def _schema(t):
+    """The function-call tool schema the model sees (drops the internal `tier`)."""
+    return {"type": "function", "function": {
+        "name": t["name"], "description": t["description"], "parameters": t["parameters"]}}
+
+
+# What core consumes: the model-facing schemas (in declared order) + a name->tier map.
+TOOL_SCHEMAS = [_schema(t) for t in BUILTIN_TOOLS]
+TIERS = {t["name"]: t["tier"] for t in BUILTIN_TOOLS}
+
+
+def setup(lc, cfg=None):
+    """Helpers-only: inject the stable core helpers/constants this module resolves as
+    plain names (see _INJECT). Called once by core after its helpers are defined, and
+    by the remote executor. Absent names are skipped (guarded), so a partial core
+    (e.g. a test harness) still loads the data + schemas."""
+    g = globals()
+    for k in _INJECT:
+        if k in lc:
+            g[k] = lc[k]
