@@ -1,0 +1,9105 @@
+#!/usr/bin/env python3
+"""lean-coder - a minimal terminal coding agent driving an Ollama model via
+native tool calling. Zero third-party dependencies: Python stdlib only.
+
+Design priority: lean context usage. Small system prompt, one-line tool
+schemas, truncated tool results. See README.md.
+"""
+
+import argparse
+import base64
+import datetime
+import hashlib
+import atexit
+import itertools
+import json
+import os
+import re
+import shlex
+import signal
+import socket
+import subprocess
+import sys
+import threading
+import time
+import types
+import urllib.error
+import urllib.request
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from difflib import unified_diff
+from pathlib import Path
+
+try:
+    import readline  # stdlib; gives Tab-completion + line history where available
+except ImportError:  # pragma: no cover - not present on some platforms
+    readline = None
+
+# ----------------------------------------------------------------------------
+# Constants / tunables
+# ----------------------------------------------------------------------------
+
+CONFIG_PATH = Path.home() / ".config" / "leancoder" / "config.toml"
+CONFIG_DIR = CONFIG_PATH.parent                  # ~/.config/leancoder; providers read
+                                                 # this via lc["CONFIG_DIR"] for secrets
+                                                 # /caches instead of hardcoding the path
+SESSIONS_DIR = CONFIG_DIR / "sessions"           # saved + autosaved conversations
+HISTORY_PATH = CONFIG_DIR / "history"            # composer input history (one line per entry)
+HISTORY_MAX = 1000                               # trailing entries kept on disk
+AUTOSAVE_KEEP = 10               # rolling autosave sessions kept (oldest pruned)
+AUTOSAVE_PREFIX = "auto-"        # autosave session names; named snapshots have none
+PRECOMPACT_PREFIX = "pre-compact-"   # rolling pre-compaction safety snapshots (auto_compact)
+PRECOMPACT_KEEP = 3              # cap them too: safety nets, not named saves - newest few suffice
+
+
+# Human-readable release version, SemVer (MAJOR.MINOR.PATCH[-prerelease]). Bump on a
+# published change; the /update lean-tool probes the repo's VERSION file against this to
+# decide whether to pull. A pre-release suffix (e.g. 1.2.0-beta.1) marks the beta track:
+# it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
+# (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
+# a different axis (any byte change), so the two are intentionally separate.
+__version__ = "0.4.0"
+
+
+def _prerelease_key(pre):
+    """SemVer pre-release precedence key for the dot-separated identifiers after '-'.
+    Numeric identifiers compare numerically and rank below alphanumerics; each is
+    wrapped as (is_alpha, num, str) so ints and strings never compare directly."""
+    key = []
+    for ident in pre.split("."):
+        if ident.isdigit():
+            key.append((0, int(ident), ""))
+        else:
+            key.append((1, 0, ident))
+    return tuple(key)
+
+
+def version_tuple(s=None):
+    """Parse a SemVer string into a comparable key. Returns (major, minor, patch,
+    is_release, prerelease_key): is_release=1 for a plain release, 0 for a
+    pre-release, so 1.2.0 > 1.2.0-beta.1 (SemVer precedence). Non-numeric core
+    parts and junk degrade to 0 so a malformed string never raises. Defaults to
+    this build's __version__."""
+    s = str(__version__ if s is None else s).strip()
+    core, _, pre = s.partition("-")           # split off any -prerelease
+    nums = []
+    for part in core.split("."):
+        digits = "".join(c for c in part if c.isdigit())
+        nums.append(int(digits) if digits else 0)
+    while len(nums) < 3:                        # pad to (major, minor, patch)
+        nums.append(0)
+    if pre:
+        return (nums[0], nums[1], nums[2], 0, _prerelease_key(pre))
+    return (nums[0], nums[1], nums[2], 1, ())
+
+
+def source_hash() -> str:
+    """sha256 of this build's own source - the 'version' /connect compares against
+    a provisioned box's installed copy to decide whether a re-push is needed."""
+    try:
+        return hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+    except OSError:
+        return ""
+COMPACT_KEEP = 3               # /compact: tool results kept in full (rest stubbed)
+NUDGE_EVERY = 5                # soft-zone: nudge the model to wrap up at most every N turns
+AUTO_CTX_CAP = 32768           # auto-detect never raises num_ctx above this (OOM guard)
+
+READ_MAX_LINES = 600           # line-number'd file read cap
+READ_HEAD = 450
+READ_TAIL = 100
+OUTPUT_MAX_CHARS = 6000        # run_command result cap (sent to model)
+OUTPUT_HEAD = 3500
+OUTPUT_TAIL = 2000
+RAW_READ_MAX = 1_000_000       # byte ceiling for remote diff-preview fetches
+SEARCH_MAX_MATCHES = 200
+SEARCH_LINE_MAX = 200          # max chars of a matched line
+TREE_MAX_ENTRIES = 400
+TREE_DEFAULT_DEPTH = 3
+
+DEFAULT_IGNORES = [
+    ".git/", "node_modules/", "dist/", "build/", "out/", ".next/",
+    "__pycache__/", ".venv/", "venv/", ".mypy_cache/", ".pytest_cache/",
+    ".cache/", ".mozilla/", ".config/",   # avoid flooding ctx when cwd is $HOME
+    "*.lock", "*.log", "*.min.js", "*.map", "*.pyc", "*.so", "*.o",
+    "*.bin", "*.png", "*.jpg", "*.jpeg", "*.gif", "*.pdf", "*.zip",
+]
+
+SYSTEM_PROMPT = (
+    "You are a precise code editor. Read files, make targeted edits with "
+    "apply_diff, and run commands when needed. Be concise - output only what "
+    "changed; don't explain unless asked."
+)
+
+HANDOVER_MARK = "===HANDOVER==="    # the visible delimiter the model wraps its handover in
+SELFPROMPT_MARK = "===NEXT==="      # the model wraps its post-compaction self-prompt in these
+PLAN_MARK = "===PLAN==="            # the model wraps its pinned goal + TODO in these
+BRIEF_MARK = "===BRIEF==="          # a worker's task (its first user turn) - see --agent-run
+GRANT_MARK = "===GRANT==="          # a worker's grant header (leash/model/cwd/limits)
+RESULT_MARK = "===RESULT==="        # a worker wraps its final answer in these; the parent harvests it
+
+HANDOVER_INSTR = (
+    "You are wrapping up this session (/handover). Two steps, in order:\n"
+    "1. DURABLE DOCS: if there are docs/notes worth persisting (a plan, a design doc, a "
+    "README, a HANDOVER.md - whatever this project already uses), update them now with "
+    "your tools, and if this is ALREADY a git repo, commit them. Do NOT initialise a new "
+    "repo, and do NOT commit if there isn't one. If you have no write/command tools right "
+    "now (read-only leash), skip this step.\n"
+    "2. HANDOVER: write a concise handover for your future self (memory will be wiped) - "
+    "the goal, key decisions, current state, WHERE the durable docs live, and a clear "
+    "prompt to continue from. Wrap ONLY that handover between two " + HANDOVER_MARK +
+    " markers as visible text, like:\n" + HANDOVER_MARK + "\n<your handover here>\n" +
+    HANDOVER_MARK + "\n"
+    "3. OPTIONAL PLAN: you may write your goal + TODO between two " + PLAN_MARK +
+    " markers; it stays pinned for whoever resumes:\n" + PLAN_MARK +
+    "\nGOAL: ...\nTODO:\n- [ ] ...\n" + PLAN_MARK + "\n"
+    "4. OPTIONAL SELF-PROMPT: if there's a clear next action, write it between two " +
+    SELFPROMPT_MARK + " markers (your continue-from prompt):\n" + SELFPROMPT_MARK +
+    "\n<what to do next>\n" + SELFPROMPT_MARK + "\n"
+    "Then call finalize_handover to pull the trigger. The handover text becomes the "
+    "ENTIRE continuing context; everything else is discarded. If you can't produce a "
+    "handover, don't call the tool."
+)
+
+
+def _extract_marked(text: str, mark: str):
+    """Text between the LAST pair of `mark` delimiters (so an echoed instruction
+    example doesn't win). None when there isn't a complete pair - the caller then
+    refuses to act, so a bad parse never nukes the session. Pure -> tested."""
+    if not text:
+        return None
+    close = text.rfind(mark)
+    open_ = text.rfind(mark, 0, close) if close != -1 else -1
+    if open_ == -1:
+        return None
+    block = text[open_ + len(mark):close].strip()
+    return block or None
+
+
+def _extract_handover_block(text: str):
+    """The handover block (between the last HANDOVER_MARK pair)."""
+    return _extract_marked(text, HANDOVER_MARK)
+
+
+def _extract_plan(text: str):
+    """The pinned goal + TODO (between the last PLAN_MARK pair), or None."""
+    return _extract_marked(text, PLAN_MARK)
+
+
+def _extract_selfprompt(text: str):
+    """The post-compaction self-prompt (between the last SELFPROMPT_MARK pair). The
+    model writes this to itself; autostart submits it as the next turn so work
+    continues seamlessly after the memory wipe."""
+    return _extract_marked(text, SELFPROMPT_MARK)
+
+
+# Auto-compaction instruction: the model gets a full tool-capable turn to wrap up,
+# then writes BOTH a handover block (@#!, kept as continuing context) and a
+# self-prompt (%%^^, autostarted as the next turn). Recent turns are kept verbatim.
+AUTO_HANDOVER_INSTR = (
+    "Your context is getting full, so you're compacting it yourself (the recent "
+    "turns will be kept; older ones get replaced by what you write now). Do this:\n"
+    "1. If useful, update any durable docs/notes with your tools and commit them ONLY "
+    "if this is already a git repo (never init one).\n"
+    "2. HANDOVER: write a concise summary of the older context for your future self - "
+    "the goal, key decisions, current task state (done / in progress / next), WHERE "
+    "things live (files, commands), and open threads. Wrap ONLY it between two " +
+    HANDOVER_MARK + " markers:\n" + HANDOVER_MARK + "\n<handover>\n" + HANDOVER_MARK + "\n"
+    "3. PLAN: write your current goal + TODO between two " + PLAN_MARK + " markers (mark "
+    "what's done and what's next) - this stays PINNED across the compaction, so keep it "
+    "accurate:\n" + PLAN_MARK + "\nGOAL: ...\nTODO:\n- [x] done\n- [ ] next\n" + PLAN_MARK + "\n"
+    "4. SELF-PROMPT: write the single next instruction to yourself - the very next "
+    "thing to do after compaction, phrased as a prompt you'd act on immediately. Wrap "
+    "ONLY it between two " + SELFPROMPT_MARK + " markers:\n" + SELFPROMPT_MARK +
+    "\n<what to do next>\n" + SELFPROMPT_MARK + "\n"
+    "Then call finalize_handover. The handover becomes your kept context; the "
+    "self-prompt is run as your next turn. If you can't produce both, don't call the tool."
+)
+
+# Soft-zone nudge: gentle, injected inline into the user turn while context is in the
+# soft zone. DELIBERATELY soft - "finish, then wrap at a clean break" - not "compact
+# now"; a harsh nudge just makes the model stop mid-thought, which is what the hard
+# auto-handover is for. {used}/{limit}/{pct} are filled in at injection time.
+HANDOVER_NUDGE = (
+    "context {used}/{limit} ({pct}%) - getting fuller. No need to stop abruptly: "
+    "finish what you're doing, then look for a clean break point to wrap the current "
+    "step up, so an automatic handover can happen tidily rather than mid-task."
+)
+
+# Editable prompts live as text files under the config dir. The built-in prompts
+# (system, handover, auto_handover, handover_nudge) live in a protected `system/`
+# subdir so a user browsing the
+# prompts dir doesn't break them by accident; custom prompts live in the root.
+# read_prompt() returns the override file's text if present, else the baked default.
+# Reloaded on /reload (and read live by _system()/handover()).
+PROMPTS_DIR = CONFIG_PATH.parent / "prompts"
+SYSTEM_PROMPTS_DIR = PROMPTS_DIR / "system"
+BUILTIN_PROMPTS = {
+    "system":         SYSTEM_PROMPT,
+    "handover":       HANDOVER_INSTR,
+    "auto_handover":  AUTO_HANDOVER_INSTR,     # the lever-pull instruction on an auto-handover turn
+    "handover_nudge": HANDOVER_NUDGE,    # the gentle soft-zone "wrap up at a break" nudge
+}
+EDITOR_FALLBACKS = ("nano", "vi", "vim")
+
+
+def prompt_file(name):
+    """Path of a prompt's override file: built-ins under system/, custom in the root."""
+    if name in BUILTIN_PROMPTS:
+        return SYSTEM_PROMPTS_DIR / f"{name}.txt"
+    return PROMPTS_DIR / f"{name}.txt"
+
+
+def read_prompt(name):
+    """Effective text of a prompt: the override file if it exists, else the baked-in
+    default for a built-in, else None for an unknown custom name."""
+    f = prompt_file(name)
+    try:
+        if f.is_file():
+            return f.read_text()
+    except OSError:
+        pass
+    return BUILTIN_PROMPTS.get(name)
+
+
+def list_prompts(all_builtins=False):
+    """(builtin_names, custom_names): customs are the .txt files in the prompts root
+    (the system/ subdir is excluded by glob's non-recursion). Built-ins are the
+    advanced system prompts - by default only the ones the user has ALREADY overridden
+    are surfaced (so a fresh menu shows just the user's own prompts, not internal
+    machinery); pass all_builtins=True to list every one (they stay editable by name
+    regardless, e.g. `/prompt system`)."""
+    custom = []
+    try:
+        custom = sorted(p.stem for p in PROMPTS_DIR.glob("*.txt"))
+    except OSError:
+        pass
+    builtins = sorted(BUILTIN_PROMPTS) if all_builtins \
+        else sorted(n for n in BUILTIN_PROMPTS if prompt_file(n).is_file())
+    return builtins, custom
+
+
+def restore_prompt(name):
+    """Revert a built-in prompt to its baked default by removing its override file.
+    Returns True if an override existed and was removed."""
+    if name not in BUILTIN_PROMPTS:
+        return False
+    f = prompt_file(name)
+    try:
+        if f.is_file():
+            f.unlink()
+            return True
+    except OSError:
+        pass
+    return False
+
+
+def seed_prompt_file(name):
+    """Ensure a prompt's override file exists (seeded with the current effective
+    text) so an editor has something to open. Returns the Path."""
+    f = prompt_file(name)
+    try:
+        if not f.is_file():
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_text(read_prompt(name) or "")
+    except OSError:
+        pass
+    return f
+
+# The built-in tool schemas (read_file..run_command) + their implementations now live
+# in the bundled lean-tools/builtins.py (canon, shipped + always-on). Core loads that
+# module once its helpers are defined and DERIVES the surfaces below from it:
+#   TOOLS        - the model-facing schema list (active_tools assembles from it)
+#   _WRITE_TIER  - names that ride at /leash rw+   (declared tier=="write")
+#   _EXEC_TIER   - names that ride at /leash rwe   (declared tier=="exec"); ask_user_to_run too
+#   SAFE_TOOLS   - read-only names (tier=="read"): parallel-safe, ask-on-read
+#   EXEC_TOOLS   - every builtin name (the remote executor allowlist)
+# See "# --- builtin tools: load + derive ---" further down (after _confirm_write).
+# `ssh` (run a command on another host) used to live in TOOLS; it moved to an opt-in
+# lean-tool (examples/lean-tools/ssh.py) - network egress, not local editing, so it is
+# off by default. /connect (remote workspace) and /sh are unaffected.
+# The leash ladder, least -> most capable. chat = no tools; r = read only; rw = read +
+# write files; rwe = + run commands. A missing cfg.leash defaults to rwe (today's full
+# surface), so old configs are unchanged.
+LEASH_LEVELS = ("chat", "r", "rw", "rwe")
+_LEASH_ALIASES = {"none": "chat", "off": "chat", "chat": "chat",
+                  "read": "r", "ro": "r", "r": "r",
+                  "write": "rw", "rw": "rw", "readwrite": "rw",
+                  "exec": "rwe", "rwe": "rwe", "all": "rwe", "full": "rwe"}
+_LEASH_GRANTS = {
+    "chat": "no tools - conversation only",
+    "r":    "read only - read/list/search; cannot edit or run commands",
+    "rw":   "read + write files; cannot run commands",
+    "rwe":  "read, write files, AND run commands (full reach)",
+}
+
+# The model's permissions note. Injected into the NEXT user turn on a leash change (and
+# at startup if restricted) - NOT baked into the cached system prompt, so toggling the
+# leash never rewrites the global system cache. The tool surface already reflects the
+# tier; this just explains it + how the user raises it.
+_LEASH_NOTES = {
+    "chat": "Permissions changed: chat-only, no tools. If a task needs one, say tools are "
+            "off and the user can enable them with /leash rwe - don't claim you can't.",
+    "r":    "Permissions changed: read-only - read/list/search only, no edits or commands. "
+            "If an edit or command is needed, say you're read-only and the user can raise it "
+            "with /leash rw or /leash rwe.",
+    "rw":   "Permissions changed: read-write - read and edit files, but no commands. If a "
+            "command is needed, say so; the user can allow it with /leash rwe.",
+    "rwe":  "Permissions changed: read-write-execute - full tool surface (read, edit, run "
+            "commands) is available now. Use the tools you have.",
+}
+
+def _leash_note(leash):
+    return _LEASH_NOTES.get(leash, "")
+
+
+def _norm_leash(s):
+    """Map a leash arg (level or alias, any case, -/_ stripped) to a canonical level,
+    or None if unrecognized. Pure -> tested."""
+    return _LEASH_ALIASES.get((s or "").strip().lower().replace("-", "").replace("_", ""))
+
+# Optional handoff tool (added by active_tools when cfg.ask_user_to_run is on).
+# Lets the model ask the operator to run a command (e.g. one needing sudo); the
+# operator can edit it, runs it in a real terminal, and the result returns here.
+ASK_USER_TOOL = {"type": "function", "function": {
+    "name": "ask_user_to_run",
+    "description": "Hand a command to the operator to run in their own terminal; the exact command and its exit code return to you (never any password). Use when run_command can't: needs sudo/root, an interactive prompt, a typed password or secret, or your judgement before acting. Also the right fallback when run_command failed because it required one of those. They may edit the command before running. Don't use it for ordinary commands run_command can handle.",
+    "parameters": {"type": "object",
+        "properties": {"cmd": {"type": "string", "description": "The command to hand over."},
+                       "reason": {"type": "string", "description": "Brief why this needs the operator (e.g. 'needs sudo')."}},
+        "required": ["cmd"]}}}
+
+# Surfaced ONLY during /handover (added to the tool surface for that window, removed
+# after). Calling it is the explicit "I'm done preparing - finalize" trigger: core
+# extracts the @#! ... @#! block from the handover turn and replaces history with it.
+UPDATE_PLAN_TOOL = {"type": "function", "function": {
+    "name": "update_plan",
+    "description": ("Set/replace your PINNED plan: the GOAL plus a TODO checklist. It stays "
+                    "pinned to the system prompt, visible every turn, and SURVIVES "
+                    "compaction/handover - so it's how you keep long-horizon work on track. "
+                    "Call it whenever the plan changes: at the start to lay out the GOAL and "
+                    "tasks, and again as you finish steps (flip '- [ ]' to '- [x]') or "
+                    "re-scope. Pass the FULL plan each time - it replaces the previous one. "
+                    "Pass an empty string to clear it. Keep it short."),
+    "parameters": {"type": "object",
+        "properties": {"plan": {"type": "string", "description":
+            "The full plan text, e.g.\nGOAL: ship feature X\nTODO:\n- [x] done step\n- [ ] next step"}},
+        "required": ["plan"]}}}
+
+
+HANDOVER_TOOL = {"type": "function", "function": {
+    "name": "finalize_handover",
+    "description": ("Call this ONCE you have (1) updated/committed any durable docs and "
+                    "(2) written your handover as visible text wrapped between two " +
+                    HANDOVER_MARK + " markers. It captures the text between the markers as "
+                    "the entire continuing context and ends the handover. Takes no "
+                    "arguments. If you haven't written the marked handover yet, do that "
+                    "first - don't call this empty."),
+    "parameters": {"type": "object", "properties": {}, "required": []}}}
+
+# Surfaced ONLY in the soft context zone (the user has, via handover_soft, opened the
+# spend window). Lets the model ELECT a handover at a clean semantic boundary - a
+# finished task, before switching to an unrelated one - instead of being nagged with
+# no lever, or force-wiped mid-thought when context later hits the hard threshold.
+# Cost is NOT the model's call: it can never hand over before the soft zone (the
+# user's threshold), only pick the tidiest MOMENT inside the window the user opened.
+REQUEST_HANDOVER_TOOL = {"type": "function", "function": {
+    "name": "request_handover",
+    "description": ("Electively hand over NOW, at a clean stopping point. Only call this "
+                    "when the CURRENT task/step is genuinely complete (work committed, "
+                    "nothing half-done) and the next thing is a fresh, unrelated task that "
+                    "won't need this history - a natural boundary to summarize + reset at. "
+                    "It runs the same handover the automatic one does: you summarize the "
+                    "older context and write your next-step self-prompt, then history is "
+                    "replaced by that summary. Do NOT call it mid-task, and do NOT call it "
+                    "just because context is large - the automatic handover covers pure "
+                    "size. Prefer finishing cleanly first. Takes no arguments."),
+    "parameters": {"type": "object", "properties": {}, "required": []}}}
+
+
+def active_tools(cfg, remote=False, lean_tool_schemas=(), model_tools=True,
+                 offer_handover=False):
+    """The tool list the model actually sees, gated by the /leash capability ceiling:
+    chat -> none; r -> read tools only; rw -> + write tools; rwe -> + run_command +
+    ask_user_to_run. Lean-tools are tiered by their `safe` flag: a safe (read-only)
+    lean-tool rides at r+, anything else only at rwe (it may write or execute).
+    `lean_tool_schemas` is an iterable of (schema, is_safe). `model_tools` is whether the
+    ACTIVE MODEL can tool-call at all (a provider may report a chat-only model via its
+    tool_support() hook); False drops the whole tool block regardless of leash - a model
+    with no tools can't be granted any by raising the ceiling. `offer_handover` adds the
+    elective request_handover tool (surfaced only in the soft context zone - the caller
+    decides). (`remote` is kept for call-site symmetry; the core tools are identical
+    local or remote.)"""
+    leash = getattr(cfg, "leash", "rwe")
+    if leash == "chat" or not model_tools:
+        return []                    # chat-only (user ceiling OR model can't tool-call)
+    allow_write = leash in ("rw", "rwe")
+    allow_exec = leash == "rwe"
+    tools = [UPDATE_PLAN_TOOL]       # plan upkeep: no fs/exec, available at every non-chat tier
+    if offer_handover:               # soft zone: let the model elect a handover at a break
+        tools.append(REQUEST_HANDOVER_TOOL)
+    for t in TOOLS:
+        nm = t["function"]["name"]
+        if nm in _WRITE_TIER and not allow_write:
+            continue
+        if nm in _EXEC_TIER and not allow_exec:
+            continue
+        tools.append(t)
+    if cfg.ask_user_to_run and allow_exec:   # a handoff to RUN a command -> exec tier
+        tools.append(ASK_USER_TOOL)
+    # A lean-tool must not shadow a core tool name (or another lean-tool): duplicate
+    # tool names make the API 400 ("Tool names must be unique"). Core wins - a
+    # lean-tool that reuses a builtin name (e.g. todo.py's `update_plan`, which is
+    # already a core tool) is silently dropped from the surface here.
+    seen = {t["function"]["name"] for t in tools}
+    for sch, is_safe in lean_tool_schemas:
+        if not (is_safe or allow_exec):      # non-safe lean-tools may write/run -> rwe only
+            continue
+        nm = sch.get("function", {}).get("name")
+        if nm in seen:                       # collides with a core tool / earlier lean-tool
+            continue
+        seen.add(nm)
+        tools.append(sch)
+    return tools
+
+
+def _min_leash_for(name, lean_safe=None):
+    """The lowest /leash level that permits `name`. `lean_safe`: a lean-tool's `safe`
+    flag, or None for a core tool. Used to tell the model exactly how to get unblocked."""
+    if lean_safe is not None:
+        return "r" if lean_safe else "rwe"
+    if name in _WRITE_TIER:
+        return "rw"
+    if name in _EXEC_TIER or name == ASK_USER_TOOL["function"]["name"]:
+        return "rwe"
+    return "r"                               # read tools (and anything unclassified)
+
+
+def _leash_allows_tool(leash, name, lean_safe=None):
+    """Authoritative DISPATCH-time capability check - the hard lock BEHIND the
+    active_tools() surface filter. active_tools decides what the model is OFFERED;
+    this decides what the executor will actually RUN. Even if a call for an above-tier
+    tool reaches dispatch anyway - a hallucinated or injected tool_call, a replayed or
+    loaded message, a tool wrongly leaked onto the surface - it is refused here unless
+    `leash` truly permits it. Mirrors active_tools()'s tiering exactly. update_plan /
+    finalize_handover are agent-internal (no fs/exec) and allowed at any tier."""
+    if name in ("update_plan", "finalize_handover", "request_handover"):
+        return True
+    if leash == "chat":
+        return False                         # no tools at all
+    allow_write = leash in ("rw", "rwe")
+    allow_exec = leash == "rwe"
+    if lean_safe is not None:                # a lean-tool: safe -> r+, else rwe only
+        return bool(lean_safe) or allow_exec
+    if name in _WRITE_TIER:
+        return allow_write
+    if name in _EXEC_TIER or name == ASK_USER_TOOL["function"]["name"]:
+        return allow_exec
+    return True                              # read tools (and anything else) ride at r+
+
+
+def _leash_block_msg(leash, name, lean_safe=None):
+    """The tool-result returned to the model when the dispatch gate refuses a call:
+    explains it's a HARD lock (not run), why, and how the user can lift it."""
+    need = _min_leash_for(name, lean_safe)
+    return (f"BLOCKED: '{name}' is above the current '{leash}' capability leash "
+            f"({_LEASH_GRANTS.get(leash, leash)}) and was NOT run. This is a hard lock "
+            f"enforced at execution - being handed the tool, or guessing/forcing its name, "
+            f"does not bypass it. You CAN do this once the user raises the ceiling to "
+            f"'{need}' or higher (e.g. /leash {need}): explain what you need to do and why, "
+            f"and let them decide. Do not retry this tool until the leash is raised.")
+
+
+def _model_no_tools_msg(model, name):
+    """Returned to the model when the active model itself can't tool-call (provider
+    tool_support=False). Distinct from the leash block: raising the leash won't help -
+    the limitation is the model, so the fix is to switch models, not change a setting."""
+    return (f"BLOCKED: the active model '{model}' does not support tool calling, so '{name}' "
+            f"was not run and no tools are available. This is the MODEL's limitation, not a "
+            f"permission setting - raising the leash will NOT help. Switch to a tool-capable "
+            f"model (/model) to use tools; otherwise continue in conversation only.")
+
+
+# ----------------------------------------------------------------------------
+# Lean-tools: drop a .py in the lean-tools dir to add a tool. Each file defines
+#   TOOL = {"name", "description", "parameters", "safe"?}   and   def run(args, cwd)
+# Enabled lean-tools surface as normal tools (local AND remote - they're pushed to
+# the remote executor on /connect, so the model's surface is identical either
+# way). Disabled by default so context stays opt-in; toggle with /tools.
+# ----------------------------------------------------------------------------
+
+def _load_lean_tool(path: Path):
+    # compile+exec (not importlib) so a reload always re-reads the source -
+    # importlib's .pyc cache can serve stale bytecode after a same-second edit.
+    mod = types.ModuleType(f"lcleantool_{path.stem}")
+    mod.__file__ = str(path)
+    exec(compile(path.read_text(), str(path), "exec"), mod.__dict__)
+    return mod
+
+
+def _same_file(a: Path, b: Path) -> bool:
+    """True if two paths have byte-identical content. Used to decide whether a
+    shadowed duplicate across the [bundled, user] search path is worth warning about:
+    an identical copy (e.g. the same plugin present in both dirs on a mirrored box) is
+    silently skipped; only a DIFFERENT file under a name already loaded is flagged."""
+    try:
+        return a.read_bytes() == b.read_bytes()
+    except OSError:
+        return False
+
+
+class LeanToolManager:
+    """Discovers lean-tool files and exposes their schemas/handlers. `enabled` is a
+    set of lean-tool names (None = all, used by the hermetic executor which only
+    ever receives the lean-tools the driver chose to push)."""
+
+    def __init__(self, lean_tools_dir, enabled=None):
+        # Accept one dir (str/Path) or a list of dirs (bundled first, then user),
+        # mirroring ProviderManager. First dir to claim a tool NAME wins, so a user
+        # drop-in can't silently shadow a bundled builtin (e.g. read_file).
+        if isinstance(lean_tools_dir, (str, Path)):
+            raw = [lean_tools_dir]
+        else:
+            raw = list(lean_tools_dir or [])
+        self.dirs = [Path(d) for d in raw if d]
+        self.dir = self.dirs[0] if self.dirs else None   # back-compat (display/first)
+        self.enabled = set(enabled) if enabled is not None else None
+        self.lean_tools = {}        # name -> {"schema", "run", "safe", "path"}
+        self._load()
+
+    def _load(self):
+        # Recurse so tools can be grouped in subdirs (lean-tools/web_dev/foo.py).
+        # A tool's GROUP is its first path component under its dir ("" = the
+        # ungrouped root, shown as "general"); deeper nesting still groups by the
+        # top-level subdir. Groups are a UI grouping only - enabling is still by
+        # tool name, so the config and remote sync are unchanged.
+        for d in self.dirs:
+            if not d.is_dir():
+                continue
+            self._load_dir(d)
+
+    def _load_dir(self, d):
+        for f in sorted(d.rglob("*.py")):
+            if "__pycache__" in f.parts:
+                continue
+            # builtins.py is the BUNDLED builtin tool surface (read_file..run_command):
+            # core loads it directly via _load_builtins() (it exports a Tools class +
+            # tier schemas, not the TOOL+run shape), so the manager must NOT also scan
+            # it as a plugin - that would double-load it and list "builtins" as a tool.
+            if f.name == "builtins.py":
+                continue
+            rel = f.relative_to(d).parts
+            group = rel[0] if len(rel) > 1 else ""
+            try:
+                mod = _load_lean_tool(f)
+                spec, run = getattr(mod, "TOOL", None), getattr(mod, "run", None)
+                setup = getattr(mod, "setup", None)
+                has_tool = isinstance(spec, dict) and callable(run) and spec.get("name")
+                if not has_tool and not callable(setup):
+                    continue            # neither a tool nor a startup hook: skip
+                # identity: the TOOL name for tool lean-tools, else the file stem
+                name = spec["name"] if has_tool else f.stem
+                if name in self.lean_tools:
+                    prev = self.lean_tools[name]["path"]
+                    if not _same_file(prev, f):     # identical copy across dirs -> silent
+                        print(yellow(f"lean-tool {f.name}: name '{name}' already loaded "
+                                     f"(from {prev.name}); skipping"))
+                    continue
+                entry = {"path": f, "group": group,
+                         "setup": setup if callable(setup) else None}
+                if has_tool:
+                    entry["schema"] = {"type": "function", "function": {
+                        "name": name,
+                        "description": spec.get("description", ""),
+                        "parameters": spec.get("parameters",
+                                               {"type": "object", "properties": {}})}}
+                    entry["run"], entry["safe"] = run, bool(spec.get("safe"))
+                    # driver_only: a model-facing tool that must run on the DRIVER even
+                    # when the session is connected to a remote (it acts on the local
+                    # machine / spawns a local process - e.g. dispatch_worker, whose
+                    # worker brain runs on the driver). Never pushed to the executor,
+                    # never routed remotely; see enabled_paths() + _run_tool routing.
+                    entry["driver_only"] = bool(spec.get("driver_only"))
+                self.lean_tools[name] = entry
+            except Exception as e:
+                print(yellow(f"lean-tool {f.name} failed to load: {e}"))
+
+    def _is_on(self, name):
+        return self.enabled is None or name in self.enabled
+
+    def names(self):
+        return list(self.lean_tools)
+
+    def group_of(self, name):
+        return (self.lean_tools.get(name) or {}).get("group", "")
+
+    def groups(self):
+        """Group names present, sorted ("" = root/general sorts first)."""
+        return sorted({p.get("group", "") for p in self.lean_tools.values()})
+
+    def names_in_group(self, group):
+        return [n for n, p in self.lean_tools.items() if p.get("group", "") == group]
+
+    def desc(self, name):
+        """One-line description for the menu: the tool description, or a marker
+        for a setup-only (startup hook) lean-tool."""
+        p = self.lean_tools.get(name) or {}
+        if "schema" in p:
+            return p["schema"]["function"]["description"]
+        return dim("(startup hook, no tool)")
+
+    def schemas(self):
+        """(schema, is_safe) for each enabled tool lean-tool. The safe flag tiers it
+        for the /leash ceiling (safe = read-only -> rides at r+; else rwe only)."""
+        return [(p["schema"], bool(p.get("safe"))) for n, p in self.lean_tools.items()
+                if self._is_on(n) and "schema" in p]
+
+    def enabled_paths(self):
+        # only tool lean-tools are pushed to the remote executor (setup() is
+        # driver-only and never runs there, so a setup-only lean-tool has nothing
+        # to do remotely). A driver_only tool is also skipped: it acts on the local
+        # machine (e.g. dispatch_worker spawns the worker brain here), so it must
+        # never run in the remote executor.
+        return [p["path"] for n, p in self.lean_tools.items()
+                if self._is_on(n) and "schema" in p and not p.get("driver_only")]
+
+    def setups(self):
+        """(name, setup) for every enabled lean-tool that defines setup()."""
+        return [(n, p["setup"]) for n, p in self.lean_tools.items()
+                if self._is_on(n) and p.get("setup")]
+
+    def get(self, name):
+        return self.lean_tools.get(name)
+
+
+def _lean_tools_dir(cfg):
+    return cfg.lean_tools_dir or str(CONFIG_PATH.parent / "lean-tools")
+
+
+def _bundled_lean_tools_dir():
+    """The code-relative lean-tools dir (bundled with the code, like providers/).
+    Holds bundled BUILTIN tools - e.g. read_file..run_command. None when absent
+    (e.g. a bare checkout without it)."""
+    d = Path(__file__).resolve().parent / "lean-tools"
+    return d if d.is_dir() else None
+
+
+def _lean_tools_dirs(cfg):
+    """Lean-tool search path, in order: the bundled dir first, then the user dir.
+    First file to claim a tool name wins, so a user drop-in can't shadow a bundled tool.
+    Mirrors _provider_dirs EXACTLY - tools and providers now discover the same way: the
+    driver scans both the code-relative bundled dir (lean-tools/, bundled with the code)
+    and cfg.lean_tools_dir. (builtins.py is the one exception - it's loaded directly by
+    _load_builtins() and skipped by the manager scan; see LeanToolManager._load_dir.)"""
+    dirs = []
+    bundled = _bundled_lean_tools_dir()
+    if bundled:
+        dirs.append(bundled)
+    user = Path(_lean_tools_dir(cfg))
+    if user not in dirs:
+        dirs.append(user)
+    return dirs
+
+
+# Names of lean-tools whose setup() has already run this session. setup() may
+# monkeypatch (not idempotent), so it runs AT MOST ONCE per tool per process -
+# whether at startup or when enabled mid-session via /tools.
+_setup_done = set()
+
+
+def _run_lean_tool_setup(cfg, mgr=None):
+    """Driver-only: call setup(lc, cfg) for each enabled lean-tool that defines it
+    and hasn't been set up yet this session, passing the module globals (lc) and
+    the live config so it can patch internals, register commands, or swap the
+    client. NEVER called in the --tool-exec executor. Runs at startup AND on a
+    /tools enable (a newly-enabled tool needs its hooks); each tool's setup runs
+    at most once (tracked in _setup_done) since setup may monkeypatch."""
+    global _registering_owner
+    if mgr is None:
+        mgr = LeanToolManager(_lean_tools_dirs(cfg), enabled=cfg.lean_tools_enabled)
+    for name, setup in mgr.setups():
+        if name in _setup_done:
+            continue
+        _registering_owner = name        # so register_command can attribute /commands
+        try:
+            setup(globals(), cfg)
+            _setup_done.add(name)
+        except Exception as e:
+            # A throw here silently strips any register_command() calls after it,
+            # so make it diagnosable: full traceback under LEANCODER_DEBUG, a
+            # pointer otherwise.
+            print(yellow(f"lean-tool setup '{name}' failed: {e}"))
+            if os.environ.get("LEANCODER_DEBUG"):
+                import traceback
+                print(dim(traceback.format_exc().rstrip()))
+            else:
+                print(dim("  (set LEANCODER_DEBUG=1 for the full traceback)"))
+    _registering_owner = None
+
+
+def _providers_dir(cfg):
+    return cfg.providers_dir or str(CONFIG_DIR / "providers")
+
+
+def _bundled_providers_dir():
+    """The code-relative providers dir (bundled with the code, like lean-tools).
+    Holds bundled providers - e.g. ollama, the default backend. None when absent
+    (e.g. a bare checkout without it)."""
+    d = Path(__file__).resolve().parent / "providers"
+    return d if d.is_dir() else None
+
+
+def _provider_dirs(cfg):
+    """Provider-plugin search path, in order: the bundled canon dir first, then the
+    user dir. First file to claim a name wins, so a user drop-in can't silently shadow
+    a bundled provider (e.g. ollama)."""
+    dirs = []
+    bundled = _bundled_providers_dir()
+    if bundled:
+        dirs.append(bundled)
+    user = Path(_providers_dir(cfg))
+    if user not in dirs:
+        dirs.append(user)
+    return dirs
+
+
+class ProviderManager:
+    """Discovers provider plugins in the providers/ dir - each a `.py` with a
+    module-level PROVIDER dict (the spec) and an optional helpers-only
+    `setup(lc, cfg)` (populate the module's display-helper namespace / register
+    commands; it must NOT call register_provider - the manager does that). `enabled`
+    is the set of provider names that are active. A provider is its own plugin type,
+    NOT a lean-tool: it never ships to a /connect remote and exposes no model tool."""
+
+    def __init__(self, providers_dir, enabled=None):
+        # Accept one dir (str/Path) or a list of dirs (bundled first, then user).
+        if isinstance(providers_dir, (str, Path)):
+            raw = [providers_dir]
+        else:
+            raw = list(providers_dir or [])
+        self.dirs = [Path(d) for d in raw if d]
+        self.dir = self.dirs[0] if self.dirs else None   # back-compat (display/first)
+        self.enabled = set(enabled or [])
+        self.providers = {}        # name -> {"path", "spec", "module", "setup"}
+        self._load()
+
+    def _load(self):
+        for d in self.dirs:
+            if not d.is_dir():
+                continue
+            for f in sorted(d.glob("*.py")):
+                if "__pycache__" in f.parts:
+                    continue
+                try:
+                    mod = _load_lean_tool(f)    # same compile+exec loader (fresh module)
+                    spec = getattr(mod, "PROVIDER", None)
+                    if not (isinstance(spec, dict) and spec.get("name")):
+                        print(yellow(f"provider {f.name}: no PROVIDER dict with a name; skipping"))
+                        continue
+                    name = spec["name"]
+                    if name in self.providers:   # first dir wins (bundled shadows a user drop-in)
+                        prev = self.providers[name]["path"]
+                        if not _same_file(prev, f):  # identical copy across dirs -> silent
+                            print(yellow(f"provider {f.name}: name '{name}' already loaded "
+                                         f"(from {prev.name}); skipping"))
+                        continue
+                    self.providers[name] = {"path": f, "spec": spec, "module": mod,
+                                            "setup": getattr(mod, "setup", None)}
+                except Exception as e:
+                    print(yellow(f"provider {f.name} failed to load: {e}"))
+
+    def names(self):
+        return list(self.providers)
+
+    def _is_on(self, name):
+        return name in self.enabled
+
+    def desc(self, name):
+        return (self.providers.get(name, {}).get("spec") or {}).get("description", "")
+
+    def register_enabled(self, cfg):
+        """Register every ENABLED provider into the global registry. Calls each file's
+        helpers-only setup(lc, cfg) first (so its display helpers / commands are live),
+        then register_provider(PROVIDER). Returns the registered names. Never raises -
+        a bad provider is reported and skipped."""
+        global _registering_owner
+        done = []
+        for name, p in self.providers.items():
+            if not self._is_on(name):
+                continue
+            _registering_owner = name      # attribute any /commands this provider adds
+            try:
+                if callable(p["setup"]):
+                    p["setup"](globals(), cfg)     # helpers-only: populate _lc, register commands
+                register_provider(p["spec"])       # the manager owns registration (Option A)
+                done.append(name)
+            except Exception as e:
+                print(yellow(f"provider '{name}' setup/register failed: {e}"))
+                if os.environ.get("LEANCODER_DEBUG"):
+                    import traceback
+                    print(dim(traceback.format_exc().rstrip()))
+        _registering_owner = None
+        return done
+
+
+def _register_dir_providers(cfg):
+    """Driver-only startup: discover the providers/ dir and register the enabled ones
+    into the global registry, BEFORE _maybe_autostart_provider so a config-named or
+    autostart()ing provider is available. Returns the ProviderManager."""
+    mgr = ProviderManager(_provider_dirs(cfg), enabled=cfg.providers_enabled)
+    mgr.register_enabled(cfg)
+    return mgr
+
+
+def _lean_tools_rows(manager, show_groups):
+    """Build the menu's display rows: ("group", name) headers + ("tool", name)
+    entries when grouping by subdir, else a flat list of ("tool", name)."""
+    if not show_groups:
+        return [("tool", n) for n in manager.names()]
+    rows = []
+    for g in manager.groups():
+        rows.append(("group", g))
+        rows += [("tool", n) for n in manager.names_in_group(g)]
+    return rows
+
+
+def lean_tools_menu(manager):
+    """Interactive enable/disable: up/down move, space toggles, enter saves, q
+    cancels. Tools in subdirs are shown under a group header whose own row toggles
+    the WHOLE group ([x] all on, [-] partial, [ ] off) - so a 'web_dev' set flips
+    in one keystroke. Returns the new enabled set, or None if cancelled. Falls
+    back to a plain listing when there's no TTY (returns None - edit config)."""
+    items = manager.names()
+    enabled = set(n for n in items if manager._is_on(n))
+    show_groups = len(manager.groups()) > 1
+    rows = _lean_tools_rows(manager, show_groups)
+
+    def gstate(g):
+        ns = manager.names_in_group(g)
+        on = sum(1 for n in ns if n in enabled)
+        return "all" if ns and on == len(ns) else ("none" if on == 0 else "partial")
+
+    try:
+        import termios, tty
+    except ImportError:
+        termios = None
+    if termios is None or not (sys.stdin.isatty() and _TTY):
+        print(bold("lean-tools:"))
+        for kind, val in rows:
+            if kind == "group":
+                print(bold(f"  [{val or 'general'}]"))
+            else:
+                ind = "    " if show_groups else "  "
+                print(f"{ind}[{'x' if val in enabled else ' '}] {val}")
+        print(dim("  (no TTY: set lean_tools_enabled in the config file to change)"))
+        return None
+
+    cur = 0
+    def render(first):
+        if not first:
+            sys.stdout.write(f"\033[{len(rows) + 1}A")   # back to top to redraw
+        # \r + \033[K so the header clears the rest of the line on redraw - without
+        # it, a shorter header drawn over a longer prior line leaves a trailing
+        # smear (e.g. the tail of an earlier tool-output line bleeding through).
+        sys.stdout.write("\r" + bold("lean-tools  ")
+                         + dim("(up/down move, space toggle, enter save, q cancel)") + "\033[K\n")
+        for i, (kind, val) in enumerate(rows):
+            pointer = cyan(">") if i == cur else " "
+            if kind == "group":
+                st = gstate(val)
+                mark = green("x") if st == "all" else (yellow("-") if st == "partial" else " ")
+                sys.stdout.write(f"\r{pointer} [{mark}] {bold(val or 'general')}\033[K\n")
+            else:
+                mark = green("x") if val in enabled else " "
+                ind = "  " if show_groups else ""
+                sys.stdout.write(f"\r{pointer} {ind}[{mark}] {val}  {dim(manager.desc(val))}\033[K\n")
+        sys.stdout.flush()
+
+    def toggle(i):
+        kind, val = rows[i]
+        if kind == "group":
+            ns = manager.names_in_group(val)
+            if all(n in enabled for n in ns):
+                enabled.difference_update(ns)
+            else:
+                enabled.update(ns)
+        else:
+            enabled.discard(val) if val in enabled else enabled.add(val)
+
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    render(True)
+    try:
+        tty.setraw(fd)
+        while True:
+            ch = sys.stdin.read(1)
+            if ch == "\x1b":                       # arrow escape sequence
+                ch += sys.stdin.read(2)
+                if ch == "\x1b[A":
+                    cur = (cur - 1) % len(rows)
+                elif ch == "\x1b[B":
+                    cur = (cur + 1) % len(rows)
+            elif ch in ("k",):
+                cur = (cur - 1) % len(rows)
+            elif ch in ("j",):
+                cur = (cur + 1) % len(rows)
+            elif ch == " ":
+                toggle(cur)
+            elif ch in ("\r", "\n"):
+                return enabled
+            elif ch in ("q", "\x03", "\x1b"):
+                return None
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+            render(False)
+            tty.setraw(fd)
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        print()
+
+# ----------------------------------------------------------------------------
+# Colors
+# ----------------------------------------------------------------------------
+
+_TTY = sys.stdout.isatty()
+
+
+def _c(code: str, s: str) -> str:
+    return f"\033[{code}m{s}\033[0m" if _TTY else s
+
+
+def dim(s):    return _c("2", s)
+def bold(s):   return _c("1", s)
+def red(s):    return _c("31", s)
+def green(s):  return _c("32", s)
+def yellow(s): return _c("33", s)
+def blue(s):   return _c("34", s)
+def cyan(s):   return _c("36", s)
+def italic(s): return _c("3", s)
+def magenta(s): return _c("35", s)
+
+
+def _pct_color(pct):
+    """Threshold colour for a percentage meter: blue (ok) -> yellow (mid) -> red."""
+    return red if pct >= 85 else (yellow if pct >= 60 else blue)
+
+
+def hr() -> str:
+    """A full-width horizontal rule used to separate turns. Dim box-draw line on a
+    capable TTY (U+2500, or ASCII '-' when the terminal isn't UTF-8); a short ASCII
+    dash run when stdout isn't a terminal (so logs/pipes still show a divider). One
+    place to change the turn separator."""
+    if not _TTY:
+        return "-" * 8
+    try:
+        cols = os.get_terminal_size().columns
+    except OSError:
+        cols = 80
+    return dim(GLYPH["rule"] * max(8, cols))
+
+
+def _fmt_tokens(n) -> str:
+    """Compact token count: 950 -> '950', 8237 -> '8.2k', 200000 -> '200k',
+    1000000 -> '1M'. Scales to any window size."""
+    n = int(n)
+    if n >= 1_000_000:
+        v = n / 1_000_000
+        return f"{v:.0f}M" if v == int(v) else f"{v:.1f}M"
+    if n >= 1000:
+        v = n / 1000
+        return f"{v:.0f}k" if v == int(v) else f"{v:.1f}k"
+    return str(n)
+
+
+def _fmt_age(seconds) -> str:
+    """Compact relative age: 5s / 5m / 2h / 3d / 2wk. Used by the /load picker."""
+    s = max(0, int(seconds))
+    if s < 60:
+        return f"{s}s"
+    m = s // 60
+    if m < 60:
+        return f"{m}m"
+    h = m // 60
+    if h < 24:
+        return f"{h}h"
+    d = h // 24
+    if d < 14:
+        return f"{d}d"
+    return f"{d // 7}wk"
+
+
+def _rl_wrap(s: str) -> str:
+    r"""Wrap ANSI SGR codes in readline's \001/\002 'invisible' markers."""
+    return re.sub(r"(\x1b\[[0-9;]*m)", "\x01\\1\x02", s)
+
+
+def _rl_safe(prompt: str) -> str:
+    r"""A colored input() prompt readline can measure correctly: ANSI codes wrapped
+    in \001/\002 so they are not counted as visible width. Without this a colored
+    prompt makes readline miscalculate wrapping, so long input overwrites itself /
+    wraps a column early - on every terminal, incl. tmux and termux. No-op when not
+    interactive (the markers would otherwise print as raw control chars)."""
+    if readline is None or not (sys.stdout.isatty() and sys.stdin.isatty()):
+        return prompt
+    return _rl_wrap(prompt)
+
+
+# ----------------------------------------------------------------------------
+# Glyphs - define a symbol ONCE with an ASCII fallback; callers use the constant
+# (or g()) and never repeat the "does this terminal support it?" check. We pick
+# the Unicode form only when stdout's encoding is UTF-8 (Windows consoles and
+# minimal TERMs get the ASCII version instead of mojibake). One place to change.
+# ----------------------------------------------------------------------------
+
+_UNICODE = "utf" in (getattr(sys.stdout, "encoding", "") or "").lower()
+
+
+def g(uni: str, alt: str) -> str:
+    """The Unicode glyph if the terminal can render it, else the ASCII fallback.
+    Exposed for ad-hoc/lean-tool use; most code uses the GLYPH constants below."""
+    return uni if _UNICODE else alt
+
+
+GLYPH = {
+    "prompt":   g("›", ">"),
+    "bullet":   g("●", "*"),       # assistant message
+    "tool":     g("⚙", "*"),       # a tool call
+    "bg":       g("⚡", "&"),       # a backgrounded (detached) run_command
+    "warn":     g("⚠", "!"),
+    "edit":     g("✎", "*"),       # files changed
+    "ok":       g("✓", "+"),
+    "no":       g("✗", "x"),
+    "think":    g("💭", "..."),    # reasoning
+    "ghost":    g("👻", "~"),       # incognito session marker (ASCII fallback ~)
+    "dot":      g("·", "-"),       # inline separator
+    "ellipsis": g("…", "..."),
+    "ret":      g("⏎", "<"),       # newline shown inline
+    "rule":     g(chr(0x2500), "-"),  # U+2500 box-draw; chr() keeps it out of the sweep
+}
+
+
+# ----------------------------------------------------------------------------
+# Spinner - simple animated activity indicator (distinct frames per phase).
+# TTY-gated: a no-op when stdout isn't a terminal (pipes, tests), so it never
+# spawns threads or writes control chars in non-interactive use.
+# ----------------------------------------------------------------------------
+
+THINK_FRAMES = g("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏", "|/-\\")   # braille when UTF-8, ASCII spinner otherwise
+TOOL_FRAMES = g("◐◓◑◒", "|/-\\")             # moon when UTF-8, ASCII otherwise
+
+# --- lightweight markdown styling for streamed model output --------------------
+# The markers are ALWAYS stripped (so a minimal terminal shows clean "Title", not
+# "## Title"), and bold/colour are layered on only when the terminal supports them
+# (the color helpers are no-ops off a TTY). Line-level + a few inline forms only -
+# enough to de-noise headings/bold/code without a real markdown engine.
+_MD_H = re.compile(r"^\s{0,3}(#{1,6})\s+(.*?)\s*#*\s*$")
+_MD_CODE = re.compile(r"`([^`\n]+)`")
+_MD_BOLD = re.compile(r"\*\*(.+?)\*\*|__(.+?)__")
+# single-* / single-_ italic: only OUTSIDE the ** case (bold is stripped first),
+# and not touching ** pairs, list-bullet "* ", or bare/unbalanced markers. The
+# operands reject a marker adjacent to whitespace so "a * b" and "2 * 3" pass through.
+_MD_ITALIC = re.compile(r"(?<![\*\w])\*(?!\s)([^*\n]+?)(?<!\s)\*(?![\*\w])"
+                        r"|(?<![_\w])_(?!\s)([^_\n]+?)(?<!\s)_(?![_\w])")
+
+
+def style_md_line(line: str) -> str:
+    """Style one COMPLETE markdown line: strip heading hashes / ** / backticks
+    (always), add bold/cyan when the terminal allows. Lists, italics, and other
+    text pass through untouched."""
+    h = _MD_H.match(line)
+    if h:
+        inner = _MD_CODE.sub(lambda m: m.group(1), h.group(2))      # strip backticks
+        inner = _MD_BOLD.sub(lambda m: m.group(1) or m.group(2), inner)  # strip **
+        return bold(inner)
+    line = _MD_CODE.sub(lambda m: cyan(m.group(1)), line)
+    line = _MD_BOLD.sub(lambda m: bold(m.group(1) or m.group(2)), line)
+    line = _MD_ITALIC.sub(lambda m: italic(m.group(1) or m.group(2)), line)
+    return line
+
+
+class MarkdownStream:
+    """Line-buffered styler for streamed output: feed() chunks, it writes styled
+    complete lines and holds the partial tail until flush(). The ``` fence
+    delimiter lines are dropped (noise); lines INSIDE a fence are emitted verbatim
+    (code must stay exact) - dimmed when colour is on.
+    Always de-noises markers; tiny terminals just don't get the ANSI."""
+
+    def __init__(self, write):
+        self._write = write
+        self._buf = ""
+        self._fence = False
+
+    def _emit(self, line, newline):
+        if line.lstrip().startswith("```"):
+            # toggle fence state but DON'T print the ``` delimiter itself - the
+            # markers are noise on a terminal (consistent with stripping #, **).
+            self._fence = not self._fence
+            return
+        elif self._fence:
+            out = dim(line)
+        else:
+            out = style_md_line(line)
+        self._write(out + ("\n" if newline else ""))
+
+    def feed(self, text):
+        self._buf += text
+        while "\n" in self._buf:
+            line, self._buf = self._buf.split("\n", 1)
+            self._emit(line, True)
+
+    def flush(self):
+        if self._buf:
+            self._emit(self._buf, False)
+            self._buf = ""
+
+_active_spinner = None             # so _ask() can pause it before prompting
+
+
+WATCHDOG_ELAPSED_AT = 6      # s before the status starts showing an elapsed counter
+WATCHDOG_HINT_AT = 25        # s before it adds the "how to bail out" hint
+
+
+def _activity_label(base, elapsed, pid=None):
+    """The status text for an in-progress activity. Below the threshold it's just
+    the label ('thinking', 'read_file', ...); once work runs long it grows an
+    elapsed counter and then an escape hint - so a slow OR wedged step never looks
+    like a dead blank screen, and the user always sees what's happening + how to
+    get out. Pure (no I/O) so it's unit-tested headless."""
+    base = base or "working"
+    if elapsed < WATCHDOG_ELAPSED_AT:
+        return base
+    out = f"{base} ({int(elapsed)}s)"
+    if elapsed >= WATCHDOG_HINT_AT:
+        out += "  ^C to stop" + (f" (kill {pid} from another shell if stuck)" if pid else "")
+    return out
+
+
+class Spinner:
+    def __init__(self, label="", frames=THINK_FRAMES, color=dim, interval=0.1):
+        self.label, self.frames = label, frames
+        self.color, self.interval = color, interval
+        self._stop = None
+        self._thread = None
+
+    def start(self):
+        global _active_spinner
+        # A live elapsed/escape ticker runs in BOTH modes so a long or wedged step
+        # keeps updating (the worker thread is separate from the stuck main thread).
+        self._stop = threading.Event()
+        t0 = time.monotonic()
+        pid = os.getpid()
+
+        if _active_composer is not None:     # composer owns the status line
+            comp = _active_composer
+
+            def tick_composer():
+                comp.status = self.label
+                while not self._stop.wait(0.5):
+                    base = _activity_label(self.label, time.monotonic() - t0, pid)
+                    q = len(getattr(comp, "queued", []))
+                    comp.status = base + (f"  ·  {q} queued (^C to send)" if q else "")
+
+            self._thread = threading.Thread(target=tick_composer, daemon=True)
+            self._thread.start()
+            return self
+        if not _TTY:
+            return self
+
+        def run():
+            for fr in itertools.cycle(self.frames):
+                if self._stop.is_set():
+                    break
+                lbl = _activity_label(self.label, time.monotonic() - t0, pid)
+                sys.stdout.write("\r\033[K" + self.color(f"{fr} {lbl}"))
+                sys.stdout.flush()
+                self._stop.wait(self.interval)
+
+        self._thread = threading.Thread(target=run, daemon=True)
+        _active_spinner = self
+        self._thread.start()
+        return self
+
+    def stop(self):
+        global _active_spinner
+        if self._stop is not None:
+            self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=0.5)
+        self._stop = self._thread = None
+        if _active_composer is not None:
+            _active_composer.status = ""
+            return
+        if not _TTY:
+            return
+        sys.stdout.write("\r\033[K")          # clear the spinner line
+        sys.stdout.flush()
+        if _active_spinner is self:
+            _active_spinner = None
+
+    def __enter__(self):
+        return self.start()
+
+    def __exit__(self, *exc):
+        self.stop()
+
+
+@contextmanager
+def suppress_echo():
+    """Stop the TTY echoing keystrokes for the duration of a turn. While the
+    model streams and the spinner rewrites column 0, the terminal would
+    otherwise paint the user's typeahead onto the same line and garble it ("I
+    can't see my typing / it won't go to a new line"). We clear ECHO but keep
+    ICANON, so a follow-up line the user types is still buffered by the line
+    discipline and shows up cleanly at the next prompt. No-op without a TTY."""
+    try:
+        import termios
+    except ImportError:
+        termios = None
+    if termios is None or not (sys.stdin.isatty() and _TTY):
+        yield
+        return
+    fd = sys.stdin.fileno()
+    try:
+        old = termios.tcgetattr(fd)
+    except (termios.error, OSError):
+        yield
+        return
+    new = termios.tcgetattr(fd)
+    new[3] &= ~termios.ECHO          # c_lflag: drop echo, keep canonical buffering
+    try:
+        termios.tcsetattr(fd, termios.TCSANOW, new)
+        yield
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+
+def flush_stdin():
+    """Discard any unread terminal input. Called after a turn in the classic
+    (non-composer) path so a multi-line paste the user dropped in WHILE the model
+    was working can't auto-run line-by-line as a string of separate turns - the
+    line discipline buffers each line, and without this each one would be read by
+    the next prompt and fired unattended. No-op without a TTY."""
+    try:
+        import termios
+    except ImportError:
+        return
+    if not (sys.stdin.isatty() and _TTY):
+        return
+    try:
+        termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
+    except (termios.error, OSError):
+        pass
+
+
+_active_composer = None            # set while a Composer owns the terminal
+
+
+class Composer:
+    """A bottom-of-screen input line (+ a status line) that stays put while the
+    model streams output above it, so the user can type a follow-up without
+    fighting the stream. Owns the keyboard during a turn.
+
+    A tool that needs approval never interrupts: it parks a pending confirmation
+    as STATE and the agent thread blocks in ask() until it is answered. The
+    confirmation is:
+      - INERT while the input buffer has text (a keystroke can't silently action
+        a y/n that appeared mid-sentence), and
+      - ARMED (answerable by y/n, and Enter == yes) only once the buffer is empty
+        - i.e. after the user sends the message or backspaces it away.
+
+    This class is pure logic + string rendering, unit-tested headless. The TTY
+    plumbing (raw-mode reader thread, scroll region) is layered on top and
+    TTY-gated, so without a terminal the feature is simply dormant."""
+
+    INPUT_ROWS = 2                       # the input box is >= 2 rows; wraps then scrolls
+
+    def __init__(self):
+        self.buf = ""
+        self.cur = 0                     # cursor index into buf (0..len)
+        self.queued = []                 # submitted lines, drained after the turn
+        self.status = ""                 # activity label for the status line
+        self._pending = None             # the confirm question, or None
+        self._answer = None
+        self._decided = threading.Event()
+        self._pstate = ("", False, [])   # input-stream parser state (set here so
+                                         # _consume_chunk is testable headless)
+        # Line-editing extras (all pure/headless-testable):
+        self.history = []                # submitted lines, oldest first
+        self._hist_idx = None            # None = editing live buf; else index into history
+        self._hist_stash = None          # live buf saved when we start browsing history
+        self.completer = None            # optional fn(word)->[options]; set by wiring
+        self.comp_display = []           # last completion candidates, for the renderer
+        self._read_active = False        # True only inside read_line() (idle reader)
+        self._read_eof = False           # Ctrl-D on an empty buffer during read_line
+        self._read_wake = threading.Event()   # reader thread -> read_line: line ready/EOF
+        self.rule_label = ""             # STATIC idle-rule label (e.g. remote host);
+                                         # never animated, unlike self.status (spinner)
+
+    def armed(self) -> bool:
+        """A pending confirm is answerable only when the buffer is empty."""
+        return self._pending is not None and self.buf == ""
+
+    @staticmethod
+    def wrap_buffer(buf, prompt, cols, max_rows, cursor=None):
+        """Pure: lay `prompt + buf` out across up to `max_rows` display rows of
+        width `cols`. Returns (rows, cur_row, cur_col):
+          - rows: list of strings (1..max_rows), each <= cols wide; the first is
+            prefixed with `prompt`.
+          - cur_row: 0-based index into `rows` where the cursor is.
+          - cur_col: 1-based column (terminal coords) of the cursor on that row.
+        `cursor` is the cursor's index into `buf` (0..len); None means end-of-buffer
+        (the old behaviour). The display char at each buf index is 1:1 (callers
+        substitute \\n with a single glyph before calling), so a buf index maps
+        straight onto the laid-out `full` string. When the laid-out text needs more
+        than max_rows, the EARLIEST rows are dropped (scroll internally) so the
+        cursor's row stays visible. cols/max_rows are floored at 1."""
+        cols = max(1, cols)
+        max_rows = max(1, max_rows)
+        full = prompt + buf
+        # chunk into width-cols segments; an empty buffer is one (prompt) row.
+        rows = [full[i:i + cols] for i in range(0, len(full), cols)] or [prompt]
+        # cursor position in `full`: prompt width + cursor index into buf.
+        pos = len(full) if cursor is None else len(prompt) + max(0, min(cursor, len(buf)))
+        if pos > 0 and pos % cols == 0:
+            # sits exactly at a row boundary -> start of the next row
+            cur_row_abs, cur_col = pos // cols, 1
+            if cur_row_abs >= len(rows):               # cursor past last char -> fresh row
+                rows = rows + [""]
+        else:
+            cur_row_abs = pos // cols
+            cur_col = (pos % cols) + 1
+        if len(rows) > max_rows:                       # scroll: keep the tail
+            drop = len(rows) - max_rows
+            rows = rows[drop:]
+            cur_row_abs -= drop
+        cur_row = max(0, min(cur_row_abs, len(rows) - 1))
+        return rows, cur_row, cur_col
+
+    def feed(self, ch: str):
+        """Process one printable keypress / Enter / backspace. Named navigation
+        keys go through feed_key(). Returns 'submit' when a line was queued,
+        'answer' when an armed confirm was resolved, else None."""
+        if self.armed():                 # empty buffer + pending confirm
+            if ch in ("y", "Y", "\r", "\n"):  # Enter on an empty buffer confirms (yes)
+                return self._resolve(True)
+            if ch in ("n", "N"):
+                return self._resolve(False)
+            # any other key falls through and starts a new message (de-arms)
+        if ch in ("\r", "\n"):
+            if self.buf:
+                self.queued.append(self.buf)
+                self._push_history(self.buf)
+                self.buf = ""
+                self.cur = 0
+                self._hist_reset()
+                return "submit"
+            return None
+        if ch in ("\x7f", "\b"):         # backspace: delete char before cursor
+            if self.cur > 0:
+                self.buf = self.buf[:self.cur - 1] + self.buf[self.cur:]
+                self.cur -= 1
+            return None
+        if ch.isprintable():
+            self.buf = self.buf[:self.cur] + ch + self.buf[self.cur:]
+            self.cur += 1
+        self.comp_display = []           # any keystroke dismisses the candidate list
+        return None
+
+    def feed_key(self, name: str):
+        """Handle a recognised control/navigation key (name from _parse). Returns
+        the same protocol as feed() ('submit'/'answer'/None). Pure: touches only
+        buf/cur/history/queued so it is unit-tested headless."""
+        if name != "tab":
+            self.comp_display = []       # anything but re-Tab dismisses the list
+        buf = self.buf
+        if name == "left":
+            self.cur = max(0, self.cur - 1)
+        elif name == "right":
+            self.cur = min(len(buf), self.cur + 1)
+        elif name in ("home", "ctrl-a"):
+            self.cur = 0
+        elif name in ("end", "ctrl-e"):
+            self.cur = len(buf)
+        elif name == "ctrl-u":               # kill to start of line
+            self.buf = buf[self.cur:]
+            self.cur = 0
+        elif name == "ctrl-k":               # kill to end of line
+            self.buf = buf[:self.cur]
+        elif name == "ctrl-w":               # delete word before cursor
+            i = self.cur
+            while i > 0 and buf[i - 1].isspace():
+                i -= 1
+            while i > 0 and not buf[i - 1].isspace():
+                i -= 1
+            self.buf = buf[:i] + buf[self.cur:]
+            self.cur = i
+        elif name == "delete":               # forward-delete
+            if self.cur < len(buf):
+                self.buf = buf[:self.cur] + buf[self.cur + 1:]
+        elif name == "up":
+            self._hist_step(-1)
+        elif name == "down":
+            self._hist_step(1)
+        elif name == "newline":              # Ctrl-O / Alt-Enter: insert \n, never submit
+            self.buf = buf[:self.cur] + "\n" + buf[self.cur:]
+            self.cur += 1
+        elif name == "tab":
+            self._complete()
+        return None
+
+    def feed_paste(self, text: str):
+        """Insert pasted text at the cursor as ONE literal edit. Newlines are KEPT
+        (so pasted code survives) but normalized to '\\n'; crucially a paste NEVER
+        submits - that is the bug that turned a 30-line paste into 30 API turns.
+        The user reviews the buffer and presses Enter once to send. A paste also
+        de-arms a pending confirm (buffer becomes non-empty), so pasted 'y' can't
+        action a y/N. Returns 'paste'."""
+        text = text.replace("\r\n", "\n").replace("\r", "\n")
+        self.buf = self.buf[:self.cur] + text + self.buf[self.cur:]
+        self.cur += len(text)
+        return "paste"
+
+    # --- history + completion (pure) -----------------------------------------
+    def load_history(self, path=None):
+        """Load persisted input history (one entry per line; blank-separated
+        multi-line entries are stored with literal \\n escaped as \\\\n). Silent
+        best-effort - a missing/corrupt file just means an empty history."""
+        path = Path(path) if path else HISTORY_PATH
+        try:
+            raw = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            return
+        self.history = [self._unescape(ln) for ln in raw if ln]
+
+    @staticmethod
+    def _unescape(s: str) -> str:
+        r"""Reverse save_history's escaping: \\ -> \ and \n -> newline, one pass
+        left-to-right so an escaped backslash can't swallow a following 'n'."""
+        out, i, n = [], 0, len(s)
+        while i < n:
+            if s[i] == "\\" and i + 1 < n:
+                nxt = s[i + 1]
+                out.append("\n" if nxt == "n" else nxt)
+                i += 2
+            else:
+                out.append(s[i])
+                i += 1
+        return "".join(out)
+
+    def save_history(self, path=None):
+        """Persist the trailing HISTORY_MAX entries. Newlines within an entry are
+        escaped so each entry stays one physical line. Best-effort."""
+        path = Path(path) if path else HISTORY_PATH
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            lines = [e.replace("\\", "\\\\").replace("\n", "\\n")
+                     for e in self.history[-HISTORY_MAX:]]
+            path.write_text("\n".join(lines) + ("\n" if lines else ""),
+                            encoding="utf-8")
+        except OSError:
+            pass
+
+    def _push_history(self, line: str):
+        """Record a submitted line (skip blanks and immediate duplicates)."""
+        if line and (not self.history or self.history[-1] != line):
+            self.history.append(line)
+
+    def _hist_reset(self):
+        self._hist_idx = None
+        self._hist_stash = None
+
+    def _hist_step(self, delta: int):
+        """Up/Down through history. Up from the live buffer stashes it; Down past
+        the newest entry restores it."""
+        if not self.history:
+            return
+        if self._hist_idx is None:
+            if delta < 0:                    # entering history from the live buffer
+                self._hist_stash = self.buf
+                self._hist_idx = len(self.history) - 1
+            else:
+                return                       # Down while already live: no-op
+        else:
+            self._hist_idx += delta
+            if self._hist_idx < 0:
+                self._hist_idx = 0
+            elif self._hist_idx >= len(self.history):   # past newest -> back to live
+                self.buf = self._hist_stash or ""
+                self.cur = len(self.buf)
+                self._hist_reset()
+                return
+        self.buf = self.history[self._hist_idx]
+        self.cur = len(self.buf)
+
+    def _complete(self):
+        """Tab-complete the token under the cursor. self.completer is called with
+        the text left of the cursor and returns the candidate completions for the
+        final token (each a full replacement for the token, e.g. '/model'). On a
+        single match we insert the rest of it; on several we insert their common
+        prefix and expose the list for the renderer. No completer/no match -> no-op."""
+        self.comp_display = []
+        if not self.completer:
+            return
+        left = self.buf[:self.cur]
+        # the token being completed = text after the last whitespace in `left`
+        sp = max(left.rfind(" "), left.rfind("\t"), left.rfind("\n"))
+        word = left[sp + 1:]
+        try:
+            opts = [o for o in self.completer(left) if o.startswith(word)]
+        except Exception:
+            opts = []
+        if not opts:
+            return
+        insert = (opts[0] if len(opts) == 1
+                  else os.path.commonprefix(opts))[len(word):]
+        if insert:
+            self.buf = self.buf[:self.cur] + insert + self.buf[self.cur:]
+            self.cur += len(insert)
+        if len(opts) > 1:
+            self.comp_display = opts
+
+    def _resolve(self, val: bool):
+        self._answer = val
+        self._decided.set()
+        return "answer"
+
+    def ask(self, question: str) -> bool:
+        """Park a confirmation and block (agent thread) until the user answers -
+        which they can only do once their buffer is empty. The tool 'waits'
+        here while the user keeps typing freely."""
+        self._pending = question
+        self._answer = None
+        self._decided.clear()
+        self._decided.wait()
+        self._pending = None
+        self.status = ""
+        return bool(self._answer)
+
+    def pop_queued(self):
+        """Hand back the lines submitted during the turn (FIFO) and clear them."""
+        out, self.queued = self.queued, []
+        return out
+
+    def status_text(self, frame: str = ""):
+        """Line-2 content. A pending confirm wins over everything; Tab-completion
+        candidates win over the activity status. Returns (text, armed): the
+        renderer greys it when not armed, lights it when armed."""
+        if self._pending is not None:
+            return (f"{self._pending} [Y/n]", self.armed())
+        if self.comp_display:
+            return (GLYPH["prompt"] + " " + "  ".join(self.comp_display), False)
+        if self.status:
+            return (f"{frame} {self.status}".strip(), False)
+        if self.rule_label:                     # static label (no spinner frame)
+            return (self.rule_label, False)
+        return ("", False)
+
+    def input_text(self) -> str:
+        return GLYPH["prompt"] + " " + self.buf
+
+    # --- Input stream parsing (pure; unit-tested headless) --------------------
+    # Terminals in bracketed-paste mode wrap a paste in ESC[200~ ... ESC[201~.
+    # We must (a) treat everything between as a single literal insert (no submit
+    # per embedded newline - that was the runaway), and (b) parse/skip ordinary
+    # escape sequences (arrows etc.) without chopping them. Markers and escapes
+    # can straddle os.read() boundaries, so the parser carries residual + paste
+    # state across chunks.
+    PASTE_START = "\x1b[200~"
+    PASTE_END = "\x1b[201~"
+
+    # Escape sequences -> navigation key names. Both CSI (ESC [) and SS3 (ESC O)
+    # arrow forms are covered because terminals disagree in application mode.
+    _ESC_KEYS = {
+        "\x1b[A": "up",    "\x1bOA": "up",
+        "\x1b[B": "down",  "\x1bOB": "down",
+        "\x1b[C": "right", "\x1bOC": "right",
+        "\x1b[D": "left",  "\x1bOD": "left",
+        "\x1b[H": "home",  "\x1bOH": "home", "\x1b[1~": "home", "\x1b[7~": "home",
+        "\x1b[F": "end",   "\x1bOF": "end",  "\x1b[4~": "end",  "\x1b[8~": "end",
+        "\x1b[3~": "delete",
+        # Insert-a-newline (never submit). Two UNAMBIGUOUS sources only:
+        #   - Kitty CSU shift-enter (ESC[13;2u); Konsole can be set to emit this.
+        #   - Alt+Enter (ESC CR), which terminals send out of the box.
+        # We deliberately DON'T map SS3 'ESC O M' - that's keypad-Enter on some
+        # terminals, so treating it as newline would hijack a normal Enter.
+        "\x1b[13;2u": "newline", "\x1b\r": "newline",
+    }
+    # Lone control bytes -> emacs-style editing keys. Ctrl-O is the portable
+    # insert-newline that works in ANY terminal (no config, no collision).
+    _CTRL_KEYS = {
+        "\x01": "ctrl-a", "\x05": "ctrl-e", "\x15": "ctrl-u",
+        "\x0b": "ctrl-k", "\x17": "ctrl-w", "\t": "tab",
+        "\x0f": "newline",
+    }
+
+    @classmethod
+    def _key_name(cls, seq: str):
+        """Map a complete escape sequence OR a single control byte to a key name,
+        or None if it isn't one we handle (caller drops it)."""
+        return cls._ESC_KEYS.get(seq) or cls._CTRL_KEYS.get(seq)
+
+    @staticmethod
+    def _csi_end(s, i):
+        """s[i] == ESC. Index just past a complete escape sequence at i, or -1 if
+        it's incomplete (need more bytes before we can classify it)."""
+        n = len(s)
+        if i + 1 >= n:
+            return -1
+        c = s[i + 1]
+        if c == "[":                         # CSI: params/intermediates, final 0x40-0x7e
+            j = i + 2
+            while j < n and "\x20" <= s[j] <= "\x3f":
+                j += 1
+            return j + 1 if j < n else -1
+        if c == "O":                         # SS3: ESC O x
+            return i + 3 if i + 2 < n else -1
+        return i + 2                         # ESC + one char
+
+    @staticmethod
+    def _tail_prefix(seg, marker):
+        """Length of the longest suffix of `seg` that is a proper prefix of
+        `marker` (so a marker split across chunks is held back, not mis-parsed)."""
+        for k in range(min(len(seg), len(marker) - 1), 0, -1):
+            if marker.startswith(seg[-k:]):
+                return k
+        return 0
+
+    @classmethod
+    def _parse(cls, state, data):
+        """Pure stream parser. `state` is (residual, in_paste, paste_chunks).
+        Returns (events, new_state) where events is a list of ('char', c) for a
+        normal keypress, ('key', name) for a recognised navigation/edit key, and
+        ('paste', text) for a completed paste. Unrecognised escape sequences are
+        dropped. Trailing bytes that could be an incomplete marker/escape are
+        returned as residual to prepend next call."""
+        residual, in_paste, paste = state
+        s = residual + data
+        events, i, n = [], 0, len(s)
+        while i < n:
+            if in_paste:
+                j = s.find(cls.PASTE_END, i)
+                if j == -1:                  # end marker not here yet
+                    k = cls._tail_prefix(s[i:], cls.PASTE_END)
+                    paste.append(s[i:n - k] if k else s[i:])
+                    return events, (s[n - k:] if k else "", True, paste)
+                paste.append(s[i:j])
+                events.append(("paste", "".join(paste)))
+                paste, in_paste, i = [], False, j + len(cls.PASTE_END)
+                continue
+            if s.startswith(cls.PASTE_START, i):
+                in_paste, i = True, i + len(cls.PASTE_START)
+                continue
+            ch = s[i]
+            if ch == "\x1b":                 # escape: an incomplete one (maybe a
+                end = cls._csi_end(s, i)      # split paste-start marker) is held back
+                if end == -1:
+                    return events, (s[i:], False, paste)
+                name = cls._key_name(s[i:end])   # recognised nav key -> event, else drop
+                if name:
+                    events.append(("key", name))
+                i = end
+                continue
+            name = cls._CTRL_KEYS.get(ch)    # lone control byte (Tab, ^A, ^E, ...)
+            if name:
+                events.append(("key", name))
+                i += 1
+                continue
+            events.append(("char", ch))
+            i += 1
+        return events, ("", in_paste, paste)
+
+    # --- TTY layer (all gated; any failure leaves active False -> classic) ----
+    # Mechanism: a scroll region (DECSTBM) confines the model's output to all but
+    # the bottom two rows; those two rows are the status line and the input line.
+    # The output cursor position is parked in the terminal's own save slot
+    # (DECSC/DECRC, ESC 7 / ESC 8) so we never hand-track it across wrapping or
+    # scrolling; _draw() only ever positions absolutely and never touches that
+    # slot. A single reader thread does both keys (via select, so it can be told
+    # to stop) and the status animation tick.
+
+    active = False
+
+    def start_tty(self):
+        """Take over the terminal: scroll region + raw(cbreak) input + reader
+        thread. Returns True if it engaged, False to fall back to the classic
+        prompt (no TTY, no termios, or any setup error)."""
+        try:
+            import termios, tty
+        except ImportError:
+            return False
+        if not (sys.stdout.isatty() and sys.stdin.isatty() and _TTY):
+            return False
+        self._out = sys.stdout
+        self._fd = sys.stdin.fileno()
+        try:
+            self._termios = termios
+            self._old_term = termios.tcgetattr(self._fd)
+            sz = os.get_terminal_size()
+            self._rows, self._cols = sz.lines, sz.columns
+            self.active = True
+            self._frame = 0
+            self._lock = threading.RLock()
+            reserve = self.INPUT_ROWS + 1                      # status line + input rows
+            self._out.write("\n" * reserve + f"\033[1;{self._rows - reserve}r")
+            self._out.write(f"\033[{self._rows - reserve};1H\0337")  # park output pos
+            self._out.write("\033[?2004h")                     # bracketed paste on
+            tty.setcbreak(self._fd)                            # non-canonical; ISIG kept (^C works)
+            # tty.setcbreak only clears ECHO on Python 3.12+. On older versions the
+            # terminal echoes each keystroke on top of the line we render ourselves
+            # ("text types over itself, then wraps a line early"). Clear ECHO
+            # explicitly so the composer is the sole renderer, on every version.
+            _m = termios.tcgetattr(self._fd)
+            _m[3] &= ~termios.ECHO
+            termios.tcsetattr(self._fd, termios.TCSANOW, _m)
+            self._pstate = ("", False, [])                     # input-parser state
+            self._running = True
+            self._thread = threading.Thread(target=self._reader, daemon=True)
+            self._thread.start()
+            self._redraw_locked()
+            self._out.flush()
+            return True
+        except Exception as e:
+            self.active = False
+            # Don't hide a fallback on a capable terminal: a silent return here was
+            # making a real engagement bug indistinguishable from "no tty". Report
+            # it to stderr (one line; the banner already shows the on/off state).
+            try:
+                sys.stderr.write(dim(f"  composer: TTY setup failed, using classic "
+                                     f"input ({type(e).__name__}: {e})\n"))
+            except Exception:
+                pass
+            try:
+                self._termios.tcsetattr(self._fd, self._termios.TCSADRAIN, self._old_term)
+            except Exception:
+                pass
+            return False
+
+    def stop_tty(self):
+        if not self.active:
+            return
+        self._running = False
+        if self._thread:
+            self._thread.join(timeout=0.4)
+        try:
+            self._out.write("\033[?2004l")                         # bracketed paste off
+            self._out.write("\033[r")                              # reset region
+            top = self._rows - self.INPUT_ROWS - 1                 # first reserved (status) row
+            for r in range(self.INPUT_ROWS + 1):                  # clear status + input rows
+                self._out.write(f"\033[{top + r};1H\033[2K")
+            self._out.write(f"\033[{top};1H")                      # cursor where output ended
+            self._out.flush()
+        except Exception:
+            pass
+        try:
+            self._termios.tcsetattr(self._fd, self._termios.TCSADRAIN, self._old_term)
+        except Exception:
+            pass
+        self.active = False
+
+    def on_resize(self, *_):
+        if not self.active:
+            return
+        try:
+            sz = os.get_terminal_size()
+            with self._lock:
+                self._rows, self._cols = sz.lines, sz.columns
+                reserve = self.INPUT_ROWS + 1
+                self._out.write(f"\033[1;{self._rows - reserve}r")
+                self._out.write(f"\033[{self._rows - reserve};1H\0337")
+                self._redraw_locked()
+                self._out.flush()
+        except Exception:
+            pass
+
+    def read_line(self, prompt_status=None):
+        """Block at the IDLE prompt reading ONE submitted line, using the same
+        proven scroll-region + reader-thread + _redraw_locked path the mid-turn
+        composer uses - so a multi-line paste renders in the bounded input box
+        (never the readline taller-than-screen mis-draw), and Tab/history/emacs
+        keys/shift-enter all work. `prompt_status` is an optional label for the
+        status line (e.g. remote indicator). Returns the submitted string, or
+        raises EOFError (Ctrl-D on empty buffer). Raises RuntimeError if it can't
+        take the TTY so the caller falls back to input()."""
+        self.buf = ""
+        self.cur = 0
+        self._read_eof = False
+        self._read_wake.clear()
+        self._read_active = True
+        self.rule_label = prompt_status or ""   # static (no spinner) idle-rule label
+        if not self.start_tty():
+            self._read_active = False
+            self.rule_label = ""
+            raise RuntimeError("no tty")
+        try:
+            while True:
+                self._read_wake.wait(0.25)
+                if self._read_eof:
+                    raise EOFError
+                if self.queued:
+                    return self.queued.pop(0)
+                self._read_wake.clear()
+        finally:
+            self._read_active = False
+            self.rule_label = ""
+            self.stop_tty()
+
+    def _consume_chunk(self, data: str) -> bool:
+        """Turn one raw read into buffer edits and return whether to redraw.
+
+        The runaway-killer: a chunk longer than one character is a paste or an
+        escape burst, NOT a deliberate Enter - so its characters (including any
+        newlines) are inserted literally and NEVER submit. Only a lone keypress
+        goes through feed(), so a single Enter is the only thing that submits a
+        line. This holds even when the terminal/multiplexer strips bracketed-paste
+        markers (the case that defeated the marker-only fix), because it keys off
+        burst length, not the markers. Bracketed pastes are still parsed out and
+        treated as the literal paste text; stray escape sequences are dropped.
+        Pure w.r.t. the TTY (only touches buf/queued/_pstate), so it is unit
+        tested headless."""
+        events, self._pstate = self._parse(self._pstate, data)
+        # A ('key', ...) event is an escape/control the parser already recognised
+        # in full, so it's a real keypress even though its bytes make the chunk
+        # long - don't let the burst-heuristic swallow it as literal paste text.
+        # The burst rule still applies to plain typed characters: a multi-char run
+        # of them is a paste (or bracketed markers were stripped), inserted whole,
+        # never submitting per embedded newline.
+        keyed = any(k == "key" for k, _ in events)
+        burst = len(data) > 1 and not keyed
+        literal, changed = [], False
+        for kind, payload in events:
+            if kind == "paste":
+                literal.append(payload)
+            elif kind == "key":
+                self.feed_key(payload)           # arrows / edit keys / Tab
+                changed = True
+            elif burst:
+                literal.append(payload)          # bursted plain chars -> literal
+            else:
+                self.feed(payload)               # lone keypress: Enter submits, etc.
+                changed = True
+        if literal:
+            self.feed_paste("".join(literal))
+            changed = True
+        return changed
+
+    def _reader(self):
+        import select
+        while self._running:
+            try:
+                r, _, _ = select.select([self._fd], [], [], 0.12)
+            except (OSError, ValueError):
+                break
+            if r:
+                try:
+                    data = os.read(self._fd, 4096).decode("utf-8", "ignore")
+                except OSError:
+                    continue
+                if not data:                     # stdin closed
+                    if self._read_active:
+                        self._read_eof = True
+                        self._read_wake.set()
+                    continue
+                # Idle reader: Ctrl-D on an empty buffer is EOF (matches input()).
+                if self._read_active and data == "\x04" and not self.buf:
+                    self._read_eof = True
+                    self._read_wake.set()
+                    continue
+                had = len(self.queued)
+                if self._consume_chunk(data):
+                    self._redraw()
+                # Idle reader: a newly queued line ends this read_line() call.
+                if self._read_active and len(self.queued) > had:
+                    self._read_wake.set()
+            elif self.status:                    # idle tick -> animate status
+                self._frame += 1
+                self._redraw()
+
+    def _redraw(self):
+        with self._lock:
+            self._redraw_locked()
+            try:
+                self._out.flush()
+            except Exception:
+                pass
+
+    def _redraw_locked(self):
+        if not self.active:
+            return
+        rows, cols = self._rows, self._cols
+        # status line: a dim rule (with any activity label) or a parked confirm.
+        frame = THINK_FRAMES[self._frame % len(THINK_FRAMES)] if self.status else ""
+        text, armed = self.status_text(frame)
+        if self._pending is not None:               # a confirm replaces the rule
+            text = text[:cols]
+            sline = bold(yellow(text)) if armed else dim(text)
+        else:                                       # a dim rule splits output/input
+            ch = GLYPH["rule"]
+            label = text.strip()
+            if label:                               # embed activity in the rule
+                seg = f"{ch}{ch} {label} "
+                sline = dim(seg[:cols] + ch * max(0, cols - len(seg)))
+            else:
+                sline = dim(ch * cols)
+        # input box: the buffer wrapped across INPUT_ROWS rows (grows to the cap
+        # then scrolls to keep the cursor visible). Newlines render as a glyph so a
+        # pasted multi-line buffer wraps by width instead of breaking the layout.
+        prompt = GLYPH["prompt"] + " "
+        disp = self.buf.replace("\n", GLYPH["ret"])
+        irows, cur_row, cur_col = self.wrap_buffer(disp, prompt, cols, self.INPUT_ROWS,
+                                                   cursor=self.cur)
+        status_row = rows - self.INPUT_ROWS         # status sits above the input rows
+        try:
+            self._out.write(f"\033[{status_row};1H\033[2K{sline}")
+            for idx in range(self.INPUT_ROWS):
+                line = irows[idx] if idx < len(irows) else ""
+                self._out.write(f"\033[{status_row + 1 + idx};1H\033[2K{line}")
+            self._out.write(f"\033[{status_row + 1 + cur_row};{cur_col}H")
+        except Exception:
+            pass
+
+    # file-like: the agent's stdout is pointed here for the turn, so every print
+    # lands above the input line (restore output pos -> write -> re-park -> redraw)
+    def write(self, text):
+        if not self.active:
+            return self._out.write(text)
+        with self._lock:
+            try:
+                self._out.write("\0338")      # restore to output position
+                self._out.write(text)
+                self._out.write("\0337")      # save new output position
+                self._redraw_locked()
+                self._out.flush()
+            except Exception:
+                pass
+        return len(text)
+
+    def flush(self):
+        try:
+            self._out.flush()
+        except Exception:
+            pass
+
+
+@contextmanager
+def composer_session(composer):
+    """Run a turn with the composer owning the terminal. Redirects stdout through
+    it, routes SIGWINCH to it, and restores everything on exit (including on
+    exceptions / ^C). Yields True if it engaged, False if it fell back."""
+    global _active_composer
+    if not composer.start_tty():
+        yield False
+        return
+    _active_composer = composer
+    old_stdout = sys.stdout
+    sys.stdout = composer
+    old_winch = None
+    if hasattr(signal, "SIGWINCH"):
+        try:
+            old_winch = signal.getsignal(signal.SIGWINCH)
+            signal.signal(signal.SIGWINCH, composer.on_resize)
+        except (ValueError, OSError):
+            old_winch = None
+    try:
+        yield True
+    finally:
+        sys.stdout = old_stdout
+        _active_composer = None
+        if old_winch is not None:
+            try:
+                signal.signal(signal.SIGWINCH, old_winch)
+            except (ValueError, OSError):
+                pass
+        composer.stop_tty()
+
+
+@contextmanager
+def composer_suspended():
+    """Hand the real terminal back to a plain cooked prompt/subprocess while a
+    composer is engaged: stop its reader thread, restore the terminal + stdout,
+    then re-engage afterwards. Without this, an interactive handoff (readline in
+    ask_user_to_run, a live sudo prompt) and the composer's reader BOTH read
+    stdin - so only every Nth keystroke lands and echo is off (the command is
+    invisible). No-op when no composer owns the terminal."""
+    global _active_composer
+    comp = _active_composer
+    if comp is None or not getattr(comp, "active", False):
+        yield
+        return
+    real_stdout = comp._out
+    sys.stdout = real_stdout
+    _active_composer = None
+    comp.stop_tty()                      # cooked mode, echo on, reader thread joined
+    try:
+        yield
+    finally:
+        if comp.start_tty():             # re-pin the input box and resume capture
+            _active_composer = comp
+            sys.stdout = comp
+        # if re-engage fails, stay on the real stdout: the turn degrades to the
+        # classic (unpinned) output rather than losing the terminal entirely.
+
+
+def open_in_editor(path, cfg=None) -> bool:
+    """Open `path` in an editor and block until it exits. Editor preference:
+    cfg.editor, then $EDITOR, then nano/vi/vim. Returns True if one ran; False if
+    none is installed or there's no TTY - the caller should then print the path so
+    the user can edit it manually. Hands the terminal over via composer_suspended."""
+    import shutil
+    cands = []
+    if cfg is not None and getattr(cfg, "editor", ""):
+        cands.append(cfg.editor)
+    if os.environ.get("EDITOR"):
+        cands.append(os.environ["EDITOR"])
+    cands += list(EDITOR_FALLBACKS)
+    editor = next((e for e in cands if shutil.which(shlex.split(e)[0])), None)
+    if not editor or not sys.stdin.isatty():
+        return False
+    try:
+        with composer_suspended():
+            subprocess.run(shlex.split(editor) + [str(path)])
+        return True
+    except Exception:
+        return False
+
+
+# ----------------------------------------------------------------------------
+# Token estimate (no tokenizer dep) - ~4 chars/token heuristic
+# ----------------------------------------------------------------------------
+
+def est_tokens(text: str) -> int:
+    return (len(text) + 3) // 4
+
+
+def messages_tokens(messages, tools) -> int:
+    total = 0
+    for m in messages:
+        total += est_tokens(m.get("content") or "")
+        for tc in m.get("tool_calls", []) or []:
+            total += est_tokens(json.dumps(tc.get("function", {})))
+    total += est_tokens(json.dumps(tools))
+    return total
+
+
+def repair_tool_pairs(messages):
+    """Guarantee every assistant tool_call is followed by a matching tool result.
+
+    An interrupted turn - ^C between tool calls, a crash, or a 400 mid-batch - can
+    leave an assistant message holding tool_calls with no `tool` messages after it
+    (the next thing appended is the user's next message). The API then rejects the
+    WHOLE history with 'tool_use ids were found without tool_result blocks', and an
+    autosave of that state bricks the session permanently (every resume replays it).
+
+    For any assistant whose tool_calls outnumber the tool messages immediately
+    following it, synthesize stub results (carrying the matching tool_call_id) for
+    the missing ones. Returns a NEW list; the input is untouched. Idempotent on
+    already-valid history (returns an equivalent list)."""
+    out = []
+    i, n = 0, len(messages)
+    while i < n:
+        m = messages[i]
+        out.append(m)
+        if m.get("role") == "assistant" and m.get("tool_calls"):
+            calls = m.get("tool_calls") or []
+            j, got = i + 1, 0
+            while j < n and messages[j].get("role") == "tool":
+                out.append(messages[j])
+                got += 1
+                j += 1
+            for c in calls[got:]:                 # backfill un-resulted calls
+                out.append({
+                    "role": "tool",
+                    "tool_name": (c.get("function") or {}).get("name", ""),
+                    "tool_call_id": c.get("id", ""),
+                    "content": "[tool not run: the previous turn was interrupted]",
+                })
+            i = j
+            continue
+        i += 1
+    return out
+
+
+# ----------------------------------------------------------------------------
+# Ignore matching (.gitignore + .leancoderignore + defaults)
+# ----------------------------------------------------------------------------
+
+class IgnoreMatcher:
+    def __init__(self, root: Path):
+        self.root = root
+        self.patterns = list(DEFAULT_IGNORES)
+        for name in (".gitignore", ".leancoderignore"):
+            f = root / name
+            if f.is_file():
+                for line in f.read_text(errors="replace").splitlines():
+                    line = line.strip()
+                    if line and not line.startswith("#") and not line.startswith("!"):
+                        self.patterns.append(line)
+
+    def ignored(self, path: Path) -> bool:
+        try:
+            rel = path.resolve().relative_to(self.root.resolve()).as_posix()
+        except ValueError:
+            return False
+        if not rel or rel == ".":
+            return False
+        is_dir = path.is_dir()
+        parts = rel.split("/")
+        for pat in self.patterns:
+            anchored = pat.startswith("/")
+            dironly = pat.endswith("/")
+            p = pat.strip("/")
+            if not p:
+                continue
+            if "/" in p:                       # path-ish pattern, match from root
+                if _fnmatch(rel, p) or rel.startswith(p + "/"):
+                    if not dironly or is_dir or (p in parts):
+                        return True
+            else:                              # name pattern, match any component
+                if anchored:
+                    if _fnmatch(parts[0], p):
+                        return True
+                else:
+                    for i, comp in enumerate(parts):
+                        if _fnmatch(comp, p):
+                            # dir-only pattern must match a directory component
+                            if dironly and i == len(parts) - 1 and not is_dir:
+                                continue
+                            return True
+        return False
+
+
+def _fnmatch(name: str, pat: str) -> bool:
+    import fnmatch
+    return fnmatch.fnmatch(name, pat)
+
+
+# ----------------------------------------------------------------------------
+# Config
+# ----------------------------------------------------------------------------
+
+@dataclass
+class Config:
+    host: str = "http://localhost:11434"
+    model: str = "qwen3-coder:30b"
+    num_ctx: int = 32768
+    max_iterations: int = 0          # tool-call rounds per user turn before the loop
+                                     # stops and hands control back. 0 = unlimited (the
+                                     # default): long agentic runs aren't cut off; set a
+                                     # 0 = unlimited) via /settings or config for fully
+                                     # autonomous runs. This is a power tool - the cap is
+                                     # a guardrail, not a wall.
+    cwd: Path = field(default_factory=Path.cwd)
+    approval: str = "ask"            # ask (confirm each) | session (ask once) | auto (never)
+    temperature: float = 0.7
+    top_p: float = 0.8
+    top_k: int = 20
+    repeat_penalty: float = 1.05
+    think: "bool | None" = None      # None = don't send; True/False = send think param
+    auto_num_ctx: bool = False       # detect num_ctx from `ollama show` at startup
+    keep_alive: str = "10m"          # ollama: how long the model stays resident after a
+                                     # request (keeps the prefill KV cache warm between
+                                     # turns). Modest default since the box may be shared;
+                                     # set "-1" to pin indefinitely, "0" to unload at once.
+    auto_evict: bool = False         # continuous tool-output eviction: each round, stub
+                                     # acted-on tool results (keep last auto_evict_keep in
+                                     # full). A raw-token quota lever - BUT it rewrites
+                                     # history mid-prefix, busting the cache it shrinks, so
+                                     # it only wins if cache reads are NOT discounted on the
+                                     # plan's quota. Defaults OFF until measured. See
+                                     # docs/cost-reduction-roadmap.md.
+    auto_evict_keep: int = 3         # tool results kept verbatim by auto_evict
+    window_messages: int = 0         # bounded context window: send only the last N
+                                     # messages (cut at a clean turn boundary) instead
+                                     # of the full history. 0 = unbounded (OFF, the
+                                     # default) - a loaded session is fully in play and
+                                     # the model sees all of it; auto-handover handles
+                                     # the size. Set >0 to opt into a hard send-bound
+                                     # (cuts tokens every turn, but the model then only
+                                     # sees the last N messages of a long session).
+                                     # On by default. The clean cut only drops WHOLE prior
+                                     # turns (never mid-turn), so the current task is never
+                                     # truncated; older turns are simply dropped until
+                                     # summarizing compaction backfills them. See
+                                     # docs/cost-reduction-roadmap.md.
+    auto_handover: bool = True       # self-managing context: when on, the model is shown a
+                                     # ctx-budget line and may hand over at a natural break in
+                                     # the soft zone; a hard threshold force-hands-over (the
+                                     # model pulls the same lever /handover does, then its
+                                     # self-prompt is fed back to it). See cost-reduction-roadmap.
+    handover_soft: float = 0.70       # soft zone start, as a fraction of the context window:
+                                     # nudge the model to wrap up + hand over at a clean break
+    handover_hard: float = 0.95       # hard threshold: force a handover at a clean boundary
+                                     # (respects the min-interval loop guard)
+    handover_emergency: float = 1.00  # emergency stop: compact regardless, bypassing the clean
+                                     # boundary AND the loop guard (about to overflow the window)
+    handover_min_interval: float = 60.0  # loop guard: min seconds between compactions (~1/min),
+                                     # bypassed only by the emergency threshold
+    autostart_after_handover: bool = True   # after a compaction, auto-run the model's
+                                     # self-prompt as the next turn so work continues (a
+                                     # 5s ^C-to-cancel beat precedes it; off = park at prompt)
+    handover_overrides: dict = field(default_factory=dict)  # per-model override of the
+                                     # handover settings (models fill context at different
+                                     # rates): model_id -> {auto, soft, hard, autostart}.
+                                     # Anything absent falls back to the global default above.
+    auto_compact_interval: int = 0   # NEW auto-COMPACT (distinct from auto-handover): the
+                                     # cheap programmatic strip (/compact - stub old tool
+                                     # outputs) fired automatically each time context crosses
+                                     # a k*interval TOKEN boundary going up. 0 = off (default).
+                                     # A first line of defence BEFORE a full handover: e.g.
+                                     # 100000 -> strip at 100k, 200k, ... Hysteresis (below)
+                                     # stops it re-firing every turn once it strips just under
+                                     # a boundary. Keeps the last handover_compact_keep tool
+                                     # results in full.
+    auto_compact_hysteresis: float = 0.25  # re-arm margin as a fraction of the interval: after
+                                     # firing at boundary B, don't re-arm that boundary until
+                                     # context drops below B - hysteresis*interval (so a strip
+                                     # to just under B can't retrigger next turn). Schmitt trigger.
+    auto_compact_keep: int = COMPACT_KEEP  # tool results kept in full by an auto-compact strip
+    ask_user_to_run: bool = True     # expose the ask_user_to_run handoff tool
+    composer: bool = True            # pinned bottom input line (type while it works)
+    statusline: bool = True          # status rows above each prompt (perms, context
+                                     # mgmt, session, model/provider) - so the live
+                                     # state is always visible. Auto-off on a non-TTY.
+    statusline_every: int = 1        # how often to reprint the full status block:
+                                     # 1 = every prompt (default), N = every N prompts,
+                                     # 0 = only when it CHANGES (keeps chat history clear).
+                                     # A real state change always reprints regardless.
+    statusline_iter: int = 0         # reprint the status block every N model iterations
+                                     # WITHIN a single long turn (so a constantly-iterating
+                                     # model still surfaces ctx/quota/perms). 0 = off (default).
+    autosave: bool = True            # autosave the session each turn; auto-load last on start
+    auto_update: bool = False        # on launch, the /update lean-tool checks the published
+                                     # VERSION and self-updates if newer. OFF by default;
+                                     # only acts when the 'update' lean-tool is enabled.
+    update_track: str = "stable"     # which /update track to follow: 'stable' (the main
+                                     # branch) or 'beta' (pre-release branch). Selects the
+                                     # branch /update fetches VERSION + lean_coder.py from.
+    command_timeout: int = 300       # foreground run_command timeout (s); long tasks use ' &'
+    bg_max_concurrent: int = 5       # max background tasks at once (0 = unlimited)
+    worker_max_concurrent: int = 2   # dispatch_worker: max worker agents alive at once (0 = unlimited)
+    worker_idle_timeout: int = 1800  # dispatch_worker: worker lease secs; unattended self-kill
+    worker_max_iterations: int = 30  # dispatch_worker: agentic-loop cap per worker
+    editor: str = ""                 # preferred editor for /prompt etc.; "" -> $EDITOR/nano
+    leash: str = "rwe"               # capability ceiling: chat (no tools) | r | rw | rwe.
+                                     # bounds what the agent is given AT ALL (never blocks
+                                     # on something above the ceiling). chat folds in the
+                                     # old chat-only mode. The model is told its ceiling.
+    confirm_reads: bool = False      # ask-on-read: read tools confirm too, not just writes
+    incognito: bool = False          # no session persistence this run; the model is told
+                                     # (ephemeral - never written to config; --incognito to start)
+    hosts: list = field(default_factory=list)  # tiered failover list (priority order)
+    host_models: dict = field(default_factory=dict)  # per-host default model (url -> model)
+    model_explicit: bool = False     # model came from --model / env (skip per-host override)
+    machines: dict = field(default_factory=dict)  # memorable name -> url alias map
+    connect_hosts: dict = field(default_factory=dict)  # name -> ssh target for /connect
+    auto_reconnect: bool = False     # on /load of a session that ran remote, reconnect
+                                     # to its host automatically (off = ask first)
+    lean_tools_dir: str = ""            # "" -> ~/.config/leancoder/lean-tools
+    lean_tools_enabled: list = field(default_factory=list)  # enabled lean-tool names
+    providers_dir: str = ""             # "" -> ~/.config/leancoder/providers
+    providers_enabled: list = field(default_factory=list)  # enabled provider plugin names
+    provider: str = "ollama"         # active backend - ALWAYS a registered provider now
+    provider_settings: dict = field(default_factory=dict)  # name -> {model, num_ctx, thinking, effort, <custom>}
+
+    # --- provider-aware accessors ---------------------------------------------
+    # There is no "native" backend any more: the active model is ALWAYS a provider's
+    # model, kept in provider_settings[provider]. Ollama is just the bundled,
+    # default-enabled provider (provider == "ollama"). Its model/settings live in
+    # provider_settings["ollama"] like any other; its transport config (host/hosts/
+    # machines/num_ctx) stays top-level, read directly by the built-in ollama
+    # provider. `model`/`num_ctx` top-level remain as migration seeds + back-compat
+    # aliases (see load_config), so the accessors fall back to them.
+    def active_model(self) -> str:
+        return self.provider_settings.get(self.provider, {}).get("model") or self.model
+
+    def ctx_window(self) -> int:
+        return self.provider_settings.get(self.provider, {}).get("num_ctx") or self.num_ctx
+
+    def handover_for(self, model: "str | None" = None):
+        """Resolve compaction settings for `model` (default: the active model),
+        applying any per-model override in handover_overrides over the global defaults.
+        Models fill context at different rates, so these are per-model. Returns a dict:
+        {auto, soft, hard, autostart}."""
+        ov = self.handover_overrides.get(model or self.active_model(), {})
+        return {
+            "auto":      ov.get("auto",      self.auto_handover),
+            "soft":      ov.get("soft",      self.handover_soft),
+            "hard":      ov.get("hard",      self.handover_hard),
+            "autostart": ov.get("autostart", self.autostart_after_handover),
+        }
+
+    def set_active_model(self, name):
+        """Set the active backend's model (provider_settings[provider]["model"]).
+        For ollama, mirror to the top-level `model` alias so anything still reading
+        cfg.model (and the back-compat config line) stays in sync."""
+        self.provider_settings.setdefault(self.provider, {})["model"] = name
+        if self.provider == "ollama":
+            self.model = name
+
+    def setting(self, key, default=None):
+        """A per-provider knob (thinking/effort/or anything the provider declares).
+        Only meaningful while a provider is active; the provider's client reads
+        these to shape its request. Core persists them but never interprets the
+        custom ones."""
+        return self.provider_settings.get(self.provider, {}).get(key, default)
+
+    def set_setting(self, key, val):
+        self.provider_settings.setdefault(self.provider, {})[key] = val
+
+    def pin_model(self, name):
+        """Set the active model and mark it as explicitly chosen, so the per-host
+        [models] default won't override it. For a lean-tool that selects a model in
+        setup() (which runs before the startup host-default adoption)."""
+        self.set_active_model(name)
+        self.model_explicit = True
+
+    def options(self) -> dict:
+        return {
+            "num_ctx": self.num_ctx,
+            "temperature": self.temperature,
+            "top_p": self.top_p,
+            "top_k": self.top_k,
+            "repeat_penalty": self.repeat_penalty,
+        }
+
+
+def _norm_host(h: str) -> str:
+    """Accept a full base URL or a bare host[:port]; return a normalized URL.
+
+    'localhost' is rewritten to 127.0.0.1: on a dual-stack box getaddrinfo returns
+    IPv6 ::1 first, but Ollama binds IPv4 127.0.0.1 by default - so urllib connects
+    to ::1, gets refused, and reports 'can't reach' even though `curl` (Happy-Eyeballs,
+    falls back to IPv4) works fine. Pinning IPv4 matches curl + Ollama's default bind.
+    Only the bare hostname is swapped, so an explicit IPv6 URL or a real DNS name is
+    left untouched.
+
+    A missing port gets Ollama's default :11434 appended - a bare 'gpu-box' would
+    otherwise resolve to port 80 and silently never connect. An explicit/custom port
+    (:8080) is left as-is, so non-default Ollama binds keep working. IPv6 literals
+    ([::1]) and hosts that already carry a port are untouched."""
+    h = h.strip().rstrip("/")
+    if not re.match(r"^https?://", h):
+        h = "http://" + h
+    h = re.sub(r"^(https?://)localhost(?=[:/]|$)", r"\g<1>127.0.0.1", h)
+    # Append the default port when the authority has none. Split off scheme, then
+    # look at only the host[:port] authority (no path), skipping IPv6 [..] literals.
+    m = re.match(r"^(https?://)([^/]+)(.*)$", h)
+    if m:
+        scheme, authority, rest = m.groups()
+        if not authority.startswith("[") and ":" not in authority:
+            authority += ":11434"
+        h = scheme + authority + rest
+    return h
+
+
+def valid_host(token: str) -> bool:
+    """Whether a token can become a usable host URL. Rejects empty/whitespace and
+    obvious junk (spaces, no host part). Used to refuse persisting a broken host."""
+    t = (token or "").strip()
+    if not t or any(c.isspace() for c in t):
+        return False
+    try:
+        u = _norm_host(t)
+    except Exception:
+        return False
+    m = re.match(r"^https?://([^/:]+|\[[^\]]+\])", u)
+    return bool(m and m.group(1))
+
+
+def resolve_host(token: str, machines: dict) -> str:
+    """Map a memorable machine name to its URL, else normalize a raw host/URL."""
+    return machines[token] if token in machines else _norm_host(token)
+
+
+def host_label(url: str, machines: dict) -> str:
+    """Display form: 'name (url)' when the url has an alias, else the url."""
+    for name, u in machines.items():
+        if u == url:
+            return f"{name} ({url})"
+    return url
+
+
+def load_config(args) -> Config:
+    cfg = Config()
+    # config file (lowest, above defaults)
+    file_vals = {}
+    if CONFIG_PATH.is_file():
+        try:
+            import tomllib  # lazy: the hermetic --tool-exec role never needs it
+            file_vals = tomllib.loads(CONFIG_PATH.read_text())
+        except Exception as e:
+            print(yellow(f"warning: could not parse {CONFIG_PATH}: {e}"))
+    for key in ("model", "num_ctx", "max_iterations", "keep_alive", "temperature", "top_p", "top_k",
+                "repeat_penalty", "ask_user_to_run", "composer", "autosave", "auto_update", "update_track",
+                "command_timeout", "bg_max_concurrent",
+                "worker_max_concurrent", "worker_idle_timeout", "worker_max_iterations", "editor",
+                "leash", "confirm_reads", "auto_reconnect", "statusline", "statusline_every",
+                "statusline_iter", "auto_evict", "auto_evict_keep",
+                "window_messages", "auto_handover", "handover_soft", "handover_hard",
+                "handover_emergency", "handover_min_interval", "autostart_after_handover",
+                "auto_compact_interval", "auto_compact_hysteresis", "auto_compact_keep",
+                "lean_tools_dir", "providers_dir"):
+        if key in file_vals:
+            setattr(cfg, key, file_vals[key])
+    # The self-managing mechanism is a HANDOVER (the model pulls the same lever
+    # /handover does); "compact" now means only the programmatic /compact strip.
+    # The knobs are handover_* accordingly - no compact_* back-compat aliases (they'd
+    # be one more thing to track); a pre-rename config just falls back to defaults.
+    _ov = file_vals.get("handover_overrides")
+    if isinstance(_ov, dict):
+        cfg.handover_overrides = {k: dict(v) for k, v in _ov.items() if isinstance(v, dict)}
+    cfg.leash = _norm_leash(cfg.leash) or "rwe"     # validate the ceiling; junk -> full
+    if isinstance(file_vals.get("lean_tools_enabled"), list):
+        cfg.lean_tools_enabled = [p for p in file_vals["lean_tools_enabled"] if isinstance(p, str)]
+    if isinstance(file_vals.get("providers_enabled"), list):
+        cfg.providers_enabled = [p for p in file_vals["providers_enabled"] if isinstance(p, str)]
+    else:
+        # No providers_enabled key = fresh install or a legacy pre-provider config: seed the
+        # bundled ollama default so it works out of the box. Once the key EXISTS we respect
+        # it verbatim (even empty) - so disabling ollama STICKS instead of being re-seeded
+        # every launch, and a box set up with only a hosted provider is never pushed to ollama.
+        cfg.providers_enabled = ["ollama"]
+    if isinstance(file_vals.get("provider"), str):
+        cfg.provider = file_vals["provider"].strip()
+    # Migration: legacy configs used provider = "" to mean the built-in (native)
+    # Ollama backend. Ollama is now a real provider, so "" -> "ollama".
+    if not cfg.provider:
+        cfg.provider = "ollama"
+    # [providers.<name>] tables: each is that provider's saved model / window /
+    # settings (thinking, effort, and any custom knobs). Kept verbatim so a
+    # provider can persist things core doesn't need to understand.
+    if isinstance(file_vals.get("providers"), dict):
+        # Drop any blank/whitespace provider name (a "" leftover from the old native
+        # `provider = ""` era) so it can't round-trip back to an invalid `[providers.]`
+        # header that would break the NEXT parse. Self-heals an already-corrupted file.
+        cfg.provider_settings = {n: dict(v) for n, v in file_vals["providers"].items()
+                                 if isinstance(v, dict) and isinstance(n, str) and n.strip()}
+    if os.environ.get("LEANCODER_MODEL"):
+        cfg.model = os.environ["LEANCODER_MODEL"]
+    if args.model:
+        cfg.model = args.model
+    cfg.model_explicit = bool(args.model or os.environ.get("LEANCODER_MODEL"))
+    # Seed the ollama provider's model from the legacy top-level `model` so a
+    # pre-migration config (or a --model/env override) carries onto the ollama
+    # provider. An existing [providers.ollama].model is kept unless explicitly
+    # overridden on the command line.
+    _oll = cfg.provider_settings.setdefault("ollama", {})
+    if cfg.model_explicit or not _oll.get("model"):
+        _oll["model"] = cfg.model
+
+    # per-host default models: [models] table mapping host URL -> model name
+    if isinstance(file_vals.get("models"), dict):
+        cfg.host_models = {_norm_host(k): v for k, v in file_vals["models"].items()
+                           if isinstance(v, str) and v.strip()}
+
+    # memorable machine names: [machines] table mapping name -> url
+    if isinstance(file_vals.get("machines"), dict):
+        cfg.machines = {n: _norm_host(u) for n, u in file_vals["machines"].items()
+                        if isinstance(u, str) and u.strip()}
+
+    # saved /connect targets: [connect] table mapping name -> ssh destination
+    if isinstance(file_vals.get("connect"), dict):
+        cfg.connect_hosts = {n: t.strip() for n, t in file_vals["connect"].items()
+                             if isinstance(t, str) and t.strip()}
+
+    # Host resolution (precedence: --host > OLLAMA_HOST > config). Names resolve
+    # via [machines]. cfg.hosts is ALWAYS the priority pool (config order, never
+    # auto-reordered); cfg.host is the active pick within it. A lone `host = "..."`
+    # loads as a one-element pool so there is a single source of truth. `hosts = [...]`
+    # is the multi-host priority list. An explicit --host/OLLAMA_HOST is a session
+    # override of the ACTIVE host: it moves the pick to that host (adding it to the
+    # front of the pool if new) but leaves the configured priority order intact.
+    if isinstance(file_vals.get("hosts"), list) and file_vals["hosts"]:
+        cfg.hosts = [resolve_host(h, cfg.machines) for h in file_vals["hosts"]
+                     if isinstance(h, str) and h.strip()]
+    elif "host" in file_vals:
+        cfg.hosts = [resolve_host(file_vals["host"], cfg.machines)]
+    else:
+        cfg.hosts = [_norm_host(cfg.host)]
+    explicit = args.host or os.environ.get("OLLAMA_HOST")
+    if explicit:
+        eh = resolve_host(explicit, cfg.machines)
+        cfg.host = eh
+        if eh not in cfg.hosts:
+            cfg.hosts.insert(0, eh)          # session override; priority order otherwise kept
+    else:
+        cfg.host = cfg.hosts[0]              # provisional; repl probes the pool and picks
+
+    # remaining CLI flags
+    if args.num_ctx:        cfg.num_ctx = args.num_ctx
+    if getattr(args, "keep_alive", None) is not None: cfg.keep_alive = args.keep_alive
+    if getattr(args, "auto_evict", None): cfg.auto_evict = True
+    if getattr(args, "window_messages", None) is not None: cfg.window_messages = args.window_messages
+    if args.temperature is not None:    cfg.temperature = args.temperature
+    if args.top_p is not None:          cfg.top_p = args.top_p
+    if args.top_k is not None:          cfg.top_k = args.top_k
+    if args.repeat_penalty is not None: cfg.repeat_penalty = args.repeat_penalty
+    if getattr(args, "approval", None):
+        cfg.approval = args.approval
+    elif args.auto or args.yolo:        # --auto (and the kept --yolo alias) = auto
+        cfg.approval = "auto"
+    if getattr(args, "no_composer", False):
+        cfg.composer = False
+    if getattr(args, "no_autosave", False):
+        cfg.autosave = False
+    if getattr(args, "incognito", False):
+        cfg.incognito = True
+    if getattr(args, "leash", None):
+        cfg.leash = args.leash
+    if getattr(args, "chat_only", False):
+        cfg.leash = "chat"
+    cfg.cwd = Path(args.cwd).expanduser().resolve() if args.cwd else Path.cwd()
+    if args.think is not None:
+        cfg.think = args.think
+
+    # Auto-detect num_ctx at startup only when it wasn't pinned explicitly
+    # (no --num-ctx flag and no num_ctx in the config file).
+    cfg.auto_num_ctx = not (args.num_ctx or "num_ctx" in file_vals)
+    return cfg
+
+
+def _toml_value(v) -> str:
+    """Serialize a scalar/list for a provider-settings table. Lean: strings,
+    bools, numbers, and string lists - all a provider knob should ever need."""
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, (int, float)):
+        return str(v)
+    if isinstance(v, list):
+        return "[" + ", ".join(_toml_value(x) for x in v) + "]"
+    return '"' + str(v).replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def save_config(cfg: Config, quiet: bool = False):
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    # One-time safety net: before the first write that introduces the new
+    # provider-based format, snapshot the legacy config so the ollama-as-provider
+    # migration can be rolled back by hand. Kept forever (only written once).
+    try:
+        bak = CONFIG_PATH.with_name(CONFIG_PATH.name + ".pre-migration.bak")
+        if CONFIG_PATH.is_file() and not bak.exists():
+            old = CONFIG_PATH.read_text()
+            if "[providers.ollama]" not in old:
+                bak.write_text(old)
+    except OSError:
+        pass
+    name_of = {u: n for n, u in cfg.machines.items()}  # url -> name, for readability
+    # cfg.hosts is the priority pool (config order). Persist the ORDER only - the
+    # active pick (cfg.host) is a session override and is intentionally not saved as
+    # priority. A single-host pool emits the scalar `host = "..."` for clean
+    # back-compat; a multi-host pool emits the `hosts = [...]` priority list.
+    pool = cfg.hosts or [cfg.host]
+    if len(pool) > 1:
+        host_line = "hosts = [\n" + "".join(
+            f'    "{name_of.get(h, h)}",\n' for h in pool) + "]"
+    else:
+        host_line = f'host = "{name_of.get(pool[0], pool[0])}"'
+    # Top-level `model` stays as a back-compat alias of the ollama provider's model
+    # (so an older lean-coder, or anything still reading cfg.model, keeps working).
+    # The canonical store is [providers.ollama].model, written below.
+    ollama_model = cfg.provider_settings.get("ollama", {}).get("model") or cfg.model
+    lines = [
+        host_line,
+        f'model = "{ollama_model}"',
+    ]
+    # Only persist num_ctx if it was explicitly pinned (--num-ctx/env/file). When
+    # it came from auto-detect, omit it so detection stays active per-host on the
+    # next launch - otherwise saving after a session on a 16k host would bake that
+    # in and silently cap a 32k host.
+    if not cfg.auto_num_ctx:
+        lines.append(f"num_ctx = {cfg.num_ctx}")
+    if cfg.keep_alive and cfg.keep_alive != "10m":
+        lines.append(f'keep_alive = "{cfg.keep_alive}"')
+    if cfg.auto_evict:
+        lines.append("auto_evict = true")
+    if cfg.auto_evict_keep != 3:
+        lines.append(f"auto_evict_keep = {cfg.auto_evict_keep}")
+    if cfg.max_iterations != 0:
+        lines.append(f"max_iterations = {cfg.max_iterations}")
+    if cfg.window_messages != 0:              # default is off (0) now
+        lines.append(f"window_messages = {cfg.window_messages}")
+    if not cfg.auto_handover:
+        lines.append("auto_handover = false")
+    if cfg.handover_soft != 0.70:
+        lines.append(f"handover_soft = {cfg.handover_soft}")
+    if cfg.handover_hard != 0.95:
+        lines.append(f"handover_hard = {cfg.handover_hard}")
+    if cfg.handover_emergency != 1.00:
+        lines.append(f"handover_emergency = {cfg.handover_emergency}")
+    if cfg.handover_min_interval != 60.0:
+        lines.append(f"handover_min_interval = {cfg.handover_min_interval}")
+    if not cfg.autostart_after_handover:       # default is on now; persist an opt-OUT
+        lines.append("autostart_after_handover = false")
+    if cfg.auto_compact_interval != 0:         # default 0 (off); persist when opted in
+        lines.append(f"auto_compact_interval = {cfg.auto_compact_interval}")
+    if cfg.auto_compact_hysteresis != 0.25:
+        lines.append(f"auto_compact_hysteresis = {cfg.auto_compact_hysteresis}")
+    if cfg.auto_compact_keep != COMPACT_KEEP:
+        lines.append(f"auto_compact_keep = {cfg.auto_compact_keep}")
+    lines += [
+        f"temperature = {cfg.temperature}",
+        f"top_p = {cfg.top_p}",
+        f"top_k = {cfg.top_k}",
+        f"repeat_penalty = {cfg.repeat_penalty}",
+        f"ask_user_to_run = {str(cfg.ask_user_to_run).lower()}",
+        f"autosave = {str(cfg.autosave).lower()}",
+        f"command_timeout = {cfg.command_timeout}",
+        f"bg_max_concurrent = {cfg.bg_max_concurrent}",
+        f"worker_max_concurrent = {cfg.worker_max_concurrent}",
+        f"worker_idle_timeout = {cfg.worker_idle_timeout}",
+        f"worker_max_iterations = {cfg.worker_max_iterations}",
+    ]
+    # leash / confirm_reads persist (modes you may want sticky); incognito does NOT -
+    # it's deliberately ephemeral (persisting it would itself be a local trace, and a
+    # fresh launch should never be silently incognito). leash omitted when it's the
+    # default (rwe = full) so a bare config still gets the full surface.
+    if cfg.leash and cfg.leash != "rwe":
+        lines.append(f'leash = "{cfg.leash}"')
+    if cfg.confirm_reads:
+        lines.append("confirm_reads = true")
+    if cfg.auto_reconnect:
+        lines.append("auto_reconnect = true")
+    if not cfg.statusline:                    # default on; persist only when turned off
+        lines.append("statusline = false")
+    if cfg.statusline_every != 1:             # default 1 (every prompt); persist if changed
+        lines.append(f"statusline_every = {cfg.statusline_every}")
+    if cfg.statusline_iter != 0:              # default 0 (off); persist if changed
+        lines.append(f"statusline_iter = {cfg.statusline_iter}")
+    if cfg.editor:
+        lines.append(f'editor = "{cfg.editor}"')
+    if cfg.lean_tools_dir:
+        lines.append(f'lean_tools_dir = "{cfg.lean_tools_dir}"')
+    if cfg.lean_tools_enabled:
+        lines.append("lean_tools_enabled = ["
+                     + ", ".join(f'"{p}"' for p in cfg.lean_tools_enabled) + "]")
+    if cfg.providers_dir:
+        lines.append(f'providers_dir = "{cfg.providers_dir}"')
+    # Always persist the enabled set (even empty): an absent key is treated as "fresh -
+    # seed ollama" on load, so an explicit empty/ollama-disabled set MUST be written to
+    # stick (otherwise disabling your last provider would silently re-seed ollama).
+    lines.append("providers_enabled = ["
+                 + ", ".join(f'"{p}"' for p in cfg.providers_enabled) + "]")
+    if cfg.machines:
+        lines.append("")
+        lines.append("[machines]")
+        lines += [f'"{n}" = "{u}"' for n, u in cfg.machines.items()]
+    if cfg.connect_hosts:
+        lines.append("")
+        lines.append("[connect]")
+        lines += [f'"{n}" = "{t}"' for n, t in cfg.connect_hosts.items()]
+    if cfg.host_models:
+        lines.append("")
+        lines.append("[models]")
+        lines += [f'"{h}" = "{m}"' for h, m in cfg.host_models.items()]
+    if cfg.provider and cfg.provider != "ollama":
+        lines.insert(2, f'provider = "{cfg.provider}"')   # just after model line
+    # ollama is the default provider; omit the line for it (a bare config still
+    # boots on ollama). A non-default active provider is written so it comes back.
+    # [providers.<name>] tables: the per-backend model + settings. num_ctx is
+    # deliberately NOT persisted - it is derived from the provider's
+    # context_window() hook at activation, so saving it would pin a stale value
+    # and override an intentional cap (e.g. a plugin capping below the raw API
+    # limit) on the next load. Top-level model/num_ctx stay the native Ollama ones.
+    for name, settings in cfg.provider_settings.items():
+        # Guard against a blank/whitespace provider name (a "" leftover from the old
+        # native-ollama `provider = ""` era): it would emit an invalid `[providers.]`
+        # header, and the NEXT load would fail to parse and silently fall back to
+        # defaults - wiping providers_enabled + lean_tools_enabled. Skip it.
+        if not (isinstance(name, str) and name.strip()):
+            continue
+        saved = {k: v for k, v in settings.items() if k != "num_ctx"}
+        if not saved:
+            continue
+        lines.append("")
+        lines.append(f"[providers.{name}]")
+        lines += [f"{k} = {_toml_value(v)}" for k, v in saved.items()]
+    CONFIG_PATH.write_text("\n".join(lines) + "\n")
+    if not quiet:
+        print(green(f"saved config -> {CONFIG_PATH}"))
+
+
+def autosave_config(cfg: Config):
+    """Persist config silently after a config-mutating command (full autosave -
+    settings stick across launches without a manual save). Never breaks a turn."""
+    try:
+        save_config(cfg, quiet=True)
+    except OSError:
+        pass
+
+
+# ----------------------------------------------------------------------------
+# Session persistence (autosave on by default)
+#
+# A conversation is just agent.messages - a list of dicts on the driver. Both
+# the local and the hosted-API backends are stateless: the full history is
+# re-sent every turn and the server stores nothing. So save = dump the list to a
+# file, resume = load it back, and it works identically across backends because
+# the history is kept in lean-coder's own canonical shape (each client translates at
+# send time).
+#
+# By default the live conversation autosaves each turn to a rolling "auto-<time>"
+# session (crash-safe) and the most-recent session auto-loads on launch, so a
+# restart picks up where you left off. `/save [name]` freezes a named snapshot;
+# `/load` resumes any session. Turn autosave off (cfg.autosave / `/autosave off`)
+# for amnesic behavior - then nothing is written and nothing auto-loads.
+# ----------------------------------------------------------------------------
+
+def _session_name_ok(name: str) -> str:
+    """Sanitize a session name to a safe single filename component (no path
+    traversal, no separators). Returns the cleaned name, or '' if nothing usable
+    remains."""
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", name.strip()).strip("-.")
+    return cleaned
+
+
+def _session_path(name: str) -> Path:
+    return SESSIONS_DIR / f"{name}.json"
+
+
+def _session_title(messages) -> str:
+    """A short label for a session: the first user message, one line, truncated."""
+    for m in messages:
+        if m.get("role") == "user":
+            line = " ".join(str(m.get("content", "")).split())
+            return (line[:60] + "…") if len(line) > 60 else line
+    return "(no user messages)"
+
+
+def save_session(messages, cfg, name: str, remote=None, pinned_plan=""):
+    """Write the conversation to ~/.config/leancoder/sessions/<name>.json with a
+    metadata header. Returns (path, meta). Raises ValueError on a bad name.
+
+    The meta captures the session's full working state - backend, model, host,
+    leash/approval ceiling, thinking/effort, the pinned plan (GOAL+TODO), and the
+    remote host it ran on (if any) - so /load can restore it. `remote` is the active
+    remote host, or None for local. A field absent from an older session's meta falls
+    back to the live config on load (and is then re-captured here on the next save)."""
+    safe = _session_name_ok(name)
+    if not safe:
+        raise ValueError("invalid session name")
+    SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+    body = [m for m in messages if m.get("role") != "system"]
+    meta = {
+        "saved_at": time.strftime("%Y-%m-%d %H:%M"),
+        "provider": cfg.provider,            # "" = native Ollama; else the backend name
+        "model": cfg.active_model(),          # the model actually in use (provider or native)
+        "host": cfg.host,
+        "cwd": str(cfg.cwd),
+        "leash": cfg.leash,                  # capability ceiling (per-session perms)
+        "approval": cfg.approval,            # confirm cadence
+        "thinking": cfg.setting("thinking"),  # provider-scoped; None on ollama / unset
+        "effort": cfg.setting("effort"),
+        "remote": remote,                    # ssh host tools ran on, or None (local)
+        "title": _session_title(messages),
+        "turns": len(body),
+        "pinned_plan": pinned_plan or "",
+    }
+    path = _session_path(safe)
+    path.write_text(json.dumps({"meta": meta, "messages": messages}, indent=2))
+    return path, meta
+
+
+def load_session(name: str):
+    """Return the stored {'meta', 'messages'} dict for a saved session.
+    Raises FileNotFoundError if it doesn't exist."""
+    safe = _session_name_ok(name)
+    path = _session_path(safe)
+    if not path.is_file():
+        raise FileNotFoundError(name)
+    return json.loads(path.read_text())
+
+
+def list_sessions():
+    """All saved sessions as (name, meta) pairs, newest first."""
+    if not SESSIONS_DIR.is_dir():
+        return []
+    out = []
+    for p in SESSIONS_DIR.glob("*.json"):
+        try:
+            meta = json.loads(p.read_text()).get("meta", {})
+        except (json.JSONDecodeError, OSError):
+            meta = {}
+        out.append((p.stem, meta))
+    out.sort(key=lambda nm: nm[1].get("saved_at", ""), reverse=True)
+    return out
+
+
+def delete_session(name: str) -> bool:
+    """Remove a saved session. Returns True if a file was deleted."""
+    path = _session_path(_session_name_ok(name))
+    if path.is_file():
+        path.unlink()
+        return True
+    return False
+
+
+def _session_rows():
+    """(name, meta, mtime) for all sessions, most-recently-used (mtime) first.
+    Used by the /load picker and the settings sessions view."""
+    rows = []
+    if not SESSIONS_DIR.is_dir():
+        return rows
+    for p in SESSIONS_DIR.glob("*.json"):
+        try:
+            meta = json.loads(p.read_text()).get("meta", {})
+        except (json.JSONDecodeError, OSError):
+            meta = {}
+        try:
+            mtime = p.stat().st_mtime
+        except OSError:
+            mtime = 0
+        rows.append((p.stem, meta, mtime))
+    rows.sort(key=lambda r: r[2], reverse=True)
+    return rows
+
+
+def _auto_resume_pick(rows):
+    """The session that auto-load resumes on launch: the most-recently-used one
+    that isn't a pre-compact safety snapshot. `rows` is _session_rows() output
+    (already most-recent first). Returns (name, meta, mtime) or None. Deliberately
+    NOT cwd-scoped - scoping silently skipped the genuinely-most-recent session
+    when it was last used from another dir. Pure -> unit-tested."""
+    return next((r for r in rows if not r[0].startswith(PRECOMPACT_PREFIX)), None)
+
+
+_autosave_seq = 0
+
+
+def _new_autosave_name() -> str:
+    """A unique rolling-autosave session id for this launch (or post-/clear). The
+    sequence suffix keeps it distinct even when two are minted in the same second
+    (e.g. /clear then immediately /handover) so neither clobbers the other."""
+    global _autosave_seq
+    _autosave_seq += 1
+    return f"{AUTOSAVE_PREFIX}{time.strftime('%Y-%m-%d-%H%M%S')}-{os.getpid()}-{_autosave_seq}"
+
+
+# --- session locks: one live writer per session ----------------------------
+# A sidecar "<name>.lock" marks who is actively writing a session: our pid + host
+# + a heartbeat bumped on every autosave. The contract:
+#   - Loading a session CLAIMS its lock immediately (not on the first autosave) -
+#     so the loader owns it from the start and is never forked off the session it
+#     just opened (the bug that lobotomised a session mid-conversation).
+#   - Auto-load on startup SKIPS a session that's live in another instance and
+#     starts fresh instead (never steals a session another instance is using).
+#   - Explicit /load (or --resume) of a live session PROMPTS to take it over; on
+#     yes it claims the lock, and only THEN does the previous owner notice the
+#     steal on its next autosave and fork to a fresh auto- session (with a clear
+#     note + how to take it back) - history intact, just renamed.
+# So a fork only ever happens after an explicit, consenting take-over.
+_LOCK_STALE_SECS = 120  # a heartbeat older than this means the writer is gone
+
+def _lock_path(name: str) -> Path:
+    return SESSIONS_DIR / f"{_session_name_ok(name)}.lock"
+
+def _read_lock(name: str):
+    try:
+        return json.loads(_lock_path(name).read_text())
+    except (OSError, ValueError):
+        return None
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+def _lock_is_live(name: str) -> bool:
+    """True if some OTHER running instance currently holds this session.
+
+    On the SAME host the pid is authoritative: a live holder owns the session no
+    matter how long it has sat idle. This is deliberate - an active instance that
+    simply hasn't autosaved in a while (>_LOCK_STALE_SECS) must NOT look dead, or a
+    second launch would silently steal the session out from under it (the "opened a
+    new session and it stole my other one" bug). A dead pid frees the lock at once.
+    Cross-host we can't probe the pid, so we fall back to heartbeat freshness."""
+    info = _read_lock(name)
+    if not info or info.get("pid") == os.getpid():
+        return False
+    if info.get("host") == socket.gethostname():
+        return _pid_alive(info.get("pid", -1))
+    return (time.time() - info.get("ts", 0)) <= _LOCK_STALE_SECS
+
+def _write_lock(name: str):
+    try:
+        SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+        _lock_path(name).write_text(json.dumps(
+            {"pid": os.getpid(), "host": socket.gethostname(), "ts": time.time()}))
+    except OSError:
+        pass
+
+def _own_lock(name: str) -> bool:
+    info = _read_lock(name)
+    return bool(info and info.get("pid") == os.getpid()
+                and info.get("host") == socket.gethostname())
+
+def _release_lock(name: str):
+    if _own_lock(name):
+        try:
+            _lock_path(name).unlink()
+        except OSError:
+            pass
+
+
+def _prune_stale_locks():
+    """Sweep session .lock files whose holder is provably gone: a stale heartbeat (older
+    than _LOCK_STALE_SECS) or a dead pid on this host. A clean exit unlinks its own lock,
+    but a KILLED instance (or a relaunch) leaves one behind - it ages out logically yet
+    the file lingers in the sessions dir forever. Never removes a LIVE lock (another
+    running instance) or our own. Called at startup so dead locks don't accumulate."""
+    if not SESSIONS_DIR.is_dir():
+        return
+    me, host = os.getpid(), socket.gethostname()
+    for lk in SESSIONS_DIR.glob("*.lock"):
+        info = _read_lock(lk.stem)
+        if info and info.get("pid") == me and info.get("host") == host:
+            continue                       # our own lock - keep
+        if not _lock_is_live(lk.stem):     # nobody live holds it -> safe to remove
+            try:
+                lk.unlink()
+            except OSError:
+                pass
+
+
+def autosave_session(agent, cfg):
+    """Write the live conversation to its rolling autosave session. No-op when
+    autosave is off or the conversation is empty. Must never raise into the turn
+    loop - a failed autosave should not kill a working session."""
+    if cfg.incognito or not cfg.autosave:
+        return
+    if not any(m.get("role") != "system" for m in agent.messages):
+        return
+    # If another instance has taken over our session (claimed the lock), don't
+    # fight over it: announce it once and fork to a fresh auto- session.
+    name = agent.autosave_name
+    info = _read_lock(name)
+    if info and not _own_lock(name) and _lock_is_live(name):
+        old = name
+        agent.autosave_name = _new_autosave_name()
+        print(yellow(f"\n  {GLYPH.get('warn', '!')} session '{old}' resumed elsewhere"
+                     f" - /load {old} to take it back."))
+        print(dim(f"  continuing here in a new session '{agent.autosave_name}'."))
+        name = agent.autosave_name
+    try:
+        rhost = agent.remote.host if getattr(agent, "remote", None) else None
+        save_session(agent.messages, cfg, name, remote=rhost,
+                     pinned_plan=getattr(agent, "pinned_plan", ""))
+        _write_lock(name)
+        _prune_autosaves()
+    except (ValueError, OSError):
+        pass
+
+
+def _prune_autosaves(keep: int = AUTOSAVE_KEEP):
+    """Keep only the newest `keep` autosave sessions, and separately cap the rolling
+    pre-handover safety snapshots (auto_handover writes one every fire) to
+    PRECOMPACT_KEEP. Both are rolling/disposable; only USER-named snapshots (neither
+    prefix) are kept forever. Without the pre-compact cap they pile up unbounded and
+    flood /load (a busy session can leave dozens)."""
+    if not SESSIONS_DIR.is_dir():
+        return
+
+    def _cap(prefix, n):
+        files = list(SESSIONS_DIR.glob(f"{prefix}*.json"))
+        try:
+            files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        except OSError:
+            return
+        for p in files[n:]:
+            try:
+                p.unlink()
+            except OSError:
+                pass
+
+    _cap(AUTOSAVE_PREFIX, keep)
+    _cap(PRECOMPACT_PREFIX, PRECOMPACT_KEEP)
+
+
+# ----------------------------------------------------------------------------
+# Path safety
+# ----------------------------------------------------------------------------
+
+def resolve_in_project(cfg: Config, path: str) -> Path:
+    p = (cfg.cwd / path).resolve() if not os.path.isabs(path) else Path(path).resolve()
+    return p
+
+
+# ----------------------------------------------------------------------------
+# Background tasks (a trailing '&' on run_command detaches; tracked + reaped)
+#
+# A backgrounded job is detached (own session) so it survives the turn, BUT it is
+# pegged to the lean-coder session: a registry under bg/tasks.jsonl records the pid +
+# the owning lean-coder pid, so a clean exit kills this session's jobs and a later
+# launch reaps orphans left by a crashed session. /bg lists + kills them.
+# ----------------------------------------------------------------------------
+
+def _bg_registry_path():
+    return CONFIG_DIR / "bg" / "tasks.jsonl"
+
+
+def _bg_register(pid, cmd, log, kind="task", idle_timeout=None):
+    """Record a backgrounded task (owner = this process's pid, host = this box).
+    A bg task runs on whichever box the executor is on, so the registry lives on
+    THAT box; the host field lets a reader tell 'my box' (pid is authoritative)
+    from a foreign record (never mine to reap) - see _proc_alive_here.
+
+    `kind` tags what the record is: "task" (a plain backgrounded run_command, the
+    default) or "worker" (a dispatched agent). Both share this lifecycle, but the
+    plain bg surface (/bg, the bg_status tool, non-agent finished-notify) FILTERS
+    to kind="task" so a session without the worker tool never sees - or is
+    confused by - a worker. Workers surface only through the worker tool's path.
+
+    `idle_timeout` (seconds, or None) records the lease: the task self-terminates
+    if left UN-attended (its '<log>.lease' file not touched) for this long. The
+    parent attends by bumping the lease (once per turn while it lives - see
+    _bg_bump_lease); when the parent is gone the lease goes stale and the task's
+    own watchdog kills it. Inverse of session-lock staleness; caps runaway quota
+    burn by a worker whose parent dropped. None = no lease (runs until done)."""
+    try:
+        p = _bg_registry_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        rec = {"pid": pid, "cmd": cmd, "log": str(log), "owner": os.getpid(),
+               "host": socket.gethostname(), "kind": kind,
+               "idle_timeout": idle_timeout,
+               "started": time.strftime("%Y-%m-%d %H:%M:%S"),
+               "started_at": time.time()}
+        with open(p, "a") as f:
+            f.write(json.dumps(rec) + "\n")
+    except OSError:
+        pass
+
+
+def _bg_lease_path(log):
+    """The lease file for a bg task with the given log path. Its mtime is 'last
+    attended'; the task's watchdog compares it against idle_timeout."""
+    return Path(str(log) + ".lease")
+
+
+def _bg_bump_lease(rec):
+    """Attend a leased task: bump its lease file mtime to now, so its watchdog sees
+    the parent is alive and doesn't self-terminate. No-op for a task with no lease
+    (idle_timeout None) or a foreign-host record (its lease lives on that box, not
+    ours to touch - the executor there bumps it). Best-effort."""
+    if not rec.get("idle_timeout") or not _bg_here(rec):
+        return
+    log = rec.get("log")
+    if not log:
+        return
+    try:
+        _bg_lease_path(log).touch()
+    except OSError:
+        pass
+
+
+def _bg_load():
+    try:
+        return [json.loads(ln) for ln in _bg_registry_path().read_text().splitlines()
+                if ln.strip()]
+    except (OSError, json.JSONDecodeError):
+        return []
+
+
+def _bg_save(recs):
+    try:
+        p = _bg_registry_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("".join(json.dumps(r) + "\n" for r in recs))
+    except OSError:
+        pass
+
+
+def _proc_alive(pid):
+    # Zombie-aware: a killed/finished child we never waitpid()'d still has a pid that
+    # os.kill(pid, 0) reports as alive, so check /proc state and treat 'Z' as dead.
+    # Falls back to signal-0 where /proc isn't available (non-Linux).
+    try:
+        with open(f"/proc/{int(pid)}/stat") as f:
+            state = f.read().rpartition(")")[2].split()[0]
+        return state != "Z"
+    except (OSError, ValueError, TypeError, IndexError):
+        pass
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except PermissionError:
+        return True            # exists but not ours
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+def _bg_kill(pid, sig=signal.SIGTERM):
+    """Kill a backgrounded task's whole group (start_new_session -> pgid == pid)."""
+    try:
+        os.killpg(int(pid), sig)
+    except (OSError, ValueError, TypeError):
+        try:
+            os.kill(int(pid), sig)
+        except OSError:
+            pass
+
+
+def _bg_here(rec) -> bool:
+    """True if this bg record was registered on THIS box (so its pid is ours to
+    probe / reap). A record with no host predates the host field - treat as local
+    (back-compat: old registries only ever held this-box tasks)."""
+    h = rec.get("host")
+    return h is None or h == socket.gethostname()
+
+
+def _bg_alive(rec) -> bool:
+    """Whether a task looks alive. Same-host: the pid is authoritative. Foreign
+    host (a task on another box we can't probe): fall back to 'has it written its
+    exit sidecar yet' - no sidecar => assume still running. Mirrors _lock_is_live:
+    trust the pid only where we can see it, else infer."""
+    if _bg_here(rec):
+        return _proc_alive(rec.get("pid"))
+    return _bg_exit_code(rec) is None
+
+
+def _bg_is_worker(rec) -> bool:
+    """A dispatched-agent record (kind='worker'). Everything else - incl. records
+    that predate the field - is a plain task. Plain-bg surfaces filter workers OUT
+    (see _bg_register); the worker tool filters them IN."""
+    return rec.get("kind") == "worker"
+
+
+def _fmt_runtime(secs) -> str:
+    """A short elapsed-time string (e.g. '5s', '3m12s', '1h04m') for how long a bg
+    task has run. '?' when we can't tell (a record older than the started_at field)."""
+    try:
+        secs = int(secs)
+    except (TypeError, ValueError):
+        return "?"
+    if secs < 0:
+        return "?"
+    if secs < 60:
+        return f"{secs}s"
+    m, s = divmod(secs, 60)
+    if m < 60:
+        return f"{m}m{s:02d}s"
+    h, m = divmod(m, 60)
+    return f"{h}h{m:02d}m"
+
+
+def _bg_runtime(rec):
+    """Seconds a task has been running (now - started_at) if still alive, or its
+    total lifetime is unknown once finished (we only stamp start). None if the
+    record predates started_at."""
+    t0 = rec.get("started_at")
+    if not isinstance(t0, (int, float)):
+        return None
+    return max(0, int(time.time() - t0))
+
+
+def _bg_running(owner=None, kind="task"):
+    """Registered tasks still alive (optionally only this session's). Filters to
+    `kind` (default 'task' = the plain-bg surface, workers excluded); pass
+    kind=None to include every kind."""
+    out = []
+    for r in _bg_load():
+        if owner is not None and r.get("owner") != owner:
+            continue
+        if kind is not None and r.get("kind", "task") != kind:
+            continue
+        if _bg_alive(r):
+            out.append(r)
+    return out
+
+
+def _bg_finished_here(owner):
+    """This-box bg tasks launched by `owner` (a pid) that have FINISHED and left an
+    exit sidecar - as [{pid, cmd, code, tail}]. Shared by the local finished-notify
+    scan and the remote BG_POLL verb (which runs in the executor, owner = its own
+    pid), so both report identically. Dedup by pid is the caller's job."""
+    out = []
+    for r in _bg_load():
+        pid = r.get("pid")
+        if r.get("owner") != owner or not _bg_here(r) or _proc_alive(pid):
+            continue
+        if r.get("kind", "task") != "task":     # workers notify via their own path
+            continue
+        code = _bg_exit_code(r)
+        if code is None:
+            continue
+        out.append({"pid": pid, "cmd": r.get("cmd", "?"), "code": code,
+                    "tail": _bg_log_tail(r.get("log"), 20)})
+    return out
+
+
+def _bg_finished_msg(items):
+    """Format finished-task dicts (from _bg_finished_here / a BG_POLL reply) into
+    the notice injected on the next turn. "" for an empty list."""
+    lines = []
+    for it in items:
+        head = f"background task finished: `{it.get('cmd', '?')}` exited {it.get('code')}"
+        tail = it.get("tail") or ""
+        lines.append(head + (f"\nlast output:\n{tail}" if tail else ""))
+    return "\n\n".join(lines)
+
+
+def _bg_exit_code(rec):
+    """The exit code a finished bg task wrote to its '<log>.exit' sidecar, as a
+    string ('0', '137', ...), or None if it hasn't finished / wrote nothing. The
+    sidecar is a plain file, so this works whether the task ran locally or on a
+    remote executor - no live process handle needed."""
+    log = rec.get("log")
+    if not log:
+        return None
+    try:
+        code = Path(str(log) + ".exit").read_text().strip()
+        return code or None
+    except (OSError, ValueError):
+        return None
+
+
+def _bg_log_tail(log, n=20) -> str:
+    """Last n lines of a bg task's log (for the finished-job notice), truncated
+    per line so a runaway line can't flood context. "" if unreadable/empty."""
+    if not log:
+        return ""
+    try:
+        lines = Path(log).read_text(errors="replace").splitlines()
+    except (OSError, ValueError):
+        return ""
+    tail = [ln[:500] for ln in lines[-n:]]
+    return "\n".join(tail).strip()
+
+
+def _bg_status_items(owner, kind="task"):
+    """Status rows for this-box bg tasks owned by `owner` (a pid), for the
+    model-facing bg_status tool. Each row: {pid, cmd, state ('running' | 'exit N'),
+    runtime (human elapsed), tail (last lines)}. Filtered to `kind` (default 'task',
+    so workers stay off the plain-bg surface). Only records on THIS box - a foreign
+    record's pid isn't ours to probe."""
+    rows = []
+    for r in _bg_load():
+        if r.get("owner") != owner or not _bg_here(r):
+            continue
+        if kind is not None and r.get("kind", "task") != kind:
+            continue
+        code = _bg_exit_code(r)
+        alive = _proc_alive(r.get("pid"))
+        if alive and code is None:
+            state = "running"
+        elif code is not None:
+            state = f"exit {code}"
+        else:
+            state = "gone"        # not alive, never wrote a sidecar (killed/crashed)
+        rt = _bg_runtime(r)
+        rows.append({"pid": r.get("pid"), "cmd": r.get("cmd", "?"), "state": state,
+                     "runtime": _fmt_runtime(rt) if rt is not None else "?",
+                     "started": r.get("started", "?"),
+                     "tail": _bg_log_tail(r.get("log"), 20)})
+    return rows
+
+
+def _bg_status_msg(rows, pid=None) -> str:
+    """Render _bg_status_items rows into the string the bg_status tool returns to
+    the model. pid given but no row -> a clear 'no such task'. Empty -> a plain note."""
+    if pid is not None and not rows:
+        return (f"no background task with pid {pid} owned by this session on this box "
+                f"(it may have been reaped, or belongs to another session).")
+    if not rows:
+        return "no background tasks from this session.  (end a run_command with ' &' to start one)"
+    out = []
+    for r in rows:
+        head = f"pid {r['pid']}  {r['state']}  (ran {r['runtime']})  {r['cmd']}"
+        tail = r.get("tail") or ""
+        out.append(head + (f"\n  last output:\n{tail}" if tail else ""))
+    return "\n\n".join(out)
+
+
+def _bg_launch(cmd, cwd=None, kind="task", idle_timeout=None):
+    """Launch a detached background process on THIS box and register it, returning
+    {pid, log, exitf, leasef} or {"error": msg}. The lean-tool-facing bg spawn hook
+    (exposed as lc["bg_launch"]): a tool - e.g. dispatch_worker - can start + track a
+    bg task via the SAME machinery as a plain backgrounded run_command (sidecar exit,
+    optional lease, kind tag) without reaching into core internals or the leash/confirm
+    path (a worker's authority is set by its GRANT, gated at dispatch by the tool).
+
+    Reuses the builtins shell wrapper so completion/lease semantics are identical to
+    run_command's ' &'. LOCAL only by design: a worker's brain runs on the driver
+    (see the worker-agents design); its TOOLS reach a remote via the executor."""
+    if not cmd:
+        return {"error": "nothing to launch"}
+    try:
+        logdir = CONFIG_DIR / "bg"
+        logdir.mkdir(parents=True, exist_ok=True)
+        log = logdir / f"{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}-{kind}.log"
+        exitf = str(log) + ".exit"
+        leasef = str(log) + ".lease"
+        wrapped = _BUILTINS.Tools._bg_wrap(cmd, exitf, leasef, idle_timeout)
+        with open(log, "ab") as f:
+            p = subprocess.Popen(wrapped, shell=True, cwd=str(cwd) if cwd else None,
+                                 stdout=f, stderr=subprocess.STDOUT,
+                                 stdin=subprocess.DEVNULL, start_new_session=True)
+    except Exception as e:
+        return {"error": f"launch failed: {e}"}
+    _bg_register(p.pid, cmd, log, kind=kind, idle_timeout=idle_timeout)
+    return {"pid": p.pid, "log": str(log), "exitf": exitf, "leasef": leasef}
+
+
+# Named bg hooks for lean-tools. The lc dict passed to a lean-tool's setup() IS the
+# core module globals(), so a tool resolves these by name (lc["bg_launch"] etc.) - a
+# stable, intention-revealing surface over the _bg_* internals, so dispatch_worker
+# never reaches into private helpers. bg_launch: spawn+register a detached task;
+# bg_status: status rows (state/runtime/tail); bg_list: live records of a kind.
+bg_launch = _bg_launch
+bg_status = _bg_status_items
+bg_list = _bg_running
+
+# The live Agent, set at repl() startup. A lean-tool's setup() runs before the agent
+# exists, so it can't capture it directly; active_remote() reads it lazily at call time.
+_active_agent = None
+
+
+def active_remote():
+    """The parent session's LIVE remote as {host, ctl, cwd}, or None when local.
+    dispatch_worker uses this to make a worker ride the SAME executor path the parent
+    uses (its tools run where the parent's do), reusing the parent's ControlMaster."""
+    ag = _active_agent
+    ws = getattr(ag, "remote", None) if ag else None
+    if ws is None:
+        return None
+    return {"host": ws.host, "ctl": ws.ctl,
+            "cwd": ws.remote_cwd or ws.cwd}
+
+
+# ControlMasters opened SOLELY to carry workers to a host the parent isn't itself
+# connected to (host -> ctl path). Kept alive for the workers' lifetime and torn down
+# at session exit. A host the parent IS connected to reuses that master instead (never
+# tracked here) so we don't double-open or tear down a socket the parent is using.
+_worker_masters = {}
+
+
+def ensure_worker_master(host):
+    """Foreground-only: make sure a LIVE ssh master exists for `host` so a detached
+    worker can ride it (BatchMode, no auth prompt of its own). Returns
+    {host, ctl, cwd} on success or {"error": msg}. Resolution order:
+      1. a /connect alias (cfg.connect_hosts) resolves to its real target;
+      2. if the parent is connected to that host (active or pooled + alive), reuse ITS
+         master - the worker rides the exact channel the parent uses;
+      3. else open a DEDICATED master with KEY AUTH ONLY (BatchMode). This runs inside
+         a tool call - the terminal isn't ours to prompt on - so it must never block on
+         a password. Keys -> silent + fast; a password-only host fails fast with a
+         'run /connect <host> first' error (that command owns the terminal and prompts
+         safely), then the dispatch is retried. A detached worker never authenticates.
+    The worker's cwd defaults to '.' on the target (the tool can override)."""
+    ag = _active_agent
+    if ag is None:
+        return {"error": "no active session"}
+    cfg = ag.cfg
+    host = (cfg.connect_hosts.get(host, host) if getattr(cfg, "connect_hosts", None)
+            else host)
+    # Parent already on this host (active or pooled + alive): reuse its master + cwd.
+    for ws in ([ag.remote] if ag.remote else []) + list(ag.remotes.values()):
+        if ws is not None and ws.host == host and _remote_alive(ws):
+            return {"host": host, "ctl": ws.ctl, "cwd": ws.remote_cwd or ws.cwd}
+    # A dedicated worker master we opened earlier and is still live.
+    ctl = _worker_masters.get(host)
+    if ctl and _ssh_master_alive(host, ctl):
+        return {"host": host, "ctl": ctl, "cwd": "."}
+    # Open one now - KEY AUTH ONLY (BatchMode). This runs inside a tool call, where
+    # the terminal belongs to the agent, so we must NEVER sit on an invisible password
+    # prompt (that hangs the whole session). If keys work it's silent + fast; if a
+    # password would be needed, ssh fails fast and we send the operator to /connect,
+    # which owns the terminal properly and surfaces the prompt - then they retry.
+    ctl = _ctl_path(host)
+    _clear_master(host, ctl)
+    print(dim(f"opening ssh master to {host} for a worker (key auth) ..."))
+    argv = ["ssh", "-o", "ControlMaster=yes", "-o", f"ControlPath={ctl}",
+            "-o", "ControlPersist=yes", "-o", "BatchMode=yes",
+            # accept-new: BatchMode can't answer a first-contact host-key prompt, so
+            # without this a key-auth host that just isn't in known_hosts yet FAILS and
+            # gets misreported as 'needs a password'. accept-new trusts a new key (TOFU)
+            # but still refuses a CHANGED one (MITM guard), same as interactive /connect.
+            "-o", "StrictHostKeyChecking=accept-new",
+            "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=8",
+            "-o", "ConnectTimeout=10", "-o", "LogLevel=ERROR", "-fN", host]
+    try:
+        rc = subprocess.run(argv, timeout=25).returncode
+    except subprocess.TimeoutExpired:
+        return {"error": f"ssh to {host} timed out (no worker dispatched)"}
+    except Exception as e:
+        return {"error": f"ssh to {host} failed: {e} (no worker dispatched)"}
+    if rc != 0:
+        return {"error": (f"can't reach {host} with key auth. If it needs a password, "
+                          f"run '/connect {host}' first (that prompts you safely), then "
+                          f"retry the dispatch. No worker dispatched.")}
+    _worker_masters[host] = ctl
+    return {"host": host, "ctl": ctl, "cwd": "."}
+
+
+def _close_worker_masters():
+    """Tear down every dedicated worker master at session exit (a host the parent is
+    connected to isn't in here, so its master is left alone)."""
+    for host, ctl in list(_worker_masters.items()):
+        _clear_master(host, ctl)
+    _worker_masters.clear()
+
+
+def _bg_clean_sidecars(rec):
+    """Remove a finished/killed task's log + '.exit' sidecar so bg/ doesn't grow
+    without bound. Best-effort; a missing file is fine."""
+    log = rec.get("log")
+    if not log:
+        return
+    for p in (Path(log), Path(str(log) + ".exit"), _bg_lease_path(log)):
+        try:
+            p.unlink()
+        except OSError:
+            pass
+
+
+def _bg_reap_orphans():
+    """Startup: on THIS box only, kill background tasks whose owning lean-coder is
+    gone and prune dead entries; keeps a crashed session from leaving daemons
+    running forever. Foreign-host records (a task on another box) are left
+    untouched - not ours to probe or reap; they age out via /bg kill. A record
+    with no host predates the field and is treated as local (back-compat)."""
+    recs = _bg_load()
+    if not recs:
+        return
+    keep, reaped = [], 0
+    for r in recs:
+        if not _bg_here(r):                       # another box's task -> leave it alone
+            keep.append(r)
+            continue
+        if not _proc_alive(r.get("pid")):
+            _bg_clean_sidecars(r)                 # already gone -> drop + tidy its files
+            continue
+        owner = r.get("owner")
+        if owner and not _proc_alive(owner):      # orphan from a dead session -> kill
+            _bg_kill(r.get("pid"))
+            _bg_clean_sidecars(r)
+            reaped += 1
+            continue
+        keep.append(r)
+    _bg_save(keep)
+    if reaped:
+        print(dim(f"reaped {reaped} orphaned background task(s) from a previous session."))
+
+
+def _bg_adopt():
+    """Executor startup (a fresh executor after a reconnect): ADOPT this-box bg
+    tasks whose owning process is gone by re-stamping owner = my pid - instead of
+    reaping them. A remote bg task is detached and SURVIVES the ssh drop that
+    killed the prior executor; if the new executor ran the owner-based reap it
+    would see the dead owner and kill the still-running task (the foot-gun). Adopt
+    keeps it tracked to a live process so /bg still lists it after a reconnect.
+    Host-gated: foreign records are left alone. Dead (already-finished) same-box
+    tasks are dropped + their sidecars tidied on the way through."""
+    me = os.getpid()
+    recs = _bg_load()
+    if not recs:
+        return
+    keep, changed = [], False
+    for r in recs:
+        if not _bg_here(r):
+            keep.append(r); continue
+        if not _proc_alive(r.get("pid")):        # finished while we were away -> drop
+            _bg_clean_sidecars(r); changed = True; continue
+        owner = r.get("owner")
+        if owner and owner != me and not _proc_alive(owner):
+            r["owner"] = me                      # re-parent the survivor to me
+            changed = True
+        keep.append(r)
+    if changed:
+        _bg_save(keep)
+
+
+def _bg_kill_session():
+    """Clean exit: kill the background tasks THIS process started (owner pid on
+    THIS box), drop them + tidy sidecars. Pegs background jobs to the lean-coder
+    that launched them. Host-gated so a pid that collides with a foreign record
+    can't make us kill/drop another box's task."""
+    me, host = os.getpid(), socket.gethostname()
+    recs = _bg_load()
+    if not recs:
+        return
+    def mine(r):
+        return r.get("owner") == me and _bg_here(r)
+    for r in recs:
+        if mine(r):
+            if _proc_alive(r.get("pid")):
+                _bg_kill(r.get("pid"))
+            _bg_clean_sidecars(r)
+    remaining = [r for r in recs if not mine(r)]
+    if len(remaining) != len(recs):
+        _bg_save(remaining)
+
+
+# Marker lines (a whole line that is only the marker, modulo surrounding space).
+# Markers are word-bearing and symbol-wrapped (===SEARCH=== / ===DIVIDER=== /
+# ===REPLACE===): unique, easy for a model to emit, and - crucially - they do NOT
+# collide with a plain row of '=' or a git-conflict marker that legitimately appears
+# in file CONTENT. This is the ONE format; there is no back-compat alias.
+_RE_OPEN = re.compile(r"^={3,}\s*SEARCH\s*={3,}\s*$")
+_RE_DIV = re.compile(r"^={3,}\s*DIVIDER\s*={3,}\s*$")
+_RE_CLOSE = re.compile(r"^={3,}\s*REPLACE\s*={3,}\s*$")
+
+
+def _parse_search_replace(diff: str):
+    """Line-based, marker-anchored parse. Returns (blocks, error).
+
+    Block format (word-bearing + symbol-wrapped so a model emits it reliably and it
+    never collides with file content):
+        ===SEARCH===
+        <exact old text>
+        ===DIVIDER===
+        <new text>
+        ===REPLACE===
+    Only a line that is WHOLLY a marker delimits a block, so content lines that merely
+    contain marker characters are kept verbatim. A malformed structure yields a
+    specific error string instead of silently dropping the block (which could corrupt
+    a file)."""
+    OPEN = "===SEARCH==="; DIV = "===DIVIDER==="; CLOSE = "===REPLACE==="
+    lines = diff.split("\n")
+    blocks = []
+    i, n = 0, len(lines)
+    saw_open = False
+    while i < n:
+        if not _RE_OPEN.match(lines[i]):
+            i += 1
+            continue
+        saw_open = True
+        i += 1
+        search = []
+        while i < n and not _RE_DIV.match(lines[i]):
+            if _RE_OPEN.match(lines[i]):
+                return [], ("malformed block: a new '%s' line appeared before "
+                            "the '%s' divider (near line %d of diff)"
+                            % (OPEN, DIV, i + 1))
+            if _RE_CLOSE.match(lines[i]):
+                return [], ("malformed block: '%s' appeared before the '%s' "
+                            "divider (near line %d of diff)"
+                            % (CLOSE, DIV, i + 1))
+            search.append(lines[i]); i += 1
+        if i >= n:
+            return [], "malformed block: missing '%s' divider after SEARCH" % DIV
+        i += 1
+        replace = []
+        while i < n and not _RE_CLOSE.match(lines[i]):
+            if _RE_OPEN.match(lines[i]) or _RE_DIV.match(lines[i]):
+                return [], ("malformed block: expected '%s' to close the block "
+                            "but found another marker (near line %d of diff)"
+                            % (CLOSE, i + 1))
+            replace.append(lines[i]); i += 1
+        if i >= n:
+            return [], "malformed block: missing '%s' to close the block" % CLOSE
+        i += 1
+        blocks.append(("\n".join(search), "\n".join(replace)))
+    if not blocks:
+        if saw_open:
+            return [], "found '%s' but the block was never completed" % OPEN
+        return [], "no SEARCH/REPLACE blocks found"
+    return blocks, None
+
+# ----------------------------------------------------------------------------
+# Text-encoded tool-call fallback
+#
+# Some models (e.g. qwen3-coder:30b) emit tool calls as text in the assistant
+# content instead of populating Ollama's native message.tool_calls. We parse
+# that text into the SAME {"function": {"name", "arguments"}} shape the native
+# path produces, so Agent.run_turn dispatches it unchanged. Engaged ONLY when
+# no native tool_calls are present.
+# ----------------------------------------------------------------------------
+
+# Format A - Qwen XML: <function=NAME><parameter=KEY>VALUE</parameter>…</function>
+_FN_RE = re.compile(r"<function=([^>]+?)\s*>(.*?)</function>", re.DOTALL)
+_PARAM_RE = re.compile(r"<parameter=([^>]+?)\s*>(.*?)</parameter>", re.DOTALL)
+# Format B - JSON-in-tags (Hermes/Nous): <tool_call>{"name":…,"arguments":…}</tool_call>
+_JSON_TC_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
+_TC_TAG_RE = re.compile(r"</?tool_call>")
+# Fenced code markers (```json ... ``` or bare ```) - stripped after we've pulled
+# the JSON object out from between them by brace-scan, so backticks inside a string
+# arg never break boundary detection.
+_FENCE_RE = re.compile(r"```[a-zA-Z0-9_]*")
+# Max leftover non-whitespace chars allowed around a bare-JSON tool call before we
+# treat the message as prose (a final answer) instead of a call. Small - a real
+# tool-call message is essentially just the object.
+_TEXT_TC_PROSE_SLACK = 24
+
+
+def _strip_one_nl(s: str) -> str:
+    """Strip a single leading and trailing newline; preserve inner content
+    (matters for multi-line diff/content args)."""
+    if s.startswith("\r\n"):
+        s = s[2:]
+    elif s[:1] in ("\n", "\r"):
+        s = s[1:]
+    if s.endswith("\r\n"):
+        s = s[:-2]
+    elif s[-1:] in ("\n", "\r"):
+        s = s[:-1]
+    return s
+
+
+def _tc_from_obj(obj):
+    """Coerce one parsed object into {"function":{"name","arguments"}} or None.
+    Accepts the bare shape {"name","arguments"} and the OpenAI wrapper
+    {"function":{"name","arguments"}}. arguments may be a JSON string."""
+    if not isinstance(obj, dict):
+        return None
+    fn = obj.get("function") if isinstance(obj.get("function"), dict) else obj
+    name = fn.get("name")
+    if not name or not isinstance(name, str):
+        return None
+    args = fn.get("arguments", {})
+    if isinstance(args, str):
+        try:
+            args = json.loads(args)
+        except (json.JSONDecodeError, ValueError):
+            args = {}
+    if not isinstance(args, dict):
+        args = {}
+    return {"function": {"name": name, "arguments": args}}
+
+
+def _json_objects_from_text(text):
+    """Yield (obj, start, end) for every complete top-level JSON object in `text`,
+    scanning brace-depth while RESPECTING string literals + escapes so a '{' or a
+    stray ``` inside a string value never confuses the boundary (the Cline
+    triple-backtick gotcha). Only depth-0 objects are yielded."""
+    i, n = 0, len(text)
+    while i < n:
+        if text[i] != "{":
+            i += 1
+            continue
+        depth, j, in_str, esc = 0, i, False, False
+        while j < n:
+            c = text[j]
+            if in_str:
+                if esc:
+                    esc = False
+                elif c == "\\":
+                    esc = True
+                elif c == '"':
+                    in_str = False
+            else:
+                if c == '"':
+                    in_str = True
+                elif c == "{":
+                    depth += 1
+                elif c == "}":
+                    depth -= 1
+                    if depth == 0:
+                        blob = text[i:j + 1]
+                        try:
+                            yield json.loads(blob), i, j + 1
+                        except (json.JSONDecodeError, ValueError):
+                            pass
+                        break
+            j += 1
+        i = j + 1
+
+
+def parse_text_tool_calls(content: str, known_names=None):
+    """Parse text-encoded tool calls from assistant content (small local models
+    that fall out of the native tool_calls channel and emit the call as TEXT).
+    Returns (calls, cleaned_content) where calls is a list of
+    {"function": {"name": str, "arguments": dict}}. If nothing valid parses,
+    returns ([], content) unchanged so the caller treats it as a final answer.
+
+    `known_names`, if given, is the set of ACTIVE tool names; any parsed call
+    whose name isn't in it is rejected (guards against listing/demonstrating a
+    tool in prose being mistaken for a call). Covers: Qwen XML <function=>,
+    Hermes <tool_call>{...}</tool_call>, bare JSON {"name","arguments"}, the
+    OpenAI {"function":{...}} wrapper, a tool_calls:[...] array, and fenced
+    ```json blocks - all scanned brace/string-aware so backticks or braces inside
+    a string arg can't break boundary detection."""
+    calls = []
+    if not content:
+        return calls, content
+    known = set(known_names) if known_names is not None else None
+
+    def _accept(tc):
+        if tc and (known is None or tc["function"]["name"] in known):
+            calls.append(tc)
+            return True
+        return False
+
+    # Format A: Qwen XML function/parameter tags.
+    for m in _FN_RE.finditer(content):
+        name = m.group(1).strip()
+        if not name:
+            continue
+        args = {pm.group(1).strip(): _strip_one_nl(pm.group(2))
+                for pm in _PARAM_RE.finditer(m.group(2))}
+        _accept({"function": {"name": name, "arguments": args}})
+
+    # Format B: JSON object inside <tool_call> tags.
+    for m in _JSON_TC_RE.finditer(content):
+        try:
+            obj = json.loads(m.group(1))
+        except (json.JSONDecodeError, ValueError):
+            continue
+        _accept(_tc_from_obj(obj))
+
+    if calls:
+        cleaned = _FN_RE.sub("", content)
+        cleaned = _JSON_TC_RE.sub("", cleaned)
+        cleaned = _TC_TAG_RE.sub("", cleaned).strip()
+        return calls, cleaned
+
+    # Formats C/D/E: bare JSON, OpenAI wrapper, tool_calls array, and fenced
+    # ```json blocks (a fence just wraps a JSON object we'd find anyway). We
+    # ONLY treat these as a call when the content is ESSENTIALLY nothing but the
+    # object(s) - prose that merely mentions/quotes JSON is left as a final
+    # answer. "Essentially" = after removing the matched object spans (and fence
+    # markers) little non-whitespace remains.
+    spans = []
+    for obj, s, e in _json_objects_from_text(content):
+        # tool_calls array wrapper: {"tool_calls":[ {...}, ... ]}
+        arr = obj.get("tool_calls") if isinstance(obj, dict) else None
+        got_here = False
+        if isinstance(arr, list):
+            for item in arr:
+                if _accept(_tc_from_obj(item)):
+                    got_here = True
+        elif _accept(_tc_from_obj(obj)):
+            got_here = True
+        if got_here:
+            spans.append((s, e))
+    if not calls:
+        return [], content
+    # Build cleaned content: drop the object spans + surrounding fence markers.
+    keep = []
+    prev = 0
+    for s, e in spans:
+        keep.append(content[prev:s])
+        prev = e
+    keep.append(content[prev:])
+    cleaned = "".join(keep)
+    cleaned = _FENCE_RE.sub("", cleaned).strip()
+    # Guard against a false positive: if meaningful prose remains, this wasn't a
+    # bare tool-call message - discard the parse and treat it as a final answer.
+    if len(cleaned) > _TEXT_TC_PROSE_SLACK:
+        return [], content
+    return calls, cleaned
+
+
+# ----------------------------------------------------------------------------
+# Confirmation + diff display
+# ----------------------------------------------------------------------------
+
+def _ask(question: str) -> bool:
+    if _active_composer is not None:  # park the confirm as state; never interrupt
+        return _active_composer.ask(question)
+    if _active_spinner:               # don't animate over an interactive prompt
+        _active_spinner.stop()
+    try:
+        ans = input(_rl_safe(bold(f"{question} [Y/n] "))).strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
+    return ans in ("", "y", "yes")
+
+
+# Approval mode: how writes/commands/non-safe tools are gated.
+#   ask     - confirm every action (default)
+#   session - confirm once; a 'yes' then auto-approves the rest of this run
+#   auto    - never confirm (the old --yolo)
+_session_approved = False    # armed once the user approves under approval="session"
+APPROVAL_MODES = ("ask", "session", "auto")
+
+
+def auto_approved(cfg) -> bool:
+    """True when an action may run WITHOUT prompting: 'auto' always; 'session' once
+    the user has approved one action this run."""
+    return cfg.approval == "auto" or (cfg.approval == "session" and _session_approved)
+
+
+def ask_action(cfg, question: str) -> bool:
+    """Confirm a write/command/tool action under the approval mode. Auto-approves
+    when auto_approved(); else prompts, and a 'yes' under 'session' arms the rest
+    of the run ('ask once')."""
+    global _session_approved
+    if auto_approved(cfg):
+        return True
+    ok = _ask(question)
+    if ok and cfg.approval == "session":
+        _session_approved = True
+    return ok
+
+
+def approval_badge(cfg) -> str:
+    """Styled indicator for the active approval mode; '' for the default 'ask'."""
+    if cfg.approval == "auto":
+        return red("AUTO")
+    if cfg.approval == "session":
+        return yellow("SESSION-AUTO" if _session_approved else "SESSION")
+    return ""
+
+
+def set_approval(cfg, mode):
+    """Set the approval mode and clear any session-arming (so a fresh 'session' must
+    be re-approved once)."""
+    global _session_approved
+    cfg.approval = mode
+    _session_approved = False
+
+
+def _confirm_action(cfg, kind: str, **info) -> bool:
+    """The single confirm POLICY for a tool's side effect, keyed by capability kind.
+    A tool supplies only the PREVIEW content; this owns the auto-approve short-circuit,
+    the preview rendering, and the prompt (with session-arming via ask_action). The
+    per-tool methods no longer carry any of this - they just call here. Returns True to
+    proceed. Kinds:
+      write: path, original (str|None), new (str) -> diff / new-file preview, 'apply changes to PATH?'
+      exec:  cmd (str)                            -> '$ cmd', 'run this command?'
+      read:  name (str), args_fmt (str)           -> 'NAME(args)', 'allow read NAME?'
+    (The remote transport has its own pre-send confirm in confirm_remote_tool; this is
+    the LOCAL policy.)"""
+    if kind == "write":
+        path, original, new = info["path"], info["original"], info["new"]
+        print()
+        if original is None:
+            print(cyan(f"+++ new file: {path}"))
+            _print_new_file(new)
+        else:
+            _print_diff(path, original, new)
+        if auto_approved(cfg):
+            print(dim("(auto-approved)"))
+            return True
+        return ask_action(cfg, f"apply changes to {path}?")
+    if kind == "exec":
+        if auto_approved(cfg):
+            return True
+        print(yellow(f"\n$ {info['cmd']}"))
+        return ask_action(cfg, "run this command?")
+    if kind == "read":
+        if auto_approved(cfg):
+            return True
+        print(yellow(f"\n{info['name']}({info.get('args_fmt', '')})"))
+        return ask_action(cfg, f"allow read {info['name']}?")
+    return ask_action(cfg, "proceed?")          # unknown kind: prompt to be safe
+
+
+def _print_diff(path: str, a: str, b: str):
+    diff = unified_diff(a.splitlines(), b.splitlines(),
+                        fromfile=path, tofile=path, lineterm="")
+    for line in diff:
+        if line.startswith("+") and not line.startswith("+++"):
+            print(green(line))
+        elif line.startswith("-") and not line.startswith("---"):
+            print(red(line))
+        elif line.startswith("@@"):
+            print(cyan(line))
+        else:
+            print(dim(line))
+
+
+def _print_new_file(text: str, cap: int = 40):
+    """Preview a created file with no prior content: the first `cap` lines as
+    +adds, then a '(N more lines)' note so a long file never silently truncates.
+    Shared by the local (_confirm_action) and remote (confirm_remote_tool) write
+    confirms - the caller prints its own header above this body."""
+    lines = text.splitlines()
+    for ln in lines[:cap]:
+        print(green("+ " + ln))
+    if len(lines) > cap:
+        print(dim(f"  …({len(lines) - cap} more lines)"))
+
+
+# ----------------------------------------------------------------------------
+# Inference control signal (shared by core and provider clients)
+# ----------------------------------------------------------------------------
+
+class _TurnAbort(Exception):
+    """Raised (or signalled) to stop streaming mid-inference on SIGINT."""
+
+
+def _menu_index(sel: str, count: int):
+    """Parse a 1-based menu selection; return 0-based index or None. Pure."""
+    sel = sel.strip()
+    if sel.isdigit():
+        n = int(sel)
+        if 1 <= n <= count:
+            return n - 1
+    return None
+
+
+def pick_connect_menu(connect_hosts, open_hosts=(), active=None, prompt=input):
+    """Numbered picker over saved [connect] targets plus any currently-open
+    sessions (marked). Returns the chosen ssh target, or None on cancel/empty.
+    No liveness probe - SSH handles auth (passwordless straight in, else prompts)."""
+    items, seen = [], set()                       # (label, target)
+    for name, target in connect_hosts.items():
+        items.append((name, target)); seen.add(target)
+    for host in open_hosts:                        # open-but-unsaved targets too
+        if host not in seen:
+            items.append((host, host)); seen.add(host)
+    if not items:
+        print(dim("no saved connect targets; use /connect <[user@]host>, or add a "
+                  "[connect] section to the config."))
+        return None
+    open_set = set(open_hosts)
+    print(bold("connect to:") + dim("  (" + green("*") + " open)"))
+    for i, (name, target) in enumerate(items, 1):
+        dot = green("*") if target in open_set else " "
+        extra = dim("  " + target) if name != target else ""
+        mark = dim("  (active)") if target == active else ""
+        print(f"  {i}) {dot} {name}{extra}{mark}")
+    print("  0) cancel")
+    try:
+        sel = prompt("choice: ")
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return None
+    idx = _menu_index(sel, len(items))
+    return items[idx][1] if idx is not None else None
+
+
+def pick_model_menu(available, current=None, warm=(), prompt=input):
+    """Numbered model picker; returns the chosen model name or None (cancel).
+    `warm` = names currently loaded in the server (shown green = instant first
+    token); `current` is marked. `prompt` injectable for tests."""
+    warm = set(warm)
+    legend = dim("  (" + green("*") + " loaded  " + dim("o") + " on disk)") if available else ""
+    print(bold("models on this host:") + legend)
+    for i, m in enumerate(available, 1):
+        dot = green("*") if m in warm else dim("o")
+        mark = dim("  (current)") if current is not None and model_available(current, [m]) else ""
+        print(f"  {i}) {dot} {m}{mark}")
+    print("  0) cancel")
+    try:
+        sel = prompt("choice: ")
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return None
+    idx = _menu_index(sel, len(available))
+    return available[idx] if idx is not None else None
+
+
+def model_available(want: str, available) -> bool:
+    """Tag-aware membership: a bare name implies `:latest` (and vice-versa), so
+    `demo-coder` matches an installed `demo-coder:latest`. Pure."""
+    if want in available:
+        return True
+    if ":" not in want and f"{want}:latest" in available:
+        return True
+    if want.endswith(":latest") and want[:-len(":latest")] in available:
+        return True
+    return False
+
+
+# ----------------------------------------------------------------------------
+# Remote execution (staged). Stage 1: a hermetic tool executor + a driver-side
+# client, both speaking newline-delimited JSON. Stage 1 runs the executor as a
+# local subprocess (no SSH) so the protocol is fully testable; later stages run
+# the same executor on a remote box over an SSH pipe.
+#
+# The executor is deliberately dumb and secret-free: no config, no model, no
+# network egress, no prompts. The driver confirms writes/commands BEFORE sending
+# them, so the executor just runs approved tool calls against one directory.
+# ----------------------------------------------------------------------------
+
+# --- builtin tools: load + derive -------------------------------------------
+# The built-in tool surface (read_file..run_command) lives in the bundled
+# lean-tools/builtins.py (canon, always-on). Load it ONCE here - after every helper
+# it needs is defined (resolve_in_project, IgnoreMatcher, _parse_search_replace,
+# _confirm_action, _bg_*, the READ_/TREE_/SEARCH_/OUTPUT_ constants) - and
+# derive the model-facing schema list + the /leash capability tuples from the tiers it
+# declares. This is the single source of truth: a tier change in builtins.py reshapes
+# the leash here with no core edit. Mirrors how providers/ollama.py owns the backend.
+
+def _load_builtins():
+    """Load + inject the bundled builtin-tools module. Required (a coder with no
+    read_file is broken), so a missing file is a hard, explained error rather than a
+    silent empty tool surface."""
+    d = _bundled_lean_tools_dir()
+    f = (d / "builtins.py") if d else None
+    if not f or not f.is_file():
+        raise RuntimeError(
+            "bundled builtin tools missing (lean-tools/builtins.py); cannot start - "
+            "this file ships with the code and must be present.")
+    mod = _load_lean_tool(f)
+    mod.setup(globals())            # inject the stable core helpers it resolves by name
+    return mod
+
+_BUILTINS = _load_builtins()
+Tools = _BUILTINS.Tools             # core holds agent.tools = Tools(cfg) (carries changed_files)
+TOOLS = _BUILTINS.TOOL_SCHEMAS      # model-facing schemas, in declared order
+_TIERS = _BUILTINS.TIERS            # name -> "read"|"write"|"exec"
+_WRITE_TIER = tuple(n for n, t in _TIERS.items() if t == "write")
+_EXEC_TIER = tuple(n for n, t in _TIERS.items() if t == "exec")  # ask_user_to_run too (exec)
+# Read-only builtins: no side effects, no confirm prompt, so a batch of them can run
+# concurrently (see Agent._run_parallel); also the ask-on-read set.
+SAFE_TOOLS = tuple(n for n, t in _TIERS.items() if t == "read")
+# Every builtin name - the remote executor allowlist (no nested ssh; ssh is a lean-tool).
+EXEC_TOOLS = tuple(_TIERS)
+
+
+def _emit_json(stream, obj):
+    stream.write(json.dumps(obj) + "\n")
+    stream.flush()
+
+
+# Driver-only verb (never in the model's tool surface): fetch a file's exact
+# bytes for diff previews, base64-encoded so it bypasses run_command's output
+# cap/rstrip and is binary-safe.
+RAW_READ = "__read_raw__"
+BG_POLL  = "__bg_poll__"        # driver-only: finished bg tasks the executor owns
+
+
+def _read_raw_b64(path: Path, max_bytes=RAW_READ_MAX):
+    """Return (b64, clipped, total, shown) for path's bytes. Raises OSError if
+    unreadable. No truncation marker is ever spliced in; if the file exceeds
+    max_bytes the prefix is returned and `clipped` is True (caller warns)."""
+    data = path.read_bytes()
+    payload = data[:max_bytes]
+    return base64.b64encode(payload).decode(), len(data) > max_bytes, len(data), len(payload)
+
+
+def _remote_idle_ttl() -> int:
+    """Self-wipe lease TTL (seconds) for a pushed remote executor. Env-tunable;
+    defaults to 30min (matches the worker lease). Floor of 60s."""
+    try:
+        return max(60, int(os.environ.get("LEANCODER_REMOTE_IDLE_TTL", "1800")))
+    except (TypeError, ValueError):
+        return 1800
+
+
+def _arm_self_wipe():
+    """Fault-tolerance for a PUSHED remote executor: leave nothing behind if the
+    driver never gets to run a clean disconnect (broken pipe, crash, hard-killed
+    worker). The pushed copy is always '<runtime>/leancoder/agent.py'; we ONLY arm
+    when running from exactly that (basename agent.py, parent dir 'leancoder') so a
+    provisioned `lean_coder` install or a local dev run is never touched.
+
+    Two parts, both self-contained on the remote (no per-turn driver ssh):
+      - a daemon BUMP thread touches '<dir>/.lease' every TTL/4 while THIS process
+        lives, so lease-freshness == executor-alive (survives long model 'thinking'
+        gaps; stops the instant the process dies);
+      - a DETACHED shell WATCHDOG (own session, so it outlives this process and the
+        ssh channel) that `rm -rf`s the dir once the lease is unbumped for TTL, or
+        exits early if the dir is already gone (a clean disconnect wiped it).
+    Reconnect within TTL relaunches the executor, whose new bump thread refreshes the
+    lease -> no wipe (self-heal). Only one watchdog runs: a prior one (from a died
+    executor reusing this fixed dir) is killed via '<dir>/.watchdog.pid' first.
+    Best-effort throughout; any failure just means we fall back to the OS clearing
+    the throwaway dir, and the files are secret-free code anyway."""
+    try:
+        mydir = os.path.dirname(os.path.abspath(__file__))
+    except Exception:
+        return
+    if os.path.basename(__file__) != "agent.py" or os.path.basename(mydir) != "leancoder":
+        return                              # not a pushed executor - do nothing
+    ttl   = _remote_idle_ttl()
+    chk   = max(5, min(30, ttl // 4))
+    lease = os.path.join(mydir, ".lease")
+    pidf  = os.path.join(mydir, ".watchdog.pid")
+    try:
+        Path(lease).touch()
+    except OSError:
+        pass
+    # kill any prior watchdog bound to this reused dir (one watchdog invariant)
+    try:
+        old = int(Path(pidf).read_text().strip())
+        if old != os.getpid():
+            os.kill(old, signal.SIGTERM)
+    except (OSError, ValueError):
+        pass
+    q = shlex.quote(mydir)
+    script = (
+        f'd={q}; l="$d/.lease"; '
+        f'while :; do '
+        f'[ -d "$d" ] || exit 0; '
+        f'now=$(date +%s); m=$(stat -c %Y "$l" 2>/dev/null || echo "$now"); '
+        f'if [ $((now - m)) -ge {ttl} ]; then rm -rf "$d"; exit 0; fi; '
+        f'sleep {chk}; done'
+    )
+    try:
+        wp = subprocess.Popen(["sh", "-c", script], stdin=subprocess.DEVNULL,
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                              start_new_session=True)
+        Path(pidf).write_text(str(wp.pid))
+    except (OSError, ValueError):
+        return
+    def _bump():
+        while True:
+            try:
+                os.utime(lease, None)
+            except OSError:
+                pass
+            time.sleep(chk)
+    threading.Thread(target=_bump, daemon=True).start()
+
+
+def run_tool_executor(cwd, lean_tools_dir=None):
+    """Hermetic executor loop: read JSON tool requests on stdin, run them against
+    `cwd`, write JSON results on stdout. Tool prints (diffs, notices) are sent to
+    stderr so they never pollute the protocol channel. Runs until stdin closes.
+    Any lean-tools under `lean_tools_dir` (pushed by the driver) are also dispatchable."""
+    proto = sys.stdout
+    sys.stdout = sys.stderr            # keep real stdout clean for the protocol
+    _arm_self_wipe()   # pushed executor: self-delete if the driver never cleanly disconnects
+    cfg = Config(cwd=Path(cwd).expanduser().resolve(), approval="auto")  # driver pre-confirms
+    tools = Tools(cfg)
+    lean_tools = LeanToolManager(lean_tools_dir) if lean_tools_dir else None  # enabled=None -> all
+    _bg_adopt()   # reconnect: re-parent this-box bg tasks that survived the prior executor
+    _emit_json(proto, {"ready": True, "cwd": str(cfg.cwd)})
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            req = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        rid, tool, args = req.get("id"), req.get("tool"), (req.get("args") or {})
+        if tool == RAW_READ:               # driver-only: exact bytes for previews
+            try:
+                b64, clipped, total, shown = _read_raw_b64(
+                    resolve_in_project(cfg, args.get("path", "")))
+            except (OSError, ValueError):
+                _emit_json(proto, {"id": rid, "ok": False, "error": "cannot read"})
+                continue
+            _emit_json(proto, {"id": rid, "ok": True, "result": b64,
+                               "clipped": clipped, "total": total, "shown": shown})
+            continue
+        if tool == BG_POLL:                # driver-only: finished bg tasks WE own here
+            # Attend our leased tasks here too: a remote task's lease lives on THIS
+            # (executor) box, so bumping it must happen where the file is - each
+            # driver turn calls BG_POLL, so this is the remote per-turn heartbeat.
+            _me = os.getpid()
+            for _r in _bg_load():
+                if _r.get("owner") == _me and _r.get("idle_timeout"):
+                    _bg_bump_lease(_r)
+            _emit_json(proto, {"id": rid, "ok": True,
+                               "result": _bg_finished_here(_me)})
+            continue
+        plug = lean_tools.get(tool) if lean_tools else None
+        if tool not in EXEC_TOOLS and not plug:
+            _emit_json(proto, {"id": rid, "ok": False, "error": f"tool not allowed: {tool}"})
+            continue
+        try:
+            if plug:
+                result = str(plug["run"](args, str(cfg.cwd)))
+            else:
+                result = getattr(tools, tool)(**args)
+            _emit_json(proto, {"id": rid, "ok": True, "result": result})
+        except Exception as e:
+            _emit_json(proto, {"id": rid, "ok": False, "error": f"{type(e).__name__}: {e}"})
+
+
+class ExecutorClient:
+    """Driver-side handle to a tool executor subprocess (stage 1: local; later:
+    over SSH). Sends a tool request and returns its result string."""
+
+    def __init__(self, argv, stderr=None):
+        self.proc = subprocess.Popen(
+            argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=stderr, text=True, bufsize=1)
+        self._id = 0
+        self.ready = self._read_obj()   # consume the {"ready": ...} handshake
+
+    def _read_obj(self):
+        while True:
+            line = self.proc.stdout.readline()
+            if not line:
+                raise ConnectionError("executor closed before responding")
+            try:
+                return json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+    def request(self, tool, args=None):
+        """Send a tool request; return the full response object."""
+        self._id += 1
+        _emit_json(self.proc.stdin, {"id": self._id, "tool": tool, "args": args or {}})
+        while True:
+            obj = self._read_obj()
+            if obj.get("id") == self._id:
+                return obj
+
+    def call(self, tool, args=None):
+        obj = self.request(tool, args)
+        return obj["result"] if obj.get("ok") else f"error: {obj.get('error')}"
+
+    def close(self):
+        try:
+            self.proc.stdin.close()
+        except OSError:
+            pass
+        try:
+            self.proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+
+
+# ----------------------------------------------------------------------------
+# Remote workspace (SSH transport, staged). Bootstraps lean_coder onto a host
+# and runs the hermetic --tool-exec executor there, driven by the same
+# ExecutorClient. Auth happens once via a multiplexed master socket
+# (ControlMaster); later calls reuse it. The script lives in throwaway space
+# ($XDG_RUNTIME_DIR or /tmp/leancoder-<uid>) and is re-pushed each connect, so
+# nothing accumulates. All bootstrap output is driver-side, never in context.
+# ----------------------------------------------------------------------------
+
+# remote shell snippet: pick/create the throwaway dir, write the script from
+# stdin, echo the dir back on stdout.
+# Throwaway dir picker: XDG_RUNTIME_DIR, else TMPDIR ($PREFIX/tmp on Termux, where
+# /tmp doesn't exist), else /tmp/leancoder-<uid>. Same precedence as the local
+# _runtime_dir(), so a Termux box works as both driver AND remote executor.
+_REMOTE_TMP = '${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp/leancoder-$(id -u)}}/leancoder'
+_REMOTE_PUSH = (f'd="{_REMOTE_TMP}"; '
+                'mkdir -p "$d" && chmod 700 "$d" 2>/dev/null; '
+                'cat > "$d/agent.py"; printf %s "$d"')
+# Same stable dir, but make it WITHOUT pushing the script - used when we can reuse
+# an existing matching-hash executor (installed lean_coder, or a prior push).
+_REMOTE_MKDIR = (f'd="{_REMOTE_TMP}"; '
+                 'mkdir -p "$d" && chmod 700 "$d" 2>/dev/null; printf %s "$d"')
+
+# package managers tried, in order, when python3 is missing on the remote.
+_PKG_INSTALL = [
+    ("apt-get", "sudo apt-get update && sudo apt-get install -y python3"),
+    ("dnf", "sudo dnf install -y python3"),
+    ("apk", "sudo apk add python3"),
+    ("pacman", "sudo pacman -S --noconfirm python3"),
+    ("zypper", "sudo zypper install -y python3"),
+]
+
+
+def _install_cmd(pm: str):
+    """Map a detected package manager to its python3 install command (or None)."""
+    for name, cmd in _PKG_INSTALL:
+        if name == pm:
+            return cmd
+    return None
+
+
+def _runtime_dir() -> Path:
+    """Local ephemeral dir for control sockets. Prefers XDG_RUNTIME_DIR, then TMPDIR
+    ($PREFIX/tmp on Termux, where /tmp doesn't exist), then /tmp - so it works on
+    Android/Termux and other non-FHS layouts, not just standard Linux. os.getuid is
+    absent on some platforms (Windows), so the uid suffix is best-effort."""
+    uid = os.getuid() if hasattr(os, "getuid") else os.environ.get("USER", "user")
+    base = (os.environ.get("XDG_RUNTIME_DIR")
+            or os.environ.get("TMPDIR")
+            or "/tmp")
+    d = Path(base) / f"leancoder-{uid}" / "leancoder"
+    d.mkdir(parents=True, exist_ok=True)
+    try:
+        d.chmod(0o700)
+    except OSError:
+        pass
+    _reap_dead_sockets(d)
+    return d
+
+
+def _reap_dead_sockets(d: Path) -> None:
+    """Unlink orphan control sockets left by instances that are no longer running.
+    Control paths are per-PID (cm-<host>-<pid>.sock) so two instances can't evict
+    each other's master; the cost is that a crashed/killed instance leaves its
+    socket behind. Reap any whose PID is dead - os.kill(pid, 0) raises for a gone
+    process and is a no-op for a live one, so a running instance's socket is never
+    touched. Best-effort: any error is ignored (e.g. no os.kill on the platform)."""
+    try:
+        mypid = os.getpid()
+        for p in d.glob("cm-*.sock"):
+            m = re.search(r"-(\d+)\.sock$", p.name)
+            if not m:
+                continue
+            pid = int(m.group(1))
+            if pid == mypid:
+                continue
+            try:
+                os.kill(pid, 0)          # alive -> leave it
+            except ProcessLookupError:
+                p.unlink(missing_ok=True)  # dead -> reap
+            except (PermissionError, OSError):
+                pass                     # exists but not ours to signal -> leave
+    except Exception:
+        pass
+
+
+def _ctl_path(host: str) -> str:
+    # Per-PID so concurrent instances on one box don't share a master socket:
+    # a second instance's /connect (_clear_master) or /disconnect does `ssh -O
+    # exit` on the ControlPath, which would otherwise tear down the FIRST
+    # instance's live master -> its next remote tool call hits a dead socket ->
+    # "Broken pipe" -> session drops to LOCAL. Isolated paths stop the stomping.
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", host)
+    return str(_runtime_dir() / f"cm-{safe}-{os.getpid()}.sock")
+
+
+def _ssh_master_argv(host, ctl, connect_timeout=10, batch=False):
+    # opens a backgrounded master; auth (key/password/passphrase) happens here,
+    # interactively if needed (no BatchMode so the user can be prompted once).
+    #
+    # batch=True: BatchMode + accept-new, for a reconnect that runs WHERE WE CAN'T
+    # PROMPT (mid-tool-call, or a detached worker). It must never sit on an invisible
+    # password prompt (that hangs the session forever), so it either succeeds via keys
+    # /a live master or fails fast; accept-new so a not-yet-known host key doesn't stall
+    # it either (TOFU on new, refuse changed).
+    #
+    # ControlPersist=yes (not a timeout): the master is -fN, so it carries NO session
+    # traffic and sits fully idle during a long model turn (e.g. minutes of "thinking"
+    # with no tool call). A finite ControlPersist reaped it in that gap, so the next
+    # tool call hit a dead master -> "Broken pipe" -> the session dropped to LOCAL.
+    # `yes` keeps it up until we explicitly tear it down (drop_remote does `-O exit`).
+    # ServerAlive* sends TCP keepalives so a NAT/firewall idle timeout can't silently
+    # kill the socket either (~15s x 8 = ~2min of dead link before ssh gives up).
+    batch_opts = (["-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new"]
+                  if batch else [])
+    return ["ssh", "-o", "ControlMaster=yes", "-o", f"ControlPath={ctl}",
+            "-o", "ControlPersist=yes"] + batch_opts + [
+            "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=8",
+            "-o", f"ConnectTimeout={connect_timeout}",
+            "-o", "LogLevel=ERROR", "-fN", host]
+
+
+def _clear_master(host, ctl):
+    """Tear down any existing/stale ControlMaster before a fresh /connect. A
+    leftover socket from a killed session makes ControlMaster=yes refuse to
+    multiplex and silently fall back to a per-command (re-auth every time)
+    connection, breaking the auth-once guarantee. `-O exit` stops a live master
+    (no-op + silent if there's none); the unlink clears a stale socket file.
+    (This also drops a master shared by another session on the same host - the
+    already-unsupported case of two sessions connected to one remote.)"""
+    subprocess.run(["ssh", "-o", f"ControlPath={ctl}", "-O", "exit", host],
+                   capture_output=True)
+    try:
+        Path(ctl).unlink()
+    except OSError:
+        pass
+
+
+def _ssh_master_alive(host, ctl) -> bool:
+    """True if a LIVE ControlMaster socket exists at ctl for host (`ssh -O check`).
+    Used by dispatch_worker to verify the parent's shared master is up BEFORE it
+    launches a detached worker that will reuse it (a bg worker can't answer an auth
+    prompt, so a dead master must be caught in the foreground dispatch call)."""
+    try:
+        return subprocess.run(["ssh", "-o", f"ControlPath={ctl}", "-O", "check", host],
+                              capture_output=True, timeout=10).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def _ssh_run_argv(host, ctl, remote_cmd, tty=False):
+    # reuses the master socket (BatchMode: auth is already done, so fail fast).
+    # LogLevel=ERROR silences the "Shared connection to <host> closed." notice a
+    # -tt channel prints when it ends (the master stays up; nothing real closes).
+    return (["ssh", "-o", f"ControlPath={ctl}", "-o", "BatchMode=yes",
+             "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=8",
+             "-o", "LogLevel=ERROR"]
+            + (["-tt"] if tty else ["-T"]) + [host, remote_cmd])
+
+
+def _ssh_exec_argv(host, ctl, exec_cmd, cwd, lean_tools_dir=None):
+    # long-lived executor channel: -T (no PTY) keeps stdio clean for the protocol.
+    # exec_cmd is the executor invocation prefix - "python3 '<dir>/agent.py'" for a
+    # pushed copy, or "lean_coder" for a matching provisioned install.
+    inner = f"{exec_cmd} --tool-exec --cwd {shlex.quote(cwd)}"
+    if lean_tools_dir:
+        inner += f" --lean-tools {shlex.quote(lean_tools_dir)}"
+    # ServerAlive on this long-lived channel too: it multiplexes over the master
+    # (which also has keepalives) but a multi-minute model turn with no traffic is
+    # exactly when a stateful firewall/NAT drops the data channel - belt-and-braces.
+    return ["ssh", "-T", "-o", f"ControlPath={ctl}", "-o", "BatchMode=yes",
+            "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=8",
+            "-o", "LogLevel=ERROR", host, inner]
+
+
+def _tools_to_sync(local, remote):
+    """Pure: given {name: sha256} for the locally-enabled lean-tools and {name:
+    sha256} already on the remote, return (to_push, to_remove) - tools whose hash
+    differs or is missing, and remote tools no longer enabled."""
+    to_push = sorted(n for n, h in local.items() if remote.get(n) != h)
+    to_remove = sorted(n for n in remote if n not in local)
+    return to_push, to_remove
+
+
+class RemoteWorkspace:
+    """A bootstrapped remote executor reached over SSH. Same call() surface as
+    ExecutorClient, so the agent loop (stage 3) can route tools through it."""
+
+    def __init__(self, host, cwd=".", lean_tool_paths=(), ctl=None):
+        self.host = host
+        self.cwd = cwd
+        # ctl given = ATTACH mode: reuse a master socket someone else already
+        # opened+authenticated (a worker reusing its PARENT's ControlMaster). The
+        # worker is a detached bg proc that can't answer an auth prompt, so it must
+        # NEVER open/clear a master - only ride an existing one. ctl None = own it
+        # (the per-PID default): open + tear down our own master as usual.
+        self.owns_master = ctl is None
+        self.ctl = ctl or _ctl_path(host)
+        self.lean_tool_paths = list(lean_tool_paths)
+        self.remote_dir = None
+        self.remote_cwd = None        # executor's resolved working dir (from handshake)
+        self.client = None
+
+    def _run(self, remote_cmd, tty=False):
+        if tty:                                    # interactive (sudo prompt is the user's)
+            return subprocess.run(_ssh_run_argv(self.host, self.ctl, remote_cmd, tty=True)).returncode, "", ""
+        r = subprocess.run(_ssh_run_argv(self.host, self.ctl, remote_cmd),
+                           capture_output=True, text=True, timeout=120)
+        return r.returncode, r.stdout, r.stderr
+
+    def connect(self, batch=False):
+        """Open the ssh master + bootstrap the executor. batch=True forces a
+        NON-INTERACTIVE open (BatchMode + a timeout) - for a reconnect that runs
+        where we can't prompt (mid-tool-call): it must fail fast rather than hang on
+        an invisible 'password:' prompt. A password host then needs an interactive
+        /connect. batch=False (default) is the interactive open (/connect can prompt)."""
+        print(dim(f"connecting to {self.host} ..."))
+        _clear_master(self.host, self.ctl)     # drop any stale socket first (#3)
+        argv = _ssh_master_argv(self.host, self.ctl, batch=batch)
+        try:
+            rc = subprocess.run(argv, timeout=30 if batch else None).returncode
+        except subprocess.TimeoutExpired:
+            raise ConnectionError(f"ssh connection to {self.host} timed out")
+        if rc != 0:
+            raise ConnectionError(f"ssh connection to {self.host} failed")
+        _, out, _ = self._run("command -v python3 || true")
+        if not out.strip():
+            self._install_python()
+        self._bootstrap_executor()
+        return self
+
+    def attach(self):
+        """ATTACH to a master a PARENT already opened (worker reuse): DON'T open or
+        clear the master - just verify it's live, then bootstrap our own executor
+        channel over it. A worker is detached and can't answer an auth prompt, so a
+        dead master is a hard error (the parent must ensure it's up before spawning).
+        Python is assumed present (the parent already connected here)."""
+        if not _ssh_master_alive(self.host, self.ctl):
+            raise ConnectionError(
+                f"no live ssh master for {self.host} at {self.ctl} (parent's "
+                f"ControlMaster is down - a worker can't authenticate on its own)")
+        self._bootstrap_executor()
+        return self
+
+    def _reuse_executor(self, want):
+        """Find an EXISTING remote executor whose source hash == `want`, so we can
+        skip the ~50KB push. Prefers a provisioned `lean_coder` on PATH, then a
+        copy pushed earlier into the stable runtime dir. Returns (exec_cmd, dir),
+        or (None, dir) when nothing matches (caller pushes). Stateless: it only
+        ever runs `--version`, never leaves anything behind beyond the dir."""
+        if not want:
+            return None, None
+        _, d, _ = self._run(_REMOTE_MKDIR)
+        rdir = d.strip() or None
+        if rdir is None:
+            return None, None
+        _, out, _ = self._run("command -v lean_coder >/dev/null 2>&1 && "
+                              "lean_coder --version 2>/dev/null || true")
+        if want in out.split():
+            self.reused = "installed"
+            return "lean_coder", rdir
+        agent_py = rdir + "/agent.py"
+        _, out, _ = self._run(f"[ -f {shlex.quote(agent_py)} ] && "
+                              f"python3 {shlex.quote(agent_py)} --version 2>/dev/null || true")
+        if want in out.split():
+            self.reused = "pushed"
+            return "python3 " + shlex.quote(agent_py), rdir
+        return None, rdir
+
+    def _bootstrap_executor(self):
+        """Launch the executor, pushing this build only if the box doesn't already
+        have a matching-hash copy. Used by connect() and reload() - reload reuses
+        the live master socket, so it never re-authenticates."""
+        self.reused = None
+        exec_cmd, self.remote_dir = self._reuse_executor(source_hash())
+        if exec_cmd is None:                       # no match - push a fresh copy
+            with open(__file__, "rb") as f:
+                src = f.read()
+            r = subprocess.run(_ssh_run_argv(self.host, self.ctl, _REMOTE_PUSH),
+                               input=src, capture_output=True, timeout=60)
+            self.remote_dir = r.stdout.decode(errors="replace").strip()
+            if r.returncode != 0 or not self.remote_dir:
+                raise ConnectionError(
+                    f"failed to push agent to {self.host}: {r.stderr.decode(errors='replace')[:200]}")
+            exec_cmd = "python3 " + shlex.quote(self.remote_dir + "/agent.py")
+        # The single-file agent.py push is NOT self-contained: at import core runs
+        # _load_builtins() from <dir>/lean-tools/builtins.py (the builtin tool surface was
+        # extracted out of core). Ship that file beside agent.py so the remote import
+        # succeeds - without it the executor dies before the handshake ("executor closed
+        # before responding"). A reused provisioned `lean_coder` carries its own copy.
+        if self.reused != "installed":
+            self._push_builtins()
+        lean_tools_remote = self._push_lean_tools() if self.lean_tool_paths else None
+        self.client = ExecutorClient(
+            _ssh_exec_argv(self.host, self.ctl, exec_cmd, self.cwd, lean_tools_remote),
+            stderr=subprocess.DEVNULL)
+        self.remote_cwd = self.client.ready.get("cwd")
+
+    def read_raw(self, path):
+        """Fetch exact remote file content for diff previews; None if unreadable.
+        Byte-exact (base64 over a dedicated verb) - not subject to run_command's
+        output cap or rstrip, so the previewed diff matches the real file."""
+        obj = self.client.request(RAW_READ, {"path": path})
+        if not obj.get("ok"):
+            return None
+        if obj.get("clipped"):
+            print(yellow(f"  ... preview clipped: {obj.get('shown', 0):,} of "
+                         f"{obj.get('total', 0):,} bytes shown (file too large) ..."))
+        return base64.b64decode(obj["result"]).decode("utf-8", "replace")
+
+    def bg_poll(self):
+        """Finished bg tasks the REMOTE executor owns (its sidecars live on that
+        box), as [{pid, cmd, code, tail}] - so a long-running remote job surfaces
+        its result on the next turn just like a local one. [] on any error (never
+        break a turn over a poll)."""
+        try:
+            obj = self.client.request(BG_POLL)
+        except (ConnectionError, OSError):
+            return []
+        return obj.get("result") or [] if obj.get("ok") else []
+
+    def reload(self, lean_tool_paths=()):
+        """Re-push current code + lean-tools and relaunch the executor over the
+        SAME ssh master (no re-auth, connection preserved)."""
+        if self.client:
+            self.client.close()
+        self.lean_tool_paths = list(lean_tool_paths)
+        self._bootstrap_executor()
+        return self
+
+    def _push_builtins(self):
+        """Ship the bundled builtins module into <remote_dir>/lean-tools/builtins.py - the
+        exact path the remote import's _load_builtins() reads (next to the pushed
+        agent.py). Hash-checked: skip when the remote copy already matches, so a reused
+        push doesn't re-transfer it. The file ships with the code, so a missing local copy
+        is a build problem, not a remote one - quietly do nothing in that case."""
+        src = _bundled_lean_tools_dir()
+        local = (src / "builtins.py") if src else None
+        if not local or not local.is_file():
+            return
+        data = local.read_bytes()
+        want = hashlib.sha256(data).hexdigest()
+        bdir = self.remote_dir + "/lean-tools"
+        _, out, _ = self._run(f"sha256sum {shlex.quote(bdir + '/builtins.py')} 2>/dev/null || true")
+        if out.split() and out.split()[0] == want:
+            return                                  # already current on the remote
+        self._run(f"mkdir -p {shlex.quote(bdir)}")
+        subprocess.run(_ssh_run_argv(self.host, self.ctl,
+                                     f'cat > {shlex.quote(bdir + "/builtins.py")}'),
+                       input=data, capture_output=True, timeout=60)
+
+    def _push_lean_tools(self):
+        """Sync enabled lean-tool files into <remote_dir>/tools and return it.
+        Hash-checks what's already there: pushes only changed/new tools and
+        removes ones no longer enabled (the stable dir persists between connects,
+        so this both saves transfers and prevents stale tools loading remotely)."""
+        pdir = self.remote_dir + "/tools"
+        self._run(f"mkdir -p {shlex.quote(pdir)}")
+        _, out, _ = self._run(f"sha256sum {shlex.quote(pdir)}/*.py 2>/dev/null || true")
+        remote = {}
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) == 2:
+                remote[Path(parts[1]).name] = parts[0]
+        local, blobs = {}, {}
+        for p in self.lean_tool_paths:
+            p = Path(p)
+            data = p.read_bytes()
+            local[p.name] = hashlib.sha256(data).hexdigest()
+            blobs[p.name] = data
+        to_push, to_remove = _tools_to_sync(local, remote)
+        for name in to_push:
+            subprocess.run(_ssh_run_argv(self.host, self.ctl,
+                                         f'cat > {shlex.quote(pdir + "/" + name)}'),
+                           input=blobs[name], capture_output=True, timeout=60)
+        if to_remove:
+            self._run("rm -f " + " ".join(shlex.quote(pdir + "/" + n) for n in to_remove))
+        return pdir
+
+    def _install_python(self):
+        print(yellow(f"python3 not found on {self.host}; trying to install it ..."))
+        _, pm, _ = self._run(
+            "for p in apt-get dnf apk pacman zypper; do "
+            "command -v $p >/dev/null 2>&1 && { echo $p; break; }; done")
+        cmd = _install_cmd(pm.strip())
+        if not cmd:
+            raise ConnectionError(
+                f"no known package manager on {self.host}; install python3 yourself")
+        print(dim(f"  $ {cmd}   (any sudo prompt is yours to answer)"))
+        self._run(cmd, tty=True)                   # interactive: operator does sudo
+        _, out, _ = self._run("command -v python3 || true")
+        if not out.strip():
+            raise ConnectionError(f"python3 still missing on {self.host} after install")
+
+    def call(self, tool, args=None):
+        return self.client.call(tool, args)
+
+    def close(self):
+        if self.client:
+            self.client.close()
+        # Only tear down a master we OWN. An attached worker rides its parent's
+        # master - killing it would drop the parent's live connection.
+        if self.owns_master:
+            self._wipe_remote()            # zero-trace: remove the pushed code first
+            subprocess.run(["ssh", "-o", f"ControlPath={self.ctl}", "-O", "exit", self.host],
+                           capture_output=True)
+
+    def _wipe_remote(self):
+        """Zero-trace teardown: delete the pushed executor dir (agent.py + bundled
+        builtins + synced lean-tools) over the still-live master, so nothing we put
+        on the remote outlives the session. Only the master-OWNER wipes: an attached
+        worker shares the SAME fixed dir as its parent, so a worker wiping would nuke
+        the parent's live executor. Skipped for a REUSED provisioned `lean_coder`
+        install (we didn't push it, and remote_dir is just the empty runtime dir).
+        Guarded to a '.../leancoder' path so a bad remote_dir can never rm elsewhere.
+        Best-effort: runs over the master before it's torn down; any failure is
+        swallowed (the files are secret-free code, and the dir is throwaway anyway)."""
+        d = (self.remote_dir or "").rstrip("/")
+        if getattr(self, "reused", None) == "installed":
+            return
+        if not d or os.path.basename(d) != "leancoder":
+            return
+        # Remove the dir FIRST, then kill the watchdog. Order matters for robustness:
+        # `rm -rf` drops the .lease/.watchdog.pid sidecars, so ANY watchdog (including
+        # stale ones from earlier reconnects that .watchdog.pid no longer names) exits
+        # on its next poll ([ -d "$d" ] || exit 0) - the kill is then just a courtesy
+        # to reap the current one immediately. Doing rm first means a partial/aborted
+        # run still guarantees the trace is gone.
+        # Run in its OWN session (start_new_session) so a terminal ^C during a graceful
+        # ^C^C/EOF quit - which SIGINTs the whole foreground process group - can't kill
+        # this wipe's ssh mid-flight. Catch BaseException for the same reason (a pending
+        # KeyboardInterrupt must not abort the wipe before rm lands).
+        q = shlex.quote(d)
+        cmd = (f'rm -rf {q}; '
+               f'p=$(cat {shlex.quote(d + "/.watchdog.pid")} 2>/dev/null) && '
+               f'kill "$p" 2>/dev/null; true')
+        try:
+            subprocess.run(_ssh_run_argv(self.host, self.ctl, cmd),
+                           capture_output=True, timeout=30, start_new_session=True)
+        except BaseException:
+            pass
+
+
+# ----------------------------------------------------------------------------
+# Direct mode: the operator runs a command in a real terminal (so sudo prompts
+# work live, never entering context). Reached two ways: the model's
+# ask_user_to_run handoff, or the user's /sh command. The command is shown with
+# a loud LOCAL/REMOTE label and is editable before it runs.
+# ----------------------------------------------------------------------------
+
+def _direct_prompt(cfg, remote=None) -> str:
+    # Loud, worded label so the operator always knows WHERE Enter sends it.
+    if remote is not None:
+        return bold(yellow(f"[remote: {remote.host}] $ "))
+    return bold(cyan("[local] $ "))
+
+
+def confirm_remote_tool(cfg, host, name, args, safe=False, fetch=None):
+    """Driver-side confirmation for tools routed to a remote executor (which
+    runs non-interactively, so the human-in-the-loop must stay here). Read-only
+    tools, safe lean-tools, and auto-approval skip it. `fetch(path)` returns the remote
+    file's current content (or None) so we can show a real unified diff, just
+    like local. Returns True to proceed."""
+    if auto_approved(cfg) or safe or name in ("read_file", "list_files", "search_files"):
+        return True
+    label = bold(yellow(f"[remote: {host}]"))
+    if name == "run_command":
+        print(f"\n{label} $ {args.get('cmd', '')}")
+        return ask_action(cfg, "run this remote command?")
+    if name == "write_file":
+        path, content = args.get("path", ""), args.get("content", "")
+        old = fetch(path) if fetch else None
+        print(f"\n{label} {cyan('write ' + path)} ({len(content.splitlines())} lines)")
+        if old is not None:
+            _print_diff(path, old, content)
+        else:
+            _print_new_file(content)
+        return ask_action(cfg, f"write {path} on {host}?")
+    if name == "apply_diff":
+        path, diff = args.get("path", ""), args.get("diff", "")
+        old = fetch(path) if fetch else None
+        print(f"\n{label} {cyan('apply diff to ' + path)}:")
+        if old is not None:
+            new = old
+            parsed, _perr = _parse_search_replace(diff)
+            for s, r in parsed:
+                new = new.replace(s, r, 1)
+            _print_diff(path, old, new)
+        else:
+            print(dim(diff[:1000]))      # fallback: show the raw blocks
+        return ask_action(cfg, f"apply this diff on {host}?")
+    print(f"\n{label} {cyan(name)}({_fmt_args(args)})")
+    return ask_action(cfg, f"run {name} on {host}?")
+
+
+def operator_note(cmd: str, exit_code, proposed: str = None, output: str = None) -> str:
+    """The note fed back to the model after the operator runs something, so it
+    stays in sync. Shows the actual command (and any edit) and, when captured, the
+    command's OUTPUT so the model can act on it (e.g. a systemctl status / log dump
+    it asked the operator to run). Never any password - the pty capture excludes the
+    echo-off password entry. Pure function for testability."""
+    line = f"$ {cmd}"
+    if proposed is not None and proposed.strip() != cmd.strip():
+        line += f"   (edited from: {proposed})"
+    tail = f"exit {exit_code}" if exit_code is not None else "(not run)"
+    note = f"[operator ran a command directly]\n{line}\n{tail}"
+    if output is not None:
+        out = output.strip()
+        note += ("\noutput:\n" + _clip_output(out) if out else "\noutput: (none)")
+    return note
+
+
+def _clip_output(s: str) -> str:
+    """Head/tail truncate captured command output to OUTPUT_MAX_CHARS, same shape as
+    the run_command cap, so a long log dump can't flood the model's context."""
+    if len(s) <= OUTPUT_MAX_CHARS:
+        return s
+    dropped = len(s) - OUTPUT_HEAD - OUTPUT_TAIL
+    return s[:OUTPUT_HEAD] + f"\n…[truncated {dropped} chars]…\n" + s[-OUTPUT_TAIL:]
+
+
+# CSI / OSC / other ANSI escape sequences - stripped from CAPTURED pty output before
+# it goes to the model (the operator's live view keeps them; the model wants text).
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]"      # CSI (cursor/colour/mode)
+                      r"|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)"  # OSC (title etc.)
+                      r"|\x1b[()][A-Za-z0-9]"           # charset select
+                      r"|\x1b[=>NOME78]")               # misc single-char escapes
+# Alternate-screen enter (?1049h / ?47h / ?1047h): a full-screen TUI (nano/vim/less/
+# htop) took over the terminal. Its screen-paint isn't meaningful "output", so we
+# don't feed the model a wall of escape noise - just a note that a TUI was used.
+_ALT_SCREEN_RE = re.compile(r"\x1b\[\?(?:1049|1047|47)h")
+
+
+def _clean_captured(text: str):
+    """Turn raw pty bytes-as-text into what the MODEL should see. Returns:
+      - a short NOTE string if a full-screen TUI ran (nano/vim/less/htop): its
+        screen-paint isn't meaningful output, so we don't feed a wall of escapes;
+      - else the ANSI-stripped text.
+    None only ever means 'no capture at all' (the pty fallback), kept distinct so the
+    caller can tell 'TUI ran' from 'couldn't capture'. The operator already saw the
+    live, un-stripped stream; this only shapes the model's copy."""
+    if text is None:
+        return None
+    if _ALT_SCREEN_RE.search(text):
+        return "[operator used a full-screen program; its screen output was not captured]"
+    cleaned = _ANSI_RE.sub("", text)
+    cleaned = cleaned.replace("\r\n", "\n").replace("\r", "\n")
+    return cleaned
+
+
+def _tee_capture(argv, cwd=None) -> tuple:
+    """Run argv attached to a pty so the operator sees output LIVE and can answer an
+    interactive prompt (sudo), while we also CAPTURE the output to hand back to the
+    model. The password itself is never captured: it's typed with echo off, so it
+    isn't in the pty's output stream. Returns (exit_code, captured_text). Falls back to
+    an uncaptured terminal-inherit run if pty isn't available (returns text=None)."""
+    try:
+        import pty
+    except ImportError:
+        code = subprocess.run(argv, cwd=cwd).returncode
+        return code, None
+    buf = []
+
+    def _read(fd):
+        data = os.read(fd, 4096)
+        buf.append(data)
+        return data          # pty.spawn writes this to our stdout -> operator sees it live
+
+    # pty.spawn has no cwd arg; wrap a local command in a cd. A remote argv (ssh ...)
+    # carries its own cwd on the far side, so it's passed through untouched.
+    status = pty.spawn(argv, _read)
+    code = os.waitstatus_to_exitcode(status) if hasattr(os, "waitstatus_to_exitcode") else status
+    raw = b"".join(buf).decode("utf-8", "replace")
+    # Shape for the MODEL: strip ANSI escapes; a full-screen TUI (nano/vim/htop) ->
+    # None, signalling the caller to attach a short note instead of screen-paint noise.
+    # The operator's live view above was the raw, un-stripped stream, untouched.
+    return code, _clean_captured(raw)
+
+
+def _edit_prompt(prompt: str, prefill: str) -> str:
+    """Editable input pre-filled with `prefill` (via readline). Empty = cancel."""
+    if readline is not None:
+        # insert_text alone: the startup hook fires inside readline's initial
+        # display, so a manual redisplay() here draws the prefilled line twice.
+        readline.set_startup_hook(lambda: readline.insert_text(prefill))
+    try:
+        return input(prompt).strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return ""
+    finally:
+        if readline is not None:
+            readline.set_startup_hook()
+
+
+def run_direct_command(cfg, cmd: str, reason: str = None, remote=None,
+                       editable=True) -> str:
+    """Run a command in a real terminal (local, or on `remote` over the ssh
+    master so sudo prompts live); return an operator_note for the model.
+    `editable` (default) shows an editable, location-labelled line for the
+    operator to confirm/edit - right for the model-proposed ask_user_to_run
+    path. `/sh` passes editable=False: the operator already typed it, so just
+    label it and run on a single Enter (no second prompt, no re-edit)."""
+    if reason:
+        print(dim(f"  (model asks the operator to run this: {reason})"))
+    if _active_spinner:
+        _active_spinner.stop()
+    if editable:
+        print(dim("  Enter to run (edit first if you like); empty line or ^C to decline."))
+        final = _edit_prompt(_direct_prompt(cfg, remote), cmd)
+    else:
+        print(_direct_prompt(cfg, remote) + cmd)   # show where it runs, then run
+        final = cmd
+    if not final:
+        return "[operator declined to run the command]"
+    # Run under a pty so the operator sees output LIVE and any prompt (sudo) works,
+    # while we CAPTURE the output for the model to act on. The password isn't captured
+    # (typed echo-off, not in the pty stream). Remote: the ssh -tt argv carries its own
+    # pty on the far side; local: run via the shell inside our pty.
+    if remote is not None:
+        argv = _ssh_run_argv(remote.host, remote.ctl, final, tty=True)
+    else:
+        argv = ["/bin/sh", "-c", f"cd {shlex.quote(str(cfg.cwd))} && {final}"]
+    try:
+        code, output = _tee_capture(argv)
+    except KeyboardInterrupt:
+        print()
+        return operator_note(final, None, proposed=cmd) + "\n(interrupted)"
+    except Exception as e:
+        return f"[operator command error] {e}"
+    return operator_note(final, code, proposed=cmd, output=output)
+
+
+def run_sh_command(agent, cfg, arg: str):
+    """/sh: run a command in a real terminal where the session points - on the
+    remote over the ssh master when connected, else local (same rule as the
+    model-driven ask_user_to_run path). Records an operator note so the model
+    stays in sync. Returns the note, or None when no command was given."""
+    if not arg:
+        # No command: drop into a real interactive shell so the operator gets the
+        # shell's own line-editing, tab-completion + history. It inherits the
+        # terminal; on exit we hand the model a brief note that a shell was used
+        # (the individual commands aren't captured - that's the point of a real
+        # subshell). When connected, ride the ssh master with a real tty so the
+        # REMOTE shell's completion/history work exactly like a local one.
+        note = run_interactive_shell(cfg, remote=agent.remote)
+        agent.messages.append({"role": "user", "content": note})
+        agent.dirty = True
+        return note
+    # the operator already typed the command: run it on one Enter, no re-edit
+    note = run_direct_command(cfg, arg, remote=agent.remote, editable=False)
+    agent.messages.append({"role": "user", "content": note})
+    agent.dirty = True
+    return note
+
+
+def run_interactive_shell(cfg, remote=None) -> str:
+    """Drop into a real interactive shell, inheriting the terminal so its own
+    line-editing, tab-completion + history all work. Local: spawn the operator's
+    $SHELL. Remote (connected): ride the ssh master with a real tty (-tt) into the
+    remote login shell - completion/history work exactly as a local shell. Returns
+    an operator_note; the commands run inside aren't captured (a real shell owns
+    the tty), so the model is told a shell session happened, not what ran."""
+    if _active_spinner:
+        _active_spinner.stop()
+    if remote is not None:
+        # Interactive login shell on the remote over the existing master (no
+        # re-auth), started in the session's remote cwd when we know it.
+        where = f"{remote.host}"
+        rcwd = getattr(remote, "remote_cwd", None) or getattr(remote, "cwd", None)
+        launch = "exec ${SHELL:-/bin/sh} -l"
+        if rcwd:
+            launch = f"cd {shlex.quote(str(rcwd))}; " + launch
+        print(dim(f"  entering a shell on {where} (exit or Ctrl-D to return "
+                  f"to lean-coder)"))
+        try:
+            code = subprocess.run(
+                _ssh_run_argv(remote.host, remote.ctl, launch, tty=True)).returncode
+        except KeyboardInterrupt:
+            print()
+            code = None
+        except Exception as e:
+            return f"[interactive shell error] {e}"
+        print(dim("  back in lean-coder."))
+        tail = f" (last exit {code})" if code is not None else ""
+        return (f"[operator dropped into an interactive shell on {where} and "
+                f"returned{tail}; the individual commands run there were not "
+                f"captured]")
+    shell = os.environ.get("SHELL") or "/bin/sh"
+    print(dim(f"  entering {shell} (exit or Ctrl-D to return to lean-coder)"))
+    try:
+        code = subprocess.run([shell], cwd=cfg.cwd).returncode
+    except KeyboardInterrupt:
+        print()
+        code = None
+    except Exception as e:
+        return f"[interactive shell error] {e}"
+    print(dim("  back in lean-coder."))
+    tail = f" (last exit {code})" if code is not None else ""
+    return (f"[operator dropped into an interactive {shell} session and returned"
+            f"{tail}; the individual commands run there were not captured]")
+
+
+# ----------------------------------------------------------------------------
+# Agent loop
+# ----------------------------------------------------------------------------
+
+class ContextMeter:
+    """Read-only context-window measurement + compaction policy for an Agent. Computes
+    how full the window is (used tokens), which compaction zone that puts us in, whether
+    a compaction is allowed under the loop guard, and prints the ctx meter line. Holds a
+    back-reference to its Agent but only READS from it (last_prompt_tokens, the client's
+    cache counters, messages, tool_defs, cfg) - it never mutates conversation state. The
+    one writable bit, the last-compaction timestamp, stays owned by the Agent (set in
+    auto_handover) and is read here as agent._last_compact_ts. Pulling this cohesive
+    read-mostly cluster out of the Agent god-class makes it unit-testable in isolation."""
+
+    def __init__(self, agent):
+        self.agent = agent
+
+    @property
+    def cfg(self):
+        return self.agent.cfg
+
+    def used(self) -> int:
+        """Current context in use (tokens) = the FULL prompt size of the last turn:
+        uncached input + cache reads + cache writes. Prompt caching makes the bare
+        input_tokens tiny (the rest is served from cache), so last_prompt_tokens ALONE
+        badly under-reports true context fill - which would both mislead the ctx meter
+        and stop the compaction zones from ever firing. Falls back to an estimate when
+        there's no real count yet. Also published to lean-tools (see _dispatch)."""
+        a = self.agent
+        est = messages_tokens(a.messages, a.tool_defs)
+        if a.last_prompt_tokens:
+            client = getattr(a, "client", None)
+            cr = getattr(client, "last_cache_read", 0) or 0
+            cw = getattr(client, "last_cache_write", 0) or 0
+            reported = a.last_prompt_tokens + cr + cw
+            # Ollama (and any server with a fixed num_ctx) SILENTLY truncates a prompt
+            # that overflows its window, then reports prompt_eval for only the part that
+            # survived. That post-truncation count looks healthy (e.g. 7k of a 32.8k
+            # window), so the compaction zones never fire while the model has actually
+            # lost most of history. When our own estimate exceeds the reported count,
+            # trust the estimate - it reflects what we TRIED to send, so emergency still
+            # trips and the fallback strip runs. (Caching legitimately makes reported >
+            # est via cr/cw; that direction we keep as-is.)
+            return max(reported, est)
+        return est
+
+    def zone(self):
+        """Context-budget zone for self-managing compaction. Returns (zone, used,
+        limit), zone in 'ok' | 'soft' | 'hard' | 'emergency' by fraction of window:
+          >= handover_emergency -> 'emergency' (compact NOW, bypass boundary + guard)
+          >= hard (per-model)   -> 'hard'      (force at a clean boundary, respect guard)
+          >= soft (per-model)   -> 'soft'      (nudge the model to compact at a break)
+          else                  -> 'ok'.
+        Used only when cfg.auto_handover (per-model) is on."""
+        used  = self.used()
+        limit = self.cfg.ctx_window() or 1
+        frac  = used / limit
+        c     = self.cfg.handover_for()        # per-model soft/hard/auto/autostart
+        if frac >= self.cfg.handover_emergency:
+            return ("emergency", used, limit)
+        if frac >= c["hard"]:
+            return ("hard", used, limit)
+        if frac >= c["soft"]:
+            return ("soft", used, limit)
+        return ("ok", used, limit)
+
+    def compact_allowed(self, zone) -> bool:
+        """Loop guard: emergency always proceeds; otherwise require at least
+        handover_min_interval seconds since the last compaction, so a self-driving
+        compact->autostart->compact cycle can't burn quota in a tight loop."""
+        if zone == "emergency":
+            return True
+        return (time.time() - self.agent._last_compact_ts) >= self.cfg.handover_min_interval
+
+    def print_meter(self):
+        used = self.used()
+        window = self.cfg.ctx_window() or 1
+        pct = used / window * 100
+        line = _pct_color(pct)(f"  ctx: ~{_fmt_tokens(used)}/{_fmt_tokens(window)} ({pct:.0f}%)")
+        extra = _provider_usage_str(self.agent, self.cfg)   # backend quota tail (shared)
+        badge = approval_badge(self.cfg)      # persistent reminder when not "ask"
+        if badge:
+            line += dim(f"  {GLYPH['dot']}  ") + badge
+        if not extra:
+            line += dim(f"  {GLYPH['dot']}  /clear to start fresh")
+        print(line + extra)
+
+
+class Agent:
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self.ctx = ContextMeter(self)        # read-only ctx measurement + compaction policy
+        # No bootstrap client: the active backend is always a provider, and
+        # _maybe_autostart_provider -> activate_provider builds the real client at
+        # launch (its prepare() hook runs first for transport setup, e.g. ollama
+        # host failover). Stays None only if no provider could be started.
+        self.client = None
+        self.tools = Tools(cfg)
+        self.remote = None                   # the ACTIVE RemoteWorkspace, or None (local)
+        self.remotes = {}                    # host -> RemoteWorkspace: the live pool
+        self.lean_tools = LeanToolManager(_lean_tools_dirs(cfg), enabled=cfg.lean_tools_enabled)
+        self.tool_defs = self._provider_tool_filter(
+            active_tools(cfg, lean_tool_schemas=self.lean_tools.schemas(),
+                         model_tools=self._model_tool_support()))
+        self.messages = [{"role": "system", "content": self._system()}]
+        self.last_prompt_tokens = None
+        self.session_in = 0              # tokens sent/received this session (any backend);
+        self.session_out = 0            # accumulated per chat() call, zeroed on /clear
+        self._last_provider = None       # last active provider, for '/provider on'
+        self._abort = False
+        self._handover_capture = None    # set by finalize_handover -> stops the loop
+        self._handover_mark = 0          # index where the current /handover turn starts
+        self._elected_handover = False   # set by request_handover -> _maybe_handover runs it
+        self._last_compact_ts = 0.0      # time of last auto-handover (loop guard)
+        self._autostart_pending = None   # self-prompt queued to run as the next turn
+        self._queued_turns = []          # user turns queued by a command (e.g. /prompt use);
+                                         # the REPL drains these as full turns before prompting
+        self._ac_armed_boundary = 0      # highest k*interval boundary auto-compact has FIRED
+                                         # at; hysteresis re-arms it only after ctx drops back
+                                         # under (boundary - hysteresis*interval). Schmitt state.
+        self._handover_boundary = 0      # message index just past the cache-STABLE prefix left
+                                         # by the last handover (0 = none yet). A provider client
+                                         # may pin a cache breakpoint here. See auto_handover().
+        # permissions note for the model, injected into the next user turn (not the cached
+        # system prompt). Seeded at startup only if the leash is restricted (rwe = full = no note).
+        self._pending_ai_note = _leash_note(cfg.leash) if cfg.leash != "rwe" else None
+        self.pinned_plan = ""            # goal + TODO the model maintains; rides an uncached
+                                         # prompt tail and survives compaction (===PLAN=== block)
+        self._turn_count = 0             # turns this session (for the soft-zone nudge throttle)
+        self._last_nudge_turn = -10**9   # turn of the last soft-zone nudge
+        self._bg_announced = set()       # (host,pid) of finished bg tasks already surfaced to the
+                                         # model, so a completed long-run job is reported once
+        self.dirty = False               # conversation changed since last save/load
+        self.autosave_name = _new_autosave_name()   # rolling autosave target this launch
+
+    def use_client(self, client):
+        """Swap the active model client and refresh num_ctx for it via the active
+        provider's context_window() (ollama detects+caps in there; a hosted backend
+        returns its cached window). Lean-tools that replace the client mid-session -
+        e.g. from a slash command - should call this rather than assigning `.client`
+        directly, so the ctx meter tracks the new backend. Clears the stale token
+        estimate too."""
+        self.client = client
+        self.last_prompt_tokens = None
+        spec = self.active_provider()
+        if spec is not None:
+            try:
+                st = self.cfg.provider_settings.setdefault(self.cfg.provider, {})
+                st["num_ctx"] = int(spec["context_window"](self.cfg.active_model()))
+            except Exception:
+                pass
+
+    def active_provider(self):
+        """The normalized spec of the live backend, or None only when NO provider is
+        enabled at all (every backend, including the bundled ollama, was disabled)."""
+        return get_provider(self.cfg.provider) if self.cfg.provider else None
+
+    def activate_provider(self, name):
+        """Switch the active backend to a registered provider: build its client,
+        restore its saved model, set its context window from context_window(), and
+        run its on_activate hook. The model/window live in
+        cfg.provider_settings[name] (for ollama, the model also mirrors to the
+        top-level alias). Returns the active model id. Raises on an unknown or
+        unavailable provider."""
+        spec = get_provider(name)
+        if spec is None:
+            raise ValueError(f"no such provider '{name}'")
+        if not spec["available"]():
+            raise RuntimeError(f"provider '{name}' is not available")
+        self.cfg.provider = name
+        st = self.cfg.provider_settings.setdefault(name, {})
+        models = list(spec["list_models"]() or [])
+        model = st.get("model")
+        if model not in models:
+            model = models[0] if models else (model or "")
+        self.cfg.set_active_model(model)          # writes st["model"] (+ ollama alias)
+        # The provider's context_window() is the single source of the window: ollama
+        # detects+caps in there, a hosted backend returns its (possibly capped)
+        # cached window. No detect_and_cap dance, no native/provider split.
+        try:
+            st["num_ctx"] = int(spec["context_window"](model))
+        except Exception:
+            pass
+        self.client = spec["make_client"](self.cfg)
+        self.last_prompt_tokens = None
+        spec["on_activate"](self, self.cfg)
+        return model
+
+    def deactivate_provider(self):
+        """Switch back to the bundled ollama provider (the default backend). Runs the
+        leaving provider's on_deactivate hook. No-op if already on ollama. If ollama
+        itself isn't registered, leaves no backend active (cfg.provider = "")."""
+        spec = self.active_provider()
+        if spec is None or self.cfg.provider == "ollama":
+            return
+        try:
+            spec["on_deactivate"](self, self.cfg)
+        except Exception:
+            pass
+        self._last_provider = self.cfg.provider   # remember it for '/provider on'
+        if get_provider("ollama"):
+            self.activate_provider("ollama")
+        else:
+            self.cfg.provider = ""
+
+    def set_remote(self, ws):
+        """Make `ws` the active workspace (or None = local) and refresh the tool
+        surface + working-directory line. A non-None ws joins the live pool so it
+        can be switched back to without reconnecting."""
+        self.remote = ws
+        if ws is not None:
+            self.remotes[ws.host] = ws
+        self.tool_defs = self._provider_tool_filter(
+            active_tools(self.cfg, remote=bool(ws),
+                         lean_tool_schemas=self.lean_tools.schemas(),
+                         model_tools=self._model_tool_support(),
+                         offer_handover=self._offer_handover()))
+        self.messages[0] = {"role": "system", "content": self._system()}
+
+    def drop_remote(self, host):
+        """Close and forget a pooled connection; if it was active, fall back to
+        local. Used on a clean /local <host> and on a detected mid-session drop."""
+        ws = self.remotes.pop(host, None)
+        if ws is not None:
+            try:
+                ws.close()
+            except Exception:
+                pass
+        if self.remote is not None and self.remote.host == host:
+            self.set_remote(None)            # back to local (rebuilds surface + cwd)
+
+    def close_all_remotes(self):
+        """Tear down every pooled connection (on quit). Nothing remote survives a
+        restart, so there is never stale remote code to worry about."""
+        for ws in list(self.remotes.values()):
+            try:
+                ws.close()
+            except Exception:
+                pass
+        self.remotes.clear()
+        self.remote = None
+
+    def _model_tool_support(self) -> bool:
+        """Whether the ACTIVE model can use tools at all. A provider may flag a chat-only
+        model (e.g. one that 400s on a tools param) via its optional tool_support(model)
+        hook. Absent-safe -> True (every current backend supports tools)."""
+        spec = self.active_provider()
+        if not spec:
+            return True
+        try:
+            return bool(spec["tool_support"](self.cfg.active_model()))
+        except Exception:
+            return True
+
+    def _provider_tool_filter(self, tools):
+        """Last-pass provider filter of the tool surface for the ACTIVE model
+        (ollama drops apply_diff for small models). Absent-safe -> unchanged."""
+        spec = self.active_provider()
+        if not spec or not spec.get("tool_filter"):
+            return tools
+        try:
+            out = spec["tool_filter"](self.cfg, tools)
+            return out if isinstance(out, list) else tools
+        except Exception:
+            return tools
+
+    def _offer_handover(self) -> bool:
+        """Whether to surface the elective request_handover tool this turn: only in the
+        soft context zone (auto-handover on), i.e. once context has crossed the user's
+        handover_soft threshold - the point at which the user has decided spending on a
+        handover is acceptable. The model then picks the tidy MOMENT within that window;
+        it can never elect one BELOW soft, so it never decides how much the user pays."""
+        if not self.cfg.handover_for()["auto"]:
+            return False
+        return self._ctx_zone()[0] == "soft"
+
+    def refresh_tools(self):
+        """Rebuild the model's tool surface (after a /tools toggle, leash or model change)."""
+        self.tool_defs = self._provider_tool_filter(
+            active_tools(self.cfg, remote=bool(self.remote),
+                         lean_tool_schemas=self.lean_tools.schemas(),
+                         model_tools=self._model_tool_support(),
+                         offer_handover=self._offer_handover()))
+
+    def reload_lean_tools(self):
+        """Re-scan the lean-tool dir (picks up new/edited/removed files) keeping the
+        enabled set, and rebuild the tool surface. Session + ssh untouched."""
+        self.lean_tools = LeanToolManager(_lean_tools_dirs(self.cfg), enabled=self.lean_tools.enabled)
+        _run_lean_tool_setup(self.cfg, self.lean_tools)   # setup() any newly-enabled tool (once each)
+        self.refresh_tools()
+        return self.lean_tools.names()
+
+    def _run_tool(self, name, args):
+        """Route a tool call: to the remote executor when connected (with a
+        local confirmation first, since the executor can't prompt), else local.
+        The model is unaware of any of this - identical surface either way."""
+        if name == "finalize_handover":      # transient /handover trigger (no remote/leash)
+            return self._finalize_handover()
+        if name == "request_handover":       # elective soft-zone handover (agent-internal)
+            return self._request_handover()
+        if name == "update_plan":            # pinned-plan upkeep (local agent state, never remote)
+            return self._update_plan(args.get("plan", ""))
+        plug = self.lean_tools.get(name)
+        safe = bool(plug and plug["safe"])
+        # Model-level lock: a chat-only model (provider tool_support=False) has NO tools,
+        # and that wins over the leash - raising the ceiling can't grant tools it lacks.
+        if (name not in ("update_plan", "finalize_handover")
+                and not self._model_tool_support()):
+            model = self.cfg.active_model()
+            print(red(f"\n{GLYPH['warn']} blocked {name}: model '{model}' has no tool calling "
+                      f"(not run; switch models with /model)"))
+            return _model_no_tools_msg(model, name)
+        # HARD capability lock (defense in depth behind the active_tools surface filter):
+        # refuse to RUN anything above the current /leash, however the call arrived - a
+        # hallucinated or injected tool_call, a replayed/loaded message, a leaked surface.
+        # The model gets an instructive result; the operator sees the block.
+        if not _leash_allows_tool(self.cfg.leash, name, lean_safe=(safe if plug else None)):
+            print(red(f"\n{GLYPH['warn']} blocked {name}: above the '{self.cfg.leash}' leash "
+                      f"(not run; raise with /leash {_min_leash_for(name, safe if plug else None)})"))
+            return _leash_block_msg(self.cfg.leash, name, lean_safe=(safe if plug else None))
+        # ask-on-read: when confirm_reads is on, read-only tools (core reads + safe
+        # lean-tools) confirm too, not just writers - for anyone who doesn't want it
+        # reading files without an OK. auto/session-armed approval still skips it.
+        if (self.cfg.confirm_reads and (name in SAFE_TOOLS or safe)
+                and not auto_approved(self.cfg)):
+            if not _confirm_action(self.cfg, "read", name=name, args_fmt=_fmt_args(args)):
+                return "operator declined the read"
+        if self.remote and (name in EXEC_TOOLS or plug) and not (plug and plug.get("driver_only")):
+            host = self.remote.host
+            try:
+                if not confirm_remote_tool(self.cfg, host, name, args,
+                                           safe=safe, fetch=self.remote.read_raw):
+                    return "operator declined the remote command"
+                try:
+                    result = self.remote.call(name, args)
+                except (ConnectionError, OSError) as e:
+                    # The exec channel died - almost always a transient master drop
+                    # (idle NAT/keepalive timeout, a brief link blip), NOT a reboot.
+                    # It surfaces on the NEXT request's write to a dead pipe. Try a
+                    # single silent reconnect (re-establish master + re-bootstrap the
+                    # executor over the same host) and retry once; only a reconnect
+                    # that ALSO fails means the box is really gone -> fall to LOCAL.
+                    # Reconnect NON-INTERACTIVELY (batch): this runs mid-tool-call, so
+                    # it must never hang on an invisible password prompt. Keys/a revived
+                    # master -> silent success; a password host or dead box -> fail fast,
+                    # caught below and dropped to LOCAL (operator re-/connect to prompt).
+                    print(dim(f"\n  remote {host} link lost ({e}); reconnecting ..."))
+                    self.remote.connect(batch=True)
+                    result = self.remote.call(name, args)
+            except (ConnectionError, OSError) as e:
+                # reconnect failed too: the box rebooted or the link is truly down.
+                # Fall back to local and tell the model, instead of crashing.
+                self.drop_remote(host)
+                print(red(f"\n! remote {host} dropped ({e}); switched to LOCAL."))
+                return (f"error: remote {host} dropped mid-command (rebooted or link "
+                        f"lost); the session is now LOCAL - retry the command.")
+            if name in ("apply_diff", "write_file") and not any(
+                    result.startswith(p) for p in
+                    ("error", "operator declined", "user declined", "no changes")):
+                if args.get("path"):
+                    self.tools.changed_files.add(args["path"])
+            return result
+        # local: a non-safe lean-tool still confirms (core tools confirm in Tools)
+        if plug and not safe and not auto_approved(self.cfg):
+            print(yellow(f"\nlean-tool {name}({_fmt_args(args)})"))
+            if not ask_action(self.cfg, f"run lean-tool {name}?"):
+                return "operator declined the lean-tool"
+        return self._dispatch(name, args)
+
+    def _parallel_safe(self, call) -> bool:
+        """True iff this call is a read-only tool with no side effect and no
+        confirm prompt, so it may run concurrently with its batch siblings. Core
+        read tools qualify; a lean-tool qualifies only if it declares safe=True.
+        Writers, run_command, and ask_user_to_run never do."""
+        # ask-on-read serializes reads (each needs its own confirm), so no fast-path
+        # unless approval is auto/armed (then reads don't prompt anyway).
+        if self.cfg.confirm_reads and not auto_approved(self.cfg):
+            return False
+        name = call.get("function", {}).get("name", "")
+        if name in SAFE_TOOLS:
+            return True
+        plug = self.lean_tools.get(name)
+        return bool(plug and plug["safe"])
+
+    def _run_parallel(self, calls):
+        """Run a batch of read-only tool calls on daemon threads, then append
+        their results in call order (the model pairs results to calls
+        positionally, so execution order is free but append order is not).
+        Callers guarantee every call is _parallel_safe and that we are local."""
+        parsed = []
+        for call in calls:
+            fn = call.get("function", {})
+            name = fn.get("name", "")
+            args = fn.get("arguments", {})
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except json.JSONDecodeError:
+                    args = {}
+            print(_tool_call_line(name, args))
+            parsed.append((name, args))
+        results = [None] * len(parsed)
+
+        def work(idx, name, args):
+            results[idx] = self._run_tool(name, args)  # already exception-guarded
+
+        spin = Spinner(f"running {len(parsed)} in parallel", TOOL_FRAMES,
+                       cyan, interval=0.12).start()
+        try:
+            threads = [threading.Thread(target=work, args=(i, n, a), daemon=True)
+                       for i, (n, a) in enumerate(parsed)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+        finally:
+            spin.stop()
+        for (name, _args), result in zip(parsed, results):
+            self.messages.append(
+                {"role": "tool", "tool_name": name, "content": result})
+
+    @contextmanager
+    def _sigint_guard(self):
+        """Install a clean SIGINT handler for the duration of a turn: ^C stops
+        inference and drops back to the prompt without a traceback, session
+        intact. Degrades to cooperative abort if not on the main thread."""
+        self._abort = False
+        prev, installed = None, False
+
+        def handler(signum, frame):
+            self._abort = True
+            raise _TurnAbort()
+
+        try:
+            prev = signal.getsignal(signal.SIGINT)
+            signal.signal(signal.SIGINT, handler)
+            installed = True
+        except (ValueError, OSError):
+            pass  # non-main thread / unsupported - cooperative check still works
+        try:
+            yield
+        except _TurnAbort:
+            print(yellow("\n^C - stopped; back to prompt"))
+        finally:
+            if installed:
+                signal.signal(signal.SIGINT, prev)
+
+    def _system(self) -> str:
+        # the dir tools actually operate in (remote cwd when connected). Stated
+        # as a plain path - the model stays unaware it is remote.
+        cwd = (self.remote.remote_cwd or self.remote.cwd) if self.remote else self.cfg.cwd
+        # NOTE: the leash/permissions note is deliberately NOT here. It varies with the
+        # leash, and the system block is a global cache breakpoint - baking it in rewrote
+        # that cache on every /leash toggle. Instead the tool surface reflects the tier and
+        # _leash_note() is injected into the next user turn on change (see run_turn). bg is
+        # always included (cache-stable) even when run_command isn't in the current tier.
+        bg = (f"\nrun_command waits up to {self.cfg.command_timeout}s; for a long-running "
+              f"or daemon process (a server, a watcher) end the command with ' &' to run "
+              f"it detached - it returns a pid + log path immediately instead of blocking.")
+        modes = []
+        if self.cfg.incognito:
+            modes.append("Incognito session: this conversation is not being saved "
+                         "locally. (This does not stop the model provider from "
+                         "processing or retaining it - it only avoids a local trace.)")
+        mode_note = ("\n" + "\n".join(modes)) if modes else ""
+        # NOTE: the pinned plan is deliberately NOT here. It's the goal+TODO the model
+        # rewrites often (~every turn on an active task), and the system block is a cache
+        # breakpoint - baking a volatile block in would rewrite system + everything after
+        # it (summary + tail) at 2x on every plan edit. Instead it rides an uncached
+        # send-time tail after the last breakpoint (see _plan_reminder / the send path),
+        # so a plan update busts nothing.
+        # Chat-only MODEL (not a leash setting): tell it plainly so it doesn't promise
+        # actions or send the user chasing a leash change that can't help. Cache-safe -
+        # this line only appears/changes when the model itself changes (which already
+        # rebuilds the prompt); it stays "" for every tool-capable model.
+        no_tools = ("\n\nThis model does not support tool calling: you have NO tools and "
+                    "cannot read files, edit, or run commands. Do not claim to have performed "
+                    "any action. If a task needs tools, tell the user to switch to a "
+                    "tool-capable model with /model - raising the leash will not help, the "
+                    "limitation is the model." if not self._model_tool_support() else "")
+        # Provider-supplied addendum for the active model (ollama: small-model
+        # tool-calling guidance). Cache-safe: only changes when the model changes.
+        addendum = ""
+        spec = self.active_provider()
+        if spec and spec.get("system_addendum") and self._model_tool_support():
+            try:
+                addendum = spec["system_addendum"](self, self.cfg) or ""
+            except Exception:
+                addendum = ""
+        return (read_prompt("system") or SYSTEM_PROMPT) + bg + mode_note + no_tools + addendum + f"\nWorking directory: {cwd}"
+
+    def _plan_reminder(self) -> str:
+        """The pinned goal+TODO as an uncached send-time reminder. Kept OUT of the
+        cached system block (it changes too often) and OUT of stored history (so it
+        never accumulates stale copies); it is stitched onto the sent message slice at
+        request time only. "" when no plan is pinned."""
+        pinned = getattr(self, "pinned_plan", "")
+        return (f"\n\n(Pinned plan - keep current; update with the update_plan tool)\n"
+                f"{pinned}") if pinned else ""
+
+    def _with_plan_reminder(self, msgs):
+        """Return a COPY of the sent slice with the pinned-plan reminder appended to the
+        last message's text. Non-destructive (never touches self.messages) and applied
+        after the last cache breakpoint, so the plan stays uncached + never persists.
+        No-op when there's no plan or no message to carry it. A tool result must stay
+        exact, so we don't append to a role:tool tail - we add a trailing user note
+        instead (rare: the slice normally ends on a user/assistant turn)."""
+        reminder = self._plan_reminder()
+        if not reminder or not msgs:
+            return msgs
+        out = list(msgs)
+        last = dict(out[-1])
+        if last.get("role") == "tool":
+            out.append({"role": "user", "content": reminder.lstrip("\n")})
+            return out
+        content = last.get("content")
+        if isinstance(content, str):
+            last["content"] = content + reminder
+        elif isinstance(content, list) and content and content[-1].get("type") == "text":
+            blocks = list(content)
+            blocks[-1] = dict(blocks[-1], text=blocks[-1].get("text", "") + reminder)
+            last["content"] = blocks
+        elif isinstance(content, list):
+            last["content"] = content + [{"type": "text", "text": reminder.lstrip("\n")}]
+        else:
+            return msgs
+        out[-1] = last
+        return out
+
+    def _bg_bump_session(self):
+        """Attend this session's leased bg tasks so their watchdogs keep them alive.
+        Called once per turn: while we live we bump each leased task's lease file;
+        when we're gone the leases go stale and the tasks self-terminate. LOCAL only -
+        a remote task's lease lives on the executor box, bumped there (the remote
+        keeps its own tasks attended); a foreign-host record is skipped by
+        _bg_bump_lease. Best-effort, never raises into the turn."""
+        try:
+            me = os.getpid()
+            for r in _bg_load():
+                if r.get("owner") == me and r.get("idle_timeout"):
+                    _bg_bump_lease(r)
+        except Exception:
+            pass
+
+    def _bg_finished_note(self) -> str:
+        """A one-time notice for background tasks THIS session started that have
+        finished since we last looked - so a long-running job the model fired and
+        moved on from surfaces its result ('job done, exit N, last lines') on the
+        next turn instead of needing a manual /bg poll. Works both LOCAL (scan our
+        own sidecars) and REMOTE (ask the executor via BG_POLL - the sidecars live
+        on that box). Reported once per pid, keyed by (host,pid) in _bg_announced
+        so a local and a remote task can't collide on a bare pid. "" when nothing
+        new finished."""
+        remote = getattr(self, "remote", None)
+        if remote is not None:
+            host = remote.host
+            items = remote.bg_poll()
+        else:
+            host = socket.gethostname()
+            items = _bg_finished_here(os.getpid())
+        lines = []
+        for it in items:
+            key = (host, it.get("pid"))
+            if key in self._bg_announced:
+                continue
+            self._bg_announced.add(key)
+            lines.append(_bg_finished_msg([it]))
+        return "\n\n".join(l for l in lines if l)
+
+    def reset(self):
+        self.messages = [{"role": "system", "content": self._system()}]
+        self.last_prompt_tokens = None
+        self.session_in = self.session_out = 0
+        self.tools.changed_files.clear()
+        self.dirty = False
+
+    def restore(self, messages):
+        """Replace the live conversation with a loaded session. The stored system
+        prompt is dropped and rebuilt for the *current* context (cwd / remote
+        state may differ from when it was saved), and the cached token count is
+        cleared so the meter re-estimates instead of showing the old session's."""
+        body = [m for m in messages if m.get("role") != "system"]
+        self.messages = [{"role": "system", "content": self._system()}] + body
+        self.last_prompt_tokens = None
+        self.tools.changed_files.clear()
+        self.dirty = False               # now showing a saved session, not unsaved work
+        return len(body)
+
+    def _trim_tool_indices(self, indices):
+        """Stub the tool messages at `indices` to short placeholders. Skips any
+        already-stubbed message. Returns (trimmed_count, tokens_freed)."""
+        trimmed, freed = 0, 0
+        for i in indices:
+            m = self.messages[i]
+            if m["content"].startswith("[trimmed"):
+                continue
+            n = len(m["content"].splitlines())
+            stub = f"[trimmed {m.get('tool_name', 'tool')} result - {n} lines]"
+            freed += est_tokens(m["content"]) - est_tokens(stub)
+            m["content"] = stub
+            trimmed += 1
+        if trimmed:
+            # The cached actual prompt_eval_count is now stale (it reflects the
+            # pre-trim prompt). Clear it so the meter shows the trimmed estimate
+            # instead of a misleading unchanged figure until the next model turn.
+            self.last_prompt_tokens = None
+        return trimmed, freed
+
+    def compact(self, keep: int = COMPACT_KEEP):
+        """Trim old tool results to short stubs, keeping the last `keep` in
+        full. The cheapest big context win - old file dumps/command output are
+        rarely needed once acted on. Returns (trimmed_count, tokens_freed)."""
+        tool_idx = [i for i, m in enumerate(self.messages)
+                    if m["role"] == "tool"]
+        to_trim = tool_idx[:-keep] if keep > 0 else tool_idx
+        return self._trim_tool_indices(to_trim)
+
+    def _window_messages(self, msgs, max_msgs):
+        """Return the system message plus a bounded tail of `msgs`, cut at a clean
+        turn boundary (the first user message in range) so a tool result is never
+        orphaned from its tool_call. Non-destructive: `msgs` itself is untouched -
+        this only shapes what a single request SENDS. max_msgs <= 0, or a history
+        already within the bound, returns `msgs` unchanged. If no clean boundary
+        falls within range, returns `msgs` unchanged (skip windowing this round
+        rather than risk an orphaned/!user-leading send). See
+        docs/cost-reduction-roadmap.md."""
+        start = self._keep_tail_start(msgs, max_msgs)
+        if start is None:
+            return msgs
+        head = msgs[:1] if msgs and msgs[0].get("role") == "system" else []
+        return head + msgs[start:]
+
+    def _keep_tail_start(self, msgs, max_msgs):
+        """Index into `msgs` where the kept tail begins: the first user-message
+        boundary within the last `max_msgs` (so a tool_result is never orphaned from
+        its tool_call, and the kept slice starts a clean turn). None when no windowing
+        applies - disabled, history already within bound, or no clean boundary in
+        range. Shared by the send-window and by compaction (what to keep vs summarize)."""
+        if max_msgs <= 0 or len(msgs) <= max_msgs:
+            return None
+        head = 1 if (msgs and msgs[0].get("role") == "system") else 0
+        tail = msgs[head:][-max_msgs:]
+        base = len(msgs) - len(tail)          # index in msgs of tail[0]
+        for i, m in enumerate(tail):
+            if m.get("role") == "user":
+                return base + i
+        return None
+
+    def _auto_evict(self):
+        """Continuous tool-output eviction - the main quota lever. Each agentic
+        round, stub the bodies of tool results the model has ALREADY responded to,
+        keeping the last `auto_evict_keep` of them in full. The in-flight batch
+        (tool results AFTER the last assistant message - what the model is about to
+        read this round) is never touched, so a parallel read batch stays intact
+        until it has been acted on. Quota counts raw tokens and the full history is
+        re-sent every round, so shrinking acted-on results shrinks every later call.
+        See docs/cost-reduction-roadmap.md. Returns (trimmed_count, tokens_freed)."""
+        keep = self.cfg.auto_evict_keep
+        last_asst = max((i for i, m in enumerate(self.messages)
+                         if m["role"] == "assistant"), default=-1)
+        acted = [i for i, m in enumerate(self.messages)
+                 if m["role"] == "tool" and i < last_asst]
+        to_trim = acted[:-keep] if keep > 0 else acted
+        return self._trim_tool_indices(to_trim)
+
+    def _handover_turn_text(self):
+        """All assistant content produced since the handover instruction was injected
+        (the marked block lives here, possibly alongside the finalize tool call)."""
+        return "\n".join(m.get("content") or "" for m in self.messages[self._handover_mark:]
+                         if m.get("role") == "assistant")
+
+    def handover(self):
+        """Agentic /handover: the model gets a real (tool-capable) turn to update +
+        commit any durable docs, write its future-self handover wrapped in @#! markers,
+        then call the transiently-surfaced finalize_handover tool. On that call we
+        extract the marked block and replace history with just it - a "smart /clear"
+        that keeps the thread. A bad/absent block does NOT nuke history (returns None).
+        Returns the handover text, or None."""
+        if len([m for m in self.messages if m["role"] != "system"]) == 0:
+            return None
+        instr = read_prompt("handover") or HANDOVER_INSTR
+        self.messages.append({"role": "user", "content": instr})
+        self.dirty = True
+        self._handover_capture = None
+        self._handover_mark = len(self.messages)
+        saved = self.tool_defs
+        self.tool_defs = list(saved) + [HANDOVER_TOOL]   # surface the finalize tool...
+        try:
+            with self._sigint_guard():
+                self._loop()
+        finally:
+            self.tool_defs = saved                        # ...and remove it at the end
+        block = self._handover_capture
+        if not block:        # tool not called but a block was written -> still honor it
+            block = _extract_handover_block(self._handover_turn_text())
+        if not block:        # no usable handover -> leave history untouched
+            return None
+        plan = _extract_plan(self._handover_turn_text())
+        if plan:
+            self.pinned_plan = plan          # survives the handover (uncached send-time reminder)
+        self.messages = [
+            {"role": "system", "content": self._system()},
+            {"role": "user",
+             "content": "Session handover (prior context summarized):\n" + block,
+             "cache_boundary": True},
+        ]
+        self._handover_boundary = 2      # stable prefix (system + summary) - see auto_handover()
+        self.last_prompt_tokens = None
+        self.tools.changed_files.clear()
+        return block
+
+    def _update_plan(self, plan: str):
+        """The update_plan tool body: replace the pinned GOAL + TODO and refresh the
+        live system prompt so the change is visible from the very next turn (and rides
+        compaction/handover). Cheap + cache-stable: the plan only moves when rewritten."""
+        plan = (plan or "").strip()
+        self.pinned_plan = plan
+        if self.messages and self.messages[0].get("role") == "system":
+            self.messages[0]["content"] = self._system()
+        self.last_prompt_tokens = None       # prompt changed; let the meter re-estimate
+        if not plan:
+            return "pinned plan cleared."
+        done = plan.count("[x]") + plan.count("[X]")
+        todo = plan.count("[ ]")
+        return f"plan pinned ({done} done, {todo} to go)."
+
+    def _finalize_handover(self):
+        """The finalize_handover tool body: extract the @#! block from this handover
+        turn. On success, stash it + signal the loop to stop; on failure, tell the
+        model to write the markers and call again (history is never touched here)."""
+        block = _extract_handover_block(self._handover_turn_text())
+        if not block:
+            return (f"no handover found: write it as visible text wrapped between two "
+                    f"{HANDOVER_MARK} markers (not inside this tool call), then call "
+                    f"finalize_handover again. Nothing has been changed.")
+        self._handover_capture = block
+        return "handover captured - finalizing."
+
+    def _request_handover(self):
+        """The request_handover tool body: the model elects a handover at a clean break.
+        We don't compact here (mid-turn, inside a tool batch) - we set a flag that
+        _maybe_handover honours AFTER the turn, running the same auto_handover machinery.
+        Guard: only honour it in the soft-or-higher zone. The tool is only offered in the
+        soft zone, but a stale/replayed/hallucinated call could arrive below it - refuse
+        those so an elected handover can never happen before the user's threshold (the
+        model never gets to spend on a handover the user hasn't opened the window for)."""
+        if not self.cfg.handover_for()["auto"]:
+            return "handover is off (auto_handover disabled) - not handing over."
+        if self._ctx_zone()[0] == "ok":
+            return ("not yet: context is still light (below the handover threshold), so a "
+                    "handover would just discard fidelity for no gain. Keep going - the "
+                    "option reappears once context is heavier.")
+        self._elected_handover = True
+        return ("handover queued - finish this turn cleanly (no half-done work); the "
+                "handover runs right after, and you'll write the summary + next-step then.")
+
+    def auto_handover(self, zone: str = "hard"):
+        """Self-managing compaction. Snapshot the full history (recoverable), then an
+        agentic turn where the model summarizes the OLDER context (between
+        HANDOVER_MARK markers) and writes its next-step self-prompt (between
+        SELFPROMPT_MARK markers) and calls finalize_handover. We keep the recent tail
+        verbatim, replace the older part with the summary, queue the self-prompt for
+        autostart, and stamp the loop-guard clock. A bad/absent summary leaves history
+        untouched (returns None). Returns the summary block, or None."""
+        if not [m for m in self.messages if m["role"] != "system"]:
+            return None
+        pre       = list(self.messages)       # capture BEFORE the compaction turn
+        pre_plan  = getattr(self, "pinned_plan", "")   # for the recovery snapshot below
+        keep_from = self._keep_tail_start(pre, self.cfg.window_messages)
+        tail      = pre[keep_from:] if keep_from is not None else []
+
+        self.messages.append({"role": "user",
+                              "content": read_prompt("auto_handover") or AUTO_HANDOVER_INSTR})
+        self.dirty = True
+        self._handover_capture = None
+        self._handover_mark = len(self.messages)
+        saved = self.tool_defs
+        self.tool_defs = list(saved) + [HANDOVER_TOOL]
+        try:
+            with self._sigint_guard():
+                self._loop()
+        finally:
+            self.tool_defs = saved
+
+        turn_text = self._handover_turn_text()
+        block = self._handover_capture or _extract_handover_block(turn_text)
+        if not block:                         # no usable summary -> don't nuke history
+            self.messages = pre
+            # Stamp the loop guard even on failure so a model that can't produce a
+            # summary doesn't re-attempt (and re-snapshot) compaction every single turn.
+            self._last_compact_ts = time.time()
+            return None
+        # Snapshot the pre-compaction history ONLY now that we have a usable summary and
+        # are about to replace it - so it stays recoverable via /load. Doing it here (not
+        # at the top) means a FAILED/futile compaction writes no snapshot: that unbounded
+        # per-turn snapshotting by a model that never summarized is what flooded /load.
+        try:
+            rhost = self.remote.host if self.remote else None
+            save_session(pre, self.cfg,
+                         PRECOMPACT_PREFIX + time.strftime("%Y-%m-%d-%H%M%S"),
+                         remote=rhost, pinned_plan=pre_plan)
+        except Exception:
+            pass
+        selfprompt = _extract_selfprompt(turn_text)
+        plan = _extract_plan(turn_text)
+        if plan:
+            self.pinned_plan = plan          # survives the handover (uncached send-time reminder)
+        summary_msg = {"role": "user",
+                       "content": "Earlier context (compacted summary):\n" + block,
+                       "cache_boundary": True}
+        self.messages = [
+            {"role": "system", "content": self._system()},
+            summary_msg,
+        ] + tail
+        # Cache-boundary signal for the provider client: after a handover the prefix
+        # [system][summary] is STABLE (it won't change turn to turn), so a client with a
+        # spare cache breakpoint can pin it there and re-read the whole prefix at ~0.1x.
+        # The signal rides the message itself ("cache_boundary": True) so it survives
+        # windowing/repair as long as the message is sent; the client decides whether/how
+        # to use it (this stays gitignored-provider territory). We also publish the index
+        # for /info. 2 = system + the one compacted-summary user message.
+        self._handover_boundary = 2
+        self.last_prompt_tokens = None
+        self.tools.changed_files.clear()
+        self._last_compact_ts = time.time()
+        if selfprompt and self.cfg.handover_for()["autostart"]:
+            self._autostart_pending = selfprompt
+        return block
+
+    def _dispatch(self, name: str, args: dict) -> str:
+        plug = self.lean_tools.get(name)
+        if plug:
+            # Publish the live context budget so a lean-tool can size its output to
+            # the active model (e.g. web_fetch caps a read to the FREE window, and
+            # warns + goes minimal when little is left). MAX = window, USED = current;
+            # free/pct derive. A fresh module per load means a tool's own setup()
+            # state wouldn't reach run(), so these env vars are the carry. Any tool
+            # may read them. Not set on the remote executor (hermetic, no model).
+            os.environ["LEANCODER_CTX_MAX"] = str(self.cfg.ctx_window())
+            os.environ["LEANCODER_CTX_USED"] = str(self._ctx_used())
+            try:
+                return str(plug["run"](args, str(self.cfg.cwd)))
+            except Exception as e:
+                return f"error in lean-tool {name}: {e}"
+        fn = getattr(self.tools, name, None)
+        if fn is None:
+            return f"error: unknown tool {name}"
+        try:
+            return fn(**args)
+        except TypeError as e:
+            return f"error: bad arguments for {name}: {e}"
+        except Exception as e:
+            return f"error in {name}: {e}"
+
+    def _soft_nudge(self) -> str:
+        """A throttled one-line context nudge while in the soft zone, injected into the
+        user turn (uncached). Tells the model context is filling so it wraps up toward a
+        clean stopping point before the hard auto-compaction. "" when not due."""
+        if not self.cfg.handover_for()["auto"]:
+            return ""
+        zone, used, limit = self._ctx_zone()
+        if zone != "soft":
+            return ""
+        if self._turn_count - self._last_nudge_turn < NUDGE_EVERY:
+            return ""
+        self._last_nudge_turn = self._turn_count
+        pct = int(used / limit * 100) if limit else 0
+        tmpl = read_prompt("handover_nudge") or HANDOVER_NUDGE
+        try:
+            return tmpl.format(used=f"{used:,}", limit=f"{limit:,}", pct=pct)
+        except (KeyError, IndexError, ValueError):
+            # a user-edited nudge with a bad placeholder must not break the turn
+            return tmpl
+
+    def run_turn(self, user_input: str):
+        self._turn_count += 1
+        # Rebuild the surface so the elective request_handover tool appears/disappears
+        # as context crosses the soft threshold (offer_handover tracks the zone). Cheap;
+        # keeps the offered tools honest to the current zone without a separate trigger.
+        self.refresh_tools()
+        notes = []
+        if self._pending_ai_note:        # leash/permissions note (on change/startup)
+            notes.append(self._pending_ai_note)
+            self._pending_ai_note = None
+        nudge = self._soft_nudge()       # throttled soft-zone context nudge
+        if nudge:
+            notes.append(nudge)
+        if notes:                        # both ride the (uncached) user turn, never the prompt
+            user_input = "(" + "  ".join(notes) + ")\n\n" + user_input
+        self._bg_bump_session()              # attend our leased bg tasks (keeps them alive)
+        bg_note = self._bg_finished_note()   # long-run bg tasks that finished since last turn
+        if bg_note:
+            user_input = user_input + "\n\n[" + bg_note + "]"
+        self.messages.append({"role": "user", "content": user_input})
+        self.tools.changed_files.clear()
+        self._handover_capture = None    # clear any prior /handover trigger (loop guard)
+        self._elected_handover = False   # clear any prior elective request (fires once)
+        self.dirty = True                # conversation now has unsaved changes
+        with self._sigint_guard():
+            self._loop()
+        # An interrupted tool batch (^C, crash) can leave a dangling tool_use; heal
+        # it in place so the autosave + next turn aren't poisoned (see repair_tool_pairs).
+        self.messages = repair_tool_pairs(self.messages)
+        self._maybe_auto_compact()        # cheap programmatic strip at token intervals (first)
+        self._maybe_handover()            # then the agentic handover (hard/emergency)
+
+    def _maybe_auto_compact(self):
+        """Auto-COMPACT: the cheap, instant, programmatic strip (like /compact - stub old
+        tool outputs) fired when context crosses a k*interval TOKEN boundary going UP. A
+        first line of defence before a full agentic handover: no model turn, no summary,
+        just drops stale tool dumps. Hysteresis (a Schmitt trigger) stops it re-firing
+        every turn once a strip lands just under a boundary: after firing at boundary B it
+        won't re-arm until context falls below B - hysteresis*interval. Off when
+        auto_compact_interval is 0."""
+        interval = getattr(self.cfg, "auto_compact_interval", 0)
+        if interval <= 0:
+            return
+        used = self._ctx_used()
+        hyst = interval * getattr(self.cfg, "auto_compact_hysteresis", 0.25)
+        # re-arm: if we've dropped a full margin below the last-fired boundary, clear it
+        if self._ac_armed_boundary and used < self._ac_armed_boundary - hyst:
+            self._ac_armed_boundary = 0
+        boundary = (used // interval) * interval        # highest boundary at/below `used`
+        if boundary <= 0 or boundary <= self._ac_armed_boundary:
+            return                                       # not past a NEW boundary yet
+        keep = getattr(self.cfg, "auto_compact_keep", COMPACT_KEEP)
+        trimmed, freed = self.compact(keep)
+        self._ac_armed_boundary = boundary               # arm this boundary (don't refire)
+        if trimmed:
+            print(yellow(f"  {GLYPH['warn']} auto-compact at {used:,} tokens: stripped "
+                         f"{trimmed} old tool result(s), ~{freed:,} tokens freed")
+                  + dim(f"  (every {interval:,} tokens; change: /settings auto_compact_interval)"))
+
+    def _maybe_handover(self):
+        """After a turn, run a handover when either (a) context is in the hard/emergency
+        zone - forced, threshold-driven; or (b) the model ELECTED one this turn via
+        request_handover (soft zone, a clean semantic boundary). Then optionally AUTOSTART
+        the model's queued self-prompt. The loop guard (handover_min_interval) caps a
+        FORCED compaction to ~1/min so the autostart->turn->compact cycle can't spin; we
+        also refuse to autostart if compaction didn't actually drop below hard."""
+        if not self.cfg.handover_for()["auto"]:
+            return
+        zone, used, limit = self._ctx_zone()
+        elected = getattr(self, "_elected_handover", False)
+        self._elected_handover = False        # consume it (fires at most once)
+        forced = zone in ("hard", "emergency")
+        if not (forced or elected):
+            return
+        if forced and not self._compact_allowed(zone):
+            return
+        if not self._model_tool_support():
+            # Compaction summarizes via finalize_handover (a TOOL); a chat-only model can
+            # never complete it, so attempting it just burns a turn + snapshot every turn.
+            # Skip, and say why once (the model, not the user, is the limitation).
+            if not getattr(self, "_compact_unsupported_warned", False):
+                print(yellow(f"  {GLYPH['warn']} context is full ({used:,}/{limit:,}) but "
+                             f"'{self.cfg.active_model()}' can't tool-call, so auto-compaction "
+                             f"can't run - switch to a tool-capable model, /compact, or /clear."))
+                self._compact_unsupported_warned = True
+            return
+        pct = int(used / limit * 100) if limit else 0
+        kind = "elective handover (clean break)" if elected and not forced else "auto-handover"
+        print(yellow(f"  {GLYPH['warn']} context {used:,}/{limit:,} ({pct}%, {zone}) - "
+                     f"{kind} (summarizing + resetting the cache prefix)…")
+              + dim("  (change: /settings handover_hard)"))
+        if self.auto_handover(zone) is None:
+            # The agentic summary failed (model couldn't produce a usable handover -
+            # common when history already overflows the window so the summarizing turn
+            # itself is truncated). For a FORCED handover, leaving history intact would
+            # re-fire emergency every turn forever (see the 232% loop) - so fall back to a
+            # programmatic strip. For an ELECTED one, context isn't full: just report and
+            # carry on (no strip needed). The loop guard is already stamped on failure.
+            if not forced:
+                print(yellow(f"  {GLYPH['warn']} elective handover produced no summary - "
+                             f"nothing changed, carrying on."))
+                return
+            trimmed, freed = self.compact(self.cfg.auto_evict_keep)
+            if trimmed:
+                print(yellow(f"  {GLYPH['warn']} agentic handover failed; stripped {trimmed} old "
+                             f"tool result(s) instead, ~{freed:,} tokens freed  ")
+                      + dim("(/compact or /clear if still full)"))
+            else:
+                print(yellow(f"  {GLYPH['warn']} agentic handover failed and nothing to strip - "
+                             f"/clear or switch to a larger-window model."))
+            return
+        print(yellow(f"  {GLYPH['warn']} handover done -> ~{self._ctx_used():,} tokens kept; "
+                     f"new cache boundary set on the summary"))
+        sp = self._autostart_pending
+        self._autostart_pending = None
+        if not sp:
+            return
+        if self._ctx_zone()[0] in ("hard", "emergency"):
+            # compaction didn't free enough; autostarting would immediately re-compact.
+            # Surface the planned step instead of running it.
+            self.messages.append({"role": "user", "content":
+                "[autostart skipped - context still full after compaction] planned next step:\n" + sp})
+            return
+        if self._autostart_countdown(sp):
+            self.run_turn(sp)
+        else:
+            # cancelled: drop the self-prompt into history as a visible note, do NOT run it
+            self.messages.append({"role": "user", "content":
+                "[autostart cancelled by user] the planned next step was:\n" + sp})
+
+    def _autostart_countdown(self, sp, secs: int = 5) -> bool:
+        """Visible 'autostarting in 5..1, ^C to cancel' beat before running the model's
+        own self-prompt. Returns True to proceed, False if the user interrupts. Thin +
+        interactive (the decision logic in _maybe_compact is what's unit-tested).
+
+        Runs under composer_suspended(): the countdown happens at the tail of run_turn
+        while the composer still owns the TTY (cbreak, reader thread draining stdin), so
+        without handing the real terminal back a ^C would be swallowed by the composer
+        (never reaching us as KeyboardInterrupt) AND the \\r redraw would garble through
+        the pinned-line renderer. Suspending restores cooked mode + echo + real stdout."""
+        preview = sp.replace("\n", " ")
+        preview = preview[:80] + "…" if len(preview) > 80 else preview
+        with composer_suspended():
+            print(dim(f"  {GLYPH['dot']} autostarting (^C to cancel): {preview}"))
+            try:
+                for n in range(secs, 0, -1):
+                    sys.stdout.write(dim(f"\r  {n}… "))
+                    sys.stdout.flush()
+                    time.sleep(1)
+                sys.stdout.write("\r" + " " * 24 + "\r")
+                sys.stdout.flush()
+                return True
+            except KeyboardInterrupt:
+                sys.stdout.write(dim("\r  autostart cancelled.        \n"))
+                sys.stdout.flush()
+                return False
+
+    def _chat_with_model_fallback(self):
+        """Send to the model; if it 404s because the active model is unavailable
+        (e.g. a tier-gated model left in the config), print a
+        clear message and retry with the next model the backend offers instead of
+        failing the whole turn. The fallback autosaves with the rest of config."""
+        tried = set()
+        while True:
+            try:
+                # repair AFTER windowing so we send a tool-pair-consistent slice -
+                # heals an already-poisoned (resumed) session that would 400 forever.
+                msgs = repair_tool_pairs(
+                    self._window_messages(self.messages, self.cfg.window_messages))
+                # Stitch the pinned plan onto the SENT slice only (a copy) - never into
+                # stored history, and after the last cache breakpoint (messages[-2]) so it
+                # stays uncached and a plan edit busts nothing. See _plan_reminder.
+                msgs = self._with_plan_reminder(msgs)
+                return self.client.chat(
+                    msgs, self.tool_defs, should_abort=lambda: self._abort)
+            except Exception as e:
+                # A 404 from the chat endpoint means the model path is bad (unknown
+                # / not entitled), not a transport failure - anything else re-raises
+                # to the normal handler.
+                if not (getattr(e, "code", None) == 404 or "404" in str(e)):
+                    raise
+                current = self.cfg.active_model()
+                tried.add(current)
+                nxt = self._next_available_model(tried)
+                if not nxt:
+                    raise RuntimeError(
+                        f"model '{current}' is unavailable on this account (404) and "
+                        f"no alternative is offered - use /model to pick one, or "
+                        f"/provider to switch.")
+                print(yellow(f"\n{GLYPH['warn']} model '{current}' unavailable (404); "
+                             f"falling back to '{nxt}'  (/model to pick another)"))
+                self._apply_model(nxt)
+
+    def _next_available_model(self, tried):
+        """First model the active backend offers that we haven't already tried."""
+        try:
+            models = list(self.client.list_models() or [])
+        except Exception:
+            models = []
+        return next((m for m in models if m and m not in tried), None)
+
+    def _apply_model(self, name):
+        """Switch the active backend's model at runtime; the client reads
+        cfg.active_model() on the next send."""
+        spec = self.active_provider()
+        self.cfg.set_active_model(name)
+        if spec and spec.get("context_window"):
+            try:
+                self.cfg.set_setting("num_ctx", int(spec["context_window"](name)))
+            except Exception:
+                pass
+        # The new model may differ in tool-support (a chat-only model exposes NO tools
+        # regardless of leash; a tool-capable one restores them). Rebuild the surface so
+        # a same-provider /model switch - or a 404 fallback - doesn't leave it stale
+        # (e.g. switching off a chat-only model used to keep showing "0 tools").
+        self.refresh_tools()
+
+    def _offer_login_on_auth_error(self, err) -> bool:
+        """First-class onboarding: when a turn fails because the active provider has no
+        (or a rejected) API key, run that provider's login hook inline and re-activate,
+        so the user can paste a key and continue rather than hitting a dead red error.
+        Returns True if login succeeded and the turn should be retried; False otherwise
+        (unrecognized error, no login hook, or the user declined/cancelled)."""
+        msg = str(err).lower()
+        auth = ("no api key" in msg or "api key" in msg
+                or " 401" in msg or "401:" in msg or " 403" in msg or "403:" in msg
+                or "unauthorized" in msg or ("invalid" in msg and "key" in msg))
+        if not auth:
+            return False
+        spec = self.active_provider()
+        if not spec or not spec.get("login"):
+            return False
+        name = self.cfg.provider
+        print(yellow(f"\n{GLYPH['warn']} {name}: authentication failed - "
+                     f"you need to log in."))
+        if not _ask(f"log in to '{name}' now?"):
+            print(dim(f"  skipped. Run /provider login {name} when ready, "
+                      f"or /provider to switch backend."))
+            return False
+        try:
+            ok = spec["login"](self, self.cfg)
+        except Exception as e:
+            print(red(f"login failed: {e}"))
+            return False
+        if ok is False:
+            print(dim("login cancelled."))
+            return False
+        try:
+            model = self.activate_provider(name)
+            print(green(f"provider: {name}") + dim(f"  model: {model}  - retrying..."))
+        except Exception as e:
+            print(red(f"/provider {name} failed: {e}"))
+            return False
+        return True
+
+    def _recover_and_should_retry(self, err) -> bool:
+        """One-shot recovery for a failed send. Tries transport failover first (the
+        provider's on_conn_error hook - ollama re-probes its priority pool and jumps to
+        the next live host), then the auth/login flow. Returns True when something
+        recovered and the turn should be retried, else False (caller prints the error)."""
+        spec = self.active_provider()
+        recover = spec.get("on_conn_error") if spec else None
+        if isinstance(err, ConnectionError) and recover:
+            try:
+                if recover(self, self.cfg, err):
+                    return True
+            except Exception:
+                pass
+        return self._offer_login_on_auth_error(err)
+
+    def _loop(self):
+        # max_iterations <= 0 means unlimited (count up forever).
+        cap = self.cfg.max_iterations
+        i = 0
+        while cap <= 0 or i < cap:
+            i += 1
+            # Periodic in-turn status: a constantly-iterating model can run many
+            # loops without ever returning to the prompt (where the status block
+            # normally prints), so ctx/quota/perms go stale on screen. When
+            # statusline_iter is set, reprint the block every N iterations.
+            _si = getattr(self.cfg, "statusline_iter", 0)
+            if (_si and i > 1 and (i - 1) % _si == 0
+                    and getattr(self.cfg, "statusline", True) and _TTY):
+                for _row in _status_rows(self, self.cfg):
+                    print(_row)
+            if self.cfg.auto_evict:
+                self._auto_evict()
+            try:
+                assistant, prompt_eval, aborted = self._chat_with_model_fallback()
+            except (ConnectionError, RuntimeError) as e:
+                # A failed send gets ONE recovery attempt then a retry:
+                #  - transport recovery: a provider may fail over (ollama re-probes its
+                #    priority pool and jumps to the next live host), so a dropped LAN box
+                #    / roaming off wifi doesn't dead-end;
+                #  - auth recovery (OBE): a missing/invalid key (401/403) on a provider
+                #    that can log in offers the login flow inline instead of a red error.
+                if not self._recover_and_should_retry(e):
+                    print(red(f"\n{e}"))
+                    return
+                try:
+                    assistant, prompt_eval, aborted = self._chat_with_model_fallback()
+                except (ConnectionError, RuntimeError) as e2:
+                    print(red(f"\n{e2}"))
+                    return
+            if aborted:
+                # Drop the half-streamed turn; history stays consistent.
+                print(yellow("\n^C - stopped mid-inference; back to prompt"))
+                return
+            if prompt_eval:
+                self.last_prompt_tokens = prompt_eval
+                self.session_in += prompt_eval
+            # Output tokens are reported by the client (Ollama eval_count / API
+            # output_tokens) on an optional attribute, so any backend contributes
+            # to the session count without a chat() signature change.
+            self.session_out += getattr(self.client, "last_out_tokens", 0) or 0
+            self.messages.append(assistant)
+            calls = assistant.get("tool_calls")
+            if not calls:
+                self._end_of_turn()
+                return
+            # Parallel fast-path: when the model batches several independent
+            # read-only tools (and we're local), run them at once - N reads/greps
+            # in the wall time of the slowest, not the sum. Whole batch must be
+            # safe: a writer/command needs an interactive confirm (can't prompt
+            # for several at once) and could race. Remote is excluded - its
+            # executor is a single serial pipe (one stdin/stdout), so concurrent
+            # calls would corrupt the stream.
+            if (len(calls) > 1 and not self.remote
+                    and all(self._parallel_safe(c) for c in calls)):
+                self._run_parallel(calls)
+                if self._abort:
+                    return
+                continue
+            for call in calls:
+                if self._abort:                 # ^C between tool calls
+                    return
+                fn = call.get("function", {})
+                name = fn.get("name", "")
+                args = fn.get("arguments", {})
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except json.JSONDecodeError:
+                        args = {}
+                print(_tool_call_line(name, args))
+                if name == "ask_user_to_run":
+                    # Interactive handoff: no spinner, operator runs it directly
+                    # (on the remote box when connected). Suspend the composer so
+                    # the editable prompt owns stdin/echo (no reader-thread race).
+                    with composer_suspended():
+                        result = run_direct_command(
+                            self.cfg, args.get("cmd", ""), args.get("reason"),
+                            remote=self.remote)
+                else:
+                    # Tool-running indicator (distinct from the model spinner),
+                    # labelled with the tool so you always see WHAT is running.
+                    # _ask() pauses it for confirmation prompts; in auto mode it
+                    # animates (with an elapsed counter) across the whole execution.
+                    spin = Spinner(name, TOOL_FRAMES, cyan, interval=0.12).start()
+                    try:
+                        result = self._run_tool(name, args)
+                    finally:
+                        spin.stop()
+                self.messages.append({
+                    "role": "tool", "tool_name": name, "content": result})
+                if self._handover_capture is not None:   # finalize_handover fired -> stop
+                    return
+        print(yellow(f"\n{GLYPH['warn']} hit {cap}-iteration cap; stopping this turn. "
+                     f"Refine your request or continue, or raise the limit: "
+                     f"/settings -> max_iterations (0 = unlimited), or set "
+                     f"max_iterations in {CONFIG_PATH}."))
+        self._end_of_turn()
+
+    def _end_of_turn(self):
+        changed = sorted(self.tools.changed_files)
+        if changed:
+            print(green(f"\n{GLYPH['edit']} changed {len(changed)} file(s): "
+                        + ", ".join(changed)))
+        # The status rows (printed before the next prompt) already carry ctx + quota,
+        # so only print the standalone meter when the status line is off (fallback).
+        if not (getattr(self.cfg, "statusline", True) and _TTY):
+            self._print_ctx()
+
+    # The context measurement / compaction-policy methods live on self.ctx
+    # (ContextMeter) now; these stay as thin delegators so the ~14 internal + external
+    # call sites - and the suite's monkeypatch seam (tests override self._ctx_zone to
+    # drive auto_handover) - keep working unchanged.
+    def _ctx_used(self) -> int:
+        return self.ctx.used()
+
+    def _ctx_zone(self):
+        return self.ctx.zone()
+
+    def _compact_allowed(self, zone) -> bool:
+        return self.ctx.compact_allowed(zone)
+
+    def _print_ctx(self):
+        self.ctx.print_meter()
+
+
+def _fmt_reset(iso) -> str:
+    """ISO timestamp -> short local reset with a countdown so a bare clock time
+    can't be misread as a number: 'HH:MM(Nh)' within a day, else 'ddMon(Nd)'
+    (e.g. '15:00(18h)', '05Jul(3d)'). Under an hour reads 'HH:MM(Nm)'. Core owns
+    this so every provider's reset times read the same way."""
+    if not iso:
+        return ""
+    try:
+        dt = datetime.datetime.fromisoformat(str(iso).replace("Z", "+00:00")).astimezone()
+    except ValueError:
+        return ""
+    secs = (dt - datetime.datetime.now(dt.tzinfo)).total_seconds()
+    if secs < 0:
+        return dt.strftime("%H:%M(now)")
+    if secs < 86400:
+        cd = f"{int(secs // 3600)}h" if secs >= 3600 else f"{int(secs // 60)}m"
+        return dt.strftime("%H:%M") + f"({cd})"
+    return dt.strftime("%d%b") + f"({int(secs // 86400)}d)"
+
+
+def render_usage_meters(usage) -> str:
+    """Render a provider's usage dict into a status suffix, with core's own colour
+    ramp / reset formatting (the provider supplies only numbers). Shape:
+    {"meters": [{"label": "5h", "pct": 12, "resets_at": iso}, ...], "note": ""}.
+    Returns "" for an empty/None usage so the caller can fall back to the plain
+    ctx line."""
+    if not usage:
+        return ""
+    parts = []
+    for m in usage.get("meters", []):
+        try:
+            pct = float(m.get("pct", 0))
+        except (TypeError, ValueError):
+            continue
+        label = str(m.get("label", "")).strip()
+        rst = _fmt_reset(m.get("resets_at", ""))
+        body = (f"{label} FULL" if pct >= 100 else f"{label} {pct:.0f}%")
+        if rst:
+            body += f" {rst}"
+        body = _pct_color(pct)(body)
+        # Optional provider tag rendered bracketed AFTER the reset with its own
+        # colour ramp (e.g. per-day headroom, whose danger is inverse of pct).
+        # {"text": str, "level": "ok"|"warn"|"crit"} - provider owns the level,
+        # core owns the colour so every provider's tags read the same.
+        tag = m.get("tag")
+        if isinstance(tag, dict) and str(tag.get("text", "")).strip():
+            tclr = {"crit": red, "warn": yellow}.get(tag.get("level"), blue)
+            body += tclr(f"({str(tag['text']).strip()})")
+        parts.append(body)
+    note = str(usage.get("note", "")).strip()
+    if note:
+        parts.append(dim(note))
+    if not parts:
+        return ""
+    sep = dim(f" {GLYPH['dot']} ")          # match the status rows' separator spacing
+    return sep + sep.join(parts)
+
+
+def _fmt_args(args: dict) -> str:
+    parts = []
+    for k, v in args.items():
+        s = str(v).replace("\n", GLYPH["ret"])
+        if len(s) > 50:
+            s = s[:50] + "…"
+        parts.append(f"{k}={s}")
+    return ", ".join(parts)
+
+
+def _is_bg_call(name: str, args: dict) -> bool:
+    """True when this is a backgrounded (detached) run_command - a trailing '&' on
+    the cmd."""
+    return name == "run_command" and str(args.get("cmd", "")).rstrip().endswith("&")
+
+
+def _tool_glyph(name: str, args: dict) -> str:
+    """Icon for a tool call line: a distinct 'bg' glyph when this is a backgrounded
+    (detached) run_command - a trailing '&' on the cmd - so a launch-and-detach reads
+    differently from an ordinary blocking run. Everything else gets the gear."""
+    return GLYPH["bg"] if _is_bg_call(name, args) else GLYPH["tool"]
+
+
+def _tool_call_line(name: str, args: dict) -> str:
+    """The dim one-line summary printed for a tool call. A backgrounded
+    run_command gets an explicit ' (background)' text tag so it reads as detached
+    even without colour/glyph support - not just a different icon."""
+    tag = "  (background)" if _is_bg_call(name, args) else ""
+    return dim(f"  {_tool_glyph(name, args)} {name}({_fmt_args(args)}){tag}")
+
+
+# ----------------------------------------------------------------------------
+# REPL
+# ----------------------------------------------------------------------------
+
+SLASH_COMMANDS = ["/clear", "/new", "/compact", "/handover", "/session", "/save", "/load",
+                  "/prompt", "/sh", "/connect", "/local", "/tools", "/reload",
+                  "/model", "/provider", "/think", "/effort",
+                  "/set", "/usage", "/approve", "/leash", "/autosave", "/incognito",
+                  "/askread", "/bg", "/info", "/settings", "/ctx", "/help", "/quit"]
+
+# Built-in command names are the shadow-protection set: lean-tool commands can't claim
+# any of them. It is DERIVED from _BUILTIN_COMMANDS_TABLE (every builtin command + alias)
+# right after that table is defined, below - so the protected set can never drift from
+# what's actually dispatched. SLASH_COMMANDS (above) is the curated completion list
+# (canonical names only; aliases like /disconnect are reachable but not offered for
+# completion). /reset is gone for good - /clear replaced it.
+
+# Slash commands contributed by lean-tools via setup() -> register_command.
+# name -> (handler(agent, cfg, arg), help_line). repl() consults this after its
+# built-in chain; populated only on the driver (setup() never runs remotely).
+_lean_tool_commands = {}
+# Optional Tab-completion for lean-tool commands: name -> completer(agent, cfg) ->
+# [str]. Lets a lean-tool (e.g. /update) complete its first arg the same way the
+# built-ins do; absence just means no inline completion (the no-arg picker, if the
+# handler implements one, still works).
+_lean_tool_completers = {}
+# Which plugin (tool/provider name) registered each command, so a SECOND plugin
+# claiming the same /command is warned + ignored (first wins) while a plugin
+# re-registering its own command still replaces. Set around each setup() call.
+_lean_tool_cmd_owner = {}
+_registering_owner = None
+
+
+# External model providers contributed by lean-tools via setup() ->
+# register_provider. name -> normalized spec. The built-in Ollama backend is NOT
+# in here; "" / "ollama" mean native. Populated only on the driver.
+_providers = {}
+
+
+def register_provider(spec):
+    """Register an external model backend (called from a lean-tool's setup(),
+    usually as lc['register_provider']). `spec` is a dict; see PROVIDER_API.md.
+
+    Required keys:
+      name            unique id (string)
+      make_client     cfg -> client with .chat(messages, tools, should_abort)
+      list_models     () -> [model_id, ...]
+      context_window  model_id -> int
+
+    Optional keys (sensible defaults filled in):
+      capabilities    model_id -> {setting_key: [choices]}   (default {})
+      available       () -> bool   gate for activation/menus  (default True)
+      autostart       () -> bool   activate on launch         (default False)
+      on_activate     (agent, cfg) -> None
+      on_deactivate   (agent, cfg) -> None
+      usage           (agent, cfg) -> {"meters":[...], "note": str} or None
+      status_line     (agent, cfg) -> str   raw-string escape hatch
+      login           (agent, cfg) -> bool  auth flow; enables /provider login
+      clear           (agent, cfg) -> None  wipe credentials; enables /provider clear
+      detail          (agent, cfg) -> str   full usage view for /usage
+      tag             str   short label for the unified /model row (default: name)
+
+    Returns the normalized spec. Re-registering a name replaces it."""
+    name = spec.get("name", "")
+    if not name:
+        raise ValueError("provider needs a unique name")
+    for req in ("make_client", "list_models", "context_window"):
+        if not callable(spec.get(req)):
+            raise ValueError(f"provider '{name}': '{req}' must be callable")
+    norm = {
+        "name": name,
+        "make_client": spec["make_client"],
+        "list_models": spec["list_models"],
+        "context_window": spec["context_window"],
+        "capabilities": spec.get("capabilities") or (lambda m: {}),
+        "available": spec.get("available") or (lambda: True),
+        "autostart": spec.get("autostart") or (lambda: False),
+        "on_activate": spec.get("on_activate") or (lambda a, c: None),
+        "on_deactivate": spec.get("on_deactivate") or (lambda a, c: None),
+        "usage": spec.get("usage"),
+        "status_line": spec.get("status_line"),
+        "login": spec.get("login"),
+        "clear": spec.get("clear"),
+        "detail": spec.get("detail"),
+        # short label shown next to each model row in the unified /model -
+        # e.g. "plan" -> "model-x  [plan]". Defaults to the provider name.
+        "tag": (spec.get("tag") or name),
+        # opt-in hooks (each absent-safe; non-implementers pay nothing):
+        #   warm_models()        -> [model_id] loaded/instant models (ollama green dots)
+        #   model_status(model)  -> str|None   install/availability hint for /model
+        #   tool_support(model)  -> bool        False = chat-only model (no tool calling);
+        #                                       absent -> True (every current backend supports tools)
+        #   endpoints()          -> [url]      multi-endpoint failover (ollama hosts)
+        #   location(cfg)        -> str         status/info label for the backend (ollama:
+        #                                       host alias + url); absent -> the provider name
+        #   prepare(agent, cfg)  -> None        pre-activation setup run by core BEFORE
+        #                                       activate_provider (ollama: tiered host failover
+        #                                       + per-host default model). Absent -> nothing.
+        "warm_models": spec.get("warm_models"),
+        "model_status": spec.get("model_status"),
+        "tool_support": spec.get("tool_support") or (lambda m: True),
+        "endpoints": spec.get("endpoints"),
+        "location": spec.get("location"),
+        "prepare": spec.get("prepare"),
+        # on_conn_error(agent, cfg, err) -> bool: last-chance recovery when a send
+        # fails with a transport error. Ollama re-probes its priority pool and fails
+        # over to the next live host; return True to retry the turn. Absent -> no retry.
+        "on_conn_error": spec.get("on_conn_error"),
+        # system_addendum(agent, cfg) -> str: extra text appended to the system
+        # prompt for the ACTIVE model (ollama: small-model tool-calling guidance -
+        # use the tool_calls channel, a few-shot, don't write calls as text).
+        # Cache-safe: only changes when the model changes. Absent/"" -> nothing.
+        "system_addendum": spec.get("system_addendum"),
+        # tool_filter(cfg, tools) -> tools: last-pass filter/reorder of the tool
+        # surface for the ACTIVE model (ollama: drop apply_diff for small models
+        # that can't produce byte-exact diffs - they use write_file instead).
+        # Absent -> tools unchanged. Must return a list.
+        "tool_filter": spec.get("tool_filter"),
+    }
+    _providers[name] = norm
+    return norm
+
+
+def get_provider(name):
+    return _providers.get(name)
+
+
+def provider_names():
+    return list(_providers)
+
+
+def _provider_label(cfg) -> str:
+    """The display label for the active backend (status row / info / usage).
+    A provider may supply location(cfg) for a richer label (ollama: host alias +
+    url); otherwise it's the provider name, or 'no provider' when none is on."""
+    spec = get_provider(cfg.provider) if cfg.provider else None
+    if spec is not None and spec.get("location"):
+        try:
+            lbl = spec["location"](cfg)
+            if lbl:
+                return lbl
+        except Exception:
+            pass
+    return cfg.provider or "no provider"
+
+
+def _provider_uses_settings(cfg) -> bool:
+    """True when the active provider drives reasoning via the 'thinking'/'effort'
+    per-provider settings (hosted APIs that declare those capabilities); False when
+    it uses the plain boolean `think` toggle (ollama). Replaces the old on_ollama
+    branch so think/effort display the right knob for any backend."""
+    spec = get_provider(cfg.provider) if cfg.provider else None
+    if spec is None:
+        return False
+    try:
+        caps = spec["capabilities"](cfg.active_model()) or {}
+    except Exception:
+        caps = {}
+    return "thinking" in caps or "effort" in caps
+
+
+def register_command(cmd, handler, help_line="", completer=None):
+    """Register a lean-tool slash command. Called from a lean-tool's setup() (usually
+    as lc['register_command']). Built-in names are refused (built-ins win), and
+    the name is added to SLASH_COMMANDS for Tab-completion. Idempotent-ish: a
+    re-register of the same name replaces its handler. Pass `completer(agent, cfg)
+    -> [str]` to Tab-complete the command's first argument."""
+    if not cmd.startswith("/"):
+        cmd = "/" + cmd
+    if cmd in _BUILTIN_COMMANDS:
+        print(yellow(f"lean-tool command {cmd} ignored: shadows a built-in"))
+        return
+    owner, prev = _registering_owner, _lean_tool_cmd_owner.get(cmd)
+    if cmd in _lean_tool_commands and owner is not None and prev is not None and owner != prev:
+        # a DIFFERENT plugin wants a name another already took: keep the first, warn
+        # (matches duplicate tool/provider NAMES). Same owner re-registering (e.g. its
+        # setup re-runs) still replaces. Direct calls with no owner context replace too.
+        print(yellow(f"command {cmd} from '{owner}' ignored: already registered by '{prev}'"))
+        return
+    _lean_tool_commands[cmd] = (handler, help_line)
+    _lean_tool_cmd_owner[cmd] = owner if owner is not None else prev
+    if completer is not None:
+        _lean_tool_completers[cmd] = completer
+    elif cmd in _lean_tool_completers:        # re-register without one clears it
+        del _lean_tool_completers[cmd]
+    if cmd not in SLASH_COMMANDS:
+        SLASH_COMMANDS.append(cmd)
+
+# (command, description) pairs. Rendered with the command bold+cyan and the
+# description dimmed, so the two are easy to tell apart even when a narrow
+# (mobile) terminal wraps the line.
+HELP_COMMANDS = [
+    ("/clear", "wipe conversation, stay in this session"),
+    ("/new [name]", "start a separate session"),
+    ("/compact [keep]", "programmatic: stub old tool outputs, keep newest [keep]"),
+    ("/handover", "agentic: summarize + commit docs, replace history (the lever auto-handover pulls)"),
+    ("/save [name]", "name the current session"),
+    ("/load [name]", "resume a session (no arg = picker)"),
+    ("/session", "list | delete <name>"),
+    ("/prompt [name]", "view/edit prompt files"),
+    ("/sh [cmd]", "run a command in a terminal (no arg: drop into your $SHELL)"),
+    ("/connect [host]", "run tools on a remote over SSH"),
+    ("/local [host]", "detach the active remote"),
+    ("/tools", "enable/disable lean-tools"),
+    ("/reload", "reload lean-tools"),
+    ("/model [name]", "switch model (no arg = list)"),
+    ("/provider [name]", "switch/manage the model backend"),
+    ("/usage", "session tokens + context / provider usage ('raw' dumps the full payload)"),
+    ("/think [level]", "set thinking (no arg = menu)"),
+    ("/effort [level]", "set reasoning effort (no arg = menu)"),
+    ("/set [key val]", "get/set a provider setting"),
+    ("/approve [mode]", "ask | session | auto"),
+    ("/leash [level]", "ceiling: chat | r | rw | rwe"),
+    ("/autosave [on|off]", "autosave + auto-load last on start"),
+    ("/incognito [on|off]", "don't save the session locally"),
+    ("/askread [on|off]", "confirm read tools too"),
+    ("/bg [kill <pid>]", "list/kill background tasks"),
+    ("/info", "live session read-out"),
+    ("/settings [key val]", "edit config.toml knobs (no arg = menu)"),
+    ("/ctx", "context-token estimate"),
+    ("/help", "this help"),
+    ("/quit", "exit"),
+]
+
+HELP_FOOTER = ("Tab completes commands and their inline arguments. ^C stops a running turn; "
+               "at the prompt it cancels the line, and ^C twice in a row exits. "
+               "Anything else goes to the model.\n"
+               "Config knobs (context/handover gates, sampling, etc.) live in /settings - "
+               "e.g. handover_soft/hard/emergency, auto_handover, auto_evict_keep.")
+
+
+def render_help(extra=()):
+    """Build the /help text: command column bold+cyan, descriptions dimmed.
+    `extra` is (command, help_line) pairs for lean-tool-registered commands. The
+    description column is aligned, but padding is computed on the raw command
+    length so the ANSI color codes don't throw the alignment off."""
+    rows = list(HELP_COMMANDS) + list(extra)
+    # Align the description column to the longest command, but CAP it: one very long
+    # command (e.g. /provider's full arg list) must not pad every other row out to its
+    # width and wrap the whole table. Commands over the cap just get 2 trailing spaces.
+    ALIGN_CAP = 24
+    width = min(max((len(c) for c, _ in rows), default=0), ALIGN_CAP)
+
+    def row(c, d):
+        pad = max(2, width - len(c) + 2)
+        return f"  {bold(cyan(c))}{' ' * pad}{dim(d)}"
+
+    out = [bold("commands:")] + [row(c, d) for c, d in HELP_COMMANDS]
+    if extra:
+        out += [bold("lean-tool commands:")] + [row(c, d) for c, d in extra]
+    out.append(dim(HELP_FOOTER))
+    return "\n".join(out)
+
+
+_PROMPT_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+
+
+def _refresh_system_prompt(agent, name):
+    """If the live system prompt changed, rebuild messages[0] so it applies now."""
+    if name == "system" and agent.messages and agent.messages[0].get("role") == "system":
+        agent.messages[0] = {"role": "system", "content": agent._system()}
+
+
+def _edit_prompt_file(agent, cfg, name):
+    if not _PROMPT_NAME_RE.match(name):
+        print(yellow(f"invalid prompt name '{name}' (use letters, digits, . _ -)"))
+        return
+    f = seed_prompt_file(name)
+    if open_in_editor(f, cfg):
+        print(dim(f"saved {f}"))
+    else:
+        print(yellow(f"no editor available - edit this file directly:\n  {f}"))
+    _refresh_system_prompt(agent, name)
+
+
+def _use_prompt(agent, name):
+    """/prompt use <name> - inject a saved prompt's text as the NEXT user turn (one-shot).
+    Lets you keep reusable instructions (a refactor brief, a review checklist, a commit-
+    message style) as a named prompt and fire one on demand without retyping it."""
+    text = read_prompt(name)
+    if not text or not text.strip():
+        f = prompt_file(name)
+        if name in BUILTIN_PROMPTS:
+            print(yellow(f"'{name}' is a system prompt, not a one-shot message - "
+                         f"/prompt use is for your own custom prompts."))
+        else:
+            print(yellow(f"no prompt '{name}' to use (create it with /prompt {name}, "
+                         f"or drop a {f.name} in {PROMPTS_DIR})."))
+        return
+    agent._queued_turns.append(text.rstrip("\n"))
+    print(dim(f"queued prompt '{name}' ({len(text.split())} words) -> sending as the next turn."))
+
+
+def handle_prompt_command(agent, cfg, arg):
+    """/prompt: view/edit prompt files, or fire one as a one-shot turn.
+      /prompt                 menu
+      /prompt <name>          edit (create a custom prompt if absent)
+      /prompt use <name>      inject a saved custom prompt as the next turn (one-shot)
+      /prompt reset <name>    restore a built-in to its baked default"""
+    arg = arg.strip()
+    if arg.startswith(("reset ", "restore ")):
+        name = arg.split(maxsplit=1)[1].strip()
+        if restore_prompt(name):
+            print(dim(f"restored '{name}' to its default."))
+            _refresh_system_prompt(agent, name)
+        else:
+            print(dim(f"'{name}' has no override to restore (already default)."))
+        return
+    if arg.startswith("use "):
+        _use_prompt(agent, arg[4:].strip())
+        return
+    if arg.startswith("edit "):
+        arg = arg[5:].strip()
+    if arg:
+        _edit_prompt_file(agent, cfg, arg)
+        return
+    # no arg -> menu. Only the user's own prompts (+ any system prompt they've already
+    # overridden) are listed; the untouched internal system prompts stay hidden but
+    # remain editable by name (e.g. /prompt system) - hinted below.
+    builtins, custom = list_prompts()
+    names = builtins + custom
+    print(bold("prompts:"))
+    if not names:
+        print(dim("  (none yet - type a new name to create a custom prompt)"))
+    for i, n in enumerate(names, 1):
+        kind = "system" if n in BUILTIN_PROMPTS else "custom"
+        edited = ", edited" if prompt_file(n).is_file() else ""
+        print(f"  {i}) {n}" + dim(f"  ({kind}{edited})"))
+    print(dim("  number = edit  |  'u <n>' = use as a one-shot turn  |  "
+              "'r <n>' = restore a system default  |  a new name = create  |  blank = cancel"))
+    _sys_hidden = sorted(n for n in BUILTIN_PROMPTS if not prompt_file(n).is_file())
+    if _sys_hidden:
+        print(dim(f"  advanced: system prompts ({', '.join(_sys_hidden)}) - "
+                  f"edit by name, e.g. /prompt {_sys_hidden[0]}"))
+    try:
+        sel = input("prompt: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return
+    if not sel:
+        return
+    if sel.startswith("r ") and sel[2:].strip().isdigit():
+        i = int(sel[2:].strip())
+        if 1 <= i <= len(names):
+            nm = names[i - 1]
+            if restore_prompt(nm):
+                print(dim(f"restored '{nm}'."))
+                _refresh_system_prompt(agent, nm)
+            else:
+                print(dim(f"'{nm}' already default."))
+        return
+    if sel.startswith("u ") and sel[2:].strip().isdigit():
+        i = int(sel[2:].strip())
+        if 1 <= i <= len(names):
+            _use_prompt(agent, names[i - 1])
+        return
+    name = names[int(sel) - 1] if (sel.isdigit() and 1 <= int(sel) <= len(names)) else sel
+    _edit_prompt_file(agent, cfg, name)
+
+
+# Config fields /settings can edit directly. (model/host/num_ctx have dedicated
+# live commands - /model, /ollama host - that also re-init the client; /settings is the
+# granular editor for the rest of the persisted knobs.) kind: str|int|float|bool, or
+# a tuple of allowed values (picker).
+_SETTINGS_FIELDS = [
+    ("temperature", "temperature", "float"),
+    ("top_p", "top_p", "float"),
+    ("top_k", "top_k", "int"),
+    ("repeat_penalty", "repeat_penalty", "float"),
+    ("editor", "editor (for /prompt)", "str"),
+    ("approval", "approval mode", tuple(APPROVAL_MODES)),
+    ("composer", "composer (pinned input)", "bool"),
+    ("autosave", "autosave session (auto-load last on start)", "bool"),
+    ("auto_update", "on launch, self-update to the latest published build (needs the 'update' lean-tool)", "bool"),
+    ("update_track", "which /update track to follow", ("stable", "beta")),
+    ("command_timeout", "run_command timeout (s)", "int"),
+    ("max_iterations", "max tool-call rounds per turn (0 = unlimited)", "int"),
+    ("bg_max_concurrent", "max background tasks (0 = unlimited)", "int"),
+    ("worker_max_concurrent", "max worker agents at once (0 = unlimited)", "int"),
+    ("worker_idle_timeout", "worker lease timeout (s); unattended self-kill", "int"),
+    ("worker_max_iterations", "max tool-call rounds per worker", "int"),
+    ("ask_user_to_run", "ask_user_to_run tool", "bool"),
+    ("leash", "capability ceiling", tuple(LEASH_LEVELS)),
+    ("confirm_reads", "ask-on-read (confirm read tools too)", "bool"),
+    ("auto_reconnect", "reconnect to a session's remote on load (off = ask)", "bool"),
+    ("statusline", "status rows above the prompt", "bool"),
+    ("statusline_every", "reprint status every N prompts (1 = every turn, 0 = only on change)", "int"),
+    ("statusline_iter", "reprint status every N model iterations within a long turn (0 = off)", "int"),
+    # --- context management (send-window + auto-handover) ---
+    ("window_messages", "send-window size (0 = off, full history)", "int"),
+    ("auto_handover", "auto-handover (self-managing context)", "bool"),
+    ("handover_soft", "handover soft-zone start (fraction of ctx)", "float"),
+    ("handover_hard", "handover hard threshold (fraction of ctx)", "float"),
+    ("handover_emergency", "handover emergency threshold (fraction of ctx)", "float"),
+    ("handover_min_interval", "min seconds between handovers", "float"),
+    ("autostart_after_handover", "auto-continue the turn after a handover (on by default; 5s ^C to cancel)", "bool"),
+    ("auto_compact_interval", "auto-compact: strip old tool outputs every N tokens (0 = off)", "int"),
+    ("auto_compact_hysteresis", "auto-compact re-arm margin (fraction of interval)", "float"),
+    ("auto_compact_keep", "tool results kept in full by an auto-compact strip", "int"),
+    ("auto_evict", "continuous tool-output eviction", "bool"),
+    ("auto_evict_keep", "tool results kept verbatim by auto_evict", "int"),
+    ("keep_alive", "ollama: model keep-alive (e.g. 10m, -1, 0)", "str"),
+    ("auto_num_ctx", "ollama: detect num_ctx at startup", "bool"),
+]
+_SETTINGS_BY_KEY = {k: (label, kind) for k, label, kind in _SETTINGS_FIELDS}
+# Settings that change the LIVE agent (its tool surface / system prompt), not just a
+# cfg value read each turn - editing these via /settings must re-apply them, exactly
+# as the dedicated command does, or the change is cosmetic (e.g. /settings leash r
+# would show 'r' but leave the model holding the full tool surface). They announce
+# themselves on apply, so the generic "key -> value" echo is skipped for them.
+_LIVE_APPLY = {"leash"}
+
+
+def _coerce_setting(raw, kind):
+    """Parse a raw string to the field's type; raise ValueError on a bad value."""
+    if kind == "int":
+        return int(raw)
+    if kind == "float":
+        return float(raw)
+    if kind == "bool":
+        return raw.strip().lower() in ("1", "true", "yes", "on", "y")
+    return raw
+
+
+def _set_setting_field(agent, cfg, key, raw):
+    """Set one /settings field from a raw string, APPLYING it to the live agent when
+    the field affects its tool surface or system prompt (leash, ask_user_to_run) -
+    not just the cfg value. Returns True on success. `agent` may be None for headless
+    callers (then live-apply is skipped)."""
+    if key not in _SETTINGS_BY_KEY:
+        print(yellow(f"unknown setting '{key}' (try: {', '.join(_SETTINGS_BY_KEY)})"))
+        return False
+    _, kind = _SETTINGS_BY_KEY[key]
+    if isinstance(kind, tuple) and raw not in kind:
+        print(yellow(f"{key} must be one of: {', '.join(kind)}"))
+        return False
+    try:
+        val = raw if isinstance(kind, tuple) else _coerce_setting(raw, kind)
+    except ValueError:
+        print(yellow(f"invalid value for {key}: {raw!r}"))
+        return False
+    if key == "approval":
+        set_approval(cfg, val)
+    elif key == "leash" and agent is not None:
+        _apply_leash(agent, cfg, val)        # live: rebuild tools + system prompt + AI note
+    else:
+        setattr(cfg, key, val)
+        # ask_user_to_run adds/removes a tool, so the live surface must rebuild too.
+        if key == "ask_user_to_run" and agent is not None:
+            agent.refresh_tools()
+    return True
+
+
+def _edit_one_setting(agent, cfg, k, label, kind):
+    """Interactively edit a single /settings field: flip a bool, pick a tuple value,
+    prompt a scalar. Routes through _set_setting_field (so live-apply settings take
+    effect), then persists + echoes. Shared by the /settings menu and `/settings <key>`
+    with no value (so a bare key edits like picking it in the menu)."""
+    cur = getattr(cfg, k)
+    if kind == "bool":
+        ok = _set_setting_field(agent, cfg, k, "off" if cur else "on")
+    elif isinstance(kind, tuple):
+        choice = _pick_value(label + ":", list(kind), cur)
+        if not choice:
+            return
+        ok = _set_setting_field(agent, cfg, k, choice)
+    else:
+        try:
+            raw = input(f"{label} [{cur}]: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+        if not raw:
+            return
+        ok = _set_setting_field(agent, cfg, k, raw)
+    if ok:
+        save_config(cfg, quiet=True)
+        if k not in _LIVE_APPLY:             # live-apply keys announce themselves
+            print(dim(f"{k} -> {getattr(cfg, k)}"))
+
+
+def _settings_sessions_view(agent, cfg):
+    """The settings 'sessions' item: list saved sessions most-recently-used first
+    with timestamps + relative age, then offer the load picker."""
+    rows = _session_rows()
+    if not rows:
+        print(dim(f"  no saved sessions yet.  dir: {SESSIONS_DIR}"))
+        return
+    now = time.time()
+    d = GLYPH["dot"]
+    state = "on" if cfg.autosave else "off (amnesic)"
+    print(bold("sessions") + dim(f"  (most-recently-used first; autosave {state})"))
+    for name, meta, mtime in rows:
+        when = meta.get("saved_at", "?")
+        turns = meta.get("turns", "?")
+        age = f"{_fmt_age(now - mtime)} ago" if mtime else "?"
+        print(f"  {bold(cyan(name))}  {dim(f'{when} {d} {age} {d} {turns} turns')}")
+    name = _session_picker("load session (enter to skip):")
+    if name:
+        _load_session_into(agent, cfg, name)
+
+
+def handle_settings_command(agent, cfg, arg):
+    """/settings - granular editor over config.toml. No arg: interactive menu.
+    `key value`: set one field directly. Persists with save_config()."""
+    if arg:
+        parts = arg.split(maxsplit=1)
+        if len(parts) == 2 and _set_setting_field(agent, cfg, parts[0], parts[1]):
+            save_config(cfg, quiet=True)
+            if parts[0] not in _LIVE_APPLY:       # live-apply keys announce themselves
+                print(dim(f"{parts[0]} -> {getattr(cfg, parts[0])}"))
+        elif len(parts) == 1:                     # bare key -> edit that one field
+            if parts[0] in _SETTINGS_BY_KEY:
+                label, kind = _SETTINGS_BY_KEY[parts[0]]
+                _edit_one_setting(agent, cfg, parts[0], label, kind)
+            else:
+                print(yellow(f"unknown setting '{parts[0]}' "
+                             f"(try: {', '.join(_SETTINGS_BY_KEY)})"))
+        return
+    sessions_item = len(_SETTINGS_FIELDS) + 1
+    while True:
+        print(bold("settings") + dim("  (config.toml; model/host via /model, /ollama host)"))
+        for i, (k, label, kind) in enumerate(_SETTINGS_FIELDS, 1):
+            print(f"  {i}) {label}: " + cyan(str(getattr(cfg, k))))
+        print(f"  {sessions_item}) sessions" + dim("  (view recent / load)"))
+        print("  0) done")
+        try:
+            sel = input("edit #: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            break
+        if sel in ("", "0"):
+            break
+        if sel == str(sessions_item):
+            _settings_sessions_view(agent, cfg)
+            continue
+        if not (sel.isdigit() and 1 <= int(sel) <= len(_SETTINGS_FIELDS)):
+            continue
+        k, label, kind = _SETTINGS_FIELDS[int(sel) - 1]
+        _edit_one_setting(agent, cfg, k, label, kind)
+
+
+def _toggle_provider_plugin(agent, cfg, mgr, name):
+    """Enable/disable one provider plugin: enabling runs its helpers-only setup() +
+    register_provider now; disabling deactivates it (if active) and drops it from the
+    registry. Persists providers_enabled."""
+    if name in cfg.providers_enabled:                       # -> disable
+        cfg.providers_enabled = [n for n in cfg.providers_enabled if n != name]
+        if cfg.provider == name:
+            agent.deactivate_provider()
+        _providers.pop(name, None)
+        print(dim(f"{name}: off"))
+        if name == "ollama":                                # the bundled default floor
+            print(dim("  (ollama is the bundled default; it re-enables on next launch)"))
+    else:                                                   # -> enable
+        p = mgr.providers.get(name)
+        try:
+            if callable(p["setup"]):
+                p["setup"](globals(), cfg)
+            register_provider(p["spec"])
+        except Exception as e:
+            print(yellow(f"enable failed: {e}"))
+            return
+        cfg.providers_enabled = sorted(set(cfg.providers_enabled) | {name})
+        print(dim(f"{name}: on  (/model to use it)"))
+    autosave_config(cfg)
+
+
+def handle_providers_command(agent, cfg, arg):
+    """The providers/ catalog manager (reached via `/provider list` and, with a name,
+    `/provider enable|disable`). No arg: a toggle menu; `<name>` toggles one. Enabling
+    registers it now; disabling deactivates it (if active) and removes it."""
+    mgr = ProviderManager(_provider_dirs(cfg), enabled=cfg.providers_enabled)
+    if not mgr.names():
+        print(dim(f"no provider plugins in {_providers_dir(cfg)} "
+                  f"(drop a .py with a PROVIDER dict there)."))
+        return
+    if arg.strip():
+        name = arg.strip()
+        if name not in mgr.names():
+            print(dim(f"no such provider '{name}' (have: {', '.join(mgr.names())})"))
+            return
+        _toggle_provider_plugin(agent, cfg, mgr, name)
+        return
+    while True:
+        print(bold("provider plugins") + dim(f"  ({_providers_dir(cfg)})"))
+        names = mgr.names()
+        for i, n in enumerate(names, 1):
+            mark = green("on ") if n in cfg.providers_enabled else dim("off")
+            d = mgr.desc(n)
+            # mark the backend actually RUNNING now: [on]/[off] is the enabled set, which
+            # doesn't tell you which enabled provider is active (the /model choice does).
+            active = green("  (active)") if n == cfg.provider else ""
+            print(f"  {i}) [{mark}] {bold(cyan(n))}" + (dim(f"  {d}") if d else "") + active)
+        print("  0) done")
+        try:
+            sel = input("toggle #: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            break
+        if sel in ("", "0"):
+            break
+        if sel.isdigit() and 1 <= int(sel) <= len(names):
+            _toggle_provider_plugin(agent, cfg, mgr, names[int(sel) - 1])
+
+
+def handle_bg_command(agent, cfg, arg):
+    """/bg - list running background tasks; /bg kill <pid|all> - stop them."""
+    parts = arg.split()
+    if parts and parts[0].lower() == "kill":
+        tgt = parts[1] if len(parts) > 1 else ""
+        running = _bg_running()
+        if tgt == "all":
+            killed = [r.get("pid") for r in running]
+        elif tgt.isdigit() and any(r.get("pid") == int(tgt) for r in running):
+            killed = [int(tgt)]
+        else:
+            print(dim("usage: /bg kill <pid|all>"
+                      + ("" if running else "  (no background tasks running)")))
+            return
+        for pid in killed:
+            _bg_kill(pid)
+        _bg_save([r for r in _bg_load() if r.get("pid") not in set(killed)])
+        print(dim(f"killed {len(killed)} background task(s)."))
+        return
+    me = os.getpid()
+    recs = _bg_load()
+    running = [r for r in recs if _proc_alive(r.get("pid"))]
+    # finished = registered, not alive, but wrote an exit sidecar (so we can report
+    # pass/fail). Entries with no sidecar have simply gone and aren't worth listing.
+    finished = [r for r in recs if not _proc_alive(r.get("pid"))
+                and _bg_exit_code(r) is not None]
+    if not running and not finished:
+        print(dim("no background tasks running.  (end a command with ' &' to start one)"))
+        return
+    print(bold("background tasks:"))
+    for r in running:
+        tag = "" if r.get("owner") == me else dim("  (other session)")
+        print(f"  {bold(cyan(str(r.get('pid'))))}  {green('running')}  "
+              f"{dim(r.get('started', '?'))}  {r.get('cmd', '?')}{tag}")
+        print(dim(f"      log: {r.get('log', '?')}   ·   /bg kill {r.get('pid')}"))
+    for r in finished:
+        code = _bg_exit_code(r)
+        stat = green("exit 0") if code == "0" else red(f"exit {code}")
+        print(f"  {dim(str(r.get('pid')))}  {stat}  "
+              f"{dim(r.get('started', '?'))}  {r.get('cmd', '?')}")
+        print(dim(f"      log: {r.get('log', '?')}"))
+
+
+def _provider_usage_str(agent, cfg) -> str:
+    """The active backend's usage/quota tail (e.g. the '5h .. wk ..' meters), already
+    styled, or '' if the backend reports none. Core does the rendering so every
+    backend reads the same. Shared by the ctx meter and the status rows."""
+    spec = agent.active_provider()
+    if spec is None:
+        return ""
+    try:
+        if spec["usage"]:
+            return render_usage_meters(spec["usage"](agent, cfg))
+        if spec["status_line"]:
+            s = (spec["status_line"](agent, cfg) or "").strip()
+            return dim("  " + GLYPH["dot"] + "  ") + s if s else ""
+    except Exception:
+        return ""
+    return ""
+
+
+def _short_model(name, n=20):
+    """Truncate a long model name for the status row (full name stays in /info)."""
+    name = name or "?"
+    return name if len(name) <= n else name[:n - 1] + GLYPH["ellipsis"]
+
+
+def _status_rows(agent, cfg):
+    """The status rows printed above each prompt so the live state is never invisible:
+      1. session (name + autosave / incognito / amnesic) + condensed model @ provider, + pinned plan
+      2. perms + context management (leash, approve, round-cap in auto, window, compact, tools)
+      3. ctx + the backend quota meters (5h / wk) + think/effort
+    Toggles render only when active so the rows stay short. Returns [] when disabled
+    (cfg.statusline off) or off a TTY. Just strings - colour helpers no-op off a TTY."""
+    if not getattr(cfg, "statusline", True) or not _TTY:
+        return []
+    d = dim(f" {GLYPH['dot']} ")
+    rows = []
+    model_at = f"{_short_model(cfg.active_model())} @ {_provider_label(cfg)}"
+
+    # 1) session + model (at the top - what/where you're running)
+    if cfg.incognito:
+        s = [magenta(f"{GLYPH['ghost']} incognito")]
+    elif cfg.autosave:
+        s = [f"session {agent.autosave_name}", "autosaving"]
+    else:
+        s = ["amnesic"]
+    s.append(model_at)
+    if getattr(agent, "pinned_plan", ""):
+        s.append("plan pinned")
+    rows.append("  " + d.join(s))
+
+    # 2) perms + context management
+    if not agent._model_tool_support():       # model can't tool-call -> chat-only, leash moot
+        # yellow so the USER notices it's the model (not a setting) and stops pushing it to tool
+        p = [yellow("chat-only (model)")]
+        if cfg.leash != "chat":
+            p.append(dim(f"leash {cfg.leash} n/a"))   # the ceiling can't grant tools the model lacks
+        p.append(f"approve {cfg.approval}")
+    else:
+        p = [bold(cfg.leash), f"approve {cfg.approval}"]
+    if cfg.approval == "auto":                # the round-cap only bites when unattended
+        mi = cfg.max_iterations
+        p.append(f"max {mi} rounds" if mi else "no round cap")
+    if cfg.confirm_reads:
+        p.append("ask-read")
+    p.append("window off" if cfg.window_messages <= 0 else f"window {cfg.window_messages}")
+    c = cfg.handover_for()
+    p.append(f"handover {c['soft'] * 100:.0f}/{c['hard'] * 100:.0f}" if c.get("auto") else "handover off")
+    p.append(f"{len(agent.tool_defs)} tools")
+    rows.append("  " + d.join(p))
+
+    # 3) context (+ think/effort + backend quota tail)
+    if _provider_uses_settings(cfg):
+        think, effort = cfg.setting("thinking") or "na", cfg.setting("effort") or "na"
+    else:
+        think, effort = {True: "on", False: "off"}.get(cfg.think, "na"), "na"
+    used, window = agent._ctx_used(), cfg.ctx_window() or 1
+    try:
+        zone = agent._ctx_zone()[0]
+    except Exception:
+        zone = "ok"
+    pct = used / window * 100
+    # '~' marks a pre-call ESTIMATE (no live API measurement yet, e.g. right after a
+    # load): _ctx_used falls back to a transcript estimate that reads lower than the
+    # cache-inclusive measured size. Without the marker a fresh load looks like ctx
+    # dropped/was lost. It firms up to the measured value on the next turn.
+    est = "~" if not getattr(agent, "last_prompt_tokens", 0) else ""
+    ctx = _pct_color(pct)(f"ctx {est}{_fmt_tokens(used)}/{_fmt_tokens(window)} ({pct:.0f}% {zone})")
+    quota = _provider_usage_str(agent, cfg)     # leading separator already, or "" if none
+    # ctx -> the backend quota meters (5h / wk) -> think / effort
+    rows.append("  " + ctx + quota + d + d.join([f"think {think}", f"effort {effort}"]))
+    return rows
+
+
+def _status_key(rows):
+    """Signature the repl uses to decide when to REPRINT the stable status rows
+    (session/model + perms/tools). The LAST row - the live context meter - is excluded
+    because it prints every turn anyway; so per-turn ctx/token/zone drift never triggers
+    a reprint, only a real settings/model/tools/plan change (in rows 1-2) does. Pure."""
+    return tuple(rows[:-1]) if rows else ()
+
+
+def handle_info_command(agent, cfg, arg=""):
+    """/info - full live read-out: model, backend, context + how it's managed
+    (send-window / auto-compaction), session + which instance holds the write-lock,
+    pinned plan, perms (leash/approval), thinking/effort, and the enabled modes. The
+    point is that nothing about the session's behaviour is invisible."""
+    where = f"remote {agent.remote.host}" if agent.remote else "local"
+    backend = _provider_label(cfg)
+    used, window = agent._ctx_used(), cfg.ctx_window() or 1
+    turns = sum(1 for m in agent.messages if m.get("role") == "user")
+    if _provider_uses_settings(cfg):
+        think, effort = cfg.setting("thinking") or "off", cfg.setting("effort") or "-"
+    else:
+        think, effort = {True: "on", False: "off"}.get(cfg.think, "unset"), "-"
+    dot = f"  {GLYPH['dot']}  "
+    badge = approval_badge(cfg)
+    try:
+        zone = agent._ctx_zone()[0]
+    except Exception:
+        zone = "ok"
+    print(f"  model:    {cfg.active_model()}")
+    print(f"  provider: {backend}  ({where})")
+    print(f"  context:  ~{_fmt_tokens(used)}/{_fmt_tokens(window)} "
+          f"({used / window * 100:.0f}%, {zone}){dot}{len(agent.messages)} msgs, {turns} turns")
+    # how context is managed - the two things that surprised people
+    wm = cfg.window_messages
+    print(f"  window:   {'off (full history sent)' if wm <= 0 else f'last {wm} messages sent'}")
+    c = cfg.handover_for()
+    if c.get("auto"):
+        comp = (f"auto on{dot}soft {c['soft']:.0%}  hard {c['hard']:.0%}"
+                + (f"{dot}autostart" if c.get("autostart") else ""))
+    else:
+        comp = "off"
+    print(f"  handover: {comp}")
+    # session + which instance owns the write-lock (so a fork is never a surprise)
+    if cfg.incognito:
+        sess = magenta(f"{GLYPH['ghost']} incognito") + dim(" (not saved locally; provider may still log)")
+    elif cfg.autosave:
+        if _own_lock(agent.autosave_name):
+            lock = "you hold the lock"
+        elif _lock_is_live(agent.autosave_name):
+            lock = yellow("held by another instance")
+        else:
+            lock = "unlocked"
+        sess = f"autosaving -> {agent.autosave_name}{dot}{lock}"
+    else:
+        sess = "amnesic (autosave off)"
+    print(f"  session:  {sess}")
+    if getattr(agent, "pinned_plan", ""):
+        print(f"  plan:     pinned (GOAL+TODO, carried across compaction + load)")
+    print(f"  usage:    in {agent.session_in:,}  out {agent.session_out:,}")
+    print(f"  thinking: {think}{dot}effort: {effort}")
+    print(f"  approval: {cfg.approval}" + (f"  {badge}" if badge else ""))
+    print(f"  leash:    {cfg.leash}  ({_LEASH_GRANTS[cfg.leash]})")
+    modes = []
+    if cfg.confirm_reads:
+        modes.append("ask-on-read")
+    if cfg.auto_reconnect:
+        modes.append("auto-reconnect")
+    if cfg.incognito:
+        modes.append("incognito")
+    if modes:
+        print(f"  modes:    {', '.join(modes)}")
+
+
+def _arg_completions(agent, cfg, cmd):
+    """Inline first-arg Tab completions for a slash command. Reads live state
+    (active backend's models, registered providers, hosts, open remotes). Returns
+    [] for commands that take no completable arg (the no-arg picker still works).
+    Pure w.r.t. the terminal, so it is unit-tested headless."""
+    if cmd in ("/model", "/models"):
+        try:
+            return list(agent.client.list_models())
+        except Exception:
+            return []
+    if cmd in ("/provider", "/providers"):
+        return (["off", "on", "login", "clear", "list", "enable", "disable"]
+                + provider_names())
+    if cmd in ("/think", "/effort"):
+        key = "thinking" if cmd == "/think" else "effort"
+        default = ["off", "adaptive", "max"] if key == "thinking" else ["low", "med", "high"]
+        spec = agent.active_provider()
+        return list(_safe_caps(spec, cfg).get(key, default)) if spec else default
+    if cmd == "/session":
+        return ["list", "delete", "save", "load"]
+    if cmd in ("/load", "/delete", "/session delete", "/session load", "/session save"):
+        return [n for n, _, _ in _session_rows()]      # saved session names
+    if cmd in ("/save", "/new"):
+        return [n for n, _, _ in _session_rows()]      # offer existing names (overwrite / reuse)
+    if cmd in ("/autosave", "/incognito", "/askread"):
+        return ["on", "off"]
+    if cmd == "/leash":
+        return list(LEASH_LEVELS)
+    if cmd == "/bg":
+        return ["kill"]
+    if cmd == "/connect":
+        return sorted(set(list(cfg.connect_hosts) + list(getattr(agent, "remotes", {}))))
+    if cmd in ("/local", "/disconnect"):
+        return list(getattr(agent, "remotes", {}))
+    if cmd == "/set":
+        spec = agent.active_provider()
+        return list(_safe_caps(spec, cfg)) if spec is not None else []
+    if cmd == "/prompt":
+        b, c = list_prompts(all_builtins=True)   # completion offers every system prompt by name
+        return ["edit", "use", "reset"] + b + c
+    if cmd == "/approve":
+        return list(APPROVAL_MODES)
+    if cmd == "/settings":
+        return [k for k, _, _ in _SETTINGS_FIELDS]
+    if cmd.startswith("/settings "):              # value completion for a chosen key
+        toks = cmd.split()
+        _, kind = _SETTINGS_BY_KEY.get(toks[1], (None, None)) if len(toks) > 1 else (None, None)
+        if isinstance(kind, tuple):
+            return list(kind)
+        return ["on", "off"] if kind == "bool" else []
+    if cmd in _lean_tool_completers:          # lean-tool-contributed completion
+        try:
+            return list(_lean_tool_completers[cmd](agent, cfg))
+        except Exception:
+            return []
+    return []
+
+
+def _completion_options(agent, cfg, left):
+    """Shared Tab-completion: given the text LEFT of the cursor, return the full
+    candidate completions for the final token (each a whole token, e.g. '/model').
+    Backs both readline's completer and the Composer's. Pure w.r.t. the terminal."""
+    buf = left.lstrip()
+    tokens = buf.split()
+    # the token being completed = "" if the line ends in whitespace, else last token
+    text = "" if (buf and buf[-1].isspace()) else (tokens[-1] if tokens else "")
+    # the "path" is every token already entered before the one being typed
+    path = tokens if (buf and buf[-1].isspace()) else tokens[:-1]
+    if path:                                 # past the command -> complete this arg,
+        key = " ".join(path)                 # keyed on the full command path
+        opts = _arg_completions(agent, cfg, key)
+        if not opts and len(path) > 1:       # fall back to the bare command
+            opts = _arg_completions(agent, cfg, path[0])
+        return [o for o in opts if o.startswith(text)]
+    if buf.startswith("/"):                  # still on the command itself
+        return [c for c in SLASH_COMMANDS if c.startswith(text)]
+    return []
+
+
+def _make_composer_completer(agent, cfg):
+    """A completer(left_text)->[options] bound to this agent/cfg, for the Composer."""
+    return lambda left: _completion_options(agent, cfg, left)
+
+
+def _setup_readline(agent, cfg):
+    """stdlib readline Tab-completion: slash commands, and each command's inline
+    first argument (model/provider/effort/session/host/connect names, etc.)."""
+    if readline is None:
+        return
+    readline.set_completer_delims(" \t\n")  # keep "/" and ":" inside one token
+
+    def complete(text, state):
+        opts = _completion_options(agent, cfg, readline.get_line_buffer())
+        # readline shows the command itself with a trailing space to advance to args
+        if opts and opts[0].startswith("/") and " " not in readline.get_line_buffer().strip():
+            opts = [o + " " for o in opts]
+        return opts[state] if state < len(opts) else None
+
+    readline.set_completer(complete)
+    readline.parse_and_bind("tab: complete")
+    # Bracketed paste: make readline treat a pasted block as one literal insert
+    # (newlines kept in the line buffer, submitted only on a real Enter) instead
+    # of executing it line-by-line - which truncates a multi-line paste to its
+    # first line. Only helps if the terminal/multiplexer actually emits the
+    # ESC[200~ / ESC[201~ markers; harmless no-op if not. parse_and_bind is
+    # wrapped because some libedit builds reject the directive.
+    try:
+        readline.parse_and_bind("set enable-bracketed-paste on")
+    except Exception:
+        pass
+
+
+def handle_save_command(agent, cfg, arg):
+    """/save [name] - snapshot the current conversation under a name. No arg
+    prompts for one. Config persists automatically and is NOT what /save means
+    any more (autosave handles it)."""
+    if not any(m.get("role") != "system" for m in agent.messages):
+        print(yellow("nothing to save (conversation is empty)."))
+        return
+    name = arg.strip()
+    if not name:
+        default = time.strftime("%Y-%m-%d-%H%M")
+        try:
+            name = input(f"save session as [{default}]: ").strip() or default
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+    try:
+        rhost = agent.remote.host if getattr(agent, "remote", None) else None
+        path, meta = save_session(agent.messages, cfg, name, remote=rhost,
+                                  pinned_plan=getattr(agent, "pinned_plan", ""))
+    except ValueError:
+        print(red(f"invalid session name: {name!r}"))
+        return
+    agent.dirty = False              # this conversation is now snapshotted
+    # Continue autosaving INTO this name, so further work + the on-exit autosave land
+    # here too - loading it later resumes where you left off, not the save-time snapshot.
+    # (To branch off an immutable checkpoint, /save under a new name.)
+    if not cfg.incognito:
+        agent.autosave_name = path.stem
+    print(green(f"saved session '{path.stem}' ({meta['turns']} turns) -> {path}"))
+    if cfg.autosave and not cfg.incognito:
+        print(dim(f"  now autosaving into '{path.stem}'"))
+
+
+def _restore_backend_for(agent, cfg, meta):
+    """Switch the live backend to match a loaded session's saved provider + model,
+    so a chat loads back onto the backend it ran on. Returns a short human note, or
+    "" if nothing changed. Never raises - a provider that won't activate
+    (unregistered, logged out, down) degrades to a note telling the user to /model.
+    Legacy sessions saved provider="" (the old native Ollama); that maps to the
+    bundled "ollama" provider now."""
+    want = (meta.get("provider") or "").strip() or "ollama"
+    model = (meta.get("model") or "").strip()
+    cur = cfg.provider or ""
+    if want != cur:                                # session ran on a different backend
+        spec = get_provider(want)
+        if spec is None:
+            return f"note: saved on provider '{want}' (not registered now) - /model to pick."
+        try:
+            if not spec["available"]():
+                return f"note: saved on provider '{want}' (not available) - login or /model."
+            if model:
+                cfg.provider_settings.setdefault(want, {})["model"] = model
+                if want == "ollama":
+                    cfg.model = model
+            m = agent.activate_provider(want)
+            autosave_config(cfg)
+            label = "ollama" if want == "ollama" else f"provider '{want}'"
+            return f"backend -> {label} (model {m})."
+        except Exception as e:
+            return f"note: couldn't restore backend '{want}' ({e}) - /model to pick."
+    if model and model != cfg.active_model():       # same backend, model drifted -> sync it
+        # Soft preference: adopt the session's model, but if it's gone from the live
+        # backend fall back to what's actually available rather than pinning a dead
+        # name. Keep it silent-graceful; sends + failover recover the rest.
+        try:
+            avail = list(get_provider(want)["list_models"]() or [])
+        except Exception:
+            avail = []
+        if avail and not model_available(model, avail):
+            alt = avail[0]
+            cfg.set_active_model(alt)
+            autosave_config(cfg)
+            return f"note: saved model '{model}' not available now - using '{alt}' (/model to pick)."
+        cfg.set_active_model(model)
+        autosave_config(cfg)
+        return f"model -> {model}."
+    return ""
+
+
+def _print_session_tail(messages, n: int = 4, width: int = 100):
+    """Echo the last few non-system messages so a resumed session shows what you were
+    doing, not just a one-line banner. Roles are labelled + coloured (you / lc /
+    tool); tool results and long lines collapse so it stays scannable. No-op for an
+    empty conversation."""
+    body = [m for m in messages if m.get("role") != "system"]
+    if not body:
+        return
+    tail = body[-n:]
+    print(dim(f"  recent context ({len(tail)} of {len(body)} messages):"))
+    for m in tail:
+        role = m.get("role", "?")
+        if role == "user":
+            label = cyan("you")
+        elif role == "assistant":
+            label = blue("llm")
+        else:
+            label = dim("tool")  # tool / other output
+        content = m.get("content")
+        if not isinstance(content, str):
+            content = "" if content is None else str(content)
+        text = " ".join(content.split())              # collapse whitespace/newlines
+        if not text and m.get("tool_calls"):
+            text = "(tool call)"
+        if len(text) > width:
+            text = text[:width] + GLYPH["ellipsis"]
+        print(f"    {label} {dim(GLYPH['dot'])} {dim(text) if role != 'user' else text}")
+    print()
+
+
+def _restore_session_state(agent, cfg, meta):
+    """Restore a loaded session's full working state onto the live config: backend +
+    model (via _restore_backend_for), then the per-session perms/settings - leash,
+    approval, thinking, effort. A field MISSING from meta (older or brand-new session)
+    falls back to the current config value, which save_session then re-captures, so
+    the session adopts it from here on. leash/approval are applied at RUNTIME only
+    (not persisted to config.toml) so two windows on one box can hold different
+    ceilings. Returns a summary dict for the load read-out, flagging any leash
+    escalation (design: apply + loud notice, never a silent raise)."""
+    note = _restore_backend_for(agent, cfg, meta)          # backend + model
+
+    # Restore the pinned plan (GOAL + TODO) BEFORE agent.restore() rebuilds the
+    # system prompt, so the plan rides the rebuilt prompt. Absent in older sessions
+    # -> keep whatever's live (don't clobber a plan with nothing).
+    plan = meta.get("pinned_plan")
+    if plan is not None:
+        agent.pinned_plan = plan
+
+    for key in ("thinking", "effort"):                     # provider-scoped settings
+        val = meta.get(key)
+        if val is not None and val != cfg.setting(key):
+            cfg.set_setting(key, val)
+
+    approval = meta.get("approval")
+    if approval in APPROVAL_MODES and approval != cfg.approval:
+        set_approval(cfg, approval)
+
+    escalated_from = None
+    want = meta.get("leash")
+    if want in LEASH_LEVELS and want != cfg.leash:
+        if LEASH_LEVELS.index(want) > LEASH_LEVELS.index(cfg.leash):
+            escalated_from = cfg.leash                     # this load RAISES the ceiling
+        cfg.leash = want                                   # runtime only (not autosaved)
+        agent.messages[0] = {"role": "system", "content": agent._system()}
+        agent.refresh_tools()
+        agent._pending_ai_note = _leash_note(want)         # tell the model next turn
+    return {
+        "backend_note": note,
+        "leash": cfg.leash,
+        "leash_escalated_from": escalated_from,
+        "approval": cfg.approval,
+        "thinking": cfg.setting("thinking"),
+        "effort": cfg.setting("effort"),
+        "remote": meta.get("remote"),
+    }
+
+
+def _print_session_state(state):
+    """Render the restored working state on load (perms always visible, per the
+    'show them on load' rule). A leash that this load RAISED is shouted in yellow."""
+    grant = _LEASH_GRANTS.get(state["leash"], "")
+    leash_line = (f"  leash    {state['leash']} ({grant})"
+                  f"   approve  {state['approval']}")
+    if state["leash_escalated_from"]:
+        print(yellow(leash_line))
+        print(yellow(f"  {GLYPH['warn']} leash raised from "
+                     f"'{state['leash_escalated_from']}' - this session grants more"))
+    else:
+        print(dim(leash_line))
+    print(dim(f"  thinking {state['thinking'] or 'off'}   effort   {state['effort'] or '-'}"))
+    if state["backend_note"]:
+        print(dim(f"  {state['backend_note']}"))
+
+
+def _maybe_reconnect(agent, cfg, meta):
+    """If the loaded session ran on a remote host, restore that connection -
+    automatically when cfg.auto_reconnect is on, otherwise after a y/N prompt
+    (default off). No-op when the session was local or we're already on that host."""
+    host = meta.get("remote")
+    if not host or (agent.remote and agent.remote.host == host):
+        return
+    if cfg.auto_reconnect:
+        print(dim(f"  reconnecting to remote {host} (auto_reconnect on)…"))
+        try:
+            _do_connect(agent, cfg, host)
+        except Exception as e:
+            print(red(f"  reconnect failed: {e} - /connect {host} to retry."))
+    elif _ask(f"this session ran on remote {host} - reconnect?"):
+        _do_connect(agent, cfg, host)
+    else:
+        print(dim(f"  staying local - /connect {host} to reconnect."))
+
+
+def _load_session_into(agent, cfg, name):
+    """Restore a named session into the live conversation (with an unsaved-work
+    guard). Shared by /load, the picker, and /session load."""
+    try:
+        data = load_session(name)
+    except FileNotFoundError:
+        print(red(f"no such session: {name}  (/load to list)"))
+        return
+    if agent.dirty and any(m.get("role") != "system" for m in agent.messages):
+        if not _ask("current session has unsaved changes - discard them and load anyway?"):
+            print(dim("load cancelled - '/save [name]' to keep them first."))
+            return
+    # If the session is live in another instance, confirm the take-over (the lock
+    # gets claimed by the first autosave into it here).
+    if not cfg.incognito and _lock_is_live(name):
+        if not _ask(f"session '{_session_name_ok(name)}' is live in another instance - "
+                    f"take it over?"):
+            print(dim("load cancelled - leaving the other instance alone."))
+            return
+    meta = data.get("meta", {})
+    state = _restore_session_state(agent, cfg, meta)   # backend, model, leash, approve, think/effort
+    msgs = data.get("messages", [])
+    n = agent.restore(msgs)
+    # Continue working IN the loaded session - further turns autosave back into it,
+    # so it stays current (no silent fork into a new auto- name). Claim its lock NOW
+    # (and drop the one we're leaving) so the first autosave owns it - this is what a
+    # take-over actually does, and what stops the loader being forked straight off it.
+    if not cfg.incognito:
+        _release_lock(agent.autosave_name)
+        agent.autosave_name = _session_name_ok(name)
+        _write_lock(agent.autosave_name)
+    print(green(f"resumed '{_session_name_ok(name)}'  {GLYPH['dot']}  {n} turns  "
+                f"{GLYPH['dot']}  saved {meta.get('saved_at', '?')}"))
+    _print_session_tail(msgs)
+    _print_session_state(state)
+    _maybe_reconnect(agent, cfg, meta)
+    # The status rows (printed before the next prompt) already carry ctx + quota,
+    # so only print the standalone meter here when the status line is off (fallback).
+    if not (getattr(cfg, "statusline", True) and _TTY):
+        agent._print_ctx()
+
+
+def _session_picker(prompt="load session:"):
+    """Recent-first session picker (most-recently-used first, with a relative-age
+    column). Returns the chosen session name, or None if cancelled/empty."""
+    rows = _session_rows()
+    if not rows:
+        print(dim(f"no saved sessions (/save [name]).  dir: {SESSIONS_DIR}"))
+        return None
+    now = time.time()
+    d = GLYPH["dot"]
+    labels = []
+    for nm, meta, mtime in rows:
+        age = f"{_fmt_age(now - mtime)} ago" if mtime else "?"
+        labels.append(f"{nm}  ({meta.get('saved_at', '?')} {d} "
+                      f"{meta.get('turns', '?')} turns {d} {age})")
+    choice = _pick_value(prompt, labels)
+    return rows[labels.index(choice)][0] if choice else None
+
+
+def handle_load_command(agent, cfg, arg):
+    """/load [name] - resume a session. No arg opens the recent-first picker;
+    a name (Tab-completes) loads directly."""
+    name = arg.strip() or _session_picker()
+    if name:
+        _load_session_into(agent, cfg, name)
+
+
+def start_new_session(agent, cfg, name=""):
+    """Finalize the current session (kept on disk under its own name) and switch to
+    a fresh, empty one. name='' -> a rolling auto- target; a non-empty name -> that
+    named session. Returns the new autosave_name. The caller handles any confirm
+    prompts (overwriting an existing name, discarding un-autosaved work)."""
+    autosave_session(agent, cfg)          # keep the session we're leaving on disk
+    agent.reset()
+    agent.autosave_name = (_session_name_ok(name) if name.strip()
+                           else _new_autosave_name())
+    return agent.autosave_name
+
+
+def handle_session_command(agent, cfg, arg):
+    """/session list | delete <name>. save -> /save, load -> /load (no arg here
+    opens the same load picker)."""
+    parts = arg.split(maxsplit=1)
+    if not parts:
+        sub = _pick_value("/session:", ["list", "load", "save", "delete"])
+        if not sub:
+            return
+        rest = ""
+    else:
+        sub = parts[0].lower()
+        rest = parts[1].strip() if len(parts) > 1 else ""
+
+    if sub == "save":
+        handle_save_command(agent, cfg, rest)
+        return
+    if sub == "load":
+        handle_load_command(agent, cfg, rest)
+        return
+
+    if sub == "list":
+        rows = _session_rows()
+        if not rows:
+            print(dim(f"no saved sessions (/save [name]).  dir: {SESSIONS_DIR}"))
+            return
+        now = time.time()
+        d = GLYPH["dot"]
+        print(bold("sessions") + dim("  (most-recently-used first)"))
+        for name, meta, mtime in rows:
+            when = meta.get("saved_at", "?")
+            turns = meta.get("turns", "?")
+            title = meta.get("title", "")
+            age = f"{_fmt_age(now - mtime)} ago" if mtime else "?"
+            print(f"  {bold(cyan(name))}  {dim(f'{when} {d} {age} {d} {turns} turns {d} {title}')}")
+        return
+
+    if sub == "delete":
+        if not rest:
+            rest = _session_picker("delete session:")
+            if not rest:
+                return
+        print(green(f"deleted session '{rest}'.") if delete_session(rest)
+              else red(f"no such session: {rest}"))
+        return
+
+    print(dim("usage: /session list | delete <name>   (save -> /save, load -> /load)"))
+
+
+def _remote_alive(ws) -> bool:
+    """Best-effort: is this pooled connection still usable? A rebooted/dropped box
+    makes the executor process exit or its pipe error, which we detect here so a
+    switch can transparently reconnect instead of failing on the next tool call."""
+    c = getattr(ws, "client", None)
+    if c is None or c.proc.poll() is not None:
+        return False
+    try:
+        c.request(RAW_READ, {"path": ".__lc_alive__"})   # any response = alive
+        return True
+    except (ConnectionError, OSError, ValueError):
+        return False
+
+
+def _do_connect(agent, cfg, rhost, rpath=".", offer_save=False):
+    """Connect to / switch to `rhost`, routing tools there. Switching to an
+    already-open box is instant (no re-push); a pooled box that died (reboot) is
+    transparently reconnected. Push is implicit (no prompt); any failure leaves
+    the session where it was. `offer_save` remembers an ad-hoc host."""
+    if agent.remote and agent.remote.host == rhost:
+        print(dim(f"already active on {rhost}."))
+        return
+    pooled = agent.remotes.get(rhost)
+    if pooled is not None:
+        if _remote_alive(pooled):
+            agent.set_remote(pooled)              # instant switch
+            print(green(f"switched to {rhost} (tools run there)."))
+            return
+        print(yellow(f"{rhost} had dropped (rebooted?) - reconnecting ..."))
+        agent.drop_remote(rhost)                  # clear the dead one, then reopen
+    where = f"on {agent.remote.host}" if agent.remote else "local"
+    try:
+        ws = RemoteWorkspace(
+            rhost, rpath, lean_tool_paths=agent.lean_tools.enabled_paths()).connect()
+    except (ConnectionError, OSError) as e:
+        print(red(f"connect failed (staying {where}): {e}"))
+        return
+    agent.set_remote(ws)
+    print(green(f"connected: tools now run on {rhost} (agent at {ws.remote_dir})"))
+    print(dim("  /local detaches (keeps it open to switch back); /connect <host> switches."))
+    if (offer_save and rhost not in cfg.connect_hosts
+            and rhost not in cfg.connect_hosts.values()):
+        if _ask(f"save '{rhost}' to your connect list?"):
+            cfg.connect_hosts[rhost] = rhost
+            save_config(cfg)
+
+
+def _pick_value(header, choices, current=None, prompt=input):
+    """Generic numbered picker for a small set of values. Returns the chosen
+    value or None (cancel). Sibling of pick_model_menu for settings/providers."""
+    print(bold(header))
+    for i, c in enumerate(choices, 1):
+        mark = dim("  (current)") if current is not None and str(c) == str(current) else ""
+        print(f"  {i}) {c}{mark}")
+    print("  0) cancel")
+    try:
+        sel = prompt("choice: ")
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return None
+    idx = _menu_index(sel, len(choices))
+    return choices[idx] if idx is not None else None
+
+
+def _safe_caps(spec, cfg) -> dict:
+    try:
+        return spec["capabilities"](cfg.active_model()) or {}
+    except Exception:
+        return {}
+
+
+def _warm_models(spec) -> list:
+    """A provider's loaded/instant models (its opt-in warm_models() hook), absent-
+    safe. [] when the provider doesn't implement it (e.g. a hosted API) or it
+    errors. Used for the green 'loaded' dots in /model and /usage."""
+    hook = spec and spec.get("warm_models")
+    if not hook:
+        return []
+    try:
+        return list(hook() or [])
+    except Exception:
+        return []
+
+
+def _apply_setting(cfg, key, val, choices):
+    """Set (or menu-pick) a per-provider setting. `choices` None = free-form."""
+    val = (val or "").strip()
+    if val:
+        if choices and val.lower() not in [str(c).lower() for c in choices]:
+            print(yellow(f"{key}: '{val}' invalid - choose from "
+                         f"{', '.join(map(str, choices))}"))
+            return
+        cfg.set_setting(key, val)
+        print(dim(f"{key}: {val}"))
+    elif choices:
+        chosen = _pick_value(f"{key}:", list(choices), current=cfg.setting(key))
+        if chosen is not None:
+            cfg.set_setting(key, chosen)
+            print(dim(f"{key}: {chosen}"))
+    else:
+        cur = cfg.setting(key)
+        print(dim(f"{key}: {cur if cur is not None else '(unset)'}  "
+                  f"(free-form; pass a value to set)"))
+
+
+def _set_known(agent, cfg, key, arg) -> bool:
+    """Capability-gated set for a well-known knob (thinking/effort) on the active
+    provider. Returns False for the bundled ollama provider (or no backend), so the
+    caller falls back to ollama's simple think=true/false toggle; True once handled
+    by a provider that declares the knob in capabilities() (including 'not
+    supported')."""
+    spec = agent.active_provider()
+    if spec is None or spec["name"] == "ollama":
+        return False
+    choices = _safe_caps(spec, cfg).get(key)
+    if not choices:
+        print(yellow(f"{key}: not supported by provider '{cfg.provider}'"))
+        return True
+    _apply_setting(cfg, key, arg, choices)
+    return True
+
+
+def handle_set_command(agent, cfg, arg):
+    """/set [key [value]] - the extensible escape hatch. Lists/sets any knob the
+    active provider declares in capabilities(), and allows free-form keys the
+    provider reads itself (tool format, prompt caching, whatever) without core
+    needing to know what they mean."""
+    spec = agent.active_provider()
+    if spec is None:
+        print(dim("/set applies to an active provider; none active (see /provider)"))
+        return
+    caps = _safe_caps(spec, cfg)
+    parts = arg.split(maxsplit=1)
+    if not parts:
+        cur = cfg.provider_settings.get(cfg.provider, {})
+        if not caps:
+            print(dim(f"provider '{cfg.provider}' declares no settings "
+                      f"(you can still /set <key> <value> a custom one)"))
+            return
+        print(bold(f"{cfg.provider} settings:"))
+        for k, ch in caps.items():
+            val = cur.get(k)
+            shown = val if val is not None else "(unset)"
+            print(f"  {k} = {shown}   " + dim("choices: " + ", ".join(map(str, ch))))
+        return
+    key = parts[0]
+    val = parts[1] if len(parts) > 1 else ""
+    _apply_setting(cfg, key, val, caps.get(key))
+
+
+def _resolve_provider_for(hook, name):
+    """Pick the provider a login/clear sub-command targets: an explicit name, or
+    the sole registered provider that implements `hook`. Returns the name or
+    None (with a printed reason)."""
+    if name:
+        spec = get_provider(name)
+        if spec is None:
+            print(yellow(f"no such provider '{name}'."))
+            return None
+        if not spec.get(hook):
+            print(dim(f"provider '{name}' has no {hook}."))
+            return None
+        return name
+    cands = [n for n in provider_names() if (get_provider(n) or {}).get(hook)]
+    if not cands:
+        print(dim(f"no provider supports {hook}."))
+        return None
+    if len(cands) > 1:
+        print(dim(f"specify which: /provider {hook} <{' | '.join(cands)}>"))
+        return None
+    return cands[0]
+
+
+def _provider_login(agent, cfg, name):
+    """/provider login [name] - run the provider's auth hook, then activate it.
+
+    First-class OBE: if `name` is a bundled-but-not-yet-enabled provider plugin, enable
+    it first so a brand-new user can go straight from `/provider login groq` to using
+    it, without a separate `/provider enable` step."""
+    if name and get_provider(name) is None:
+        mgr = ProviderManager(_provider_dirs(cfg), enabled=cfg.providers_enabled)
+        if name in mgr.names():
+            _toggle_provider_plugin(agent, cfg, mgr, name)   # registers + persists
+    target = _resolve_provider_for("login", name)
+    if target is None:
+        return
+    spec = get_provider(target)
+    try:
+        ok = spec["login"](agent, cfg)
+    except Exception as e:
+        print(red(f"login failed: {e}"))
+        return
+    if ok is False:
+        print(dim("login cancelled."))
+        return
+    try:
+        model = agent.activate_provider(target)
+        print(green(f"provider: {target}") + dim(f"  model: {model}"))
+    except Exception as e:
+        print(red(f"/provider {target} failed: {e}"))
+
+
+def _provider_clear(agent, cfg, name):
+    """/provider clear [name] - wipe a provider's stored credentials (and drop
+    back to Ollama if it was active)."""
+    target = _resolve_provider_for("clear", name or cfg.provider)
+    if target is None:
+        return
+    spec = get_provider(target)
+    try:
+        spec["clear"](agent, cfg)
+    except Exception as e:
+        print(red(f"clear failed: {e}"))
+        return
+    if cfg.provider == target:
+        agent.deactivate_provider()
+    print(dim(f"cleared credentials for '{target}'."))
+
+
+def _manage_provider_plugin(agent, cfg, name, action):
+    """enable/disable/toggle one providers/ dir plugin (the catalog), respecting the
+    requested state so an explicit enable/disable is idempotent."""
+    mgr = ProviderManager(_provider_dirs(cfg), enabled=cfg.providers_enabled)
+    if name not in mgr.names():
+        print(dim(f"no such provider plugin '{name}' "
+                  f"(have: {', '.join(mgr.names()) or 'none'})"))
+        return
+    is_on = name in cfg.providers_enabled
+    want_on = action == "enable" or (action == "toggle" and not is_on)
+    if want_on == is_on:
+        print(dim(f"{name}: already {'on' if is_on else 'off'}"))
+        return
+    _toggle_provider_plugin(agent, cfg, mgr, name)
+
+
+def handle_provider_command(agent, cfg, arg):
+    """/provider - manage the model backends (folds in the old /providers):
+      /provider                 the on/off catalog menu (toggle backends, incl. ollama)
+      /provider list            alias for the catalog menu
+      /provider <name>          switch the active backend to a registered one
+      /provider off             back to the bundled ollama default
+      /provider on              re-activate the last-used backend
+      /provider login [name]    run a provider's auth flow, then activate
+      /provider clear [name]    wipe a provider's credentials
+      /provider enable <name>   enable a providers/ dir plugin
+      /provider disable <name>  disable one
+    Switching the active MODEL (and its backend) is /model; bare /provider is the
+    catalog (what's on/off), matching the old /provider list."""
+    parts = arg.split()
+    sub = parts[0] if parts else ""
+    rest = parts[1] if len(parts) > 1 else ""
+    if sub == "login":
+        _provider_login(agent, cfg, rest)
+        return
+    if sub == "clear":
+        _provider_clear(agent, cfg, rest)
+        return
+    if sub in ("", "list"):                 # bare /provider == the catalog on/off menu
+        handle_providers_command(agent, cfg, "")
+        return
+    if sub in ("enable", "disable", "toggle"):
+        if not rest:
+            print(dim(f"usage: /provider {sub} <plugin-name>"))
+            return
+        _manage_provider_plugin(agent, cfg, rest, sub)
+        return
+    if sub in ("off", "none"):
+        # "off" means back to the bundled ollama default (there is no other "native").
+        if cfg.provider == "ollama":
+            print(dim("already on the ollama provider."))
+        else:
+            name = cfg.provider
+            agent.deactivate_provider()
+            print(dim(f"left provider '{name}' - back on ollama ({cfg.active_model()})."))
+        return
+    names = provider_names()                    # includes the bundled "ollama"
+    if not names:
+        print(dim("no provider enabled - /provider to add one."))
+        return
+    if sub == "on":
+        # mirror of '/provider off': re-activate the last-used provider, or the
+        # sole non-ollama one. With several and none remembered, ask for a name.
+        others = [n for n in names if n != "ollama"]
+        sub = agent._last_provider or (others[0] if len(others) == 1 else "")
+        if not sub:
+            print(dim(f"which provider? /provider <{' | '.join(names)}>"))
+            return
+    if sub == cfg.provider:
+        print(dim(f"already on '{sub}' ({cfg.active_model()})."))
+        return
+    try:
+        model = agent.activate_provider(sub)   # named activation: /provider <name>
+        where = "ollama" if sub == "ollama" else f"provider: {sub}"
+        print(green(where) + dim(f"  model: {model}"))
+    except Exception as e:
+        print(red(f"/provider {sub} failed: {e}"))
+
+
+def handle_usage_command(agent, cfg, arg=""):
+    """/usage - the active provider's full usage view (its detail() hook), or a
+    core default (model, session tokens, ctx%, warm models) on Ollama / when a
+    provider declares no detail()."""
+    spec = agent.active_provider()
+    if spec is not None and spec.get("detail"):
+        try:
+            fn = spec["detail"]
+            # detail() is (agent, cfg); some providers accept an extra arg string
+            # (e.g. the subscription provider's 'raw' dump). Pass it only if taken.
+            try:
+                nparams = fn.__code__.co_argcount
+            except Exception:
+                nparams = 2
+            out = fn(agent, cfg, arg) if nparams >= 3 else fn(agent, cfg)
+        except Exception as e:
+            print(red(f"usage failed: {e}"))
+            return
+        if out:
+            print(out if isinstance(out, str) else str(out))
+            return
+    # core default - works for any backend
+    loc = _provider_label(cfg)
+    print(bold(cfg.active_model()) + dim(f"  @ {loc}"))
+    si, so = agent.session_in, agent.session_out
+    print(dim(f"  session   in {si:,}   out {so:,}   total {si + so:,}"))
+    used = agent.last_prompt_tokens or messages_tokens(agent.messages, agent.tool_defs)
+    window = cfg.ctx_window() or 1
+    print(dim(f"  context   ~{used:,}/{window:,} ({used / window * 100:.0f}%)"))
+    warm = _warm_models(spec)              # loaded/instant models (ollama green dots)
+    if warm:
+        print(dim(f"  loaded    {', '.join(warm)}"))
+
+
+def _index_pick(arg, items):
+    """If `arg` is a 1-based index into `items` (matching the numbered menu),
+    return that item; else None. Lets '/model 7' select option 7."""
+    if arg.isdigit() and 1 <= int(arg) <= len(items):
+        return items[int(arg) - 1]
+    return None
+
+
+def _model_rows(agent, cfg):
+    """Every selectable backend/model across all enabled providers, with display
+    metadata. Each row: {provider, model, tag, warm, status, available, current}.
+    An unavailable (e.g. logged-out) provider yields a single model=None row so the
+    menu can offer to log it in. Pure w.r.t. the terminal - the provider hooks are
+    faked in tests - so it's unit-tested headless."""
+    rows = []
+    cur_p, cur_m = cfg.provider, cfg.active_model()
+    for pname in provider_names():
+        spec = get_provider(pname)
+        tag = (spec.get("tag") if spec else None) or pname
+        try:
+            avail = bool(spec["available"]())
+        except Exception:
+            avail = False
+        if not avail:
+            rows.append({"provider": pname, "model": None, "tag": tag, "warm": False,
+                         "status": "logged out - select to log in",
+                         "available": False, "current": False})
+            continue
+        try:
+            models = list(spec["list_models"]() or [])
+        except Exception:
+            models = []
+        warm = set(_warm_models(spec))
+        # An enabled provider that lists NO models (its host/endpoint is unreachable -
+        # e.g. ollama pointed at a down host) must not silently vanish from /model: show
+        # a single hint row so the user sees it's on but can't be reached, with a nudge
+        # to fix the host. `endpoints` marks the multi-host (ollama-style) providers.
+        if not models:
+            hint = ("host unreachable - /ollama host to point it, or start ollama"
+                    if spec.get("endpoints") else "no models available")
+            rows.append({"provider": pname, "model": None, "tag": tag, "warm": False,
+                         "status": hint, "available": True, "current": False})
+            continue
+        for m in models:
+            status = None
+            if spec.get("model_status"):
+                try:
+                    status = spec["model_status"](m)
+                except Exception:
+                    status = None
+            rows.append({"provider": pname, "model": m, "tag": tag,
+                         "warm": m in warm, "status": status, "available": True,
+                         "current": pname == cur_p and m == cur_m})
+    return rows
+
+
+def _resolve_model_arg(arg, sel_rows):
+    """Map a /model argument to a selectable row. Accepts a 1-based index into the
+    listed rows, a 'provider:model' qualifier, or a bare model name (first match
+    wins, preferring the active provider). Returns a row or None. Pure."""
+    arg = arg.strip()
+    if arg.isdigit():
+        i = int(arg) - 1
+        return sel_rows[i] if 0 <= i < len(sel_rows) else None
+    if ":" in arg:
+        p, _, m = arg.partition(":")
+        # ollama model tags contain ':' (e.g. qwen3:30b), so only treat the prefix
+        # as a provider when it actually names one.
+        if any(r["provider"] == p for r in sel_rows):
+            cand = [r for r in sel_rows if r["provider"] == p and r["model"] == m]
+            if cand:
+                return cand[0]
+    exact = [r for r in sel_rows if r["model"] == arg]
+    if exact:
+        return exact[0]
+    # tag-aware (bare name vs :latest), preferring the current provider
+    loose = [r for r in sel_rows if model_available(arg, [r["model"]])]
+    return loose[0] if loose else None
+
+
+def _select_model_row(agent, cfg, row):
+    """Activate a chosen row's backend (switching providers if needed) and model."""
+    p, m = row["provider"], row["model"]
+    if p != cfg.provider:
+        try:
+            agent.activate_provider(p)
+        except Exception as e:
+            print(red(f"/model: couldn't switch to '{p}' ({e})"))
+            return
+    agent._apply_model(m)
+    agent.last_prompt_tokens = None
+    # ollama: remember this as the host's last-used model (Anthropic-style, silent),
+    # keyed by the normalized active host so host <-> host_models never drift.
+    if p == "ollama":
+        cfg.host_models[_norm_host(cfg.host)] = m
+    autosave_config(cfg)
+    where = "ollama" if p == "ollama" else f"[{row.get('tag') or p}]"
+    print(dim(f"model -> {m}  {where}"))
+
+
+def pick_unified_model_menu(rows, prompt=input):
+    """Numbered picker over all backends' models, grouped by provider with its tag,
+    a green dot for warm/loaded models, and any model_status() hint dimmed. Returns
+    the chosen row or None. `prompt` injectable for tests."""
+    sel = [r for r in rows if r["model"]]
+    legend = dim("  (" + green("*") + " loaded)")
+    print(bold("models") + legend)
+    n = 0
+    last_p = None
+    index_of = []                                 # menu-number -> row
+    for r in rows:
+        if r["provider"] != last_p:
+            last_p = r["provider"]
+            head = r["provider"] + (f"  [{r['tag']}]" if r["tag"] != r["provider"] else "")
+            print(dim(f"  {head}:"))
+        if not r["model"]:
+            if not r["available"]:                # logged-out -> selectable to log in
+                n += 1; index_of.append(r)
+                print(f"  {n}) " + dim(f"  (login) {r['status']}"))
+            else:                                 # enabled but unreachable -> info only
+                print(dim(f"       {r['status']}"))
+            continue
+        n += 1; index_of.append(r)
+        dot = green("*") if r["warm"] else " "
+        mark = dim("  (current)") if r["current"] else ""
+        hint = dim(f"   {r['status']}") if r["status"] else ""
+        print(f"  {n}) {dot} {r['model']}{mark}{hint}")
+    print("  0) cancel")
+    if not index_of:
+        return None
+    try:
+        s = prompt("choice: ")
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return None
+    idx = _menu_index(s, len(index_of))
+    return index_of[idx] if idx is not None else None
+
+
+def handle_model_command(agent, cfg, arg):
+    """/model - unified across every enabled+available backend. Lists each
+    provider's models (tagged), with a green dot for loaded models and any
+    model_status() hint; selecting one activates its backend + model. With an arg:
+    a 1-based index, a 'provider:model' qualifier, or a model name."""
+    rows = _model_rows(agent, cfg)
+    sel = [r for r in rows if r["model"]]
+    if arg:
+        chosen = _resolve_model_arg(arg, sel)
+        if chosen is None:
+            print(yellow(f"no model matching '{arg}'  (/model with no arg to list)"))
+            return
+        _select_model_row(agent, cfg, chosen)
+        return
+    if not rows:
+        print(dim("no provider enabled - /provider to add one."))
+        return
+    if not sel and not any(not r["available"] for r in rows):
+        loc = _provider_label(cfg)
+        print(yellow(f"no models available from any provider "
+                     f"(current: {cfg.active_model()} @ {loc})."))
+        return
+    if not (_TTY and sys.stdin.isatty()):
+        for r in rows:
+            if r["model"]:
+                tag = f"[{r['tag']}]" if r["tag"] != r["provider"] else ""
+                cur = " (current)" if r["current"] else ""
+                print(f"  {r['provider']}: {r['model']} {tag}{cur}".rstrip())
+        print(dim("  (no tty: /model <name> or provider:model to switch)"))
+        return
+    chosen = pick_unified_model_menu(rows)
+    if chosen is None:
+        return
+    if chosen.get("model"):
+        _select_model_row(agent, cfg, chosen)
+    elif not chosen["available"]:                 # logged-out provider row -> log in
+        _provider_login(agent, cfg, chosen["provider"])
+
+
+def _maybe_autostart_provider(agent, cfg):
+    """Activate the configured backend at launch (cfg.provider, default 'ollama'),
+    or a registered provider whose autostart() asks for it. Returns the active
+    spec, or None only if no backend could be started (every provider disabled).
+    Never raises: on a failure it falls back to the bundled ollama provider."""
+    # Precedence: an explicit non-ollama config provider, then a non-ollama
+    # autostart() (so a hosted provider with live auth beats the ollama default),
+    # then the configured provider (incl. ollama), then the bundled ollama floor.
+    want = cfg.provider if (cfg.provider and cfg.provider != "ollama"
+                            and cfg.provider in _providers) else ""
+    if not want:
+        for name, spec in _providers.items():
+            if name == "ollama":
+                continue
+            try:
+                if spec["autostart"]() and spec["available"]():
+                    want = name
+                    break
+            except Exception:
+                continue
+    if not want:
+        if cfg.provider in _providers:
+            want = cfg.provider
+        elif "ollama" in _providers:
+            want = "ollama"               # the bundled, out-of-the-box default
+    if not want:
+        cfg.provider = ""
+        return None                       # no provider at all -> no backend
+    try:
+        prep = get_provider(want).get("prepare")
+        if prep:                          # transport setup before model/ctx pickup
+            prep(agent, cfg)              # (ollama: tiered host failover + per-host model)
+        model = agent.activate_provider(want)
+        if want != "ollama":              # ollama is the quiet default; named ones announce
+            print(green(f"provider: {want}") + dim(f"  model: {model}"))
+        return agent.active_provider()
+    except Exception as e:
+        print(yellow(f"provider '{want}' not started: {e}"))
+        if want != "ollama" and "ollama" in _providers:
+            try:
+                agent.activate_provider("ollama")
+                return agent.active_provider()
+            except Exception:
+                pass
+        cfg.provider = ""
+        return None
+
+
+def _parse_toggle(arg, current):
+    """Map an [on|off] arg to a bool: on/off/true/false/yes/no/1/0; empty = flip the
+    current value; anything else = None (invalid). Pure -> tested."""
+    a = (arg or "").strip().lower()
+    if a in ("on", "true", "yes", "1"):
+        return True
+    if a in ("off", "false", "no", "0"):
+        return False
+    if a == "":
+        return not current
+    return None
+
+
+def handle_incognito_command(agent, cfg, arg):
+    """/incognito [on|off] - no local session persistence this run, and the model is
+    told. Deliberately honest: it does NOT hide anything from the model provider."""
+    want = _parse_toggle(arg, cfg.incognito)
+    if want is None:
+        print(dim("usage: /incognito [on|off]"))
+        return
+    cfg.incognito = want
+    agent.messages[0] = {"role": "system", "content": agent._system()}   # tell/untell the model
+    if want:
+        print(magenta(f"{GLYPH['ghost']} incognito: on")
+              + dim(" - nothing is written to disk here (no autosave, no auto-load). "
+                    "NOTE: this does not hide anything from the model provider; "
+                    "requests may still be processed/retained per its policy."))
+    else:
+        print(dim(f"{GLYPH['ghost']} incognito: off - session persistence follows your "
+                  "autosave setting again."))
+
+
+def _apply_leash(agent, cfg, want):
+    """Set the capability ceiling, rebuild the system prompt + tool surface live, and
+    announce the grant. Used by /leash."""
+    cfg.leash = want
+    agent.messages[0] = {"role": "system", "content": agent._system()}
+    agent.refresh_tools()
+    agent._pending_ai_note = _leash_note(want)   # tell the model on its next turn (not via the cached prompt)
+    autosave_config(cfg)
+    print(bold(f"leash: {want}") + dim(f"  - {_LEASH_GRANTS[want]}  "
+                                       f"({len(agent.tool_defs)} tools)"))
+    if want == "rwe":
+        print(dim("  note: the leash bounds what the agent will ATTEMPT; the OS bounds what "
+                  "it CAN do. Running lean-coder as root removes that bound - power-user only."))
+
+
+def handle_leash_command(agent, cfg, arg):
+    """/leash [chat|r|rw|rwe] - the capability ceiling: what the agent is given AT ALL,
+    so it never blocks on (or reaches for) anything above it. Pairs with /approve (the
+    confirm cadence): e.g. /leash r = walk-away-safe analysis; /leash rw + /approve auto
+    = unattended editing; /leash rwe = full reach. No arg = a menu."""
+    if not arg.strip():
+        print(bold("leash") + dim(f"  (current: {cfg.leash} - {_LEASH_GRANTS[cfg.leash]})"))
+        chosen = _pick_value("leash:", list(LEASH_LEVELS), current=cfg.leash)
+        if chosen is None:
+            return
+        want = chosen
+    else:
+        want = _norm_leash(arg)
+        if want is None:
+            print(dim("usage: /leash <chat|r|rw|rwe>  (aliases: read/write/exec, none/all)"))
+            return
+    _apply_leash(agent, cfg, want)
+
+
+def handle_askread_command(agent, cfg, arg):
+    """/askread [on|off] - ask-on-read: read tools (read_file/list_files/search_files
+    + safe lean-tools) confirm too, not just writers. For anyone who doesn't want it
+    reading without an OK. Orthogonal to /approve."""
+    want = _parse_toggle(arg, cfg.confirm_reads)
+    if want is None:
+        print(dim("usage: /askread [on|off]"))
+        return
+    cfg.confirm_reads = want
+    autosave_config(cfg)
+    print(dim("ask-on-read: " + ("on - reads now confirm too (auto/session approval still skips)"
+                                 if want else "off - reads run without a prompt")))
+
+
+def _split_queued_commands(queued):
+    """Partition drained mid-turn lines into (commands, messages), preserving order.
+    A line is a command iff its first non-whitespace char is '/' (same rule the main
+    prompt uses). Commands are dispatched as commands and never sent to the model;
+    only messages go through the combine/separate/discard drain. Pure -> tested."""
+    cmds = [q for q in queued if q.strip().startswith("/")]
+    msgs = [q for q in queued if not q.strip().startswith("/")]
+    return cmds, msgs
+
+
+def _drain_choice(raw):
+    """Map a queue-drain keypress to combine / separate / discard. Pure -> tested.
+    Default (Enter or anything unrecognized) is 'combine' - one turn carrying all the
+    queued lines, the least-surprising "I typed more while you worked, just take it"."""
+    r = (raw or "").strip().lower()
+    if r in ("s", "separate", "split"):
+        return "separate"
+    if r in ("d", "n", "discard", "no", "drop"):
+        return "discard"
+    return "combine"
+
+
+def handle_clear_command(agent, cfg, arg):
+    """/clear - wipe the conversation but STAY in the current session (same autosave
+    name), so you can clear and keep working without forking off. /new starts a separate
+    session. With autosave on the cleared conversation is /load-able until you continue."""
+    nonempty = any(m.get("role") != "system" for m in agent.messages)
+    will_persist = cfg.autosave and not cfg.incognito
+    if nonempty:
+        # Staying in the same name, continuing will overwrite this conversation. With
+        # autosave on it's still /load-able until the next turn; with autosave off it's
+        # gone now - say which.
+        if will_persist:
+            msg = (f"clear the conversation in session "
+                   f"'{agent.autosave_name}'? (recoverable with /load "
+                   f"until you continue)")
+        else:
+            msg = "current conversation is NOT autosaved - clear and lose it?"
+        if not _ask(msg):
+            print(dim("clear cancelled - /save [name] to keep it, "
+                      "/new for a separate session."))
+            return
+    autosave_session(agent, cfg)     # finalize (no-op if off/empty)
+    agent.reset()                    # keep the SAME autosave_name
+    print(dim(f"history cleared (still in session '{agent.autosave_name}')."))
+
+
+def handle_new_command(agent, cfg, arg):
+    """/new [name] - start a separate session, keeping the current one on disk. /new with
+    a name targets that named session directly; bare /new -> rolling auto-name."""
+    want = arg.strip()
+    will_persist = cfg.autosave and not cfg.incognito
+    nonempty = any(m.get("role") != "system" for m in agent.messages)
+    if want:
+        safe = _session_name_ok(want)
+        if not safe:
+            print(red(f"invalid session name: {want!r}"))
+            return
+        if _session_path(safe).is_file():
+            if not _ask(f"session '{safe}' already exists - reuse the "
+                        f"name for a new empty session?"):
+                print(dim(f"cancelled - /load {safe} to resume it instead."))
+                return
+    # /new keeps the current session under its own name, so loss only happens when it
+    # isn't being autosaved at all.
+    if nonempty and not will_persist:
+        if not _ask("current conversation is NOT autosaved - start a new "
+                    "one and lose it?"):
+            print(dim("cancelled - /save [name] to keep it first."))
+            return
+    new = start_new_session(agent, cfg, want)
+    print(dim(f"started new session '{new}'."))
+
+
+def handle_connect_command(agent, cfg, arg):
+    """/connect <[user@]host> [remote-path] - enter/switch a remote workspace: all
+    file/exec tools then run there, transparently to the model. Bare /connect with saved
+    [connect] hosts (or open ones) opens a menu. Any failure leaves you where you were."""
+    if not arg:
+        if cfg.connect_hosts or agent.remotes:
+            active = agent.remote.host if agent.remote else None
+            target = pick_connect_menu(cfg.connect_hosts,
+                                       open_hosts=list(agent.remotes),
+                                       active=active)
+            if target:
+                _do_connect(agent, cfg, target)
+        else:
+            print(dim("usage: /connect <[user@]host> [remote-path]  "
+                      "(or add a [connect] section to the config)"))
+    else:
+        sp = arg.split(maxsplit=1)
+        # a bare token may be a saved [connect] name -> resolve to its target
+        rhost = cfg.connect_hosts.get(sp[0], sp[0])
+        rpath = sp[1] if len(sp) > 1 else "."
+        _do_connect(agent, cfg, rhost, rpath, offer_save=True)
+
+
+def handle_tools_command(agent, cfg, arg):
+    """/tools - menu to enable/disable the discovered lean-tools; persists the selection,
+    refreshes the live tool set, and flags if a connected remote needs /reload."""
+    if not agent.lean_tools.names():
+        print(dim(f"no lean-tools in {agent.lean_tools.dir} "
+                  f"(drop a .py with TOOL + run there)"))
+    else:
+        new = lean_tools_menu(agent.lean_tools)
+        if new is not None:
+            agent.lean_tools.enabled = new
+            cfg.lean_tools_enabled = sorted(new)
+            _run_lean_tool_setup(cfg, agent.lean_tools)   # run setup() for newly-enabled tools
+            agent.refresh_tools()
+            save_config(cfg)
+            print(dim(f"enabled: {', '.join(sorted(new)) or '(none)'}"))
+            if agent.remote:
+                print(yellow(f"connected - run /reload to push to {agent.remote.host}."))
+
+
+def handle_reload_command(agent, cfg, arg):
+    """/reload - re-scan lean-tools and pick up system-prompt edits; if connected,
+    re-push code + enabled tools to the remote (ssh kept). Local core changes still need
+    a restart."""
+    names = agent.reload_lean_tools()
+    # prompts are file-backed; pick up any edits to the system prompt now
+    if agent.messages and agent.messages[0].get("role") == "system":
+        agent.messages[0] = {"role": "system", "content": agent._system()}
+    msg = f"reloaded lean-tools ({len(names)} found)"
+    if agent.remote:
+        try:
+            agent.remote.reload(agent.lean_tools.enabled_paths())
+            msg += f"; re-pushed code + lean-tools to {agent.remote.host} (ssh kept)"
+        except (ConnectionError, OSError) as e:
+            print(red(f"remote reload failed: {e}"))
+    print(dim(msg + ". (local core changes still need a restart; /handover first)"))
+
+
+def handle_local_command(agent, cfg, arg):
+    """/local | /disconnect [host] - detach from the active remote (tools run locally
+    again) but KEEP it open in the pool; /local <host> closes that pooled connection."""
+    if arg:
+        # /local <host> (or saved name): close that pooled connection
+        target = cfg.connect_hosts.get(arg, arg)
+        if target in agent.remotes:
+            agent.drop_remote(target)
+            print(dim(f"closed {target}."))
+        else:
+            print(dim(f"no open connection to {target}."))
+    elif agent.remote:
+        host = agent.remote.host
+        agent.set_remote(None)        # detach but KEEP it open in the pool
+        note = (f"  (still open: {', '.join(agent.remotes)} - /connect <host> to switch back)"
+                if agent.remotes else "")
+        print(dim(f"detached from {host}; tools run locally again.{note}"))
+    else:
+        print(dim("already local."))
+
+
+def handle_compact_command(agent, cfg, arg):
+    """/compact [keep] - summarize/drop old tool results, keeping the last `keep` in full
+    (default COMPACT_KEEP)."""
+    keep = COMPACT_KEEP
+    if arg.isdigit():
+        keep = int(arg)
+    n, freed = agent.compact(keep)
+    print(dim(f"compacted {n} tool result(s), ~{freed:,} tokens freed "
+              f"(kept last {keep} in full)."))
+    agent._print_ctx()
+
+
+def handle_handover_command(agent, cfg, arg):
+    """/handover - agentic handover: the model updates+commits durable docs, writes the
+    handover between the markers, and calls the transiently surfaced finalize tool;
+    history is then replaced with the handover."""
+    print(dim("handover: update + commit durable docs, then write the "
+              f"handover between {HANDOVER_MARK} markers and finalize…"))
+    # snapshot the full pre-handover conversation so it stays loadable
+    autosave_session(agent, cfg)
+    summary = agent.handover()
+    if summary is None:
+        print(yellow("\nno handover captured - history left intact. (Write it "
+                     f"between {HANDOVER_MARK} markers and call finalize_handover.)"))
+    else:
+        agent.autosave_name = _new_autosave_name()
+        print(dim("\nhistory replaced with the handover above; "
+                  "new cache boundary set on the summary."))
+        agent._print_ctx()
+
+
+def handle_autosave_command(agent, cfg, arg):
+    """/autosave [on|off] - toggle persisting the conversation; no arg flips it."""
+    want = arg.strip().lower()
+    if want in ("on", "true", "yes", "1"):
+        cfg.autosave = True
+    elif want in ("off", "false", "no", "0"):
+        cfg.autosave = False
+    elif want:
+        print(dim("usage: /autosave [on|off]"))
+        return
+    else:
+        cfg.autosave = not cfg.autosave      # no arg toggles
+    autosave_config(cfg)
+    print(dim(f"autosave -> {'on' if cfg.autosave else 'off (amnesic)'}"))
+
+
+def _apply_think(agent, cfg, arg, key):
+    """Shared body for /think | /effort. `key` is 'thinking' or
+    'effort'. No arg -> a menu of valid values. With a provider active these are
+    capability-gated settings; on native Ollama thinking stays the think=true/false
+    toggle."""
+    if not arg:
+        choices = _arg_completions(agent, cfg,
+                                   "/effort" if key == "effort" else "/think")
+        _spec = agent.active_provider()
+        _native_think = key == "thinking" and (_spec is None or _spec["name"] == "ollama")
+        if _native_think:
+            current = "off" if not cfg.think else "on"
+        else:
+            current = cfg.setting(key)
+        arg = _pick_value(f"{key}:", choices, current) or ""
+    if arg:
+        if not _set_known(agent, cfg, key, arg):
+            if key == "thinking":
+                cfg.think = arg.lower() not in ("off", "false", "no", "0", "none")
+                print(dim(f"think -> {cfg.think}"))
+            else:
+                print(dim("/effort applies to a provider that supports it "
+                          "(not the ollama backend)."))
+        autosave_config(cfg)
+
+
+def handle_think_command(agent, cfg, arg):
+    """/think [on|off|...] - thinking level. No arg -> a menu."""
+    _apply_think(agent, cfg, arg, "thinking")
+
+
+def handle_effort_command(agent, cfg, arg):
+    """/effort [low|medium|...] - reasoning effort for providers that support it. No arg
+    -> a menu."""
+    _apply_think(agent, cfg, arg, "effort")
+
+
+def handle_approve_command(agent, cfg, arg):
+    """/approve [mode] - set the confirm cadence (one of APPROVAL_MODES); no arg -> menu."""
+    mode = arg.strip().lower() or (
+        _pick_value("approval:", list(APPROVAL_MODES), cfg.approval) or "")
+    if mode in APPROVAL_MODES:
+        set_approval(cfg, mode)
+        autosave_config(cfg)
+        print(dim(f"approval -> {cfg.approval}"))
+    elif mode:
+        print(dim(f"approval modes: {', '.join(APPROVAL_MODES)}"))
+
+
+def handle_ctx_command(agent, cfg, arg):
+    """/ctx - print the context-window meter."""
+    agent._print_ctx()
+
+
+def handle_help_command(agent, cfg, arg):
+    """/help | /h | /? - list builtin + lean-tool-registered commands."""
+    extra = [(c, h) for c, (_, h) in sorted(_lean_tool_commands.items())]
+    print(render_help(extra))
+
+
+# Loop-control sentinel: a builtin handler returns this to tell the repl dispatch to
+# leave the loop (only /quit does). Every other handler returns None -> dispatch
+# continues. Keeps handlers pure (agent, cfg, arg) -> control|None, no exception-for-flow.
+REPL_EXIT = object()
+
+
+def handle_quit_command(agent, cfg, arg):
+    """/quit | /exit | /q - close any open remotes and leave the repl."""
+    agent.close_all_remotes()
+    print("bye")
+    return REPL_EXIT
+
+
+# The builtin slash-command dispatch table: command-or-alias -> handler. ONE lookup for
+# every builtin (aliases map to the same handler), replacing the former if/elif chain.
+# All handlers share the (agent, cfg, arg) signature; lean-tool-registered commands keep
+# their own `_lean_tool_commands` registry, consulted after this table (A3 unifies them).
+_BUILTIN_COMMANDS_TABLE = {
+    "/quit": handle_quit_command, "/exit": handle_quit_command, "/q": handle_quit_command,
+    "/clear": handle_clear_command,
+    "/new": handle_new_command,
+    "/prompt": handle_prompt_command,
+    "/sh": run_sh_command,
+    "/connect": handle_connect_command,
+    "/tools": handle_tools_command,
+    "/reload": handle_reload_command,
+    "/local": handle_local_command, "/disconnect": handle_local_command,
+    "/compact": handle_compact_command,
+    "/handover": handle_handover_command,
+    "/session": handle_session_command,
+    "/save": handle_save_command,
+    "/load": handle_load_command,
+    "/bg": handle_bg_command,
+    "/autosave": handle_autosave_command,
+    "/incognito": handle_incognito_command,
+    "/leash": handle_leash_command,
+    "/askread": handle_askread_command,
+    "/think": handle_think_command,
+    "/effort": handle_effort_command,
+    "/provider": handle_provider_command,
+    "/providers": handle_provider_command,
+    "/usage": handle_usage_command,
+    "/info": handle_info_command,
+    "/settings": handle_settings_command,
+    "/set": handle_set_command,
+    "/model": handle_model_command,
+    "/models": handle_model_command,
+    "/approve": handle_approve_command,
+    "/ctx": handle_ctx_command,
+    "/help": handle_help_command, "/h": handle_help_command, "/?": handle_help_command,
+}
+
+# Commands that persist a config change: the dispatch autosaves the config AFTER the
+# handler returns (these handlers have many early-return paths, so the autosave belongs
+# in the dispatch, exactly where the former chain ran it - not inside the handler).
+_CMD_AUTOSAVE = frozenset({"/provider", "/providers", "/set"})
+
+# Single source of truth for shadow protection: every builtin command + alias, derived
+# from the dispatch table so the protected set can never drift from what's dispatched
+# (this also covers aliases like /disconnect that the old hand-maintained list missed).
+_BUILTIN_COMMANDS = frozenset(_BUILTIN_COMMANDS_TABLE)
+
+
+def dispatch_command(agent, cfg, cmd, arg):
+    """The one slash-command lookup: builtin table first, then the lean-tool registry,
+    else 'unknown command'. Returns True iff the repl should exit (only /quit signals
+    it, via the REPL_EXIT sentinel). Builtin handlers run unguarded (core code); a
+    lean-tool handler is wrapped so a buggy plugin can't take the loop down. Folds in
+    the /provider + /set post-handler config autosave."""
+    handler = _BUILTIN_COMMANDS_TABLE.get(cmd)
+    if handler is not None:
+        if handler(agent, cfg, arg) is REPL_EXIT:
+            return True
+        if cmd in _CMD_AUTOSAVE:      # persist a settings change across launches
+            autosave_config(cfg)
+        return False
+    if cmd in _lean_tool_commands:        # lean-tool-registered command
+        try:
+            _lean_tool_commands[cmd][0](agent, cfg, arg)
+        except Exception as e:
+            print(red(f"error in {cmd}: {e}"))
+        return False
+    print(yellow(f"unknown command {cmd} - /help"))
+    return False
+
+
+def repl(cfg: Config, resume=None):
+    global _active_agent
+    agent = Agent(cfg)
+    _active_agent = agent                 # expose to lean-tools via active_remote()
+    # Safety net: the explicit exit paths (/quit, ^D, ^C^C) call close_all_remotes()
+    # to wipe pushed remotes, but a non-graceful death (SIGTERM, window/terminal close,
+    # an uncaught error) skips them. Register it with atexit too so ANY interpreter exit
+    # attempts the clean wipe over still-live masters; if the process is hard-killed
+    # (SIGKILL) or the link is already gone, the remote self-wipe watchdog is the final
+    # backstop. close_all_remotes is idempotent (empties the pool), so double-firing on a
+    # graceful exit is harmless.
+    atexit.register(agent.close_all_remotes)
+    # Driver-only startup hooks: run each enabled lean-tool's setup() on the AGENT's
+    # own manager instance (not a throwaway) - a tool that stashes hooks in its own
+    # module globals (e.g. dispatch_worker's _H) needs the SAME module instance whose
+    # run() later fires. _setup_done keeps it at most once per tool per process.
+    _run_lean_tool_setup(cfg, agent.lean_tools)
+    # Clear .lock files left by instances that were killed without a clean exit (they
+    # age out logically after _LOCK_STALE_SECS but the files otherwise pile up forever).
+    # Before we claim any session below, so it can never remove our own fresh lock.
+    _prune_stale_locks()
+    # Release our session lock on exit so another instance doesn't see a stale
+    # "live elsewhere" and prompt to take over a session nobody is holding.
+    atexit.register(lambda: _release_lock(getattr(agent, "autosave_name", "")))
+
+    # The active backend is ALWAYS a provider now. Any pre-activation transport
+    # setup (e.g. the ollama provider's tiered host failover + per-host default
+    # model) runs inside _maybe_autostart_provider via the chosen provider's
+    # prepare() hook, BEFORE activate_provider picks the model + context window up.
+    prov = _maybe_autostart_provider(agent, cfg)
+
+    if prov is None:
+        print(yellow("No model backend is active yet. To get started:"))
+        print(dim("  /provider            list backends and enable one (Anthropic, "
+                  "Gemini, Groq, OpenRouter, ...)"))
+        print(dim("  /provider login <name>   paste an API key for a hosted backend"))
+        print(dim("  or run a local model with Ollama (https://ollama.com), then relaunch"))
+        print(dim("  /model               pick a model once a backend is up   "
+                  f"{GLYPH['dot']}  /help  all commands"))
+        ctx_note, capped_from = "-", None
+    elif prov["name"] == "ollama":
+        ctx_note = "auto-detected" if cfg.auto_num_ctx else "pinned"
+        capped_from = getattr(cfg, "_ollama_capped_from", None)
+    else:
+        ctx_note, capped_from = "provider", None
+
+    _setup_readline(agent, cfg)
+
+    location = _provider_label(cfg)
+    overhead = messages_tokens([agent.messages[0]], agent.tool_defs)
+    print(bold("lean-coder") + dim(f"  {cfg.active_model()} @ {location}"))
+    print(dim(f"  cwd: {cfg.cwd}"))
+    _badge = approval_badge(cfg)
+    print(dim(f"  num_ctx: {cfg.ctx_window():,} ({ctx_note})  {GLYPH['dot']}  baseline overhead "
+              f"(system + {len(agent.tool_defs)} tools): ~{overhead} tokens")
+          + (dim(f"  {GLYPH['dot']}  ") + _badge if _badge else ""))
+    if capped_from:
+        print(yellow(f"  note: model max is {capped_from:,}; capped to "
+                     f"{AUTO_CTX_CAP:,} to avoid OOM - pass --num-ctx to raise it."))
+    # Composer state on the banner: a broken input channel can't paste diagnostics
+    # back, so the program self-reports WHY the pinned input is or isn't active.
+    if not cfg.composer:
+        _comp_state = "off (composer=false / --no-composer)"
+    elif not (_TTY and sys.stdin.isatty()):
+        _comp_state = "off (no tty: stdout/stdin not a terminal)"
+    else:
+        _comp_state = "on (pinned input)"
+    print(dim(f"  composer: {_comp_state}"))
+
+    def _take_over_or_fork(name) -> bool:
+        """If `name` is held live by another instance, ask whether to take it over.
+        Returns True to load it (the lock gets claimed by the first autosave),
+        False to leave it alone and start a fresh auto- session here."""
+        if cfg.incognito or not _lock_is_live(name):
+            return True
+        if _ask(f"session '{_session_name_ok(name)}' is live in another instance - "
+                f"take it over?"):
+            return True
+        print(dim("  starting a fresh session here instead."))
+        return False
+
+    state_shown = False
+    if resume:
+        try:
+            if not _take_over_or_fork(resume):
+                raise FileNotFoundError  # decline -> fall through to a clean start
+            data = load_session(resume)
+            meta = data.get("meta", {})
+            state = _restore_session_state(agent, cfg, meta)  # backend/model/perms
+            msgs = data.get("messages", [])
+            n = agent.restore(msgs)
+            # Continue IN the resumed session (named or auto-): further work autosaves
+            # back into it, so it stays current instead of forking to a new auto- name.
+            agent.autosave_name = _session_name_ok(resume)
+            if not cfg.incognito:
+                _write_lock(agent.autosave_name)   # claim it now (take-over is real)
+            print(green(f"resumed '{_session_name_ok(resume)}'  {GLYPH['dot']}  {n} turns  "
+                        f"{GLYPH['dot']}  saved {meta.get('saved_at', '?')}"))
+            _print_session_tail(msgs)
+            _print_session_state(state); state_shown = True
+            _maybe_reconnect(agent, cfg, meta)
+        except FileNotFoundError:
+            print(yellow(f"--resume: no such session '{resume}' "
+                         f"(starting fresh; /load to see saved ones)"))
+    elif cfg.autosave and not cfg.incognito:
+        # Auto-load the session you were last actually in: the most-recently-used one,
+        # EXCLUDING pre-compact snapshots (those are safety checkpoints, not the live
+        # thread). cwd is a HINT, not a hard filter - scoping auto-load by cwd silently
+        # skipped the genuinely-most-recent session whenever it was last used from a
+        # different dir (e.g. a session worked over a remote connection, or a synced
+        # one), resuming a stale same-cwd session instead. If the resumed session was
+        # last used in another cwd, we say so rather than hide it.
+        # (Incognito starts clean and leaves no trace, so it never auto-loads.)
+        here = str(cfg.cwd)
+        cand = _auto_resume_pick(_session_rows())
+        if cand and _lock_is_live(cand[0]):
+            # Another live instance is using it - never steal it on a silent auto-load;
+            # start fresh here (explicit /load can still take it over).
+            print(dim(f"last session '{cand[0]}' is open in another instance - "
+                      f"starting fresh here (/load {cand[0]} to take it over)."))
+        elif cand:
+            last = cand[0]
+            try:
+                data = load_session(last)
+                meta = data.get("meta", {})
+                state = _restore_session_state(agent, cfg, meta)
+                msgs = data.get("messages", [])
+                n = agent.restore(msgs)
+                # Continue IN the resumed session (named or auto-) so it stays current;
+                # claim its lock now so the first autosave owns it.
+                agent.autosave_name = _session_name_ok(last)
+                _write_lock(agent.autosave_name)
+                print(dim(f"resumed last session '{last}' ({n} turns) - "
+                          f"/clear for a fresh one, /load to switch."))
+                other = meta.get("cwd")
+                if other and other != here:
+                    print(dim(f"  (last used in {other})"))
+                _print_session_tail(msgs)
+                _print_session_state(state); state_shown = True
+                _maybe_reconnect(agent, cfg, meta)
+            except (FileNotFoundError, OSError, json.JSONDecodeError):
+                pass
+
+    if cfg.incognito:
+        print(magenta(f"  session: {GLYPH['ghost']} incognito")
+              + dim(" (not saved locally; provider may still log)"))
+    else:
+        _sess_state = (f"autosaving -> {agent.autosave_name}" if cfg.autosave
+                       else "off (amnesic)  /autosave on to enable")
+        print(dim(f"  session: {_sess_state}"))
+    if not state_shown and cfg.leash != "rwe":   # resume already showed the full state
+        print(dim(f"  leash: {cfg.leash} ({_LEASH_GRANTS[cfg.leash]})"))
+    print(dim("  /help for commands, /quit to exit\n"))
+
+    pending_exit = False           # armed by one ^C at the prompt; a second exits
+    pending_inputs = []            # lines the user typed via the composer mid-turn
+    use_composer = cfg.composer and _TTY and sys.stdin.isatty()
+    # Persistent idle-prompt composer: owns the input line at idle (correct
+    # multi-line paste rendering + Tab/history/emacs keys), and its history
+    # persists to disk across the session. readline stays the no-TTY fallback.
+    idle_comp = None
+    if use_composer:
+        idle_comp = Composer()
+        idle_comp.completer = _make_composer_completer(agent, cfg)
+        idle_comp.load_history()
+    seen_turn = False              # draw a turn-separator rule before every prompt but the first
+    status_key = object()          # last-shown status signature; sentinel forces the first print
+    prompt_no = 0                  # prompts drawn, for the "reprint every N" cadence
+    status_shown_at = 0            # prompt_no when the block was last printed
+    while True:
+        # a full-width rule between turns so user vs model turns are easy to tell apart
+        # (the prompt's own colour/dot distinguishes who is speaking within a turn)
+        if seen_turn:
+            print(hr())
+        # Status block above the prompt. statusline_every controls the cadence: 1 (default)
+        # = every prompt, N = every N prompts, 0 = only when it changes. A real state change
+        # (settings/model/tools/plan - the ctx row's per-turn token drift is excluded from
+        # the signature) ALWAYS reprints regardless of cadence. /info and /ctx show it too.
+        prompt_no += 1
+        _rows = _status_rows(agent, cfg)
+        _key = _status_key(_rows)
+        _every = getattr(cfg, "statusline_every", 1)
+        _due = _every >= 1 and (prompt_no - status_shown_at) >= _every
+        if _rows and (_key != status_key or _due):
+            for _row in _rows:
+                print(_row)
+            status_key = _key
+            status_shown_at = prompt_no
+        # prompt shows the active location so you always know where you are
+        indicator = f"[remote: {agent.remote.host}] " if agent.remote else ""
+        if agent._queued_turns:    # a command queued a full turn (e.g. /prompt use) - run it
+            line = agent._queued_turns.pop(0)
+            print(bold(cyan(indicator + GLYPH["prompt"] + " ")) + dim("(queued prompt)"))
+        elif pending_inputs:       # drain composer typeahead before prompting anew
+            line = pending_inputs.pop(0).strip()
+            print(bold(cyan(indicator + GLYPH["prompt"] + " ")) + line)
+        else:
+            try:
+                if idle_comp is not None:
+                    # Idle composer owns the line: correct multi-line paste render
+                    # + Tab/history/emacs. Falls back to input() if it can't take
+                    # the TTY (RuntimeError). The prompt glyph is drawn by the
+                    # composer's own input row, so pass only the remote indicator.
+                    try:
+                        line = idle_comp.read_line(
+                            prompt_status=(indicator.strip() or None)).strip()
+                        # stop_tty() cleared the pinned input rows; echo the
+                        # submitted line into scrollback so the turn history reads
+                        # naturally (input() leaves the line on screen for free).
+                        if line:
+                            print(bold(cyan(indicator + GLYPH["prompt"] + " "))
+                                  + line.replace("\n", GLYPH["ret"]))
+                    except RuntimeError:
+                        line = input(_rl_safe(bold(cyan(
+                            indicator + GLYPH["prompt"] + " ")))).strip()
+                else:
+                    line = input(_rl_safe(bold(cyan(
+                        indicator + GLYPH["prompt"] + " ")))).strip()
+                pending_exit = False   # any input (even empty) disarms the exit
+            except EOFError:           # Ctrl-D
+                agent.close_all_remotes()
+                if idle_comp is not None:
+                    idle_comp.save_history()
+                print("\nbye")
+                return
+            except KeyboardInterrupt:  # ^C at the prompt: first cancels, second exits
+                if pending_exit:
+                    agent.close_all_remotes()
+                    if idle_comp is not None:
+                        idle_comp.save_history()
+                    print("\nbye")
+                    return
+                pending_exit = True
+                print(yellow("\npress ^C again to exit"))
+                continue
+        if not line:
+            continue
+        seen_turn = True           # next loop draws a separator before the prompt
+        if line.startswith("/"):
+            parts = line.split(maxsplit=1)
+            cmd = parts[0]
+            arg = parts[1].strip() if len(parts) > 1 else ""
+            if dispatch_command(agent, cfg, cmd, arg):    # True only on /quit
+                return
+            continue
+        if use_composer:
+            comp = Composer()
+            interrupted = False
+            with composer_session(comp) as engaged:
+                try:
+                    if engaged:
+                        agent.run_turn(line)
+                    else:
+                        # Composer couldn't take the TTY. Fall back to the SAME
+                        # protection as the classic path - without this the turn
+                        # ran with echo on, garbling the stream and line-buffering
+                        # typeahead that then auto-fired as turns.
+                        with suppress_echo():
+                            agent.run_turn(line)
+                except KeyboardInterrupt:
+                    interrupted = True
+            queued = comp.pop_queued() if engaged else []
+            # Slash-command lines typed mid-turn are NEVER sent to the model: peel them
+            # off and run them as commands (they dispatch at the top of the loop). Only
+            # plain messages go through the combine/separate/discard drain. This stops a
+            # mid-turn '/help' (etc.) from being folded into a model turn as literal text.
+            cmds, queued = _split_queued_commands(queued)
+            if interrupted:
+                if queued:
+                    # ^C WITH something typed = "stop this task and send what I typed
+                    # now" (steering): combine the typed lines into one redirect, drop
+                    # any older backlog (runaway can't outlive ^C).
+                    pending_inputs.clear()
+                    pending_inputs.append("\n".join(queued))
+                    print(yellow("\n^C - stopped; sending your message now"
+                                 + (f" ({len(queued)} lines combined)" if len(queued) > 1 else "")))
+                else:
+                    # ^C with nothing typed = just stop; clear any waiting backlog.
+                    dropped = len(pending_inputs)
+                    pending_inputs.clear()
+                    print(yellow("\n^C - stopped"
+                                 + (f"; cleared {dropped} queued message(s)" if dropped else "")))
+            elif len(queued) == 1:
+                # one typed-ahead message auto-runs next - tell the user so (no silent magic)
+                pending_inputs.extend(queued)
+                print(dim(f"  {GLYPH['dot']} 1 message queued -> sending as the next turn."))
+            elif queued:
+                # several queued -> explicit 3-way (never a silent burst, never an
+                # ambiguous "send all now?"). Default (Enter) = combine into one turn.
+                print(dim(f"{len(queued)} messages queued while working:"))
+                for q in queued:
+                    print(dim(f"  {GLYPH['dot']} {q}"))
+                try:
+                    raw = input(_rl_safe(bold(
+                        "[c]ombine into 1 turn  ·  [s]eparate turns (one each)  ·  [d]iscard?  [c] ")))
+                except (EOFError, KeyboardInterrupt):
+                    raw = "d"
+                choice = _drain_choice(raw)
+                if choice == "combine":
+                    pending_inputs.append("\n".join(queued))
+                    print(dim(f"combined {len(queued)} into one turn."))
+                elif choice == "discard":
+                    print(dim("discarded queued messages."))
+                else:
+                    pending_inputs.extend(queued)
+                    print(dim(f"queued {len(queued)} as separate turns (one per turn)."))
+            # queued commands run as commands, after any drained messages, in order typed
+            if cmds:
+                pending_inputs.extend(cmds)
+                print(dim(f"  {GLYPH['dot']} {len(cmds)} command(s) queued -> running next: "
+                          + ", ".join(c.split()[0] for c in cmds)))
+            autosave_session(agent, cfg)  # crash-safe: persist after every turn
+            flush_stdin()                # drop any stray typeahead left in the tty
+        else:
+            interrupted = False
+            try:
+                with suppress_echo():    # don't let typeahead garble the stream
+                    agent.run_turn(line)
+            except KeyboardInterrupt:
+                interrupted = True
+            if interrupted:
+                dropped = len(pending_inputs)
+                pending_inputs.clear()
+                print(yellow("\n^C - stopped"
+                             + (f"; cleared {dropped} queued message(s)" if dropped else "")))
+            autosave_session(agent, cfg)  # crash-safe: persist after every turn
+            flush_stdin()                # drop typeahead buffered during the turn
+
+
+# ----------------------------------------------------------------------------
+# Entry
+# ----------------------------------------------------------------------------
+
+def _parse_grant(text: str) -> dict:
+    """Parse the ===GRANT=== block's simple 'key: value' lines into a dict. Unknown
+    keys are ignored; junk lines are skipped. Pure -> tested."""
+    grant = {}
+    for line in (text or "").splitlines():
+        if ":" not in line:
+            continue
+        k, _, v = line.partition(":")
+        k, v = k.strip().lower(), v.strip()
+        if k and v:
+            grant[k] = v
+    return grant
+
+
+def _brief_result_path(brief_file, result_file):
+    return result_file or (str(brief_file) + ".result")
+
+
+def run_agent_brief(args) -> int:
+    """Headless WORKER role (`--agent-run`): read a brief file, run ONE brief to
+    completion, write the model's final answer (its ===RESULT=== block, or the whole
+    final message) to the result file, exit. No composer, no readline, no banner, no
+    interactive confirm (approval=auto - nobody's there), no session autoload, no
+    ===NEXT=== autostart. The brain runs HERE (this box's activated provider + auth);
+    the brief's GRANT sets leash/model/cwd/limits (the dispatch tool caps them <= the
+    parent's). Returns a process exit code: 0 ok, non-zero on a setup/run failure so
+    the parent's '<log>.exit' sidecar reflects pass/fail. See dispatch_worker."""
+    brief_file = args.brief_file
+    resultf = _brief_result_path(brief_file, args.result_file)
+
+    def _fail(msg, code=1):
+        print(red(f"agent-run: {msg}"))
+        try:
+            Path(resultf).write_text(f"{RESULT_MARK}\nERROR: {msg}\n{RESULT_MARK}\n")
+        except OSError:
+            pass
+        return code
+
+    if not brief_file:
+        return _fail("no --brief-file given")
+    try:
+        raw = Path(brief_file).read_text()
+    except OSError as e:
+        return _fail(f"cannot read brief file: {e}")
+    brief = _extract_marked(raw, BRIEF_MARK)
+    if not brief:
+        return _fail(f"brief file has no {BRIEF_MARK} block")
+    grant = _parse_grant(_extract_marked(raw, GRANT_MARK) or "")
+
+    # Build the worker's config from CLI + grant (grant wins - it's the parent's grant).
+    cfg = load_config(args)
+    cfg.approval = "auto"                 # headless: no operator to confirm
+    cfg.composer = False
+    cfg.autosave = False                  # a worker doesn't autosave/auto-load sessions
+    cfg.auto_handover = False             # one brief, no self-compaction handover
+    if grant.get("leash"):
+        cfg.leash = _norm_leash(grant["leash"]) or cfg.leash
+    # The worker attaches its TOOLS to the parent's remote when one is passed. In that
+    # case the grant 'cwd' is a path on the REMOTE (not the driver), so it must NOT
+    # constrain the driver-local cfg.cwd - leave cfg.cwd at the driver default and hand
+    # the remote cwd to the workspace below. Local worker: grant cwd is driver-local.
+    remote_host = getattr(args, "remote_host", None)
+    remote_ctl = getattr(args, "remote_ctl", None)
+    if grant.get("cwd") and not remote_host:
+        cfg.cwd = Path(grant["cwd"]).expanduser()
+    if grant.get("max_iterations"):
+        try:
+            cfg.max_iterations = int(grant["max_iterations"])
+        except ValueError:
+            pass
+    if not cfg.cwd.is_dir():
+        return _fail(f"cwd is not a directory: {cfg.cwd}")
+
+    _register_dir_providers(cfg)
+    agent = Agent(cfg)
+    prov = _maybe_autostart_provider(agent, cfg)
+    if prov is None or agent.client is None:
+        return _fail("no provider/model available on this box (worker needs the "
+                     "driver's activated provider + auth)")
+
+    # Attach to the parent's remote (its brain runs here on the driver, but its TOOLS
+    # run where the PARENT's do - same box, same codebase). Reuse the parent's live ssh
+    # master via the passed ControlPath (BatchMode, no re-auth); a detached worker can't
+    # answer a prompt, so a dead master is a hard fail (the parent verified it live
+    # before spawning). Local parent -> no host passed -> worker stays local.
+    if remote_host and remote_ctl:
+        rcwd = grant.get("cwd") or "."
+        try:
+            ws = RemoteWorkspace(remote_host, rcwd,
+                                 lean_tool_paths=agent.lean_tools.enabled_paths(),
+                                 ctl=remote_ctl).attach()
+        except (ConnectionError, OSError) as e:
+            return _fail(f"cannot attach to parent's remote {remote_host}: {e}")
+        agent.set_remote(ws)
+        print(dim(f"agent-run: tools attached to remote {remote_host} (cwd {ws.remote_cwd or rcwd})"))
+    # Grant's model: applied AFTER activation (active_model reads provider_settings,
+    # not cfg.model). Only switch if it's actually available on this box; else keep
+    # the activated default and note it - a worker must never die on a bad model name.
+    want_model = grant.get("model")
+    if want_model and want_model != cfg.active_model():
+        spec = agent.active_provider()
+        avail = list(spec["list_models"]() or []) if spec else []
+        if want_model in avail:
+            cfg.set_active_model(want_model)
+            agent.use_client(spec["make_client"](cfg))
+            agent.messages[0] = {"role": "system", "content": agent._system()}
+        else:
+            print(yellow(f"agent-run: model '{want_model}' not available here; "
+                         f"using '{cfg.active_model()}'"))
+
+    # Preamble: tell the worker it's headless + how to return its answer.
+    preamble = (
+        "You are a headless worker agent. You have ONE task (below). Do it using your "
+        "tools, then STOP. When finished, write your final answer as your last message, "
+        f"wrapped between two {RESULT_MARK} markers, e.g.\n{RESULT_MARK}\n<your result>\n"
+        f"{RESULT_MARK}\nNothing after the closing marker. There is no user to ask - if "
+        "you get stuck, put what you found + what blocked you inside the result block. "
+        "Your leash is fixed; do not ask to raise it.\n\nTASK:\n" + brief)
+    try:
+        agent.run_turn(preamble)
+    except Exception as e:
+        return _fail(f"worker run failed: {e}")
+
+    # Harvest: the last assistant text -> its RESULT block, or the whole message.
+    final = ""
+    for m in reversed(agent.messages):
+        if m.get("role") == "assistant" and isinstance(m.get("content"), str) and m["content"].strip():
+            final = m["content"]
+            break
+    block = _extract_marked(final, RESULT_MARK) or final.strip() or "(worker produced no output)"
+    try:
+        Path(resultf).write_text(f"{RESULT_MARK}\n{block}\n{RESULT_MARK}\n")
+    except OSError as e:
+        return _fail(f"cannot write result file: {e}")
+    print(dim(f"agent-run: done -> {resultf}"))
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog="lean-coder",
+        description="Lean terminal coding agent over Ollama native tool calling.")
+    ap.add_argument("--host", help="Ollama base URL (env OLLAMA_HOST)")
+    ap.add_argument("--model", help="model name (env LEANCODER_MODEL)")
+    ap.add_argument("--num-ctx", type=int, dest="num_ctx",
+                    help="context window (default 32768)")
+    ap.add_argument("--keep-alive", dest="keep_alive",
+                    help="ollama model resident time, e.g. 10m, 30m, -1 (default 10m)")
+    ap.add_argument("--auto-evict", dest="auto_evict", action="store_true", default=None,
+                    help="continuously stub acted-on tool results to cut tokens sent (see docs)")
+    ap.add_argument("--window-messages", type=int, dest="window_messages",
+                    help="send only the last N messages per request (default 30; 0 = unbounded)")
+    ap.add_argument("--cwd", help="project directory (default: current dir)")
+    ap.add_argument("--resume", metavar="NAME",
+                    help="resume a saved session by name (see /load)")
+    ap.add_argument("--approval", choices=APPROVAL_MODES,
+                    help="approval mode: ask (default) | session | auto")
+    ap.add_argument("--auto", action="store_true",
+                    help="auto-approve writes and commands (same as --approval auto)")
+    ap.add_argument("--yolo", action="store_true", help=argparse.SUPPRESS)  # alias for --auto
+    ap.add_argument("--no-composer", dest="no_composer", action="store_true",
+                    help="disable the pinned bottom input line (use the classic prompt)")
+    ap.add_argument("--no-autosave", dest="no_autosave", action="store_true",
+                    help="amnesic: don't autosave the session or auto-load the last one")
+    ap.add_argument("--incognito", action="store_true",
+                    help="incognito: no session saved locally + the model is told "
+                         "(does not stop the provider from logging)")
+    ap.add_argument("--leash", choices=LEASH_LEVELS,
+                    help="capability ceiling: chat (no tools) | r | rw | rwe (default)")
+    ap.add_argument("--chat-only", dest="chat_only", action="store_true",
+                    help="alias for --leash chat (send no tools, pure conversation)")
+    ap.add_argument("--think", dest="think", action="store_const", const=True,
+                    default=None, help="send think=true (extended reasoning)")
+    ap.add_argument("--no-think", dest="think", action="store_const", const=False,
+                    help="send think=false")
+    ap.add_argument("--temperature", type=float)
+    ap.add_argument("--top-p", type=float, dest="top_p")
+    ap.add_argument("--top-k", type=int, dest="top_k")
+    ap.add_argument("--repeat-penalty", type=float, dest="repeat_penalty")
+    ap.add_argument("--tool-exec", action="store_true", dest="tool_exec",
+                    help="run as a hermetic tool executor (JSON over stdio); internal")
+    ap.add_argument("--lean-tools", dest="lean_tools_exec",
+                    help="(executor) directory of lean-tools to load; internal")
+    ap.add_argument("--agent-run", action="store_true", dest="agent_run",
+                    help="run headless as a worker agent: execute one brief, write the "
+                         "result, exit; internal (spawned by the dispatch_worker tool)")
+    ap.add_argument("--brief-file", dest="brief_file",
+                    help="(agent-run) path to the brief file to execute; internal")
+    ap.add_argument("--result-file", dest="result_file",
+                    help="(agent-run) where to write the ===RESULT===; "
+                         "default <brief-file>.result; internal")
+    ap.add_argument("--remote-host", dest="remote_host",
+                    help="(agent-run) attach the worker's tools to this remote host, "
+                         "reusing the parent's ssh master; internal")
+    ap.add_argument("--remote-ctl", dest="remote_ctl",
+                    help="(agent-run) ControlPath of the parent's ssh master to reuse; "
+                         "internal")
+    ap.add_argument("--version", action="store_true",
+                    help="print this build's source hash and exit "
+                         "(used by /connect to skip a redundant re-push)")
+    args = ap.parse_args()
+
+    if args.version:                   # version probe: print self-hash, do nothing else
+        print(source_hash())           # /connect parses this exact line (hash only)
+        return
+    if args.tool_exec:                 # hermetic executor role: no config, no model
+        run_tool_executor(args.cwd or ".", args.lean_tools_exec)
+        return
+    if args.agent_run:                 # headless worker role: run one brief, write result, exit
+        sys.exit(run_agent_brief(args))
+        return
+
+    # Reattach stdin to the controlling terminal when a wrapper/launcher left it
+    # piped (stdout IS a tty but stdin is not) - otherwise the composer's gate
+    # (and any interactive prompt) correctly refuses, and input only flushes at
+    # end-of-turn. Reopening /dev/tty restores the pinned input for these
+    # wrapper-launched sessions. Best-effort and quiet: if /dev/tty isn't there
+    # (no controlling terminal - cron, true pipe), we leave stdin as-is.
+    if sys.stdout.isatty() and not sys.stdin.isatty():
+        try:
+            _tty_in = open("/dev/tty")
+            if _tty_in.isatty():
+                sys.stdin = _tty_in
+        except OSError:
+            pass
+
+    cfg = load_config(args)
+    if not cfg.cwd.is_dir():
+        print(red(f"error: --cwd is not a directory: {cfg.cwd}"))
+        sys.exit(1)
+    _register_dir_providers(cfg)          # register enabled providers/ plugins (bundled ollama + user)
+    _bg_reap_orphans()                    # kill background tasks left by a crashed session
+    atexit.register(_bg_kill_session)     # peg this session's bg tasks to it: kill on exit
+    atexit.register(_close_worker_masters)  # tear down masters opened just to carry workers
+    try:
+        repl(cfg, resume=args.resume)
+    except KeyboardInterrupt:
+        print("\nbye")
+
+
+if __name__ == "__main__":
+    main()

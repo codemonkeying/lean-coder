@@ -1,0 +1,39 @@
+*.bak
+__pycache__/
+
+# Live lean-tools working dir (point lean_tools_dir here to a separate one if you
+# want an isolated working set). We ignore the CONTENTS (leading slash anchors to the
+# repo root) then re-include the BUNDLED tools that ship and load out of the box, so
+# they stay version-controlled while your own local drop-ins here stay untracked.
+/lean-tools/*
+!/lean-tools/builtins.py
+!/lean-tools/dispatch_worker.py
+!/lean-tools/update.py
+!/lean-tools/brave_search.py
+!/lean-tools/diagnostics.py
+!/lean-tools/git_summary.py
+!/lean-tools/note.py
+!/lean-tools/notify.py
+!/lean-tools/provision.py
+!/lean-tools/session_info.py
+!/lean-tools/shell_session.py
+!/lean-tools/ssh.py
+!/lean-tools/web_fetch.py
+!/lean-tools/word_count.py
+!/lean-tools/README.md
+
+# Live providers working dir. Same pattern: ignore the contents, re-include the
+# bundled providers that ship enabled/available out of the box. Your own local
+# provider drop-ins (which may carry credentials) stay untracked automatically.
+/providers/*
+!/providers/README.md
+!/providers/ollama.py
+!/providers/anthropic_api.py
+!/providers/gemini.py
+!/providers/groq.py
+!/providers/openai.py
+!/providers/openrouter.py
+
+# For machine-specific ignores of your own (personal provider plugins, local tools,
+# scratch files) use .git/info/exclude - local, never committed - rather than naming
+# them in this shared file.

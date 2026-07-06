@@ -1,0 +1,409 @@
+"""dispatch_worker - let the model hand a scoped sub-task to a headless WORKER
+agent that runs in the background, then collect its result later.
+
+WHY: some work is a self-contained errand - "read this large module and tell me
+where X is handled", "run the test suite and summarise the failures". Doing it
+inline burns the main session's context on raw output. A worker does it in its
+OWN session (own context, own model choice) and hands back only the answer.
+
+HOW (piggybacks the background-task machinery, adds no new transport):
+  - the model calls dispatch_worker(task=..., [model=...], [cwd=...]);
+  - we write a BRIEF file (the task + a GRANT header: leash, model, cwd, limits);
+  - we bg_launch `lean_coder --agent-run --brief-file B --result-file R` as a
+    detached task tagged kind="worker", with a lease (self-terminates if this
+    session dies / stops attending - caps runaway quota);
+  - the worker runs one brief on THIS box (the driver's provider + auth - no
+    per-box install/oauth), writes its answer between ===RESULT=== markers to R,
+    exits. Its file/command tools ride the same executor path this session uses.
+  - the finished worker is surfaced via /worker (workers are deliberately hidden
+    from /bg + the bg_status tool, so a session without this tool never sees them).
+
+PHASE 1 = READ-ONLY workers only: the grant leash is capped at 'r'. Write/exec
+workers (Phase 2) and parallel fan-out (Phase 3) come later. This is a driver_only
+tool: it spawns the worker process on the driver, so it is never pushed to / run
+on a remote executor.
+
+WORKER CEILINGS (the cost lever) - each resolves in priority order:
+  1. the env var (operator LOCKDOWN - still wins, a running session can't move it);
+  2. else the live cfg value (editable in /settings, saved to config, usable at once);
+  3. else the built-in default (shown below).
+  cfg field              /settings + config      env var                          default
+  worker_max_concurrent  most workers at once     LEANCODER_WORKER_MAX_CONCURRENT   2
+  worker_idle_timeout    lease secs; self-kill    LEANCODER_WORKER_IDLE_TIMEOUT     1800
+  worker_max_iterations  agentic-loop cap/worker  LEANCODER_WORKER_MAX_ITER         30
+  model_allowlist        (env only)               LEANCODER_WORKER_MODELS           any
+"""
+import os
+import shlex
+import sys
+import time
+from pathlib import Path
+
+# Built-in ceiling defaults (last resort: env var > live cfg > this - see docstring).
+_DEFAULTS = {"max_concurrent": 2, "idle_timeout": 1800, "max_iterations": 30}
+_ENV = {"max_concurrent": "LEANCODER_WORKER_MAX_CONCURRENT",
+        "idle_timeout": "LEANCODER_WORKER_IDLE_TIMEOUT",
+        "max_iterations": "LEANCODER_WORKER_MAX_ITER"}
+
+TOOL = {
+    "name": "dispatch_worker",
+    "description": (
+        "Hand a self-contained sub-task to a background worker agent (own session + context); "
+        "returns a pid, collect the result via /worker. For scoped errands whose output would "
+        "bloat this session - e.g. 'scout this module, report where X is handled'. Default "
+        "READ-ONLY; leash='rw'/'rwe' to let it edit/run, never above YOUR capability."),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task": {"type": "string",
+                     "description": "Full self-contained instruction: what to do and exactly "
+                                    "what to report back (the worker has no other context)."},
+            "model": {"type": "string",
+                      "description": "Optional model (must be available here); defaults to current."},
+            "host": {"type": "string",
+                     "description": "Optional box to run the worker's TOOLS on ([user@]host or a "
+                                    "/connect name); defaults to this session's target. A password "
+                                    "host is prompted ONCE here - a worker can't answer prompts."},
+            "cwd": {"type": "string",
+                    "description": "Optional working directory (defaults to current)."},
+            "leash": {"type": "string", "enum": ["r", "rw", "rwe"],
+                      "description": "Worker capability: r=read-only (default), rw=edit, rwe=edit+run. "
+                                     "Capped at your own leash."},
+        },
+        "required": ["task"],
+    },
+    "driver_only": True,   # spawns the worker process on the driver; never pushed remotely
+    # NOT safe: dispatching a worker spends quota + runs commands, so it confirms
+    # unless approval is auto/armed (same policy as any non-read tool).
+}
+
+# Captured from core in setup(). A tool's run() doesn't get lc, so we stash the
+# hooks + helpers here at startup (setup runs driver-only, which is where a worker
+# is launched - so these are always present when run() fires).
+_H = {}
+
+
+def _ceiling(key):
+    """An integer worker ceiling, resolved in priority order:
+      1. the env var (LEANCODER_WORKER_*) if set + valid - an operator LOCKDOWN that
+         a running session can't move;
+      2. else the live cfg value (worker_<key>), editable in /settings + persisted to
+         config - the user's own knob, usable straight away;
+      3. else the built-in default.
+    So users get simple, persistent control via /settings, while an env var still wins
+    as a hard ceiling when the operator wants one."""
+    env = os.environ.get(_ENV.get(key, ""), "")
+    if env.strip():
+        try:
+            return int(env)
+        except ValueError:
+            pass
+    cfg = _H.get("cfg")
+    val = getattr(cfg, f"worker_{key}", None) if cfg else None
+    if isinstance(val, int):
+        return val
+    return _DEFAULTS[key]
+
+
+def _model_allowlist():
+    """The model allowlist (LEANCODER_WORKER_MODELS, comma-separated), or None = any."""
+    raw = os.environ.get("LEANCODER_WORKER_MODELS", "").strip()
+    if not raw:
+        return None
+    return [m.strip() for m in raw.split(",") if m.strip()]
+
+
+def _capped_leash(requested):
+    """The worker's granted leash = MIN(requested, the parent's LIVE leash). A worker
+    can NEVER exceed its parent's authority (the leash principle: a grant is <= the
+    grantor's own). requested defaults to 'r' (read-only). Junk -> 'r'. Reads the
+    parent's leash off the live cfg captured in setup(), so a runtime /leash change is
+    respected. Returns (granted_leash, was_downgraded)."""
+    levels = _H["LEASH_LEVELS"]                       # ("chat","r","rw","rwe")
+    req = _H["_norm_leash"](requested) or "r"
+    if req == "chat":                                 # a worker with no tools is pointless
+        req = "r"
+    parent = getattr(_H.get("cfg"), "leash", "rwe") or "rwe"
+    granted = req if levels.index(req) <= levels.index(parent) else parent
+    return granted, (granted != req)
+
+
+def _workers_dir():
+    return Path(_H["CONFIG_DIR"]) / "workers"
+
+
+def _compose_brief(task, model, cwd, max_iter, leash="r"):
+    """Build the brief file text: the task wrapped in BRIEF markers + a GRANT header.
+    `leash` is the already-capped grant (see _capped_leash)."""
+    B, G = _H["BRIEF_MARK"], _H["GRANT_MARK"]
+    grant = [f"leash: {leash}", f"cwd: {cwd}", f"max_iterations: {max_iter}"]
+    if model:
+        grant.append(f"model: {model}")
+    return (f"{B}\n{task.strip()}\n{B}\n{G}\n" + "\n".join(grant) + f"\n{G}\n")
+
+
+def _self_argv():
+    """The command that launches THIS lean-coder as a headless worker. Uses the same
+    interpreter + the CORE module file (captured as lc["__file__"] in setup()), so the
+    worker is the exact build the parent runs (no PATH lookup, no version drift)."""
+    core = Path(_H["__file__"]).resolve()
+    return f"{shlex.quote(sys.executable)} {shlex.quote(str(core))}"
+
+
+def run(args, cwd):
+    task = (args.get("task") or "").strip()
+    if not task:
+        return "error: dispatch_worker needs a non-empty task."
+    if "bg_launch" not in _H:
+        return ("error: dispatch_worker is not initialised (its setup() did not run; "
+                "it must be enabled as a driver lean-tool).")
+
+    # Operator ceiling: concurrency.
+    bg_list = _H["bg_list"]
+    max_conc = _ceiling("max_concurrent")
+    live = bg_list(kind="worker")
+    if max_conc and len(live) >= max_conc:
+        return (f"error: at the worker limit ({max_conc} running). Wait for one to "
+                f"finish (/worker) or raise LEANCODER_WORKER_MAX_CONCURRENT.")
+
+    # Model: default to the active one; validate against an allowlist + availability.
+    model = (args.get("model") or "").strip()
+    allow = _model_allowlist()
+    if model and allow and model not in allow:
+        return f"error: model '{model}' is not in the worker allowlist ({', '.join(allow)})."
+    if model:
+        avail = _H.get("available_models", lambda: [])()
+        if avail and model not in avail:
+            return (f"error: model '{model}' is not available on this box. "
+                    f"available: {', '.join(avail) or '(unknown)'}")
+
+    # Where the worker's TOOLS run. Precedence:
+    #   1. an explicit `host` arg -> run the worker's tools on THAT machine. We ensure a
+    #      live ssh master to it HERE, in the foreground (the one place a password can be
+    #      entered - a detached worker can't answer a prompt). Key auth is silent.
+    #   2. else the PARENT's live remote -> ride the same executor path the parent uses.
+    #   3. else local on the driver.
+    want_host = (args.get("host") or "").strip()
+    if want_host:
+        ensure = _H.get("ensure_worker_master")
+        if ensure is None:
+            return "error: this build can't target a host for a worker (update lean-coder)."
+        remote = ensure(want_host)
+        if "error" in remote:
+            return (f"error: {remote['error']}. The worker was NOT dispatched - "
+                    f"connect/authenticate to '{want_host}' works from your terminal, "
+                    f"so try again once it's reachable.")
+        wcwd = (args.get("cwd") or "").strip() or remote["cwd"]
+    else:
+        remote = _H.get("active_remote", lambda: None)()
+        if remote:
+            # A detached worker can't answer an auth prompt, so the master MUST be live NOW
+            # (we're in the foreground dispatch call - the one place a password could be
+            # entered). Verify it; if it's down, tell the operator to reconnect.
+            alive = _H.get("_ssh_master_alive", lambda *a: False)(remote["host"], remote["ctl"])
+            if not alive:
+                return (f"error: connected to {remote['host']} but its ssh master isn't live "
+                        f"- a worker can't authenticate on its own. Run a remote command (or "
+                        f"/connect {remote['host']}) to re-establish it, then retry.")
+            # cwd is on the REMOTE: default to the parent's remote cwd, don't stat locally.
+            wcwd = (args.get("cwd") or "").strip() or remote["cwd"]
+        else:
+            wcwd = (args.get("cwd") or "").strip() or cwd
+            if not Path(wcwd).is_dir():
+                return f"error: cwd is not a directory: {wcwd}"
+
+    # Leash: cap the requested grant at the parent's live authority (never exceed it).
+    leash, downgraded = _capped_leash(args.get("leash") or "r")
+    cap_note = ""
+    if downgraded:
+        cap_note = (f" (capped to '{leash}' - a worker can't exceed your current "
+                    f"'{getattr(_H.get('cfg'), 'leash', '?')}' leash)")
+
+    max_iter = _ceiling("max_iterations")
+    idle_timeout = _ceiling("idle_timeout")
+
+    # Write the brief + result-file targets under CONFIG_DIR/workers.
+    wdir = _workers_dir()
+    try:
+        wdir.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        return f"error: cannot create workers dir: {e}"
+    # Unique per worker: two workers dispatched in the SAME second must not share a
+    # brief/result path (os.getpid() is the parent's - identical for all of them), or
+    # the second's ===RESULT=== overwrites the first's. A per-session monotonic counter
+    # guarantees uniqueness even within one second.
+    _H["_seq"] = _H.get("_seq", 0) + 1
+    stamp = f"{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}-{_H['_seq']}"
+    brief_file = wdir / f"{stamp}.brief"
+    result_file = wdir / f"{stamp}.result"
+    try:
+        brief_file.write_text(_compose_brief(task, model, wcwd, max_iter, leash=leash))
+    except OSError as e:
+        return f"error: cannot write brief file: {e}"
+
+    # The worker PROCESS always runs on the driver; when attached to a remote its
+    # driver-local cwd is irrelevant (tools run remotely), so launch it from the parent's
+    # cwd there. --cwd is the worker's LOCAL cfg.cwd (driver); when remote, run_agent_brief
+    # leaves cfg.cwd at the driver default and the remote workspace carries wcwd instead.
+    launch_cwd = cwd if remote else wcwd
+    cmd = (f"{_self_argv()} --agent-run "
+           f"--brief-file {shlex.quote(str(brief_file))} "
+           f"--result-file {shlex.quote(str(result_file))} "
+           f"--cwd {shlex.quote(launch_cwd)}")
+    if remote:
+        cmd += (f" --remote-host {shlex.quote(remote['host'])} "
+                f"--remote-ctl {shlex.quote(remote['ctl'])}")
+    launched = _H["bg_launch"](cmd, cwd=launch_cwd, kind="worker", idle_timeout=idle_timeout)
+    if "error" in launched:
+        return f"error: could not launch worker: {launched['error']}"
+
+    # Remember the result-file per pid so /worker can harvest it.
+    where = remote["host"] if remote else "local"
+    _H["workers"][launched["pid"]] = {"result": str(result_file), "task": task,
+                                      "started": time.time(), "model": model or "(default)",
+                                      "where": where}
+    mstr = model or "current model"
+    lstr = {"r": "read-only", "rw": "read+write", "rwe": "read+write+exec"}.get(leash, leash)
+    _H["workers"][launched["pid"]]["leash"] = leash
+    wnote = f"on {remote['host']}" if remote else "local (driver)"
+    return (f"dispatched worker pid {launched['pid']} ({mstr}, {lstr}, tools {wnote}, "
+            f"cwd {wcwd}){cap_note}.\n"
+            f"It runs in the background; check it with /worker (or you'll get a finish "
+            f"notice). Result -> {result_file}")
+
+
+def _read_result(path):
+    """The worker's ===RESULT=== block from its result file, or None if not written
+    yet / unreadable."""
+    try:
+        return _H["_extract_marked"](Path(path).read_text(), _H["RESULT_MARK"])
+    except OSError:
+        return None
+
+
+def _finished_notice():
+    """Scan tracked workers for ones that FINISHED since we last looked (result file
+    written), and build the notice to inject into the model's next turn. Reports each
+    newly-finished worker once (dedup via meta['announced']); when that clears the LAST
+    outstanding worker, appends an 'all N finished' line. Fires a desktop ping per
+    finish if the notify lean-tool's _ping is present. "" when nothing new finished."""
+    workers = _H["workers"]
+    if not workers:
+        return ""
+    ping = _H.get("ping")
+    lines = []
+    just_finished = []
+    for pid, meta in workers.items():
+        if meta.get("announced"):
+            continue
+        res = _read_result(meta["result"])
+        if res is None:
+            continue                     # still running / not written yet
+        meta["announced"] = True
+        just_finished.append(pid)
+        tail = res.strip()
+        if len(tail) > 1500:             # keep a long result from flooding the turn
+            tail = tail[:1500] + " …[truncated; /worker %d for the full result]" % pid
+        lines.append(f"worker {pid} finished ({meta.get('leash','r')}, {meta['model']}) - "
+                     f"task: {meta['task'][:100]}\nresult:\n{tail}")
+        if ping:
+            try:
+                ping("lean-coder worker", f"worker {pid} finished")
+            except Exception:
+                pass
+    if not just_finished:
+        return ""
+    total = len(workers)
+    outstanding = sum(1 for m in workers.values() if not m.get("announced"))
+    if outstanding == 0 and total > 1:
+        lines.append(f"all {total} dispatched workers have finished - collect any "
+                     f"you haven't used with /worker.")
+        if ping:
+            try:
+                ping("lean-coder workers", f"all {total} workers finished")
+            except Exception:
+                pass
+    return "[" + "\n\n".join(lines) + "]"
+
+
+def _worker_cmd(agent, cfg, arg):
+    """/worker - list dispatched workers with state + result; /worker <pid> prints
+    that worker's full result."""
+    workers = _H["workers"]
+    if not workers:
+        print(_H["dim"]("no workers dispatched this session."))
+        return
+    bg_status = _H["bg_status"]
+    rows = {r["pid"]: r for r in bg_status(os.getpid(), kind="worker")}
+    arg = (arg or "").strip()
+    if arg.isdigit():
+        pid = int(arg)
+        meta = workers.get(pid)
+        if not meta:
+            print(_H["dim"](f"no worker with pid {pid} this session."))
+            return
+        res = _read_result(meta["result"])
+        print(_H["bold"](f"worker {pid}") + _H["dim"](f"  {meta['task'][:80]}"))
+        print(res if res else _H["dim"]("(no result yet - still running or terminated)"))
+        return
+    print(_H["bold"]("workers:"))
+    for pid, meta in workers.items():
+        row = rows.get(pid)
+        state = row["state"] if row else "gone"
+        runtime = row["runtime"] if row else "?"
+        done = _read_result(meta["result"]) is not None
+        tag = _H["green"]("result ready") if done else _H["dim"](state)
+        print(f"  {_H['cyan'](str(pid))}  {tag}  (ran {runtime})  "
+              f"{meta['model']}  {_H['dim'](meta['task'][:60])}")
+    print(_H["dim"]("  /worker <pid> prints that worker's full result"))
+
+
+def setup(lc, cfg):
+    # Capture the core hooks + helpers run()/the command need (a tool's run() gets
+    # no lc). setup() is driver-only = exactly where a worker is launched, so these
+    # are always present when run() fires.
+    for k in ("bg_launch", "bg_list", "bg_status", "_extract_marked", "CONFIG_DIR",
+              "BRIEF_MARK", "GRANT_MARK", "RESULT_MARK", "LEASH_LEVELS", "_norm_leash",
+              "active_remote", "_ssh_master_alive", "ensure_worker_master",
+              "dim", "bold", "green", "cyan"):
+        if k in lc:
+            _H[k] = lc[k]
+    _H["__file__"] = lc.get("__file__")     # the CORE module file, for the worker argv
+    _H["cfg"] = cfg
+    _H["workers"] = {}                       # pid -> {result, task, started, model, announced}
+
+    # Desktop ping on a worker finish, IF the notify lean-tool is also enabled (its
+    # _ping is exposed on lc when it runs). Optional - absent => notices are text-only.
+    _H["ping"] = lc.get("_ping")
+
+    # Surface a worker's finished result to the model: wrap run_turn so each turn, any
+    # tracked worker that finished since last turn injects a finish notice (per-worker
+    # + an 'all done' line when the last one clears). Workers are hidden from the core
+    # bg finished-notify (kind filter), so this is their notification path.
+    Agent = lc["Agent"]
+    _orig_run_turn = Agent.run_turn
+
+    def run_turn(self, user_input):
+        try:
+            notice = _finished_notice()
+        except Exception:
+            notice = ""
+        if notice:
+            user_input = user_input + "\n\n" + notice
+        return _orig_run_turn(self, user_input)
+    Agent.run_turn = run_turn
+
+    # A small helper to list models available on this box (for validation), resolved
+    # lazily so it reflects the live provider.
+    def _available_models():
+        try:
+            get_provider = lc["get_provider"]
+            spec = get_provider(cfg.provider) if cfg.provider else None
+            return list(spec["list_models"]() or []) if spec else []
+        except Exception:
+            return []
+    _H["available_models"] = _available_models
+
+    lc["register_command"]("/worker", _worker_cmd,
+                           "list dispatched worker agents (+ results); /worker <pid> "
+                           "prints a worker's full result")
