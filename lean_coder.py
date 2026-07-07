@@ -58,7 +58,7 @@ PRECOMPACT_KEEP = 3              # cap them too: safety nets, not named saves - 
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.4.1"
+__version__ = "0.4.2"
 
 
 def _prerelease_key(pre):
@@ -1311,7 +1311,7 @@ class Composer:
     plumbing (raw-mode reader thread, scroll region) is layered on top and
     TTY-gated, so without a terminal the feature is simply dormant."""
 
-    INPUT_ROWS = 2                       # the input box is >= 2 rows; wraps then scrolls
+    INPUT_ROWS = 5                       # the input box is >= 5 rows; wraps then scrolls
 
     def __init__(self):
         self.buf = ""
@@ -1372,6 +1372,13 @@ class Composer:
             drop = len(rows) - max_rows
             rows = rows[drop:]
             cur_row_abs -= drop
+            # Signal that earlier text is scrolled off (so a long buffer doesn't
+            # LOOK like it was clipped/lost): mark the top visible row with a leading
+            # up-arrow. Only overlays the first char of that row; the full text is
+            # intact in the buffer and submits whole on Enter.
+            if rows:
+                first = rows[0]
+                rows[0] = "\u2191" + (first[1:] if first else "")
         cur_row = max(0, min(cur_row_abs, len(rows) - 1))
         return rows, cur_row, cur_col
 
@@ -1904,9 +1911,19 @@ class Composer:
                     self._read_eof = True
                     self._read_wake.set()
                     continue
-                had = len(self.queued)
-                if self._consume_chunk(data):
-                    self._redraw()
+                # Hold the lock across the buffer mutation: _consume_chunk edits
+                # self.buf/queued while write()/_redraw_locked read them under the
+                # same lock. Without this, fast typing during heavy model-output
+                # streaming can race and drop/garble a keystroke.
+                with self._lock:
+                    had = len(self.queued)
+                    changed = self._consume_chunk(data)
+                    if changed:
+                        self._redraw_locked()
+                        try:
+                            self._out.flush()
+                        except Exception:
+                            pass
                 # Idle reader: a newly queued line ends this read_line() call.
                 if self._read_active and len(self.queued) > had:
                     self._read_wake.set()
