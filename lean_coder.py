@@ -3539,30 +3539,32 @@ def _bg_kill_session():
 
 
 # Marker lines (a whole line that is only the marker, modulo surrounding space).
-# Markers are word-bearing and symbol-wrapped (===SEARCH=== / ===DIVIDER=== /
-# ===REPLACE===): unique, easy for a model to emit, and - crucially - they do NOT
-# collide with a plain row of '=' or a git-conflict marker that legitimately appears
-# in file CONTENT. This is the ONE format; there is no back-compat alias.
-_RE_OPEN = re.compile(r"^={3,}\s*SEARCH\s*={3,}\s*$")
-_RE_DIV = re.compile(r"^={3,}\s*DIVIDER\s*={3,}\s*$")
-_RE_CLOSE = re.compile(r"^={3,}\s*REPLACE\s*={3,}\s*$")
+# We use the git-conflict-marker SEARCH/REPLACE format (<<<<<<< SEARCH / ======= /
+# >>>>>>> REPLACE) that Aider/Cline/Roo-Code use: these markers occur millions of
+# times in pretraining corpora (every committed merge conflict), so a model emits
+# them near-perfectly zero-shot - unlike a bespoke syntax it must be taught.
+# Tradeoff: a file whose CONTENT literally contains these conflict markers can
+# confuse the parser; that is rare and accepted. This is the ONE format; no alias.
+_RE_OPEN = re.compile(r"^<{3,}\s*SEARCH\s*$")
+_RE_DIV = re.compile(r"^={3,}\s*$")
+_RE_CLOSE = re.compile(r"^>{3,}\s*REPLACE\s*$")
 
 
 def _parse_search_replace(diff: str):
     """Line-based, marker-anchored parse. Returns (blocks, error).
 
-    Block format (word-bearing + symbol-wrapped so a model emits it reliably and it
-    never collides with file content):
-        ===SEARCH===
+    Block format (the git-conflict-marker SEARCH/REPLACE format, ubiquitous in
+    pretraining so a model emits it reliably):
+        <<<<<<< SEARCH
         <exact old text>
-        ===DIVIDER===
+        =======
         <new text>
-        ===REPLACE===
+        >>>>>>> REPLACE
     Only a line that is WHOLLY a marker delimits a block, so content lines that merely
     contain marker characters are kept verbatim. A malformed structure yields a
     specific error string instead of silently dropping the block (which could corrupt
     a file)."""
-    OPEN = "===SEARCH==="; DIV = "===DIVIDER==="; CLOSE = "===REPLACE==="
+    OPEN = "<<<<<<< SEARCH"; DIV = "======="; CLOSE = ">>>>>>> REPLACE"
     lines = diff.split("\n")
     blocks = []
     i, n = 0, len(lines)

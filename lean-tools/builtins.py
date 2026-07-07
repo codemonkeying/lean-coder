@@ -149,7 +149,7 @@ class Tools:
         blocks, perr = _parse_search_replace(diff)
         if perr:
             return ("error: " + perr + "\nExpected one or more blocks:\n"
-                    "===SEARCH===\\n<old>\\n===DIVIDER===\\n<new>\\n===REPLACE===")
+                    "<<<<<<< SEARCH\\n<old>\\n=======\\n<new>\\n>>>>>>> REPLACE")
         original = p.read_text(errors="replace")
         new = original
         applied = 0
@@ -411,7 +411,7 @@ BUILTIN_TOOLS = [
     {"name": "apply_diff", "tier": "write",
      "description": ("Preferred way to edit a file: replace exact spans via SEARCH/REPLACE blocks. SEARCH must "
                      "match verbatim (read_file first); on mismatch nothing is written - re-read and retry. "
-                     "Format per block: '===SEARCH===', old text, '===DIVIDER===', new text, '===REPLACE==='. "
+                     "Format per block: '<<<<<<< SEARCH', old text, '=======', new text, '>>>>>>> REPLACE'. "
                      "Multiple blocks applied in order."),
      "parameters": {"type": "object",
         "properties": {"path": {"type": "string", "description": "File to edit (must already exist)."},

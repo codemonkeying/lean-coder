@@ -313,11 +313,11 @@ writing your own is a drop-in `.py` - [docs/BUILD_GUIDE.md](docs/BUILD_GUIDE.md)
 The `diff` argument is one or more SEARCH/REPLACE blocks:
 
 ```
-===SEARCH===
+<<<<<<< SEARCH
 exact existing text (must match the file verbatim)
-===DIVIDER===
+=======
 replacement text
-===REPLACE===
+>>>>>>> REPLACE
 ```
 
 Blocks apply in order. If any SEARCH text isn't found, **nothing is written** and
