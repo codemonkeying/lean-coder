@@ -58,7 +58,7 @@ PRECOMPACT_KEEP = 3              # cap them too: safety nets, not named saves - 
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.4.4"
+__version__ = "0.4.5"
 
 
 def _prerelease_key(pre):
@@ -3383,6 +3383,16 @@ bg_list = _bg_running
 _active_agent = None
 
 
+def log_system_activity(kind, summary, detail=""):
+    """Module-level bridge so a provider (which has no Agent handle, only the _lc
+    dict) can record an automatic-behaviour event - e.g. the 429->Haiku fallback
+    or a token refresh. No-op if there's no active agent. Reachable from a
+    provider as _lc["log_system_activity"]."""
+    ag = _active_agent
+    if ag is not None and hasattr(ag, "_log_activity"):
+        ag._log_activity(kind, summary, detail)
+
+
 def active_remote():
     """The parent session's LIVE remote as {host, ctl, cwd}, or None when local.
     dispatch_worker uses this to make a worker ride the SAME executor path the parent
@@ -5156,6 +5166,10 @@ class Agent:
         self._autostart_pending = None   # self-prompt queued to run as the next turn
         self._queued_turns = []          # user turns queued by a command (e.g. /prompt use);
                                          # the REPL drains these as full turns before prompting
+        self._activity = []              # system-activity log: automatic behaviours
+                                         # (auto-evict, auto-compact, handover, 429->Haiku,
+                                         # token refresh) recorded with a reason so /activity
+                                         # shows "what the system did for you, and why".
         self._ac_armed_boundary = 0      # highest k*interval boundary auto-compact has FIRED
                                          # at; hysteresis re-arms it only after ctx drops back
                                          # under (boundary - hysteresis*interval). Schmitt state.
@@ -5962,6 +5976,26 @@ class Agent:
         self._maybe_auto_compact()        # cheap programmatic strip at token intervals (first)
         self._maybe_handover()            # then the agentic handover (hard/emergency)
 
+    def _log_activity(self, kind, summary, detail=""):
+        """Record one automatic-behaviour event for /activity. `kind` is a short
+        tag (auto-compact, handover, 429-fallback, token-refresh, ...), `summary`
+        the one-line "what happened", `detail` any extra "why". These are the
+        smart-but-invisible things the system does on the user's behalf; the log
+        makes them scrollable after the fact instead of a scroll-past warning.
+        Ring-buffered (cap 200) so it never grows unbounded. Lazily inits the
+        buffer so a partially-built Agent (test doubles that skip __init__) can't
+        crash a compaction/handover path on it."""
+        if not hasattr(self, "_activity") or self._activity is None:
+            self._activity = []
+        self._activity.append({
+            "t": time.time(),
+            "kind": kind,
+            "summary": summary,
+            "detail": detail,
+        })
+        if len(self._activity) > 200:
+            del self._activity[:-200]
+
     def _maybe_auto_compact(self):
         """Auto-COMPACT: the cheap, instant, programmatic strip (like /compact - stub old
         tool outputs) fired when context crosses a k*interval TOKEN boundary going UP. A
@@ -5988,6 +6022,10 @@ class Agent:
             print(yellow(f"  {GLYPH['warn']} auto-compact at {used:,} tokens: stripped "
                          f"{trimmed} old tool result(s), ~{freed:,} tokens freed")
                   + dim(f"  (every {interval:,} tokens; change: /settings auto_compact_interval)"))
+            self._log_activity(
+                "auto-compact",
+                f"stripped {trimmed} old tool result(s), ~{freed:,} tokens freed",
+                f"context crossed {boundary:,} (at {used:,}); fires every {interval:,} tokens")
 
     def _maybe_handover(self):
         """After a turn, run a handover when either (a) context is in the hard/emergency
@@ -6037,12 +6075,24 @@ class Agent:
                 print(yellow(f"  {GLYPH['warn']} agentic handover failed; stripped {trimmed} old "
                              f"tool result(s) instead, ~{freed:,} tokens freed  ")
                       + dim("(/compact or /clear if still full)"))
+                self._log_activity(
+                    "handover-failed",
+                    f"summary call failed; fell back to stripping {trimmed} tool result(s), ~{freed:,} tokens freed",
+                    "usually a backend overload/429 during the summarizing turn; history kept, raw tool output dropped")
             else:
                 print(yellow(f"  {GLYPH['warn']} agentic handover failed and nothing to strip - "
                              f"/clear or switch to a larger-window model."))
+                self._log_activity(
+                    "handover-failed",
+                    "summary call failed and nothing left to strip",
+                    "/clear or switch to a larger-window model")
             return
         print(yellow(f"  {GLYPH['warn']} handover done -> ~{self._ctx_used():,} tokens kept; "
                      f"new cache boundary set on the summary"))
+        self._log_activity(
+            "handover",
+            f"summarized the session -> ~{self._ctx_used():,} tokens kept",
+            f"{kind}; new cache boundary set on the summary")
         sp = self._autostart_pending
         self._autostart_pending = None
         if not sp:
@@ -6216,7 +6266,12 @@ class Agent:
                 for _row in _status_rows(self, self.cfg):
                     print(_row)
             if self.cfg.auto_evict:
-                self._auto_evict()
+                _ev_trimmed, _ev_freed = self._auto_evict()
+                if _ev_trimmed:
+                    self._log_activity(
+                        "auto-evict",
+                        f"stubbed {_ev_trimmed} acted-on tool result(s), ~{_ev_freed:,} tokens freed",
+                        f"continuous eviction; keeps last {self.cfg.auto_evict_keep} in full")
             try:
                 assistant, prompt_eval, aborted = self._chat_with_model_fallback()
             except (ConnectionError, RuntimeError) as e:
@@ -6426,7 +6481,7 @@ SLASH_COMMANDS = ["/clear", "/new", "/compact", "/handover", "/session", "/save"
                   "/prompt", "/sh", "/connect", "/local", "/tools", "/reload",
                   "/model", "/provider", "/think", "/effort",
                   "/set", "/usage", "/approve", "/leash", "/autosave", "/incognito",
-                  "/askread", "/bg", "/info", "/settings", "/ctx", "/help", "/quit"]
+                  "/askread", "/bg", "/info", "/settings", "/ctx", "/activity", "/help", "/quit"]
 
 # Built-in command names are the shadow-protection set: lean-tool commands can't claim
 # any of them. It is DERIVED from _BUILTIN_COMMANDS_TABLE (every builtin command + alias)
@@ -6638,6 +6693,7 @@ HELP_COMMANDS = [
     ("/info", "live session read-out"),
     ("/settings [key val]", "edit config.toml knobs (no arg = menu)"),
     ("/ctx", "context-token estimate"),
+    ("/activity [n|all]", "what the system did automatically (compaction, handover, fallback, ...)"),
     ("/help", "this help"),
     ("/quit", "exit"),
 ]
@@ -8557,6 +8613,36 @@ def handle_ctx_command(agent, cfg, arg):
     agent._print_ctx()
 
 
+def handle_activity_command(agent, cfg, arg):
+    """/activity [n] - show the system-activity log: the automatic behaviours the
+    system ran on your behalf (auto-compact, handover, auto-evict, 429->Haiku
+    fallback, token refresh), newest last, each with a reason. `n` limits to the
+    last n entries (default 20; `all` for everything)."""
+    log = getattr(agent, "_activity", [])
+    if not log:
+        print(dim("  no automatic activity yet this session."))
+        return
+    arg = (arg or "").strip()
+    if arg == "all":
+        shown = log
+    else:
+        try:
+            n = int(arg)
+        except (TypeError, ValueError):
+            n = 20
+        shown = log[-n:]
+    hidden = len(log) - len(shown)
+    print(bold(f"system activity ({len(log)} event(s)"
+               + (f", showing last {len(shown)}" if hidden > 0 else "") + "):"))
+    for e in shown:
+        ts = time.strftime("%H:%M:%S", time.localtime(e["t"]))
+        print(f"  {dim(ts)}  {yellow(e['kind'])}  {e['summary']}")
+        if e.get("detail"):
+            print(dim(f"           {e['detail']}"))
+    if hidden > 0:
+        print(dim(f"  ... {hidden} older; /activity all for everything."))
+
+
 def handle_help_command(agent, cfg, arg):
     """/help | /h | /? - list builtin + lean-tool-registered commands."""
     extra = [(c, h) for c, (_, h) in sorted(_lean_tool_commands.items())]
@@ -8612,6 +8698,7 @@ _BUILTIN_COMMANDS_TABLE = {
     "/models": handle_model_command,
     "/approve": handle_approve_command,
     "/ctx": handle_ctx_command,
+    "/activity": handle_activity_command,
     "/help": handle_help_command, "/h": handle_help_command, "/?": handle_help_command,
 }
 
