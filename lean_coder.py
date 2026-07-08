@@ -58,7 +58,7 @@ PRECOMPACT_KEEP = 3              # cap them too: safety nets, not named saves - 
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.4.2"
+__version__ = "0.4.3"
 
 
 def _prerelease_key(pre):
@@ -1827,8 +1827,12 @@ class Composer:
         status line (e.g. remote indicator). Returns the submitted string, or
         raises EOFError (Ctrl-D on empty buffer). Raises RuntimeError if it can't
         take the TTY so the caller falls back to input()."""
-        self.buf = ""
-        self.cur = 0
+        # Preserve any partial (unsubmitted) buffer carried over from the turn
+        # that just ended: keystrokes typed mid-turn but NOT terminated with Enter
+        # live in self.buf. pop_queued() only drains Enter-submitted lines, so
+        # clearing here silently ate whatever the user was still typing when the
+        # turn handed control back. Keep it and park the cursor at its end.
+        self.cur = len(self.buf)
         self._read_eof = False
         self._read_wake.clear()
         self._read_active = True
@@ -4080,6 +4084,81 @@ def _read_raw_b64(path: Path, max_bytes=RAW_READ_MAX):
     return base64.b64encode(payload).decode(), len(data) > max_bytes, len(data), len(payload)
 
 
+def _sniff_image_media_type(data):
+    """Media type from magic bytes (stdlib only). None if not a supported image."""
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if data[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+
+def _encode_image_block(path, max_edge=1568):
+    """Return (media_type, base64_str) for an image file, or None on any failure
+    (missing file, not an image) so the caller falls back to text-only.
+
+    PIL is OPTIONAL, not a hard dep. When present, the image is downscaled so its
+    long edge is <= max_edge - keeps Anthropic on the cheap standard vision tier
+    (the cost win). When PIL is absent, we send the raw bytes as-is: Anthropic
+    auto-resizes oversized images server-side, so it still WORKS - it just costs
+    a few more tokens on a big screenshot. Format is detected from magic bytes."""
+    try:
+        with open(path, "rb") as fh:
+            raw = fh.read()
+    except OSError:
+        return None
+
+    # Best-effort downscale + re-encode when Pillow is available.
+    try:
+        import io
+        from PIL import Image
+        img = Image.open(io.BytesIO(raw))
+        img.load()
+        w, h = img.size
+        if max(w, h) > max_edge:
+            scale = max_edge / float(max(w, h))
+            img = img.resize((max(1, int(w * scale)), max(1, int(h * scale))))
+        if img.mode in ("RGBA", "LA", "P"):
+            img = img.convert("RGBA")
+            media, fmt = "image/png", "PNG"
+        else:
+            img = img.convert("RGB")
+            media, fmt = "image/jpeg", "JPEG"
+        buf = io.BytesIO()
+        img.save(buf, format=fmt)
+        return media, base64.b64encode(buf.getvalue()).decode()
+    except Exception:
+        pass
+
+    # PIL absent (or failed): send raw bytes, detecting the type from magic bytes.
+    media = _sniff_image_media_type(raw)
+    if not media:
+        return None
+    return media, base64.b64encode(raw).decode()
+
+
+def _tool_result_msg(name, result):
+    """Build a role:tool message from a tool's return. A str is stored as-is
+    (unchanged legacy path). A dict {text, image_path?} stores the text as
+    `content` (so eviction/compaction, which key on a string content, keep
+    working untouched) and carries `image_path` as a sibling key that only the
+    Anthropic serializers read. On a non-vision model those serializers ignore
+    it, so images auto-strip on a mid-session model switch."""
+    msg = {"role": "tool", "tool_name": name}
+    if isinstance(result, dict) and "text" in result:
+        msg["content"] = str(result.get("text", ""))
+        ip = result.get("image_path")
+        if ip:
+            msg["image_path"] = ip
+    else:
+        msg["content"] = result if isinstance(result, str) else str(result)
+    return msg
+
+
 def _remote_idle_ttl() -> int:
     """Self-wipe lease TTL (seconds) for a pushed remote executor. Env-tunable;
     defaults to 30min (matches the worker lease). Floor of 60s."""
@@ -5378,8 +5457,7 @@ class Agent:
         finally:
             spin.stop()
         for (name, _args), result in zip(parsed, results):
-            self.messages.append(
-                {"role": "tool", "tool_name": name, "content": result})
+            self.messages.append(_tool_result_msg(name, result))
 
     @contextmanager
     def _sigint_guard(self):
@@ -5560,6 +5638,12 @@ class Agent:
             stub = f"[trimmed {m.get('tool_name', 'tool')} result - {n} lines]"
             freed += est_tokens(m["content"]) - est_tokens(stub)
             m["content"] = stub
+            # An evicted result drops its image too - the big cost. The file
+            # stays on disk (path is in the stubbed text), so it can be re-fetched
+            # if needed; we just stop re-sending the base64 every round.
+            if "image_path" in m:
+                m["image_path"] = None
+                m.pop("image_path")
             trimmed += 1
         if trimmed:
             # The cached actual prompt_eval_count is now stale (it reflects the
@@ -5801,7 +5885,15 @@ class Agent:
             os.environ["LEANCODER_CTX_MAX"] = str(self.cfg.ctx_window())
             os.environ["LEANCODER_CTX_USED"] = str(self._ctx_used())
             try:
-                return str(plug["run"](args, str(self.cfg.cwd)))
+                out = plug["run"](args, str(self.cfg.cwd))
+                # Image tool-result contract: a tool may return a dict
+                # {text, image_path?} instead of a str. Preserve it here; the
+                # append sites split it into content(+image_path). Anything else
+                # is stringified (unchanged behaviour for the thousands of
+                # str-returning tools).
+                if isinstance(out, dict) and "text" in out:
+                    return out
+                return str(out)
             except Exception as e:
                 return f"error in lean-tool {name}: {e}"
         fn = getattr(self.tools, name, None)
@@ -6201,8 +6293,7 @@ class Agent:
                         result = self._run_tool(name, args)
                     finally:
                         spin.stop()
-                self.messages.append({
-                    "role": "tool", "tool_name": name, "content": result})
+                self.messages.append(_tool_result_msg(name, result))
                 if self._handover_capture is not None:   # finalize_handover fired -> stop
                     return
         print(yellow(f"\n{GLYPH['warn']} hit {cap}-iteration cap; stopping this turn. "
