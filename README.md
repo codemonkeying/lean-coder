@@ -2,11 +2,11 @@
 
 # lean-coder
 
-**A small, dependency-free terminal coding agent that treats context as the scarce resource it is.**
+**A small terminal coding agent, dependency-free at its core, that treats context as the scarce resource it is.**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
-![Dependencies: none](https://img.shields.io/badge/dependencies-none%20(stdlib%20only)-brightgreen.svg)
+![Core dependencies: none](https://img.shields.io/badge/core%20dependencies-none%20(stdlib%20only)-brightgreen.svg)
 ![Baseline overhead: ~1.2k tokens](https://img.shields.io/badge/baseline%20overhead-~1.2k%20tokens-orange.svg)
 
 [Install](#install) &middot; [Providers](#providers-pick-a-model-backend) &middot; [Safety](#safety-two-axes) &middot; [Tools](#tools) &middot; [Handover](#handover-the-agent-documents-its-work-before-a-memory-wipe) &middot; [Why it exists](#why-it-exists)
@@ -81,8 +81,10 @@ can drive reliably.
 
 ## Highlights
 
-- **No third-party dependencies.** `python3` (3.11+) is the entire runtime. Nothing
-  to `pip install`.
+- **No third-party dependencies in the core.** `python3` (3.11+) is the entire
+  runtime - nothing to `pip install` to edit, run, and drive a model. (A few opt-in
+  lean-tools bring their own deps - e.g. `web_screenshot` needs Playwright - and say
+  so; they're disabled by default and cost nothing until you enable them.)
 - **Roll your own tools - one drop-in file.** A small always-on set covers
   read/edit/run. Everything else is an **opt-in "lean-tool"**: a single `.py` file
   with a `TOOL` schema and a `run` function, dropped in a directory and toggled on
@@ -123,7 +125,9 @@ can drive reliably.
 
 ## Requirements
 
-- **Python 3.11+** (uses the stdlib `tomllib`). No third-party packages.
+- **Python 3.11+** (uses the stdlib `tomllib`). No third-party packages for the
+  core; a couple of opt-in lean-tools have their own (e.g. `web_screenshot` needs
+  Playwright) and are disabled by default.
 - A tool-calling model behind a provider:
   - **Ollama** (local or self-hosted) - e.g. `ollama pull qwen3-coder:30b` - works
     out of the box, or
@@ -290,6 +294,7 @@ on with `/tools` and it costs context only from that point. These ship bundled i
 |-------------------|------|
 | `dispatch_worker` | Hand a scoped sub-task to a background worker agent; collect its result. |
 | `web_fetch`       | Read a URL as clean text. |
+| `web_screenshot`  | Screenshot a URL with a headless browser + return the page text (and, on a vision model, the image itself). **Needs [Playwright](https://playwright.dev/python/) + a browser** (`pip install playwright && playwright install firefox`); says so if absent. Disabled by default. |
 | `brave_search`    | Web search (Brave API). |
 | `git_summary`     | Read-only git snapshot (branch, status, diffstat, recent commits). |
 | `diagnostics`     | Run the installed linter / typechecker for a file. |
