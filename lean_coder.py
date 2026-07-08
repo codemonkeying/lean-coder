@@ -58,7 +58,7 @@ PRECOMPACT_KEEP = 3              # cap them too: safety nets, not named saves - 
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.4.6"
+__version__ = "0.4.7"
 
 
 def _prerelease_key(pre):

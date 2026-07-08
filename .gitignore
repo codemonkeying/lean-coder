@@ -19,6 +19,7 @@ __pycache__/
 !/lean-tools/shell_session.py
 !/lean-tools/ssh.py
 !/lean-tools/web_fetch.py
+!/lean-tools/web_screenshot.py
 !/lean-tools/word_count.py
 !/lean-tools/README.md
 
