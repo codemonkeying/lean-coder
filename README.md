@@ -73,7 +73,9 @@ actual code. lean-coder treats context as the scarce resource it is:
   That's the floor on a fresh session; enabling opt-in lean-tools or editing the
   prompts adds to it - the meter always shows the real current figure.
 - **Truncated results** - a single big file read or noisy command can't blow the budget.
-- **`/compact` and `/handover`** reclaim space mid-task without losing the thread.
+- **Layered context management** - documented handover (automatic, on by default)
+  plus opt-in continuous eviction and periodic compaction - reclaims space mid-task
+  without losing the thread (`/compact` and `/handover` are the manual levers). More below.
 
 The payoff: it stays usable on **small local models**, not just frontier hosted
 ones. The tools are deliberately small and few, because that is what a 7B-30B model
@@ -117,8 +119,26 @@ can drive reliably.
   scoped sub-task to a headless worker agent that runs in the background on its own
   context, then reports just its result back - so the main session spends its window
   on the plan, not the raw output. Run several at once.
+- **Any tool can return an image.** On a vision-capable model, a tool result can
+  carry a picture - a screenshot, a rendered chart, a diff image - and lean-coder
+  feeds it to the model the right way for each backend (Anthropic, OpenAI, Gemini).
+  The image rides only in the request, never bloating saved history, and it's gated
+  to models that can actually see. `web_screenshot` is the ready-made example.
+- **One conversation, any model.** The full history is re-sent each turn, so you can
+  switch model or provider mid-session with `/model` (lists every enabled backend)
+  without starting over - drive a local Ollama for the cheap steps, jump to a
+  frontier model for the hard one, and back.
+- **Nothing happens off-screen.** `/activity` replays what the system did on its own -
+  compaction, handover, model fallback, eviction - so the automatic context
+  management is auditable, not magic.
+- **Updates and spreads itself.** `/update` self-updates the script to the latest
+  published build (`stable` or `beta` track; `auto_update` checks at launch), and
+  `/provision` installs lean-coder onto another box over SSH.
 - **Sessions.** Conversations autosave each turn and the last one auto-loads on
-  start, so a relaunch picks up where you left off.
+  start, so a relaunch picks up where you left off. Keep as many as you like -
+  `/save <name>`, `/load` between them, `/session` to list - and because
+  `/connect` moves only the *executor*, a single saved session can drive your
+  laptop one moment and a remote box the next without losing a thing.
 - **Pinned input.** Type your next message while the model works - output scrolls
   above a fixed input line. Pure ANSI + stdlib; falls back on terminals that can't
   support it.
@@ -371,6 +391,13 @@ in as the next turn**, so the agent continues the same task from a clean slate (
 pinned plan; the context window resets. That's how a task outruns the window while
 its documentation stays current instead of rotting.
 
+- **Continuous eviction (`auto_evict`).** The lightest, always-quietest lever: each
+  agentic round, the bodies of tool results the model has *already acted on* are
+  stubbed out, keeping the last few (`auto_evict_keep`, default 3) verbatim. The
+  in-flight batch is never touched. Since the whole history is re-sent every round,
+  shrinking spent results shrinks every later call - so a long tool-heavy turn stops
+  paying for stale output. `auto_compact` does the same on a token interval as a
+  one-shot strip; `/compact` is the manual version.
 - **Self-managing (on by default).** As context fills, the agent manages it in tiers:
   a **soft zone** (~70% of the window) where it's nudged to wrap up at a *clean break*
   and hand over tidily; a **hard threshold** (~95%) that forces a handover at a
