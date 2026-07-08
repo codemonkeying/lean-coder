@@ -286,7 +286,19 @@ def _cvt_tools(tools):
     return out
 
 
-def _cvt_messages(messages):
+# OpenAI vision-capable model families (accept image_url input). A text-only
+# model 400s on an image, so images are gated on this - unlike Anthropic where
+# every model is multimodal. Substring match against the model id.
+_VISION_FAMILIES = ("gpt-4o", "gpt-4.1", "gpt-4-turbo", "gpt-4-vision",
+                    "o1", "o3", "o4", "gpt-5", "chatgpt-4o")
+
+
+def _model_supports_vision(model_id):
+    m = (model_id or "").lower()
+    return any(f in m for f in _VISION_FAMILIES)
+
+
+def _cvt_messages(messages, vision=False):
     out = []
     i   = 0
     while i < len(messages):
@@ -324,6 +336,7 @@ def _cvt_messages(messages):
                     prev_calls = prev.get("tool_calls") or []
                     break
             ci = 0
+            pending_images = []   # (data-uri) to emit AFTER the tool batch
             while i < len(messages) and messages[i].get("role") == "tool":
                 r    = messages[i]
                 tcid = r.get("tool_call_id", "")
@@ -334,8 +347,27 @@ def _cvt_messages(messages):
                     "tool_call_id": tcid,
                     "content":      r.get("content", ""),
                 })
+                # /chat/completions: a tool message is string-only, so an image
+                # can't ride inside it. On a vision model, defer it to a synthetic
+                # user message emitted right after the tool batch (below). This is
+                # built ONLY in this transient conversion - history (self.messages)
+                # keeps image_path as a sibling key and is never mutated, so the
+                # pairing guard + compaction are untouched.
+                if vision and r.get("image_path"):
+                    enc = _lc.get("_encode_image_block")
+                    got = enc(r["image_path"]) if enc else None
+                    if got:
+                        media, data = got
+                        pending_images.append(f"data:{media};base64,{data}")
                 ci += 1
                 i  += 1
+            if pending_images:
+                out.append({
+                    "role": "user",
+                    "content": [{"type": "image_url",
+                                 "image_url": {"url": uri}}
+                                for uri in pending_images],
+                })
         else:
             i += 1
     return out
@@ -529,7 +561,7 @@ class _OpenAIClient:
 
         payload = {
             "model":                 cur_model,
-            "messages":              _cvt_messages(messages),
+            "messages":              _cvt_messages(messages, vision=_model_supports_vision(cur_model)),
             # Newer models (gpt-5, o-series) require max_completion_tokens and
             # reject the legacy max_tokens; it's accepted by all current models.
             "max_completion_tokens": max_out,
