@@ -58,7 +58,7 @@ PRECOMPACT_KEEP = 3              # cap them too: safety nets, not named saves - 
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.4.7"
+__version__ = "0.4.8"
 
 
 def _prerelease_key(pre):
@@ -164,15 +164,35 @@ HANDOVER_INSTR = (
 def _extract_marked(text: str, mark: str):
     """Text between the LAST pair of `mark` delimiters (so an echoed instruction
     example doesn't win). None when there isn't a complete pair - the caller then
-    refuses to act, so a bad parse never nukes the session. Pure -> tested."""
+    refuses to act, so a bad parse never nukes the session. Pure -> tested.
+
+    Belt-and-braces fallback: a small model often opens with the fence but closes
+    with an XML-style tag derived from the mark (e.g. the HANDOVER fence, then the
+    body, then a </handover> close), leaving only ONE fence - so the strict pair
+    match misses a perfectly good block and the whole handover is silently
+    discarded. When there is exactly one fence, accept a matching close tag whose
+    letters equal the mark's letters (case-insensitive). Only that XML-close case
+    is rescued; we never greedily take everything after a lone fence (that would
+    swallow later blocks)."""
     if not text:
         return None
     close = text.rfind(mark)
     open_ = text.rfind(mark, 0, close) if close != -1 else -1
-    if open_ == -1:
+    if open_ != -1:
+        block = text[open_ + len(mark):close].strip()
+        return block or None
+    if close == -1:
         return None
-    block = text[open_ + len(mark):close].strip()
-    return block or None
+    tag = re.sub(r"[^a-z0-9]", "", mark.lower())
+    if tag:
+        m = re.search(re.escape(mark) + r"(.*?)</\s*" + re.escape(tag) + r"\s*>",
+                      text, re.IGNORECASE | re.DOTALL)
+        if m:
+            body = m.group(1)
+            body = re.sub(r"^\s*<\s*" + re.escape(tag) + r"\s*>\s*", "", body,
+                          flags=re.IGNORECASE)
+            return body.strip() or None
+    return None
 
 
 def _extract_handover_block(text: str):
@@ -192,27 +212,152 @@ def _extract_selfprompt(text: str):
     return _extract_marked(text, SELFPROMPT_MARK)
 
 
+# --- tolerant handover parsing (research-backed, model-eval/) --------------------
+# A model under peak cognitive load (the handover turn is the highest-load turn in a
+# session) frequently drops marker discipline: markdown headers instead of fences, a
+# JSON object, fuzzy field names, or just prose. The strict fence parser then finds
+# nothing and the OLD behaviour no-op'd - which on a FULL context leaves the model
+# stuck (can't compact, can't continue). The fix (per the research handover): try
+# tiers, and ACCEPT a degraded handover over a no-op. Only truly-empty output no-ops.
+_HANDOVER_MIN = 30    # a block shorter than this is treated as empty (parse failure)
+
+# Escalating corrective retries for a handover the tolerant parser couldn't salvage
+# (research: accept a degraded handover over a no-op; only truly-empty output no-ops).
+# Retry 1 = terse "start with the marker"; retry 2 = the exact template to copy.
+HANDOVER_RETRY_1 = (
+    "Your handover blocks were not found. Start your reply with " + HANDOVER_MARK +
+    " immediately - no preamble, no other tool. The parser needs the exact fence markers."
+)
+HANDOVER_RETRY_2 = (
+    "Still no usable blocks. Copy this EXACT shape, filling the brackets, nothing "
+    "before the first marker:\n" +
+    HANDOVER_MARK + "\n<what you were doing, what changed, what's next, open questions>\n" + HANDOVER_MARK + "\n" +
+    PLAN_MARK + "\nGOAL: <one line>\nTODO:\n- [ ] <item>\n" + PLAN_MARK + "\n" +
+    SELFPROMPT_MARK + "\n<the single next instruction>\n" + SELFPROMPT_MARK + "\nBegin now:"
+)
+
+# fuzzy field-name aliases for the JSON/markdown tiers.
+_HANDOVER_ALIASES = ("handover", "summary", "context")
+_PLAN_ALIASES     = ("plan", "todo", "checklist", "goal")
+_NEXT_ALIASES     = ("next", "selfprompt", "self_prompt", "next_step", "next_prompt", "prompt")
+
+
+def _md_section(text, names):
+    """Tier 3: content under a markdown header (## Handover / **Plan** / etc.) up to
+    the next header or end. `names` is the alias tuple. Returns the section or None."""
+    if not text:
+        return None
+    pat = (r"(?im)^\s*(?:#{1,6}\s*|\*\*)\s*(?:" + "|".join(names) +
+           r")\b[^\n]*\**\s*$")
+    m = re.search(pat, text)
+    if not m:
+        return None
+    start = m.end()
+    nxt = re.search(r"(?im)^\s*(?:#{1,6}\s*|\*\*)\s*\w", text[start:])
+    section = text[start: start + nxt.start()] if nxt else text[start:]
+    return section.strip() or None
+
+
+def _json_field(text, names):
+    """Tier 4: a top-level JSON object anywhere in the text, read a fuzzy-named field
+    (case-insensitive). Value may be str or list (a TODO). Returns str or None."""
+    if not text or "{" not in text:
+        return None
+    import json as _json
+    # try the largest brace-balanced span
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end <= start:
+        return None
+    try:
+        obj = _json.loads(text[start:end + 1])
+    except Exception:
+        return None
+    if not isinstance(obj, dict):
+        return None
+    low = {k.lower(): v for k, v in obj.items()}
+    for nm in names:
+        if nm in low:
+            v = low[nm]
+            if isinstance(v, list):
+                return "\n".join(str(x) for x in v).strip() or None
+            return (str(v).strip() or None) if v is not None else None
+    return None
+
+
+def _parse_handover(text: str) -> dict:
+    """Tolerant multi-tier parse of a handover turn -> {handover, plan, next, tier}.
+    Each field is a string or None. `tier` records the HIGHEST (most-degraded) tier
+    any field needed, for observability. Tiers, tried per-field in order:
+      1 fences  - the canonical ===HANDOVER=== pair (also XML-close, via _extract_marked)
+      3 md      - a markdown header section
+      4 json    - a fuzzy-named field in a JSON object
+      5 prose   - last resort: split raw content into summary / plan-ish / last line
+    (Tier 2 = single-fence+XML, folded into _extract_marked.)"""
+    text = text or ""
+    tier = 0
+    def _pick(fence_mark, md_names, json_names):
+        nonlocal tier
+        v = _extract_marked(text, fence_mark)
+        if v:
+            tier = max(tier, 1); return v
+        v = _md_section(text, md_names)
+        if v:
+            tier = max(tier, 3); return v
+        v = _json_field(text, json_names)
+        if v:
+            tier = max(tier, 4); return v
+        return None
+    handover = _pick(HANDOVER_MARK, _HANDOVER_ALIASES, _HANDOVER_ALIASES)
+    plan     = _pick(PLAN_MARK, _PLAN_ALIASES, _PLAN_ALIASES)
+    nxt      = _pick(SELFPROMPT_MARK, _NEXT_ALIASES, _NEXT_ALIASES)
+    # Tier 5 (semantic): no handover block found at all, but there IS real prose - use
+    # it wholesale as the summary so a full-context session is never left stuck.
+    if not handover:
+        stripped = re.sub(r"(?m)^\s*(?:#{1,6}.*|=+.*=+)\s*$", "", text).strip()
+        if len(stripped) >= _HANDOVER_MIN:
+            handover = stripped
+            tier = max(tier, 5)
+    # min-content guard: a too-short block is treated as absent (empty != usable).
+    if handover and len(handover) < _HANDOVER_MIN:
+        handover = None
+    return {"handover": handover, "plan": plan, "next": nxt, "tier": tier}
+
+
 # Auto-compaction instruction: the model gets a full tool-capable turn to wrap up,
 # then writes BOTH a handover block (@#!, kept as continuing context) and a
 # self-prompt (%%^^, autostarted as the next turn). Recent turns are kept verbatim.
+# Forced (hard/emergency) handover. IMPORTANT ordering lesson (measured, model-eval/
+# tune_handover.py): the OLD version opened with an optional "update docs with your
+# tools" step, which invited a chatty preamble ("I'll compact the context...") that
+# smaller models emitted and then STOPPED - no blocks, failed handover. The fix that
+# tested best (qwen3-coder:30b 4/4 vs a flaky ~3/4 before) is blocks-FIRST, an explicit
+# "start your reply with the first marker - no preamble", and durable-doc saving demoted
+# to an AFTER option. Keep that shape if you edit this.
 AUTO_HANDOVER_INSTR = (
-    "Your context is getting full, so you're compacting it yourself (the recent "
-    "turns will be kept; older ones get replaced by what you write now). Do this:\n"
-    "1. If useful, update any durable docs/notes with your tools and commit them ONLY "
-    "if this is already a git repo (never init one).\n"
-    "2. HANDOVER: write a concise summary of the older context for your future self - "
-    "the goal, key decisions, current task state (done / in progress / next), WHERE "
-    "things live (files, commands), and open threads. Wrap ONLY it between two " +
-    HANDOVER_MARK + " markers:\n" + HANDOVER_MARK + "\n<handover>\n" + HANDOVER_MARK + "\n"
-    "3. PLAN: write your current goal + TODO between two " + PLAN_MARK + " markers (mark "
-    "what's done and what's next) - this stays PINNED across the compaction, so keep it "
-    "accurate:\n" + PLAN_MARK + "\nGOAL: ...\nTODO:\n- [x] done\n- [ ] next\n" + PLAN_MARK + "\n"
-    "4. SELF-PROMPT: write the single next instruction to yourself - the very next "
-    "thing to do after compaction, phrased as a prompt you'd act on immediately. Wrap "
-    "ONLY it between two " + SELFPROMPT_MARK + " markers:\n" + SELFPROMPT_MARK +
-    "\n<what to do next>\n" + SELFPROMPT_MARK + "\n"
-    "Then call finalize_handover. The handover becomes your kept context; the "
-    "self-prompt is run as your next turn. If you can't produce both, don't call the tool."
+    "Your context is full - compact it yourself now (recent turns are kept; older ones "
+    "get replaced by what you write here). You are writing a note to YOURSELF in a fresh "
+    "session that has NO memory of this conversation - capture everything that future-you "
+    "needs to continue without losing the thread. Write these three blocks IN THIS REPLY, "
+    "using the exact markers, then call finalize_handover. Start your reply with " +
+    HANDOVER_MARK + " - no preamble, no narration, no other tool first.\n"
+    "1. HANDOVER: a concise summary of the older context for your future self - the goal, "
+    "key decisions, current task state (done / in progress / next), WHERE things live "
+    "(files, commands), and open threads. Put the summary text BETWEEN two identical " +
+    HANDOVER_MARK + " lines (repeat the marker exactly - do NOT invent an XML-style "
+    "closing tag):\n" +
+    HANDOVER_MARK + "\nyour summary here\n" + HANDOVER_MARK + "\n"
+    "2. PLAN: your current goal + TODO (mark done vs next) - this stays PINNED across the "
+    "compaction, so keep it accurate. Again between two identical " + PLAN_MARK + " lines:\n" +
+    PLAN_MARK + "\nGOAL: ...\nTODO:\n- [x] done\n- [ ] next\n" + PLAN_MARK + "\n"
+    "3. SELF-PROMPT: the single next instruction to yourself - the very next thing to do "
+    "after compaction, phrased as a prompt you'd act on immediately. Between two identical " +
+    SELFPROMPT_MARK + " lines:\n" +
+    SELFPROMPT_MARK + "\nwhat to do next\n" + SELFPROMPT_MARK + "\n"
+    "Then call finalize_handover. The handover becomes your kept context; the self-prompt "
+    "runs as your next turn. If durable notes need saving, do that AFTER the blocks (and "
+    "commit ONLY if this is already a git repo - never init one). If you truly can't "
+    "produce the blocks, don't call the tool."
 )
 
 # Soft-zone nudge: gentle, injected inline into the user turn while context is in the
@@ -220,11 +365,12 @@ AUTO_HANDOVER_INSTR = (
 # now"; a harsh nudge just makes the model stop mid-thought, which is what the hard
 # auto-handover is for. {used}/{limit}/{pct} are filled in at injection time.
 HANDOVER_NUDGE = (
-    "context {used}/{limit} tokens ({pct}%). Heads-up: at {hard} tokens ({hard_pct}%) "
-    "an automatic handover is FORCED - your history gets compacted whether or not "
-    "you're at a clean point. You're not there yet, so DON'T drop what you're doing or "
-    "hand over now; just start steering toward a clean break for the current step so "
-    "the handover lands tidily instead of mid-task when it triggers."
+    "context {used}/{limit} tokens ({pct}%). At {hard} tokens ({hard_pct}%) a handover is "
+    "FORCED - history gets compacted whether or not you're at a clean point. To land it "
+    "tidily instead, steer toward a clean break; and IF the current task/step is fully "
+    "done (nothing half-finished) and the next thing is unrelated, you may call "
+    "request_handover NOW to compact at this clean boundary. Don't interrupt work in "
+    "progress for it - only at a genuine boundary."
 )
 
 # Editable prompts live as text files under the config dir. The built-in prompts
@@ -5750,12 +5896,14 @@ class Agent:
                 self._loop()
         finally:
             self.tool_defs = saved                        # ...and remove it at the end
-        block = self._handover_capture
-        if not block:        # tool not called but a block was written -> still honor it
-            block = _extract_handover_block(self._handover_turn_text())
-        if not block:        # no usable handover -> leave history untouched
+        parsed = _parse_handover(self._handover_turn_text())
+        block = self._handover_capture or parsed["handover"]
+        if not block:        # no usable handover (truly empty) -> leave history untouched
             return None
-        plan = _extract_plan(self._handover_turn_text())
+        if parsed["tier"] >= 3:
+            self._log_activity("handover", f"degraded parse (tier {parsed['tier']})",
+                               "model dropped marker discipline; salvaged via tolerant parser")
+        plan = parsed["plan"]
         if plan:
             self.pinned_plan = plan          # survives the handover (uncached send-time reminder)
         self.messages = [
@@ -5836,20 +5984,34 @@ class Agent:
         self._handover_mark = len(self.messages)
         saved = self.tool_defs
         self.tool_defs = list(saved) + [HANDOVER_TOOL]
+        # Run the handover turn, then parse tolerantly. If nothing usable came back,
+        # re-prompt with escalating specificity (research: accept a degraded handover
+        # over a no-op - only truly-empty output should leave a full context stuck).
+        block = parsed = None
         try:
-            with self._sigint_guard():
-                self._loop()
+            for attempt, retry in enumerate((None, HANDOVER_RETRY_1, HANDOVER_RETRY_2)):
+                if retry is not None:
+                    self.messages.append({"role": "user", "content": retry})
+                with self._sigint_guard():
+                    self._loop()
+                turn_text = self._handover_turn_text()
+                parsed = _parse_handover(turn_text)
+                block = self._handover_capture or parsed["handover"]
+                if block:
+                    break
         finally:
             self.tool_defs = saved
-
-        turn_text = self._handover_turn_text()
-        block = self._handover_capture or _extract_handover_block(turn_text)
         if not block:                         # no usable summary -> don't nuke history
             self.messages = pre
             # Stamp the loop guard even on failure so a model that can't produce a
             # summary doesn't re-attempt (and re-snapshot) compaction every single turn.
             self._last_compact_ts = time.time()
             return None
+        if parsed["tier"] >= 3 or attempt > 0:
+            self._log_activity(
+                "handover",
+                f"degraded parse (tier {parsed['tier']}, {attempt} retr{'y' if attempt == 1 else 'ies'})",
+                "model dropped marker discipline; salvaged via tolerant parser + retry")
         # Snapshot the pre-compaction history ONLY now that we have a usable summary and
         # are about to replace it - so it stays recoverable via /load. Doing it here (not
         # at the top) means a FAILED/futile compaction writes no snapshot: that unbounded
