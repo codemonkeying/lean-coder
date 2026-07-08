@@ -314,7 +314,19 @@ def _cvt_tools(tools):
     return [{"functionDeclarations": decls}] if decls else []
 
 
-def _cvt_messages(messages):
+# Gemini vision-capable model families (accept inline_data image parts). Gemini
+# 1.5+ is multimodal; the embedding/tts/etc. families are already filtered out
+# upstream (_SKIP_KEYS). Gate images on this so a rare text-only model won't 400.
+_VISION_FAMILIES = ("gemini-1.5", "gemini-2", "gemini-3", "gemini-flash",
+                    "gemini-pro", "gemini-exp")
+
+
+def _model_supports_vision(model_id):
+    m = (model_id or "").lower()
+    return any(f in m for f in _VISION_FAMILIES)
+
+
+def _cvt_messages(messages, vision=False):
     # tool-call id -> function name, so a tool result can name its call.
     id2name = {}
     for m in messages:
@@ -370,6 +382,7 @@ def _cvt_messages(messages):
                     break
             parts = []
             ci    = 0
+            image_parts = []   # inline_data parts to emit AFTER the response batch
             while i < len(messages) and messages[i].get("role") == "tool":
                 r    = messages[i]
                 name = r.get("tool_name") or ""
@@ -384,9 +397,21 @@ def _cvt_messages(messages):
                 except Exception:
                     resp = {"output": content}
                 parts.append({"functionResponse": {"name": name, "response": resp}})
+                # generateContent won't take an image inside a functionResponse, so
+                # on a vision model defer it to a following user turn as an
+                # inline_data part. Built ONLY in this transient conversion; history
+                # keeps image_path as a sibling key and is never mutated.
+                if vision and r.get("image_path"):
+                    enc = _lc.get("_encode_image_block")
+                    got = enc(r["image_path"]) if enc else None
+                    if got:
+                        media, data = got
+                        image_parts.append({"inlineData": {"mimeType": media, "data": data}})
                 ci += 1
                 i  += 1
             contents.append({"role": "user", "parts": parts})
+            if image_parts:
+                contents.append({"role": "user", "parts": image_parts})
 
         else:
             i += 1
@@ -547,10 +572,10 @@ class _GeminiClient:
         if not key:
             raise RuntimeError("no API key - use /provider login")
 
-        system, contents = _cvt_messages(messages)
+        cur_model = self._model()
+        system, contents = _cvt_messages(messages, vision=_model_supports_vision(cur_model))
         gem_tools        = _cvt_tools(tools) if tools else []
 
-        cur_model = self._model()
         minfo     = _ensure_models().get(cur_model, {})
         max_out   = minfo.get("max_tokens", _MAX_TOKENS)
         max_in    = minfo.get("max_input_tokens", _CTX_DEFAULT)
