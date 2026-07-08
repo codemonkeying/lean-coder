@@ -236,6 +236,32 @@ def _cvt_tools(tools):
     return out
 
 
+def _tool_result_content(r):
+    """tool_result.content for one role:tool message. Plain string when there is
+    no image (legacy path, unchanged). When the message carries image_path AND
+    the core image encoder is available, return an ARRAY of blocks - text first,
+    then an image block - per the Anthropic vision spec (content MUST be a list,
+    never a stringified list). Any encode failure falls back to the text string,
+    so a broken/missing image never breaks the turn."""
+    text = r.get("content", "")
+    ip   = r.get("image_path")
+    if not ip:
+        return text
+    enc = _lc.get("_encode_image_block")
+    got = enc(ip) if enc else None
+    if not got:
+        return text
+    media, data = got
+    blocks = []
+    if text:
+        blocks.append({"type": "text", "text": text})
+    blocks.append({
+        "type": "image",
+        "source": {"type": "base64", "media_type": media, "data": data},
+    })
+    return blocks
+
+
 def _cvt_messages(messages):
     system = ""
     out    = []
@@ -293,7 +319,7 @@ def _cvt_messages(messages):
                 blocks.append({
                     "type":        "tool_result",
                     "tool_use_id": tcid,
-                    "content":     r.get("content", ""),
+                    "content":     _tool_result_content(r),
                 })
                 ci += 1
                 i  += 1
