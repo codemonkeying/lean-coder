@@ -58,7 +58,7 @@ PRECOMPACT_KEEP = 3              # cap them too: safety nets, not named saves - 
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.4.5"
+__version__ = "0.4.6"
 
 
 def _prerelease_key(pre):
@@ -8998,6 +8998,14 @@ def repl(cfg: Config, resume=None):
                 except KeyboardInterrupt:
                     interrupted = True
             queued = comp.pop_queued() if engaged else []
+            # Carry any UNSUBMITTED partial line (typed mid-turn but not Enter'd) from
+            # the throwaway turn-composer into the persistent idle composer, so it
+            # survives the turn->idle handoff instead of being eaten with `comp`. The
+            # idle composer's read_line() preserves + redraws whatever is in its buf.
+            _partial = comp.buf if engaged else ""
+            if _partial and idle_comp is not None:
+                idle_comp.buf = (idle_comp.buf + _partial) if idle_comp.buf else _partial
+                idle_comp.cur = len(idle_comp.buf)
             # Slash-command lines typed mid-turn are NEVER sent to the model: peel them
             # off and run them as commands (they dispatch at the top of the loop). Only
             # plain messages go through the combine/separate/discard drain. This stops a
