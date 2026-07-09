@@ -405,6 +405,11 @@ its documentation stays current instead of rotting.
   (~1/min) stops a compact->continue->compact spin. All thresholds are tunable per
   model via `/settings` (`handover_soft`, `handover_hard`, `handover_emergency`,
   `auto_handover`, `autostart_after_handover`), and the prompts themselves are editable.
+- **Autonomous wake on background finish (off by default).** With
+  `wake_on_bg_finish = true` (via `/settings`), a finished background task or worker
+  wakes the agent with a synthesised turn so it reacts to the result with no operator
+  input - otherwise the finish notice waits passively for your next turn. See
+  LEAN_TOOLS.md for details.
 - **Bounded send-window (off by default).** For a very small local model, even the
   handover flow can be too much history to hold. `window_messages = N` (via `/settings`)
   caps each request to the last N messages, cut at a *whole-turn boundary* so the

@@ -463,6 +463,16 @@ def setup(lc, cfg):
         return _orig_run_turn(self, user_input)
     Agent.run_turn = run_turn
 
+    # AUTONOMY: also feed worker finishes into the event-driven WAKE path so a finished
+    # worker wakes the agent with no operator input (when cfg.wake_on_bg_finish is on).
+    # Workers are hidden from the core bg wake (kind filter), so this hook is their only
+    # wake route. _finished_notice owns its dedup (meta['announced']), so a worker
+    # surfaced by wake won't re-report via the run_turn wrapper above. Best-effort: if
+    # the core is older and lacks the registry, wake simply stays task-only.
+    _reg = lc.get("register_wake_hook")
+    if _reg:
+        _reg(lambda: _finished_notice() or "")
+
     # A small helper to list models available on this box (for validation), resolved
     # lazily so it reflects the live provider.
     def _available_models():

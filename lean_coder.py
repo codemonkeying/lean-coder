@@ -155,9 +155,9 @@ HANDOVER_INSTR = (
     "4. OPTIONAL SELF-PROMPT: if there's a clear next action, write it between two " +
     SELFPROMPT_MARK + " markers (your continue-from prompt):\n" + SELFPROMPT_MARK +
     "\n<what to do next>\n" + SELFPROMPT_MARK + "\n"
-    "Then call finalize_handover to pull the trigger. The handover text becomes the "
-    "ENTIRE continuing context; everything else is discarded. If you can't produce a "
-    "handover, don't call the tool."
+    "Write these blocks as visible text and then STOP - the handover text becomes the "
+    "ENTIRE continuing context; everything else is discarded. No tool call is needed to "
+    "finish; just end your reply after the blocks."
 )
 
 
@@ -220,6 +220,8 @@ def _extract_selfprompt(text: str):
 # stuck (can't compact, can't continue). The fix (per the research handover): try
 # tiers, and ACCEPT a degraded handover over a no-op. Only truly-empty output no-ops.
 _HANDOVER_MIN = 30    # a block shorter than this is treated as empty (parse failure)
+_HANDOVER_MAX_TRIES = 3   # total handover-turn attempts before accepting what we have
+                          # (completeness retry; separate from _loop's send/429 recovery)
 
 # Escalating corrective retries for a handover the tolerant parser couldn't salvage
 # (research: accept a degraded handover over a no-op; only truly-empty output no-ops).
@@ -324,6 +326,36 @@ def _parse_handover(text: str) -> dict:
     return {"handover": handover, "plan": plan, "next": nxt, "tier": tier}
 
 
+def _handover_missing(parsed) -> list:
+    """Which required handover blocks are still missing (in emit order). The model
+    writes all three as marked text; the turn ending is the trigger (no finalize
+    tool), and any missing block is re-solicited before we accept what we have.
+    This completeness retry recovers an incomplete-but-successful ANSWER - a
+    DIFFERENT layer from the send-level overload/429 recovery inside _loop (which
+    recovers a failed SEND). Separate budgets; they compose, never share a counter."""
+    missing = []
+    if not parsed.get("handover"):
+        missing.append("handover")
+    if not parsed.get("plan"):
+        missing.append("plan")
+    if not parsed.get("next"):
+        missing.append("next-step")
+    return missing
+
+
+def _handover_nudge_missing(missing) -> str:
+    """A corrective re-prompt naming exactly which block(s) to emit, and how."""
+    how = {
+        "handover":  f"the SUMMARY between two {HANDOVER_MARK} markers",
+        "plan":      f"the PLAN (GOAL + TODO) between two {PLAN_MARK} markers",
+        "next-step": f"the NEXT-STEP self-prompt between two {SELFPROMPT_MARK} markers",
+    }
+    want = "; ".join(how[m] for m in missing)
+    return ("Your handover is incomplete - still missing " + want + ". Emit ONLY the "
+            "missing block(s) now as visible text between the exact markers - start with "
+            "the marker, no preamble, no other tool.")
+
+
 # Auto-compaction instruction: the model gets a full tool-capable turn to wrap up,
 # then writes BOTH a handover block (@#!, kept as continuing context) and a
 # self-prompt (%%^^, autostarted as the next turn). Recent turns are kept verbatim.
@@ -339,8 +371,8 @@ AUTO_HANDOVER_INSTR = (
     "get replaced by what you write here). You are writing a note to YOURSELF in a fresh "
     "session that has NO memory of this conversation - capture everything that future-you "
     "needs to continue without losing the thread. Write these three blocks IN THIS REPLY, "
-    "using the exact markers, then call finalize_handover. Start your reply with " +
-    HANDOVER_MARK + " - no preamble, no narration, no other tool first.\n"
+    "using the exact markers, then STOP. Start your reply with " +
+    HANDOVER_MARK + " - no preamble, no narration, no tool call.\n"
     "1. HANDOVER: a concise summary of the older context for your future self - the goal, "
     "key decisions, current task state (done / in progress / next), WHERE things live "
     "(files, commands), and open threads. Put the summary text BETWEEN two identical " +
@@ -354,10 +386,10 @@ AUTO_HANDOVER_INSTR = (
     "after compaction, phrased as a prompt you'd act on immediately. Between two identical " +
     SELFPROMPT_MARK + " lines:\n" +
     SELFPROMPT_MARK + "\nwhat to do next\n" + SELFPROMPT_MARK + "\n"
-    "Then call finalize_handover. The handover becomes your kept context; the self-prompt "
-    "runs as your next turn. If durable notes need saving, do that AFTER the blocks (and "
-    "commit ONLY if this is already a git repo - never init one). If you truly can't "
-    "produce the blocks, don't call the tool."
+    "Then STOP - just end your reply after the blocks (no tool call). The handover becomes "
+    "your kept context; the self-prompt runs as your next turn. If durable notes need "
+    "saving, do that AFTER the blocks (and commit ONLY if this is already a git repo - "
+    "never init one)."
 )
 
 # Soft-zone nudge: gentle, injected inline into the user turn while context is in the
@@ -534,16 +566,6 @@ UPDATE_PLAN_TOOL = {"type": "function", "function": {
         "required": ["plan"]}}}
 
 
-HANDOVER_TOOL = {"type": "function", "function": {
-    "name": "finalize_handover",
-    "description": ("Call this ONCE you have (1) updated/committed any durable docs and "
-                    "(2) written your handover as visible text wrapped between two " +
-                    HANDOVER_MARK + " markers. It captures the text between the markers as "
-                    "the entire continuing context and ends the handover. Takes no "
-                    "arguments. If you haven't written the marked handover yet, do that "
-                    "first - don't call this empty."),
-    "parameters": {"type": "object", "properties": {}, "required": []}}}
-
 # Surfaced ONLY in the soft context zone (the user has, via handover_soft, opened the
 # spend window). Lets the model ELECT a handover at a clean semantic boundary - a
 # finished task, before switching to an unrelated one - instead of being nagged with
@@ -629,8 +651,8 @@ def _leash_allows_tool(leash, name, lean_safe=None):
     tool reaches dispatch anyway - a hallucinated or injected tool_call, a replayed or
     loaded message, a tool wrongly leaked onto the surface - it is refused here unless
     `leash` truly permits it. Mirrors active_tools()'s tiering exactly. update_plan /
-    finalize_handover are agent-internal (no fs/exec) and allowed at any tier."""
-    if name in ("update_plan", "finalize_handover", "request_handover"):
+    request_handover is agent-internal (no fs/exec) and allowed at any tier."""
+    if name in ("update_plan", "request_handover"):
         return True
     if leash == "chat":
         return False                         # no tools at all
@@ -1964,7 +1986,7 @@ class Composer:
         except Exception:
             pass
 
-    def read_line(self, prompt_status=None):
+    def read_line(self, prompt_status=None, wake_check=None):
         """Block at the IDLE prompt reading ONE submitted line, using the same
         proven scroll-region + reader-thread + _redraw_locked path the mid-turn
         composer uses - so a multi-line paste renders in the bounded input box
@@ -1972,7 +1994,13 @@ class Composer:
         keys/shift-enter all work. `prompt_status` is an optional label for the
         status line (e.g. remote indicator). Returns the submitted string, or
         raises EOFError (Ctrl-D on empty buffer). Raises RuntimeError if it can't
-        take the TTY so the caller falls back to input()."""
+        take the TTY so the caller falls back to input().
+
+        `wake_check` (optional, no-arg callable) is polled once per idle tick
+        (~4x/s) while waiting: if it returns a truthy string, read_line abandons
+        the wait and returns THAT string as if submitted - the event-driven wake
+        path (a finished bg task synthesises a turn with NO operator input). The
+        partial buffer being typed is preserved (self.buf untouched)."""
         # Preserve any partial (unsubmitted) buffer carried over from the turn
         # that just ended: keystrokes typed mid-turn but NOT terminated with Enter
         # live in self.buf. pop_queued() only drains Enter-submitted lines, so
@@ -1995,6 +2023,10 @@ class Composer:
                 if self.queued:
                     return self.queued.pop(0)
                 self._read_wake.clear()
+                if wake_check is not None:
+                    woke = wake_check()
+                    if woke:
+                        return woke
         finally:
             self._read_active = False
             self.rule_label = ""
@@ -2421,6 +2453,12 @@ class Config:
                                      # context drops below B - hysteresis*interval (so a strip
                                      # to just under B can't retrigger next turn). Schmitt trigger.
     auto_compact_keep: int = COMPACT_KEEP  # tool results kept in full by an auto-compact strip
+    wake_on_bg_finish: bool = False  # AUTONOMY: when a background task THIS session started
+                                     # finishes, WAKE the agent with a synthesised turn (react
+                                     # to the result with NO operator input) instead of only
+                                     # surfacing the notice on the next human turn. OFF by
+                                     # default: an idle-wake loop changes REPL semantics and can
+                                     # burn quota unattended. Composer (idle-poll) path only.
     ask_user_to_run: bool = True     # expose the ask_user_to_run handoff tool
     composer: bool = True            # pinned bottom input line (type while it works)
     statusline: bool = True          # status rows above each prompt (perms, context
@@ -2604,6 +2642,7 @@ def load_config(args) -> Config:
                 "window_messages", "auto_handover", "handover_soft", "handover_hard",
                 "handover_emergency", "handover_min_interval", "autostart_after_handover",
                 "auto_compact_interval", "auto_compact_hysteresis", "auto_compact_keep",
+                "wake_on_bg_finish",
                 "lean_tools_dir", "providers_dir"):
         if key in file_vals:
             setattr(cfg, key, file_vals[key])
@@ -2807,6 +2846,8 @@ def save_config(cfg: Config, quiet: bool = False):
         lines.append(f"auto_compact_hysteresis = {cfg.auto_compact_hysteresis}")
     if cfg.auto_compact_keep != COMPACT_KEEP:
         lines.append(f"auto_compact_keep = {cfg.auto_compact_keep}")
+    if cfg.wake_on_bg_finish:                  # default off; persist an opt-IN
+        lines.append("wake_on_bg_finish = true")
     lines += [
         f"temperature = {cfg.temperature}",
         f"top_p = {cfg.top_p}",
@@ -3330,6 +3371,22 @@ def _bg_alive(rec) -> bool:
     if _bg_here(rec):
         return _proc_alive(rec.get("pid"))
     return _bg_exit_code(rec) is None
+
+
+# Wake-hook registry: extra no-arg callables that return a finish-notice string (or "")
+# for the event-driven wake path. A lean-tool whose jobs are HIDDEN from the core bg
+# notify (e.g. dispatch_worker's workers, kind-filtered out) registers its own
+# _finished_notice here so its finishes also wake the agent. Each hook owns its dedup,
+# so a job surfaced by wake won't re-report on the next real turn. Empty by default.
+_WAKE_HOOKS = []
+
+
+def register_wake_hook(fn):
+    """Register a no-arg callable fn() -> str for Agent.bg_wake_turn to aggregate.
+    Idempotent (won't add the same fn twice). Returns fn (usable as a decorator)."""
+    if fn not in _WAKE_HOOKS:
+        _WAKE_HOOKS.append(fn)
+    return fn
 
 
 def _bg_is_worker(rec) -> bool:
@@ -5306,6 +5363,7 @@ class Agent:
         self._last_provider = None       # last active provider, for '/provider on'
         self._abort = False
         self._handover_capture = None    # set by finalize_handover -> stops the loop
+        self.handovers = 0               # completed handovers this session (manual + auto)
         self._handover_mark = 0          # index where the current /handover turn starts
         self._elected_handover = False   # set by request_handover -> _maybe_handover runs it
         self._last_compact_ts = 0.0      # time of last auto-handover (loop guard)
@@ -5495,8 +5553,6 @@ class Agent:
         """Route a tool call: to the remote executor when connected (with a
         local confirmation first, since the executor can't prompt), else local.
         The model is unaware of any of this - identical surface either way."""
-        if name == "finalize_handover":      # transient /handover trigger (no remote/leash)
-            return self._finalize_handover()
         if name == "request_handover":       # elective soft-zone handover (agent-internal)
             return self._request_handover()
         if name == "update_plan":            # pinned-plan upkeep (local agent state, never remote)
@@ -5505,7 +5561,7 @@ class Agent:
         safe = bool(plug and plug["safe"])
         # Model-level lock: a chat-only model (provider tool_support=False) has NO tools,
         # and that wins over the leash - raising the ceiling can't grant tools it lacks.
-        if (name not in ("update_plan", "finalize_handover")
+        if (name != "update_plan"
                 and not self._model_tool_support()):
             model = self.cfg.active_model()
             print(red(f"\n{GLYPH['warn']} blocked {name}: model '{model}' has no tool calling "
@@ -5705,6 +5761,12 @@ class Agent:
         No-op when there's no plan or no message to carry it. A tool result must stay
         exact, so we don't append to a role:tool tail - we add a trailing user note
         instead (rare: the slice normally ends on a user/assistant turn)."""
+        # One-shot suppression: the send right after an update_plan skips the reminder,
+        # so the model doesn't get its just-written plan echoed back and narrate it (a
+        # wasted turn). Re-arms automatically for the following send.
+        if getattr(self, "_skip_plan_reminder_once", False):
+            self._skip_plan_reminder_once = False
+            return msgs
         reminder = self._plan_reminder()
         if not reminder or not msgs:
             return msgs
@@ -5766,6 +5828,37 @@ class Agent:
             self._bg_announced.add(key)
             lines.append(_bg_finished_msg([it]))
         return "\n\n".join(l for l in lines if l)
+
+    def bg_wake_turn(self):
+        """AUTONOMY: a synthesised user turn describing any background job THIS session
+        started that has finished since we last looked - or "" if none. Aggregates two
+        sources, both using their OWN dedup so a job is claimed by whichever fires first
+        (this wake path when idle, or the passive turn-rider when the operator types):
+          1. plain bg TASKS via _bg_finished_note (_bg_finished_here + _bg_announced);
+          2. WORKERS via the wake-hook registry (_WAKE_HOOKS) - the dispatch_worker
+             lean-tool registers its _finished_notice there, so worker finishes wake
+             the agent too. Workers are hidden from the core bg notify (kind filter),
+             so the hook is their only wake path; its own meta['announced'] dedup means
+             a worker surfaced by wake won't re-report on the next real turn.
+        Only meaningful when cfg.wake_on_bg_finish is on (the caller gates on that).
+        Wrapped in autonomous-wake framing + an explicit react instruction, since no
+        operator prompt accompanies it."""
+        parts = []
+        note = self._bg_finished_note()
+        if note:
+            parts.append(note)
+        for hook in list(_WAKE_HOOKS):
+            try:
+                h = hook()
+            except Exception:
+                h = ""
+            if h:
+                parts.append(h)
+        if not parts:
+            return ""
+        return ("[autonomous wake - a background job you started finished; no operator "
+                "input. React to the result now: inspect it, decide the next step, and "
+                "either act or hand back.]\n\n" + "\n\n".join(parts))
 
     def reset(self):
         self.messages = [{"role": "system", "content": self._system()}]
@@ -5877,11 +5970,11 @@ class Agent:
 
     def handover(self):
         """Agentic /handover: the model gets a real (tool-capable) turn to update +
-        commit any durable docs, write its future-self handover wrapped in @#! markers,
-        then call the transiently-surfaced finalize_handover tool. On that call we
-        extract the marked block and replace history with just it - a "smart /clear"
-        that keeps the thread. A bad/absent block does NOT nuke history (returns None).
-        Returns the handover text, or None."""
+        commit any durable docs, then write its future-self handover as marked text
+        (@#! block + plan + next-step). No finalize tool - the turn ending is the
+        trigger; we parse the marked blocks, re-solicit any missing one, then replace
+        history with the summary - a "smart /clear" that keeps the thread. A bad/absent
+        block does NOT nuke history (returns None). Returns the handover text, or None."""
         if len([m for m in self.messages if m["role"] != "system"]) == 0:
             return None
         instr = read_prompt("handover") or HANDOVER_INSTR
@@ -5889,19 +5982,27 @@ class Agent:
         self.dirty = True
         self._handover_capture = None
         self._handover_mark = len(self.messages)
-        saved = self.tool_defs
-        self.tool_defs = list(saved) + [HANDOVER_TOOL]   # surface the finalize tool...
-        try:
+        # No finalize tool: the model writes the marked blocks; the turn ending is the
+        # trigger. Re-solicit any missing block by name, up to _HANDOVER_MAX_TRIES.
+        parsed = None
+        missing = ["handover"]
+        for attempt in range(_HANDOVER_MAX_TRIES):
+            if attempt > 0:
+                nudge = (_handover_nudge_missing(missing) if attempt == 1
+                         else HANDOVER_RETRY_2)
+                self.messages.append({"role": "user", "content": nudge})
             with self._sigint_guard():
                 self._loop()
-        finally:
-            self.tool_defs = saved                        # ...and remove it at the end
-        parsed = _parse_handover(self._handover_turn_text())
-        block = self._handover_capture or parsed["handover"]
+            parsed = _parse_handover(self._handover_turn_text())
+            missing = _handover_missing(parsed)
+            if not missing:
+                break
+        block = parsed["handover"]
         if not block:        # no usable handover (truly empty) -> leave history untouched
             return None
-        if parsed["tier"] >= 3:
-            self._log_activity("handover", f"degraded parse (tier {parsed['tier']})",
+        if parsed["tier"] >= 3 or missing:
+            self._log_activity("handover",
+                               f"degraded parse (tier {parsed['tier']}, missing {missing})",
                                "model dropped marker discipline; salvaged via tolerant parser")
         plan = parsed["plan"]
         if plan:
@@ -5915,6 +6016,7 @@ class Agent:
         self._handover_boundary = 2      # stable prefix (system + summary) - see auto_handover()
         self.last_prompt_tokens = None
         self.tools.changed_files.clear()
+        self.handovers += 1
         return block
 
     def _update_plan(self, plan: str):
@@ -5926,23 +6028,15 @@ class Agent:
         if self.messages and self.messages[0].get("role") == "system":
             self.messages[0]["content"] = self._system()
         self.last_prompt_tokens = None       # prompt changed; let the meter re-estimate
+        # Suppress the plan reminder on the NEXT send only: the model just wrote the plan
+        # (this call), so re-appending the full plan onto the update_plan tool result makes
+        # it echo/narrate it back - a wasted turn. It re-arms on the following send.
+        self._skip_plan_reminder_once = True
         if not plan:
             return "pinned plan cleared."
         done = plan.count("[x]") + plan.count("[X]")
         todo = plan.count("[ ]")
         return f"plan pinned ({done} done, {todo} to go)."
-
-    def _finalize_handover(self):
-        """The finalize_handover tool body: extract the @#! block from this handover
-        turn. On success, stash it + signal the loop to stop; on failure, tell the
-        model to write the markers and call again (history is never touched here)."""
-        block = _extract_handover_block(self._handover_turn_text())
-        if not block:
-            return (f"no handover found: write it as visible text wrapped between two "
-                    f"{HANDOVER_MARK} markers (not inside this tool call), then call "
-                    f"finalize_handover again. Nothing has been changed.")
-        self._handover_capture = block
-        return "handover captured - finalizing."
 
     def _request_handover(self):
         """The request_handover tool body: the model elects a handover at a clean break.
@@ -5966,7 +6060,7 @@ class Agent:
         """Self-managing compaction. Snapshot the full history (recoverable), then an
         agentic turn where the model summarizes the OLDER context (between
         HANDOVER_MARK markers) and writes its next-step self-prompt (between
-        SELFPROMPT_MARK markers) and calls finalize_handover. We keep the recent tail
+        SELFPROMPT_MARK markers), then ends the turn (no finalize tool). We keep the recent tail
         verbatim, replace the older part with the summary, queue the self-prompt for
         autostart, and stamp the loop-guard clock. A bad/absent summary leaves history
         untouched (returns None). Returns the summary block, or None."""
@@ -5983,24 +6077,27 @@ class Agent:
         self._handover_capture = None
         self._handover_mark = len(self.messages)
         saved = self.tool_defs
-        self.tool_defs = list(saved) + [HANDOVER_TOOL]
-        # Run the handover turn, then parse tolerantly. If nothing usable came back,
-        # re-prompt with escalating specificity (research: accept a degraded handover
-        # over a no-op - only truly-empty output should leave a full context stuck).
+        # No finalize tool: the model writes the marked blocks and the turn ENDING is
+        # the trigger. Parse tolerantly, then re-solicit any MISSING block BY NAME - up
+        # to _HANDOVER_MAX_TRIES total. This completeness retry (an incomplete-but-
+        # successful ANSWER) is a DIFFERENT layer from the send-level overload/429
+        # recovery inside _loop (a failed SEND): separate budgets, they compose.
         block = parsed = None
-        try:
-            for attempt, retry in enumerate((None, HANDOVER_RETRY_1, HANDOVER_RETRY_2)):
-                if retry is not None:
-                    self.messages.append({"role": "user", "content": retry})
-                with self._sigint_guard():
-                    self._loop()
-                turn_text = self._handover_turn_text()
-                parsed = _parse_handover(turn_text)
-                block = self._handover_capture or parsed["handover"]
-                if block:
-                    break
-        finally:
-            self.tool_defs = saved
+        missing = ["handover"]
+        for attempt in range(_HANDOVER_MAX_TRIES):
+            if attempt > 0:
+                nudge = (_handover_nudge_missing(missing) if attempt == 1
+                         else HANDOVER_RETRY_2)   # last try: the exact full template
+                self.messages.append({"role": "user", "content": nudge})
+            with self._sigint_guard():
+                self._loop()
+            turn_text = self._handover_turn_text()
+            parsed = _parse_handover(turn_text)
+            block = parsed["handover"]
+            missing = _handover_missing(parsed)
+            if not missing:
+                break
+        self.tool_defs = saved
         if not block:                         # no usable summary -> don't nuke history
             self.messages = pre
             # Stamp the loop guard even on failure so a model that can't produce a
@@ -6047,6 +6144,7 @@ class Agent:
         self._last_compact_ts = time.time()
         if selfprompt and self.cfg.handover_for()["autostart"]:
             self._autostart_pending = selfprompt
+        self.handovers += 1
         return block
 
     def _dispatch(self, name: str, args: dict) -> str:
@@ -6207,7 +6305,7 @@ class Agent:
         if forced and not self._compact_allowed(zone):
             return
         if not self._model_tool_support():
-            # Compaction summarizes via finalize_handover (a TOOL); a chat-only model can
+            # Compaction summarizes via a tool-capable turn; a chat-only model can
             # never complete it, so attempting it just burns a turn + snapshot every turn.
             # Skip, and say why once (the model, not the user, is the limitation).
             if not getattr(self, "_compact_unsupported_warned", False):
@@ -6511,8 +6609,6 @@ class Agent:
                     finally:
                         spin.stop()
                 self.messages.append(_tool_result_msg(name, result))
-                if self._handover_capture is not None:   # finalize_handover fired -> stop
-                    return
         print(yellow(f"\n{GLYPH['warn']} hit {cap}-iteration cap; stopping this turn. "
                      f"Refine your request or continue, or raise the limit: "
                      f"/settings -> max_iterations (0 = unlimited), or set "
@@ -6566,12 +6662,14 @@ def _fmt_reset(iso) -> str:
     return dt.strftime("%d%b") + f"({int(secs // 86400)}d)"
 
 
-def render_usage_meters(usage) -> str:
+def render_usage_meters(usage, verbose=False) -> str:
     """Render a provider's usage dict into a status suffix, with core's own colour
     ramp / reset formatting (the provider supplies only numbers). Shape:
-    {"meters": [{"label": "5h", "pct": 12, "resets_at": iso}, ...], "note": ""}.
-    Returns "" for an empty/None usage so the caller can fall back to the plain
-    ctx line."""
+    {"meters": [{"label": "5h", "pct": 12, "resets_at": iso, "day": "D6",
+    "tag": {...}}, ...], "note": ""}.
+    The status line stays TIDY: reset time/countdown is shown only when verbose
+    (i.e. /info), never on the row-3 meter. Returns "" for an empty/None usage so
+    the caller can fall back to the plain ctx line."""
     if not usage:
         return ""
     parts = []
@@ -6581,19 +6679,20 @@ def render_usage_meters(usage) -> str:
         except (TypeError, ValueError):
             continue
         label = str(m.get("label", "")).strip()
-        rst = _fmt_reset(m.get("resets_at", ""))
         body = (f"{label} FULL" if pct >= 100 else f"{label} {pct:.0f}%")
-        if rst:
-            body += f" {rst}"
+        if verbose:                      # reset lives in /info, not the tidy status line
+            rst = _fmt_reset(m.get("resets_at", ""))
+            if rst:
+                body += f" {rst}"
         body = _pct_color(pct)(body)
-        # Optional provider tag rendered bracketed AFTER the reset with its own
-        # colour ramp (e.g. per-day headroom, whose danger is inverse of pct).
+        # Optional provider tag rendered bracketed AFTER the pct with its own colour
+        # ramp (e.g. today's spend '(0%/day6)').
         # {"text": str, "level": "ok"|"warn"|"crit"} - provider owns the level,
         # core owns the colour so every provider's tags read the same.
         tag = m.get("tag")
         if isinstance(tag, dict) and str(tag.get("text", "")).strip():
             tclr = {"crit": red, "warn": yellow}.get(tag.get("level"), blue)
-            body += tclr(f"({str(tag['text']).strip()})")
+            body += tclr(f" ({str(tag['text']).strip()})")
         parts.append(body)
     note = str(usage.get("note", "")).strip()
     if note:
@@ -7032,6 +7131,7 @@ _SETTINGS_FIELDS = [
     ("handover_emergency", "handover emergency threshold (fraction of ctx)", "float"),
     ("handover_min_interval", "min seconds between handovers", "float"),
     ("autostart_after_handover", "auto-continue the turn after a handover (on by default; 5s ^C to cancel)", "bool"),
+    ("wake_on_bg_finish", "wake + react autonomously when a background task finishes (off by default)", "bool"),
     ("auto_compact_interval", "auto-compact: strip old tool outputs every N tokens (0 = off)", "int"),
     ("auto_compact_hysteresis", "auto-compact re-arm margin (fraction of interval)", "float"),
     ("auto_compact_keep", "tool results kept in full by an auto-compact strip", "int"),
@@ -7285,16 +7385,17 @@ def handle_bg_command(agent, cfg, arg):
         print(dim(f"      log: {r.get('log', '?')}"))
 
 
-def _provider_usage_str(agent, cfg) -> str:
+def _provider_usage_str(agent, cfg, verbose=False) -> str:
     """The active backend's usage/quota tail (e.g. the '5h .. wk ..' meters), already
     styled, or '' if the backend reports none. Core does the rendering so every
-    backend reads the same. Shared by the ctx meter and the status rows."""
+    backend reads the same. Shared by the ctx meter and the status rows. verbose=True
+    (used by /info) also shows the reset time/countdown, kept off the tidy status line."""
     spec = agent.active_provider()
     if spec is None:
         return ""
     try:
         if spec["usage"]:
-            return render_usage_meters(spec["usage"](agent, cfg))
+            return render_usage_meters(spec["usage"](agent, cfg), verbose=verbose)
         if spec["status_line"]:
             s = (spec["status_line"](agent, cfg) or "").strip()
             return dim("  " + GLYPH["dot"] + "  ") + s if s else ""
@@ -7322,16 +7423,18 @@ def _status_rows(agent, cfg):
     rows = []
     model_at = f"{_short_model(cfg.active_model())} @ {_provider_label(cfg)}"
 
-    # 1) session + model (at the top - what/where you're running)
+    # 1) session + model (at the top - what/where you're running). The live turn
+    # counter sits where 'autosaving' used to (autosave state -> /info now); it's a
+    # volatile token _status_key strips so 'changed-only' mode still gates correctly.
+    turns = sum(1 for m in agent.messages if m.get("role") == "user")
     if cfg.incognito:
         s = [magenta(f"{GLYPH['ghost']} incognito")]
     elif cfg.autosave:
-        s = [f"session {agent.autosave_name}", "autosaving"]
+        s = [f"session: {agent.autosave_name}"]
     else:
         s = ["amnesic"]
+    s.append(f"{turns} turns")
     s.append(model_at)
-    if getattr(agent, "pinned_plan", ""):
-        s.append("plan pinned")
     rows.append("  " + d.join(s))
 
     # 2) perms + context management
@@ -7340,17 +7443,18 @@ def _status_rows(agent, cfg):
         p = [yellow("chat-only (model)")]
         if cfg.leash != "chat":
             p.append(dim(f"leash {cfg.leash} n/a"))   # the ceiling can't grant tools the model lacks
-        p.append(f"approve {cfg.approval}")
+        p.append(f"approve: {cfg.approval}")
     else:
-        p = [bold(cfg.leash), f"approve {cfg.approval}"]
+        p = [bold(cfg.leash), f"approve: {cfg.approval}"]
     if cfg.approval == "auto":                # the round-cap only bites when unattended
         mi = cfg.max_iterations
         p.append(f"max {mi} rounds" if mi else "no round cap")
     if cfg.confirm_reads:
         p.append("ask-read")
-    p.append("window off" if cfg.window_messages <= 0 else f"window {cfg.window_messages}")
+    if cfg.window_messages > 0:               # only show when on - don't nag with 'window off'
+        p.append(f"window {cfg.window_messages}")
     c = cfg.handover_for()
-    p.append(f"handover {c['soft'] * 100:.0f}/{c['hard'] * 100:.0f}" if c.get("auto") else "handover off")
+    p.append(f"handover {c['hard'] * 100:.0f}%" if c.get("auto") else "handover off")
     p.append(f"{len(agent.tool_defs)} tools")
     rows.append("  " + d.join(p))
 
@@ -7370,10 +7474,14 @@ def _status_rows(agent, cfg):
     # cache-inclusive measured size. Without the marker a fresh load looks like ctx
     # dropped/was lost. It firms up to the measured value on the next turn.
     est = "~" if not getattr(agent, "last_prompt_tokens", 0) else ""
-    ctx = _pct_color(pct)(f"ctx {est}{_fmt_tokens(used)}/{_fmt_tokens(window)} ({pct:.0f}% {zone})")
+    # drop the 'ok' zone label - only surface a zone once it's noteworthy (soft/hard/emergency)
+    zlabel = "" if zone == "ok" else f" {zone}"
+    ctx = _pct_color(pct)(f"ctx {est}{_fmt_tokens(used)}/{_fmt_tokens(window)} ({pct:.0f}%{zlabel})")
     quota = _provider_usage_str(agent, cfg)     # leading separator already, or "" if none
-    # ctx -> the backend quota meters (5h / wk) -> think / effort
-    rows.append("  " + ctx + quota + d + d.join([f"think {think}", f"effort {effort}"]))
+    # handovers is a live counter (row 3 reprints every turn); shown once any happened.
+    hov = (d + f"{agent.handovers} handovers") if agent.handovers else ""
+    # ctx -> handover count -> the backend quota meters (5h / wk) -> think / effort
+    rows.append("  " + ctx + hov + quota + d + d.join([f"think {think}", f"effort {effort}"]))
     return rows
 
 
@@ -7381,8 +7489,15 @@ def _status_key(rows):
     """Signature the repl uses to decide when to REPRINT the stable status rows
     (session/model + perms/tools). The LAST row - the live context meter - is excluded
     because it prints every turn anyway; so per-turn ctx/token/zone drift never triggers
-    a reprint, only a real settings/model/tools/plan change (in rows 1-2) does. Pure."""
-    return tuple(rows[:-1]) if rows else ()
+    a reprint, only a real settings/model/tools/plan change (in rows 1-2) does. The live
+    'N turns' token on row 1 is also stripped (it changes every turn, and would defeat
+    the changed-only gate otherwise). Pure."""
+    if not rows:
+        return ()
+    stable = list(rows[:-1])
+    if stable:                       # drop the volatile 'N turns' token from row 1
+        stable[0] = re.sub(r"\s*" + re.escape(GLYPH["dot"]) + r"\s*\d+ turns", "", stable[0])
+    return tuple(stable)
 
 
 def handle_info_command(agent, cfg, arg=""):
@@ -7406,8 +7521,9 @@ def handle_info_command(agent, cfg, arg=""):
         zone = "ok"
     print(f"  model:    {cfg.active_model()}")
     print(f"  provider: {backend}  ({where})")
+    hov = f", {agent.handovers} handovers" if agent.handovers else ""
     print(f"  context:  ~{_fmt_tokens(used)}/{_fmt_tokens(window)} "
-          f"({used / window * 100:.0f}%, {zone}){dot}{len(agent.messages)} msgs, {turns} turns")
+          f"({used / window * 100:.0f}%, {zone}){dot}{len(agent.messages)} msgs, {turns} turns{hov}")
     # how context is managed - the two things that surprised people
     wm = cfg.window_messages
     print(f"  window:   {'off (full history sent)' if wm <= 0 else f'last {wm} messages sent'}")
@@ -7435,6 +7551,9 @@ def handle_info_command(agent, cfg, arg=""):
     if getattr(agent, "pinned_plan", ""):
         print(f"  plan:     pinned (GOAL+TODO, carried across compaction + load)")
     print(f"  usage:    in {agent.session_in:,}  out {agent.session_out:,}")
+    _quota = _provider_usage_str(agent, cfg, verbose=True)   # backend quota incl. reset times
+    if _quota:
+        print(f"  quota:    {_quota.lstrip()}")
     print(f"  thinking: {think}{dot}effort: {effort}")
     print(f"  approval: {cfg.approval}" + (f"  {badge}" if badge else ""))
     print(f"  leash:    {cfg.leash}  ({_LEASH_GRANTS[cfg.leash]})")
@@ -8697,7 +8816,7 @@ def handle_handover_command(agent, cfg, arg):
     summary = agent.handover()
     if summary is None:
         print(yellow("\nno handover captured - history left intact. (Write it "
-                     f"between {HANDOVER_MARK} markers and call finalize_handover.)"))
+                     f"between {HANDOVER_MARK} markers as visible text.)"))
     else:
         agent.autosave_name = _new_autosave_name()
         print(dim("\nhistory replaced with the handover above; "
@@ -8896,6 +9015,42 @@ def dispatch_command(agent, cfg, cmd, arg):
         return False
     print(yellow(f"unknown command {cmd} - /help"))
     return False
+
+
+def _input_or_wake(prompt, wake_check=None, tick=0.25):
+    """input() that can also WAKE on a background event, for the non-composer path
+    (no-TTY-but-live-stdin: piped-but-open stdin, some Termux/ssh setups). When
+    wake_check is None it's a plain blocking input() (identical behaviour - the
+    common case). When set, stdin is polled with select() every `tick` seconds; on a
+    ready line we read + return it, and on each idle tick we call wake_check() - a
+    truthy return is a synthesised turn we return as if typed (NO operator input).
+    Falls back to a plain blocking input() where select-on-stdin isn't possible
+    (Windows, no fileno) so nothing regresses. Raises EOFError on stdin close, as
+    input() does, so the caller's ^D handling is unchanged."""
+    if wake_check is None:
+        return input(prompt).strip()
+    try:
+        import select
+        fd = sys.stdin.fileno()
+    except (ValueError, OSError, AttributeError):
+        return input(prompt).strip()        # no pollable stdin -> plain blocking read
+    sys.stdout.write(prompt)
+    sys.stdout.flush()
+    while True:
+        try:
+            r, _, _ = select.select([fd], [], [], tick)
+        except (OSError, ValueError):
+            return input("").strip()        # select unusable -> block for the rest
+        if r:
+            data = sys.stdin.readline()
+            if data == "":                  # EOF (stdin closed) - match input()
+                raise EOFError
+            return data.strip()
+        woke = wake_check()
+        if woke:
+            sys.stdout.write("\n")          # leave the prompt line cleanly
+            sys.stdout.flush()
+            return woke
 
 
 def repl(cfg: Config, resume=None):
@@ -9102,8 +9257,10 @@ def repl(cfg: Config, resume=None):
                     # the TTY (RuntimeError). The prompt glyph is drawn by the
                     # composer's own input row, so pass only the remote indicator.
                     try:
+                        _wake = (agent.bg_wake_turn if cfg.wake_on_bg_finish else None)
                         line = idle_comp.read_line(
-                            prompt_status=(indicator.strip() or None)).strip()
+                            prompt_status=(indicator.strip() or None),
+                            wake_check=_wake).strip()
                         # stop_tty() cleared the pinned input rows; echo the
                         # submitted line into scrollback so the turn history reads
                         # naturally (input() leaves the line on screen for free).
@@ -9111,11 +9268,13 @@ def repl(cfg: Config, resume=None):
                             print(bold(cyan(indicator + GLYPH["prompt"] + " "))
                                   + line.replace("\n", GLYPH["ret"]))
                     except RuntimeError:
-                        line = input(_rl_safe(bold(cyan(
-                            indicator + GLYPH["prompt"] + " ")))).strip()
+                        line = _input_or_wake(
+                            _rl_safe(bold(cyan(indicator + GLYPH["prompt"] + " "))),
+                            agent.bg_wake_turn if cfg.wake_on_bg_finish else None)
                 else:
-                    line = input(_rl_safe(bold(cyan(
-                        indicator + GLYPH["prompt"] + " ")))).strip()
+                    line = _input_or_wake(
+                        _rl_safe(bold(cyan(indicator + GLYPH["prompt"] + " "))),
+                        agent.bg_wake_turn if cfg.wake_on_bg_finish else None)
                 pending_exit = False   # any input (even empty) disarms the exit
             except EOFError:           # Ctrl-D
                 agent.close_all_remotes()
