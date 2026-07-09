@@ -515,6 +515,21 @@ class _OpenRouterClient:
                     if dm:
                         raise RuntimeError(dm) from None
                 raise RuntimeError(f"API {e.code}: {body[:400]}") from None
+            except (urllib.error.URLError, ConnectionError, OSError) as e:
+                # Transport failure (dropped connection, TLS reset, DNS blip) - no
+                # HTTP status. Retry with backoff; a bad message never surfaces empty.
+                if attempt < _MAX_RETRIES:
+                    wait = _backoff(attempt)
+                    attempt += 1
+                    detail = str(getattr(e, "reason", None) or e) or type(e).__name__
+                    print(_lc["red"](f"[!] {model} connection error ({detail[:80]}) - "
+                                     f"retry {attempt}/{_MAX_RETRIES} in {wait:.0f}s"))
+                    if not _interruptible_sleep(wait, should_abort):
+                        raise RuntimeError("aborted during retry wait") from None
+                    continue
+                raise RuntimeError(
+                    f"request failed: {str(getattr(e, 'reason', None) or e) or type(e).__name__}"
+                ) from None
 
     def chat(self, messages, tools, should_abort=None):
         key = _api_key()
@@ -557,6 +572,20 @@ class _OpenRouterClient:
             elif eff == "off":
                 payload["reasoning"] = {"enabled": False}
 
+        # Opt-in cross-model fallback (OpenRouter-native): `/set or_fallback
+        # "openai/gpt-5,google/gemini-3-pro"` -> OpenRouter walks the list top to
+        # bottom when the active model 5xx/429s/refuses, no app-side retry needed.
+        # The active model leads the chain; you pay whichever model actually serves.
+        # Off by default (unset): swapping models mid-session changes quality/cost,
+        # so it must be chosen deliberately.
+        fb = (self.cfg.setting("or_fallback") or "").strip()
+        if fb:
+            extra = [m.strip() for m in fb.replace(",", " ").split() if m.strip()
+                     and m.strip() != cur_model]
+            if extra:
+                payload["models"] = [cur_model] + extra
+                payload["route"]  = "fallback"
+
         result = self._send(key, payload, should_abort)
         self._sess_cache_read  += self.last_cache_read
         self._sess_cache_write += self.last_cache_write
@@ -594,6 +623,11 @@ def _on_activate(agent, cfg):
         print(_lc["dim"]("  free tier: only :free models listed; /set tier all for paid, /set or_filter <text> to narrow"))
     else:
         print(_lc["dim"]("  tier all: paid + free models listed; /set tier free for :free only, /set or_filter <text> to narrow"))
+    fb = (cfg.setting("or_fallback") or "").strip()
+    if fb:
+        print(_lc["dim"](f"  fallback chain: {cfg.active_model()} -> {fb}  (/set or_fallback '' to disable)"))
+    else:
+        print(_lc["dim"]("  /set or_fallback 'openai/gpt-5,google/gemini-3-pro' for auto cross-model fallback on outage/ratelimit"))
     print(_privacy_note())
     d = _cred_data()
     d["active"] = True
