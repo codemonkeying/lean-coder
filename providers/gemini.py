@@ -566,6 +566,21 @@ class _GeminiClient:
                             raise RuntimeError("aborted during retry wait") from None
                         continue
                 raise RuntimeError(f"API {e.code}: {body[:400]}") from None
+            except (urllib.error.URLError, ConnectionError, OSError) as e:
+                # Transport failure (dropped connection, TLS reset, DNS blip) - no
+                # HTTP status. Retry with backoff; a bad message never surfaces empty.
+                if attempt < _MAX_RETRIES:
+                    wait = _backoff(attempt)
+                    attempt += 1
+                    detail = str(getattr(e, "reason", None) or e) or type(e).__name__
+                    print(_lc["red"](f"[!] {model} connection error ({detail[:80]}) - "
+                                     f"retry {attempt}/{_MAX_RETRIES} in {wait:.0f}s"))
+                    if not _interruptible_sleep(wait, should_abort):
+                        raise RuntimeError("aborted during retry wait") from None
+                    continue
+                raise RuntimeError(
+                    f"request failed: {str(getattr(e, 'reason', None) or e) or type(e).__name__}"
+                ) from None
 
     def chat(self, messages, tools, should_abort=None):
         key = _api_key()
