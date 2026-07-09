@@ -246,6 +246,40 @@ is ready; `/worker <pid>` prints that worker's full result. Workers are delibera
 hidden from `/bg` and the `bg_status` tool, so a session without this tool never sees
 them.
 
+
+## Autonomous wake on background finish (`wake_on_bg_finish`)
+
+By default a finished background job (a plain `' &'` task **or** a dispatched worker)
+surfaces **passively**: its notice rides the *next turn you type*. If you never type,
+the agent never sees it. That's fine when you're driving, but it means a long job
+that finishes while you're away just waits.
+
+Turn on **`wake_on_bg_finish`** (config, `/settings`, or `/set wake_on_bg_finish
+true`) and a finish **wakes the agent itself** - it synthesises a turn carrying the
+result and an instruction to react, with **no operator input**. The agent inspects
+the result, decides the next step, and either acts or hands back. Off by default: an
+idle-wake loop changes REPL semantics and can burn quota unattended, so it's opt-in.
+
+How it works:
+
+- **Idle poll.** While waiting at the prompt, the input path polls ~4×/s. The
+  composer (`Composer.read_line`) and the classic no-composer path
+  (`_input_or_wake`, a `select()` on stdin) both check for a finished job each tick;
+  a hit returns a synthesised line exactly as if you'd typed it.
+- **One source, both kinds.** `Agent.bg_wake_turn()` aggregates plain bg tasks (via
+  the same `_bg_finished_here` + `_bg_announced` dedup the passive notice uses) and
+  workers (via the `_WAKE_HOOKS` registry - `dispatch_worker` registers its
+  `_finished_notice`, whose own `announced` dedup applies). A job is claimed by
+  whichever fires first (wake when idle, or the passive turn-rider if you type
+  first), so it is **never double-reported**.
+- **Where it works.** Any real terminal - a plain TTY, tmux/screen, SSH, Termux -
+  and even a non-composer session with live (still-open) stdin. It does **not** wake
+  in a headless one-shot (piped-then-EOF stdin, cron) because there is no idle loop
+  to wake into; a fire-and-forget `--serve` daemon mode for that is on the backlog.
+- **Desktop ping** still comes from the `notify` lean-tool if enabled (workers ping
+  on finish); wake is the turn-level reaction, `notify` is the OS-level nudge - they
+  compose.
+
 **Capability (leash).** A worker defaults to **read-only**. Pass `leash="rw"` (may
 edit files) or `leash="rwe"` (may edit + run commands), but the grant is always
 capped at **your own current leash** - a worker can never exceed its parent's
