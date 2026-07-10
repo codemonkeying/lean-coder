@@ -31,7 +31,7 @@ WORKER CEILINGS (the cost lever) - each resolves in priority order:
   2. else the live cfg value (editable in /settings, saved to config, usable at once);
   3. else the built-in default (shown below).
   cfg field              /settings + config      env var                          default
-  worker_max_concurrent  most workers at once     LEANCODER_WORKER_MAX_CONCURRENT   6
+  worker_max_concurrent  most workers at once     LEANCODER_WORKER_MAX_CONCURRENT   10
   worker_idle_timeout    lease secs; self-kill    LEANCODER_WORKER_IDLE_TIMEOUT     1800
   worker_max_iterations  agentic-loop cap/worker  LEANCODER_WORKER_MAX_ITER         30
   model_allowlist        (env only)               LEANCODER_WORKER_MODELS           any
@@ -43,7 +43,7 @@ import time
 from pathlib import Path
 
 # Built-in ceiling defaults (last resort: env var > live cfg > this - see docstring).
-_DEFAULTS = {"max_concurrent": 6, "idle_timeout": 1800, "max_iterations": 30}
+_DEFAULTS = {"max_concurrent": 10, "idle_timeout": 1800, "max_iterations": 30}
 _ENV = {"max_concurrent": "LEANCODER_WORKER_MAX_CONCURRENT",
         "idle_timeout": "LEANCODER_WORKER_IDLE_TIMEOUT",
         "max_iterations": "LEANCODER_WORKER_MAX_ITER"}
