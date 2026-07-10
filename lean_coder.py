@@ -2480,7 +2480,7 @@ class Config:
                                      # branch /update fetches VERSION + lean_coder.py from.
     command_timeout: int = 300       # foreground run_command timeout (s); long tasks use ' &'
     bg_max_concurrent: int = 5       # max background tasks at once (0 = unlimited)
-    worker_max_concurrent: int = 6   # dispatch_worker: max worker agents alive at once (0 = unlimited)
+    worker_max_concurrent: int = 10   # dispatch_worker: max worker agents alive at once (0 = unlimited)
     worker_idle_timeout: int = 1800  # dispatch_worker: worker lease secs; unattended self-kill
     worker_max_iterations: int = 30  # dispatch_worker: agentic-loop cap per worker
     editor: str = ""                 # preferred editor for /prompt etc.; "" -> $EDITOR/nano

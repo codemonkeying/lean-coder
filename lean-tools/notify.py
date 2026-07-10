@@ -59,6 +59,13 @@ def setup(lc, cfg):
     _orig_end = Agent._end_of_turn
     def _end_of_turn(self):
         _orig_end(self)
+        # Only ping when the turn ACTUALLY ends - i.e. control returns to the
+        # operator. If the agent has an autostart continuation queued (post-handover
+        # self-prompt), the "turn" immediately continues into the next one, so
+        # pinging here spams a "turn finished" for every intermediate continuation.
+        # Suppress until we're really handing back.
+        if getattr(self, "_autostart_pending", None):
+            return
         if _state["on"] and (time.monotonic() - _state["start"]) >= NOTIFY_AFTER:
             _ping("lean-coder", "turn finished")
     Agent._end_of_turn = _end_of_turn
