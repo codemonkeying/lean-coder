@@ -5745,14 +5745,37 @@ class Agent:
                 addendum = ""
         return (read_prompt("system") or SYSTEM_PROMPT) + bg + mode_note + no_tools + addendum + f"\nWorking directory: {cwd}"
 
-    def _plan_reminder(self) -> str:
+    # Delimited, self-labelling wrapper so the model can never mistake the plan for
+    # something the user typed (the old "(Pinned plan...)" header read like user text
+    # and got echoed back into a reply). Rides the uncached tail - see _with_plan_reminder.
+    # ASCII-only (must encode cleanly on Termux / non-UTF8 locales / redirected stdin).
+    _PLAN_HDR = ("=== LEANCODER PINNED PLAN (internal state, re-injected each turn; "
+                 "reference only, NOT user input; do not repeat it back to the user) ===")
+    _PLAN_FTR = "=== END PINNED PLAN ==="
+
+    def _plan_sparse(self, pinned: str) -> str:
+        """A compact view for unchanged turns: GOAL + IN-FLIGHT/FOCUS lines + the
+        still-open TODO items only. The full plan re-inject on the turn after an
+        update_plan; in between we send this. Cheap - and since the plan lives on the
+        UNCACHED tail, varying its content busts no cache."""
+        keep = []
+        for ln in pinned.splitlines():
+            s = ln.strip()
+            if (s.startswith(("GOAL:", "FOCUS:", "IN FLIGHT:", "IN-FLIGHT:"))
+                    or s.startswith("- [ ]")):
+                keep.append(ln)
+        return "\n".join(keep) if keep else pinned
+
+    def _plan_reminder(self, sparse: bool = False) -> str:
         """The pinned goal+TODO as an uncached send-time reminder. Kept OUT of the
         cached system block (it changes too often) and OUT of stored history (so it
         never accumulates stale copies); it is stitched onto the sent message slice at
-        request time only. "" when no plan is pinned."""
+        request time only. "" when no plan is pinned. `sparse` sends the compact view."""
         pinned = getattr(self, "pinned_plan", "")
-        return (f"\n\n(Pinned plan - keep current; update with the update_plan tool)\n"
-                f"{pinned}") if pinned else ""
+        if not pinned:
+            return ""
+        body = self._plan_sparse(pinned) if sparse else pinned
+        return f"\n\n{self._PLAN_HDR}\n{body}\n{self._PLAN_FTR}"
 
     def _with_plan_reminder(self, msgs):
         """Return a COPY of the sent slice with the pinned-plan reminder appended to the
@@ -5763,11 +5786,19 @@ class Agent:
         instead (rare: the slice normally ends on a user/assistant turn)."""
         # One-shot suppression: the send right after an update_plan skips the reminder,
         # so the model doesn't get its just-written plan echoed back and narrate it (a
-        # wasted turn). Re-arms automatically for the following send.
+        # wasted turn). Re-arms automatically for the following send - and arms a FULL
+        # re-inject on that following send (the plan just changed; refresh it in full),
+        # sparse on every turn after that until the next update_plan.
         if getattr(self, "_skip_plan_reminder_once", False):
             self._skip_plan_reminder_once = False
+            self._plan_full_next = True
             return msgs
-        reminder = self._plan_reminder()
+        # Event-driven full/sparse: FULL on the turn right after an update_plan, SPARSE
+        # thereafter. Refreshes on CHANGE, not a clock. Cache-free: the plan rides the
+        # uncached tail, so shrinking it busts nothing (see _with_plan_reminder docstring).
+        full = getattr(self, "_plan_full_next", True)
+        self._plan_full_next = False
+        reminder = self._plan_reminder(sparse=not full)
         if not reminder or not msgs:
             return msgs
         out = list(msgs)
