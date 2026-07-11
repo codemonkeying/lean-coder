@@ -2517,7 +2517,26 @@ class Config:
         return self.provider_settings.get(self.provider, {}).get("model") or self.model
 
     def ctx_window(self) -> int:
-        return self.provider_settings.get(self.provider, {}).get("num_ctx") or self.num_ctx
+        # Prefer the provider's LIVE context_window() hook so the window can't go
+        # stale after a models-cache refresh or a code/cap change (the stored num_ctx
+        # is only a snapshot taken at activation). Fall back to the stored value
+        # (ollama pins a detected/capped num_ctx there; also covers no-provider).
+        stored = self.provider_settings.get(self.provider, {}).get("num_ctx") or self.num_ctx
+        # ollama pins a detected/capped num_ctx at activation and its context_window()
+        # hook can shell out to `ollama show` - too costly for a per-turn status render,
+        # and the stored value is already authoritative there. Only hosted providers
+        # (cheap cache-backed hook) get the live read, which is where staleness bit.
+        if self.provider and self.provider != "ollama":
+            try:
+                spec = get_provider(self.provider)
+                model = self.provider_settings.get(self.provider, {}).get("model")
+                if spec and spec.get("context_window") and model:
+                    live = int(spec["context_window"](model))
+                    if live > 0:
+                        return live
+            except Exception:
+                pass
+        return stored
 
     def handover_for(self, model: "str | None" = None):
         """Resolve compaction settings for `model` (default: the active model),
@@ -5749,22 +5768,42 @@ class Agent:
     # something the user typed (the old "(Pinned plan...)" header read like user text
     # and got echoed back into a reply). Rides the uncached tail - see _with_plan_reminder.
     # ASCII-only (must encode cleanly on Termux / non-UTF8 locales / redirected stdin).
-    _PLAN_HDR = ("=== LEANCODER PINNED PLAN (internal state, re-injected each turn; "
-                 "reference only, NOT user input; do not repeat it back to the user) ===")
+    _PLAN_HDR = ("=== LEANCODER PINNED PLAN (internal state, silently re-injected "
+                 "every turn; reference only, NOT a user message and NOT new input). "
+                 "Read it for context, act only on the ACTUAL user turn. Do NOT repeat "
+                 "it back, quote it, or remark on its presence (e.g. 'that's the pinned "
+                 "plan'); when it is the only thing that changed, treat the turn as "
+                 "having no new instruction and stay silent about the block itself. ===")
     _PLAN_FTR = "=== END PINNED PLAN ==="
 
     def _plan_sparse(self, pinned: str) -> str:
-        """A compact view for unchanged turns: GOAL + IN-FLIGHT/FOCUS lines + the
-        still-open TODO items only. The full plan re-inject on the turn after an
-        update_plan; in between we send this. Cheap - and since the plan lives on the
-        UNCACHED tail, varying its content busts no cache."""
+        """A compact view for unchanged turns: drop ONLY completed '- [x]' checklist
+        items; keep everything else. This is lossless for parked durable state - run
+        handles, invariants, 'do NOT touch' notes, GOAL/FOCUS - which callers routinely
+        put in the plan body under their own labels. (An earlier version whitelisted
+        only GOAL/FOCUS/IN-FLIGHT/'- [ ]' lines, which SILENTLY ate any unlabelled
+        state on every sparse turn - a real loss just before a compaction.) The saving
+        now comes purely from shedding the ticked-off list. Cheap, and since the plan
+        rides the UNCACHED tail, varying its content busts no cache."""
         keep = []
         for ln in pinned.splitlines():
             s = ln.strip()
-            if (s.startswith(("GOAL:", "FOCUS:", "IN FLIGHT:", "IN-FLIGHT:"))
-                    or s.startswith("- [ ]")):
-                keep.append(ln)
+            if s.startswith(("- [x]", "- [X]")):
+                continue                      # drop completed items only
+            keep.append(ln)
         return "\n".join(keep) if keep else pinned
+
+    def _plan_goal_only(self, pinned: str) -> str:
+        """Collapsed view for a FINISHED plan (no open '- [ ]' items): keep just the
+        GOAL/FOCUS anchor lines, drop the fully-checked TODO list. The GOAL is the
+        long-horizon anchor that must survive compaction/handover, so we keep it -
+        but the ticked-off checklist is dead-weight tokens on every send, so it goes.
+        Returns "" if there is no GOAL/FOCUS line to anchor on."""
+        keep = [ln for ln in pinned.splitlines()
+                if ln.strip().startswith(("GOAL:", "FOCUS:", "IN FLIGHT:", "IN-FLIGHT:"))]
+        if not keep:
+            return ""
+        return "\n".join(keep) + "\n(all TODO steps complete)"
 
     def _plan_reminder(self, sparse: bool = False) -> str:
         """The pinned goal+TODO as an uncached send-time reminder. Kept OUT of the
@@ -5774,6 +5813,13 @@ class Agent:
         pinned = getattr(self, "pinned_plan", "")
         if not pinned:
             return ""
+        # Finished plan (every box ticked, none open): collapse to the GOAL anchor
+        # instead of re-sending the whole checked-off checklist every turn. Keeps the
+        # long-horizon context, drops the dead-weight list. "" only when there's also
+        # no GOAL line to anchor on (then suppress entirely).
+        if "- [ ]" not in pinned:
+            goal = self._plan_goal_only(pinned)
+            return f"\n\n{self._PLAN_HDR}\n{goal}\n{self._PLAN_FTR}" if goal else ""
         body = self._plan_sparse(pinned) if sparse else pinned
         return f"\n\n{self._PLAN_HDR}\n{body}\n{self._PLAN_FTR}"
 
@@ -5897,6 +5943,10 @@ class Agent:
         self.session_in = self.session_out = 0
         self.tools.changed_files.clear()
         self.dirty = False
+        # A fresh session starts with no goal. The pinned plan is separate agent
+        # state (not in self.messages), so it would otherwise survive /new and
+        # mislead the next task with a stale GOAL. /load restores its own plan.
+        self.pinned_plan = ""
 
     def restore(self, messages):
         """Replace the live conversation with a loaded session. The stored system

@@ -299,8 +299,13 @@ the context budget. Seven file/shell tools live in the required builtin-tools mo
 | `bg_status`    | Poll / reap background tasks started with a trailing `&`. |
 
 Alongside these the model always has **`update_plan`** (maintains a pinned goal +
-TODO that survives compaction) and, by default, **`ask_user_to_run`** (hand a command
-back to you to run yourself - toggle with `/settings`). A batch of read-only calls in
+TODO that survives compaction) and, by default, **`ask_user_to_run`** — the escape
+hatch for anything `run_command` can't do itself: a command needing **sudo/root**, an
+**interactive prompt**, or a **typed password or secret**. Instead of running it, the
+agent hands the exact command back to *you* to run in your own terminal; only the
+command and its exit code return to the agent — **whatever you type (the password,
+the secret) never reaches the model**. You can also edit the command before running
+it, or decline. On by default; toggle with `/settings`. A batch of read-only calls in
 one turn runs **concurrently**.
 
 ### Opt-in lean-tools
