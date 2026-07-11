@@ -48,28 +48,34 @@ AUTO_CTX_CAP = 32768           # auto-detect never raises num_ctx above this (OO
 
 
 def _parse_num_ctx(show: dict):
-    """Extract a context length from an /api/show response. Prefers an explicit
-    num_ctx in the model's parameters, else the architecture context_length.
-    Pure function (no I/O) for testability. Returns int or None."""
+    """Extract a context length from an /api/show response, and whether it came
+    from an explicit num_ctx PIN in the model's parameters (a deliberate
+    Modelfile choice) vs. the architecture context_length (the raw max).
+    Pure function (no I/O) for testability. Returns (int or None, pinned: bool)."""
     params = show.get("parameters")
     if isinstance(params, str):
         m = re.search(r"(?m)^\s*num_ctx\s+(\d+)", params)
         if m:
-            return int(m.group(1))
+            return int(m.group(1)), True
     info = show.get("model_info") or {}
     for k, v in info.items():
         if k.endswith(".context_length") and isinstance(v, int):
-            return v
-    return None
+            return v, False
+    return None, False
 
 
-def cap_num_ctx(detected, cap: int = AUTO_CTX_CAP):
+def cap_num_ctx(detected, cap: int = AUTO_CTX_CAP, pinned: bool = False):
     """Apply the auto-detect safety policy: never raise num_ctx above `cap`
     (a model's architectural max can be huge, e.g. 262144 -> OOM); only lower it
-    when the model's own window is smaller. An explicit --num-ctx bypasses this.
+    when the model's own window is smaller. An explicit --num-ctx bypasses this,
+    and so does an explicit num_ctx PIN baked into the model's Modelfile
+    (`pinned=True`): the operator already chose a deliberate window there, so we
+    honour it rather than clamp it to the generic OOM cap.
     Returns (value_or_None, was_capped). Pure function for testability."""
     if detected is None:
         return None, False
+    if pinned:
+        return detected, False
     return min(detected, cap), detected > cap
 
 
@@ -319,7 +325,7 @@ class OllamaClient:
         """Read the model's context window from `ollama show`. None on failure."""
         try:
             return _parse_num_ctx(self._get_json("/api/show",
-                                                 {"model": self.cfg.active_model()}))
+                                                 {"model": self.cfg.active_model()}))[0]
         except (urllib.error.URLError, OSError, ValueError, json.JSONDecodeError):
             return None
 
@@ -539,13 +545,13 @@ def _context_window(model):
     cfg._ollama_capped_from = None        # banner note: model max when capped
     if not cfg.auto_num_ctx and cfg.num_ctx:
         return cfg.num_ctx
-    detected = None
+    detected, pinned = None, False
     try:
-        detected = _parse_num_ctx(
+        detected, pinned = _parse_num_ctx(
             OllamaClient(cfg)._get_json("/api/show", {"model": model}))
     except Exception:
-        detected = None
-    value, was_capped = cap_num_ctx(detected)
+        detected, pinned = None, False
+    value, was_capped = cap_num_ctx(detected, pinned=pinned)
     if was_capped:
         cfg._ollama_capped_from = detected
     return value or cfg.num_ctx or AUTO_CTX_CAP
