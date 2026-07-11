@@ -7803,8 +7803,17 @@ def _restore_backend_for(agent, cfg, meta):
     bundled "ollama" provider now."""
     want = (meta.get("provider") or "").strip() or "ollama"
     model = (meta.get("model") or "").strip()
+    saved_host = (meta.get("host") or "").strip()
     cur = cfg.provider or ""
-    if want != cur:                                # session ran on a different backend
+    # For ollama, the SESSION HOST is part of the backend identity: a chat on
+    # 192.0.2.28 must reload onto 192.0.2.28, not snap back to whatever host is
+    # current. Restore it before activation so the model list / ctx detection
+    # run against the right box. (Hosted providers have no per-session host.)
+    host_note = ""
+    if want == "ollama" and saved_host and saved_host != cfg.host:
+        cfg.hosts = [saved_host] + [h for h in cfg.hosts if h != saved_host]
+        host_note = f" @ {saved_host}"
+    if want != cur or host_note:                   # different backend OR different ollama host
         spec = get_provider(want)
         if spec is None:
             return f"note: saved on provider '{want}' (not registered now) - /model to pick."
