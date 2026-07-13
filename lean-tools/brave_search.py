@@ -31,6 +31,11 @@ TOOL = {
         "required": ["query"],
     },
     # no "safe": egress goes through the confirm gate
+    # driver_only: pure network egress with NO dependency on the connected workspace's
+    # filesystem. It must run on the DRIVER, not the /connect remote: the API key lives
+    # in the driver's ~/.config/leancoder/brave.key, and search traffic should egress
+    # from the driver, never from the target box. Never pushed to the remote executor.
+    "driver_only": True,
 }
 
 BRAVE_URL = "https://api.search.brave.com/res/v1/web/search"

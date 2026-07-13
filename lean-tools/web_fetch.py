@@ -38,6 +38,12 @@ TOOL = {
         "required": ["url"],
     },
     # no "safe": egress always goes through the confirm gate
+    # driver_only: pure network fetch with NO dependency on the connected workspace's
+    # filesystem. Runs on the DRIVER, not the /connect remote, so egress is always from
+    # the driver (never the target box) and the core's LEANCODER_CTX_MAX/USED env (set
+    # per-dispatch on the driver only) is present, so the read is context-sized correctly
+    # instead of falling back to full MAX_TEXT on a remote executor. Never pushed remote.
+    "driver_only": True,
 }
 
 MAX_BYTES = 400_000     # raw bytes read
