@@ -2880,12 +2880,12 @@ def save_config(cfg: Config, quiet: bool = False):
         f"worker_idle_timeout = {cfg.worker_idle_timeout}",
         f"worker_max_iterations = {cfg.worker_max_iterations}",
     ]
-    # leash / confirm_reads persist (modes you may want sticky); incognito does NOT -
-    # it's deliberately ephemeral (persisting it would itself be a local trace, and a
-    # fresh launch should never be silently incognito). leash omitted when it's the
-    # default (rwe = full) so a bare config still gets the full surface.
-    if cfg.leash and cfg.leash != "rwe":
-        lines.append(f'leash = "{cfg.leash}"')
+    # leash is deliberately EPHEMERAL - it is NOT persisted. /leash is a runtime-only
+    # ceiling (see the load path, which also treats it as runtime-only): a fresh launch
+    # must default to the full surface (rwe), never silently boot chat-only/read-only
+    # because some earlier session narrowed the leash and then any unrelated setting
+    # change snapshotted it to disk. Pass --leash / --chat-only to start narrowed.
+    # incognito is ephemeral too (persisting it would be a local trace).
     if cfg.confirm_reads:
         lines.append("confirm_reads = true")
     if cfg.auto_reconnect:
