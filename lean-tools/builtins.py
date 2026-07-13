@@ -29,7 +29,8 @@ _INJECT = (
     "IgnoreMatcher", "resolve_in_project", "_parse_search_replace", "_confirm_action",
     "_bg_running", "_bg_register", "_bg_status_items", "_bg_status_msg",
     "READ_MAX_LINES", "READ_HEAD", "READ_TAIL", "TREE_DEFAULT_DEPTH", "TREE_MAX_ENTRIES",
-    "SEARCH_MAX_MATCHES", "SEARCH_LINE_MAX", "OUTPUT_MAX_CHARS", "OUTPUT_HEAD", "OUTPUT_TAIL",
+    "SEARCH_MAX_MATCHES", "SEARCH_LINE_MAX", "SEARCH_MAX_FILE_BYTES",
+    "OUTPUT_MAX_CHARS", "OUTPUT_HEAD", "OUTPUT_TAIL",
     "CONFIG_DIR",
 )
 
@@ -121,22 +122,34 @@ class Tools:
                 hits.append("…[more matches truncated]…")
                 break
             try:
-                for i, line in enumerate(f.read_text(errors="replace").splitlines(), 1):
-                    if rx.search(line):
-                        # A file outside the project (e.g. searching /tmp while cwd
-                        # is elsewhere) has no path relative to cwd - relative_to
-                        # would raise and the broad except below would silently drop
-                        # every match. Fall back to the absolute path instead.
-                        fp = f.resolve()
-                        try:
-                            rel = fp.relative_to(self.cfg.cwd.resolve()).as_posix()
-                        except ValueError:
-                            rel = fp.as_posix()
-                        txt = line.strip()[:SEARCH_LINE_MAX]
-                        hits.append(f"{rel}:{i}: {txt}")
-                        count += 1
-                        if count >= SEARCH_MAX_MATCHES:
-                            break
+                # Never slurp a whole file into RAM (a multi-GB VM image / DB / log
+                # under a broad base like $HOME would exhaust memory -> swap death).
+                # Skip oversize files, and stream line-by-line instead of read_text().
+                if f.stat().st_size > SEARCH_MAX_FILE_BYTES:
+                    continue
+                with f.open("r", errors="replace") as fh:
+                    # Cheap binary sniff: a NUL byte in the first chunk -> skip.
+                    head = fh.read(8192)
+                    if "\x00" in head:
+                        continue
+                    fh.seek(0)
+                    for i, line in enumerate(fh, 1):
+                        line = line.rstrip("\n")
+                        if rx.search(line):
+                            # A file outside the project (e.g. searching /tmp while cwd
+                            # is elsewhere) has no path relative to cwd - relative_to
+                            # would raise and the broad except below would silently drop
+                            # every match. Fall back to the absolute path instead.
+                            fp = f.resolve()
+                            try:
+                                rel = fp.relative_to(self.cfg.cwd.resolve()).as_posix()
+                            except ValueError:
+                                rel = fp.as_posix()
+                            txt = line.strip()[:SEARCH_LINE_MAX]
+                            hits.append(f"{rel}:{i}: {txt}")
+                            count += 1
+                            if count >= SEARCH_MAX_MATCHES:
+                                break
             except Exception:
                 continue
         return "\n".join(hits) if hits else "(no matches)"

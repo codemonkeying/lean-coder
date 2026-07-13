@@ -113,6 +113,8 @@ OUTPUT_TAIL = 2000
 RAW_READ_MAX = 1_000_000       # byte ceiling for remote diff-preview fetches
 SEARCH_MAX_MATCHES = 200
 SEARCH_LINE_MAX = 200          # max chars of a matched line
+SEARCH_MAX_FILE_BYTES = 5_000_000   # skip files bigger than this - never slurp a
+                                    # multi-GB VM image / DB / log into RAM (swap death)
 TREE_MAX_ENTRIES = 400
 TREE_DEFAULT_DEPTH = 3
 
