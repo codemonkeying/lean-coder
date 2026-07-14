@@ -1504,6 +1504,8 @@ class Composer:
         self._read_wake = threading.Event()   # reader thread -> read_line: line ready/EOF
         self.rule_label = ""             # STATIC idle-rule label (e.g. remote host);
                                          # never animated, unlike self.status (spinner)
+        self._resize_pending = False     # SIGWINCH sets this; the reader thread does
+                                         # the actual resize (see on_resize / _reader)
 
     def armed(self) -> bool:
         """A pending confirm is answerable only when the buffer is empty."""
@@ -1974,19 +1976,32 @@ class Composer:
         self.active = False
 
     def on_resize(self, *_):
+        # SIGWINCH runs async in the MAIN thread and can interrupt a write()
+        # mid-sequence (streaming output holds the RLock reentrantly). Doing the
+        # terminal rewrite (scroll region + saved cursor) here would corrupt the
+        # display and leave typed input invisible. So just flag it; the reader
+        # thread (loops <=0.12s) performs the actual resize in a clean context.
+        self._resize_pending = True
+
+    def _apply_resize(self):
+        """Perform a pending terminal resize. Called from the reader thread (never
+        the signal handler) so it can't interrupt an in-flight write()."""
         if not self.active:
             return
         try:
             sz = os.get_terminal_size()
-            with self._lock:
-                self._rows, self._cols = sz.lines, sz.columns
-                reserve = self.INPUT_ROWS + 1
+        except OSError:
+            return
+        with self._lock:
+            self._rows, self._cols = sz.lines, sz.columns
+            reserve = self.INPUT_ROWS + 1
+            try:
                 self._out.write(f"\033[1;{self._rows - reserve}r")
                 self._out.write(f"\033[{self._rows - reserve};1H\0337")
                 self._redraw_locked()
                 self._out.flush()
-        except Exception:
-            pass
+            except Exception:
+                pass
 
     def read_line(self, prompt_status=None, wake_check=None):
         """Block at the IDLE prompt reading ONE submitted line, using the same
@@ -2080,6 +2095,9 @@ class Composer:
                 r, _, _ = select.select([self._fd], [], [], 0.12)
             except (OSError, ValueError):
                 break
+            if self._resize_pending:         # SIGWINCH flagged a resize; do it here
+                self._resize_pending = False # (clean context, not the signal handler)
+                self._apply_resize()
             if r:
                 try:
                     data = os.read(self._fd, 4096).decode("utf-8", "ignore")
@@ -2502,6 +2520,9 @@ class Config:
                                      # to its host automatically (off = ask first)
     lean_tools_dir: str = ""            # "" -> ~/.config/leancoder/lean-tools
     lean_tools_enabled: list = field(default_factory=list)  # enabled lean-tool names
+    always_expand: list = field(default_factory=lambda: ["apply_diff"])  # tool names
+                                     # whose full args auto-print after the call line
+                                     # (see /expand); default shows diffs in full
     providers_dir: str = ""             # "" -> ~/.config/leancoder/providers
     providers_enabled: list = field(default_factory=list)  # enabled provider plugin names
     provider: str = "ollama"         # active backend - ALWAYS a registered provider now
@@ -2677,6 +2698,8 @@ def load_config(args) -> Config:
     cfg.leash = _norm_leash(cfg.leash) or "rwe"     # validate the ceiling; junk -> full
     if isinstance(file_vals.get("lean_tools_enabled"), list):
         cfg.lean_tools_enabled = [p for p in file_vals["lean_tools_enabled"] if isinstance(p, str)]
+    if isinstance(file_vals.get("always_expand"), list):
+        cfg.always_expand = [p for p in file_vals["always_expand"] if isinstance(p, str)]
     if isinstance(file_vals.get("providers_enabled"), list):
         cfg.providers_enabled = [p for p in file_vals["providers_enabled"] if isinstance(p, str)]
     else:
@@ -2869,6 +2892,8 @@ def save_config(cfg: Config, quiet: bool = False):
         lines.append(f"auto_compact_keep = {cfg.auto_compact_keep}")
     if cfg.wake_on_bg_finish:                  # default off; persist an opt-IN
         lines.append("wake_on_bg_finish = true")
+    if cfg.always_expand != ["apply_diff"]:    # default = diffs shown in full
+        lines.append("always_expand = [" + ", ".join(_toml_value(x) for x in cfg.always_expand) + "]")
     lines += [
         f"temperature = {cfg.temperature}",
         f"top_p = {cfg.top_p}",
@@ -5406,6 +5431,10 @@ class Agent:
         self._pending_ai_note = _leash_note(cfg.leash) if cfg.leash != "rwe" else None
         self.pinned_plan = ""            # goal + TODO the model maintains; rides an uncached
                                          # prompt tail and survives compaction (===PLAN=== block)
+        self._tool_calls = []            # ring (cap 100) of {id,name,args} for /expand:
+                                         # the full args of recent tool calls, so the
+                                         # operator can view what was truncated on-screen
+        self._tool_call_seq = 0          # monotonic id assigned to each printed tool call
         self._turn_count = 0             # turns this session (for the soft-zone nudge throttle)
         self._last_nudge_turn = -10**9   # turn of the last soft-zone nudge
         self._bg_announced = set()       # (host,pid) of finished bg tasks already surfaced to the
@@ -5675,7 +5704,9 @@ class Agent:
                     args = json.loads(args)
                 except json.JSONDecodeError:
                     args = {}
-            print(_tool_call_line(name, args))
+            cid = self.record_tool_call(name, args)
+            print(_tool_call_line(name, args, cid))
+            self._maybe_auto_expand(name, cid)
             parsed.append((name, args))
         results = [None] * len(parsed)
 
@@ -6319,6 +6350,33 @@ class Agent:
         self._maybe_auto_compact()        # cheap programmatic strip at token intervals (first)
         self._maybe_handover()            # then the agentic handover (hard/emergency)
 
+    def record_tool_call(self, name, args):
+        """Store a tool call's FULL args in the ring and return its monotonic id.
+        Called at print time (the instant the call starts, before it runs), so an
+        in-progress call already has its number. The on-screen line truncates args
+        to 50 chars; /expand id (or bare /expand = newest) re-renders the full args
+        from here. Ring-buffered (cap 100) so it never grows unbounded; lazily inits
+        so a test-double Agent that skipped __init__ can't crash on it."""
+        if not hasattr(self, "_tool_calls") or self._tool_calls is None:
+            self._tool_calls, self._tool_call_seq = [], 0
+        self._tool_call_seq += 1
+        self._tool_calls.append({"id": self._tool_call_seq,
+                                 "name": name,
+                                 "args": dict(args) if isinstance(args, dict) else {}})
+        if len(self._tool_calls) > 100:
+            del self._tool_calls[:-100]
+        return self._tool_call_seq
+
+    def _maybe_auto_expand(self, name, call_id):
+        """Auto-print the full args right after the call line when `name` is in the
+        cfg.always_expand list (default ["apply_diff"] - diffs shown in full even when
+        approval is auto/off). No-op otherwise."""
+        if name not in getattr(self.cfg, "always_expand", []):
+            return
+        entry = next((e for e in self._tool_calls if e["id"] == call_id), None)
+        if entry:
+            print(_render_tool_call(entry))
+
     def _log_activity(self, kind, summary, detail=""):
         """Record one automatic-behaviour event for /activity. `kind` is a short
         tag (auto-compact, handover, 429-fallback, token-refresh, ...), `summary`
@@ -6672,7 +6730,9 @@ class Agent:
                         args = json.loads(args)
                     except json.JSONDecodeError:
                         args = {}
-                print(_tool_call_line(name, args))
+                cid = self.record_tool_call(name, args)
+                print(_tool_call_line(name, args, cid))
+                self._maybe_auto_expand(name, cid)
                 if name == "ask_user_to_run":
                     # Interactive handoff: no spinner, operator runs it directly
                     # (on the remote box when connected). Suspend the composer so
@@ -6809,12 +6869,35 @@ def _tool_glyph(name: str, args: dict) -> str:
     return GLYPH["bg"] if _is_bg_call(name, args) else GLYPH["tool"]
 
 
-def _tool_call_line(name: str, args: dict) -> str:
+def _tool_call_line(name: str, args: dict, call_id: int = 0) -> str:
     """The dim one-line summary printed for a tool call. A backgrounded
     run_command gets an explicit ' (background)' text tag so it reads as detached
-    even without colour/glyph support - not just a different icon."""
+    even without colour/glyph support - not just a different icon. `call_id` (when
+    >0) is shown as a '#N' tag so `/expand N` can re-render the full (untruncated)
+    args; bare `/expand` targets the newest."""
     tag = "  (background)" if _is_bg_call(name, args) else ""
-    return dim(f"  {_tool_glyph(name, args)} {name}({_fmt_args(args)}){tag}")
+    idt = dim(f"  #{call_id}") if call_id else ""
+    return dim(f"  {_tool_glyph(name, args)} {name}({_fmt_args(args)}){tag}") + idt
+
+
+EXPAND_MAX_CHARS = 4000     # cap on /expand output so it can't flood/hang the terminal
+
+
+def _render_tool_call(entry: dict, cap: int = EXPAND_MAX_CHARS) -> str:
+    """Full, human-readable view of a recorded tool call's args (for /expand).
+    A diff (apply_diff) renders as a colorized unified diff; everything else is
+    printed as key: value blocks. Total output is head/tail capped at `cap` chars
+    so a huge write_file/diff can't flood the terminal (the flood-hang we fixed)."""
+    name, args = entry.get("name", ""), entry.get("args", {}) or {}
+    out = []
+    for k, v in args.items():
+        s = v if isinstance(v, str) else json.dumps(v, indent=2, ensure_ascii=False)
+        out.append(f"{bold(k)}:\n{s}" if "\n" in str(s) else f"{bold(k)}: {s}")
+    body = "\n".join(out) if out else dim("(no args)")
+    if len(body) > cap:
+        head, tail = cap * 2 // 3, cap // 3
+        body = body[:head] + dim(f"\n…[{len(body) - head - tail} chars hidden]…\n") + body[-tail:]
+    return body
 
 
 # ----------------------------------------------------------------------------
@@ -6825,7 +6908,7 @@ SLASH_COMMANDS = ["/clear", "/new", "/compact", "/handover", "/session", "/save"
                   "/prompt", "/sh", "/connect", "/local", "/tools", "/reload",
                   "/model", "/provider", "/think", "/effort",
                   "/set", "/usage", "/approve", "/leash", "/autosave", "/incognito",
-                  "/askread", "/bg", "/info", "/settings", "/ctx", "/activity", "/help", "/quit"]
+                  "/askread", "/bg", "/info", "/settings", "/ctx", "/activity", "/expand", "/help", "/quit"]
 
 # Built-in command names are the shadow-protection set: lean-tool commands can't claim
 # any of them. It is DERIVED from _BUILTIN_COMMANDS_TABLE (every builtin command + alias)
@@ -7038,6 +7121,7 @@ HELP_COMMANDS = [
     ("/settings [key val]", "edit config.toml knobs (no arg = menu)"),
     ("/ctx", "context-token estimate"),
     ("/activity [n|all]", "what the system did automatically (compaction, handover, fallback, ...)"),
+    ("/expand [N]", "show a tool call's full (untruncated) args; bare = newest, N = the #id"),
     ("/help", "this help"),
     ("/quit", "exit"),
 ]
@@ -9016,6 +9100,33 @@ def handle_activity_command(agent, cfg, arg):
         print(dim(f"  ... {hidden} older; /activity all for everything."))
 
 
+def handle_expand_command(agent, cfg, arg):
+    """/expand [N] - re-print the FULL (untruncated) args of a recent tool call.
+    Bare /expand = the most recent call; /expand N = the call tagged '#N' on its
+    line. On-screen tool-call lines truncate args to 50 chars; this shows all of it
+    (a diff renders colorized), capped so it can't flood the terminal."""
+    calls = getattr(agent, "_tool_calls", None)
+    if not calls:
+        print(dim("  no tool calls to expand yet this session."))
+        return
+    arg = (arg or "").strip().lstrip("#")
+    if not arg:
+        entry = calls[-1]
+    else:
+        try:
+            want = int(arg)
+        except ValueError:
+            print(dim("  usage: /expand [N]  (N = the #id on a tool-call line; bare = newest)"))
+            return
+        entry = next((e for e in calls if e["id"] == want), None)
+        if entry is None:
+            lo, hi = calls[0]["id"], calls[-1]["id"]
+            print(dim(f"  no tool call #{want} (have #{lo}..#{hi}, last 100)."))
+            return
+    print(dim(f"  {GLYPH['tool']} #{entry['id']} {entry['name']}"))
+    print(_render_tool_call(entry))
+
+
 def handle_help_command(agent, cfg, arg):
     """/help | /h | /? - list builtin + lean-tool-registered commands."""
     extra = [(c, h) for c, (_, h) in sorted(_lean_tool_commands.items())]
@@ -9072,6 +9183,7 @@ _BUILTIN_COMMANDS_TABLE = {
     "/approve": handle_approve_command,
     "/ctx": handle_ctx_command,
     "/activity": handle_activity_command,
+    "/expand": handle_expand_command,
     "/help": handle_help_command, "/h": handle_help_command, "/?": handle_help_command,
 }
 
