@@ -1060,6 +1060,148 @@ def _lean_tools_rows(manager, show_groups):
     return rows
 
 
+# ----------------------------------------------------------------------------
+# Shared interactive-picker engine. ONE implementation of the raw-mode, scrolling,
+# type-to-filter menu that every picker (/tools multiselect, /set + /model + /session
+# single-select) drives - so there's no per-menu rewrite and no drift. Three layers:
+#   _picker_capable()  - the capability gate (real tty + termios + not TERM=dumb)
+#   _read_key()        - robust escape-tolerant single keypress -> a normalised token
+#   run_picker()       - the scrolling-viewport render + input loop (bounded to the
+#                        terminal height, so a long list can never overflow/corrupt)
+# A caller that can't/shouldn't go interactive (gate false, or the user forced plain
+# mode) uses its own numbered-prompt fallback - the bulletproof floor that works on
+# ANY terminal, pipe, or OS.
+# ----------------------------------------------------------------------------
+
+# Set by a command's `--plain`/`--fallback` arg (see _wants_plain): a session-wide
+# escape hatch so a user stuck in a garbled render on a mis-detected terminal can
+# force the numbered fallback for the NEXT menu without restarting. One-shot: consumed
+# by the next _picker_capable() check.
+_FORCE_PLAIN_ONCE = False
+
+
+def _wants_plain(arg):
+    """True if a command arg opts out of the rich picker for this invocation
+    (`--plain`, `--fallback`, or bare `plain`). Lets any menu command offer an
+    emergency escape from a broken render without a restart: e.g. `/tools --plain`,
+    `/model --plain`. Returns (wants_plain, remaining_arg)."""
+    toks = (arg or "").split()
+    if toks and toks[0] in ("--plain", "--fallback", "plain"):
+        return True, " ".join(toks[1:]).strip()
+    return False, (arg or "").strip()
+
+
+def _picker_capable():
+    """Can we safely run the rich raw-mode picker? Requires termios, both stdin AND
+    stdout to be real ttys, and a non-dumb TERM. A one-shot force-plain flag (set by
+    a `--plain` arg) overrides to False so a user on a mis-detected terminal can
+    always fall back. Returns True for rich, False for the numbered fallback."""
+    global _FORCE_PLAIN_ONCE
+    if _FORCE_PLAIN_ONCE:
+        _FORCE_PLAIN_ONCE = False
+        return False
+    try:
+        import termios  # noqa: F401
+    except ImportError:
+        return False
+    if not (sys.stdin.isatty() and _TTY):
+        return False
+    term = os.environ.get("TERM", "")
+    if term in ("", "dumb"):
+        return False
+    return True
+
+
+# Normalised key tokens returned by _read_key.
+_K_UP, _K_DOWN, _K_ENTER, _K_CANCEL, _K_BACK, _K_SPACE, _K_PGUP, _K_PGDN, _K_HOME, _K_END = (
+    "up", "down", "enter", "cancel", "back", "space", "pgup", "pgdn", "home", "end")
+
+
+def _read_key(stdin):
+    """Read ONE logical keypress from a raw-mode stdin and normalise it to a token.
+    Tolerates partial/unknown escape sequences (an unrecognised sequence returns None
+    -> caller just redraws, never crashes or mis-fires). Returns a token string, a
+    single printable char (for filtering), or None. j/k also move (vim-style), but
+    ONLY as bare keys - inside an active filter they're treated as text, so the caller
+    passes `filtering` to say whether a bare letter should navigate or type."""
+    ch = stdin.read(1)
+    if not ch:
+        return _K_CANCEL                       # EOF/^D
+    if ch == "\x1b":                           # ESC or an escape sequence
+        nxt = stdin.read(1)
+        if nxt == "":
+            return _K_CANCEL                   # bare ESC
+        if nxt == "[" or nxt == "O":           # CSI / SS3
+            code = stdin.read(1)
+            # multi-char (e.g. ESC[5~ pgup, ESC[3~ del) - swallow to the final byte
+            seq = code
+            while code and not (code.isalpha() or code == "~"):
+                code = stdin.read(1)
+                seq += code
+            return {
+                "A": _K_UP, "B": _K_DOWN, "H": _K_HOME, "F": _K_END,
+                "5~": _K_PGUP, "6~": _K_PGDN, "1~": _K_HOME, "4~": _K_END,
+            }.get(seq)                          # unknown -> None (ignored)
+        return None                             # ESC + other -> ignore (don't cancel)
+    if ch in ("\r", "\n"):
+        return _K_ENTER
+    if ch == "\x03":                            # ^C
+        return _K_CANCEL
+    if ch in ("\x7f", "\x08"):
+        return _K_BACK
+    if ch == " ":
+        return _K_SPACE
+    return ch                                   # a printable char (or control) as-is
+
+
+def run_picker(render, on_key, height_reserve=2):
+    """The shared raw-mode render+input loop with a SCROLLING VIEWPORT. `render(top,
+    rows_avail)` prints the menu (the callback decides what to draw within `rows_avail`
+    visible rows starting at scroll offset `top`) and returns the number of terminal
+    lines it emitted; on the next tick we jump the cursor back up exactly that many and
+    redraw, so the region is bounded to the screen and a long list scrolls instead of
+    overflowing. `on_key(token)` handles one normalised key and returns either None
+    (keep looping) or a ("done", value) / ("cancel", None) result. Restores the tty on
+    every exit. Assumes _picker_capable() already passed."""
+    import termios, tty
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    prev_lines = [0]
+
+    def _draw(first):
+        if not first and prev_lines[0]:
+            sys.stdout.write(f"\033[{prev_lines[0]}A")
+        rows = max(1, _term_rows() - height_reserve)
+        n = render(rows)
+        sys.stdout.write("\033[J")             # clear anything below the region
+        sys.stdout.flush()
+        prev_lines[0] = n
+
+    _draw(True)
+    try:
+        tty.setraw(fd)
+        while True:
+            token = _read_key(sys.stdin)
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+            if token is not None:
+                res = on_key(token)
+                if res is not None:
+                    return res
+            _draw(False)
+            tty.setraw(fd)
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        print()
+
+
+def _term_rows():
+    """Visible terminal height in rows (best-effort; 24 when unknown)."""
+    try:
+        return os.get_terminal_size().lines or 24
+    except OSError:
+        return 24
+
+
 def lean_tools_menu(manager):
     """Interactive enable/disable: up/down move, space toggles, enter saves, q
     cancels. Tools in subdirs are shown under a group header whose own row toggles
@@ -1076,11 +1218,7 @@ def lean_tools_menu(manager):
         on = sum(1 for n in ns if n in enabled)
         return "all" if ns and on == len(ns) else ("none" if on == 0 else "partial")
 
-    try:
-        import termios, tty
-    except ImportError:
-        termios = None
-    if termios is None or not (sys.stdin.isatty() and _TTY):
+    if not _picker_capable():                     # no tty / dumb term / forced plain
         print(bold("lean-tools:"))
         for kind, val in rows:
             if kind == "group":
@@ -1091,26 +1229,7 @@ def lean_tools_menu(manager):
         print(dim("  (no TTY: set lean_tools_enabled in the config file to change)"))
         return None
 
-    cur = 0
-    def render(first):
-        if not first:
-            sys.stdout.write(f"\033[{len(rows) + 1}A")   # back to top to redraw
-        # \r + \033[K so the header clears the rest of the line on redraw - without
-        # it, a shorter header drawn over a longer prior line leaves a trailing
-        # smear (e.g. the tail of an earlier tool-output line bleeding through).
-        sys.stdout.write("\r" + bold("lean-tools  ")
-                         + dim("(up/down move, space toggle, enter save, q cancel)") + "\033[K\n")
-        for i, (kind, val) in enumerate(rows):
-            pointer = cyan(">") if i == cur else " "
-            if kind == "group":
-                st = gstate(val)
-                mark = green("x") if st == "all" else (yellow("-") if st == "partial" else " ")
-                sys.stdout.write(f"\r{pointer} [{mark}] {bold(val or 'general')}\033[K\n")
-            else:
-                mark = green("x") if val in enabled else " "
-                ind = "  " if show_groups else ""
-                sys.stdout.write(f"\r{pointer} {ind}[{mark}] {val}  {dim(manager.desc(val))}\033[K\n")
-        sys.stdout.flush()
+    st = {"cur": 0, "top": 0}
 
     def toggle(i):
         kind, val = rows[i]
@@ -1123,35 +1242,57 @@ def lean_tools_menu(manager):
         else:
             enabled.discard(val) if val in enabled else enabled.add(val)
 
-    fd = sys.stdin.fileno()
-    old = termios.tcgetattr(fd)
-    render(True)
-    try:
-        tty.setraw(fd)
-        while True:
-            ch = sys.stdin.read(1)
-            if ch == "\x1b":                       # arrow escape sequence
-                ch += sys.stdin.read(2)
-                if ch == "\x1b[A":
-                    cur = (cur - 1) % len(rows)
-                elif ch == "\x1b[B":
-                    cur = (cur + 1) % len(rows)
-            elif ch in ("k",):
-                cur = (cur - 1) % len(rows)
-            elif ch in ("j",):
-                cur = (cur + 1) % len(rows)
-            elif ch == " ":
-                toggle(cur)
-            elif ch in ("\r", "\n"):
-                return enabled
-            elif ch in ("q", "\x03", "\x1b"):
-                return None
-            termios.tcsetattr(fd, termios.TCSADRAIN, old)
-            render(False)
-            tty.setraw(fd)
-    finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old)
-        print()
+    def render(rows_avail):
+        cur, top = st["cur"], st["top"]
+        body = rows_avail - 1                      # 1 row for the header
+        if cur < top:                              # keep the cursor in view
+            top = cur
+        elif cur >= top + body:
+            top = cur - body + 1
+        st["top"] = top
+        window = rows[top:top + body]
+        more_up   = " ↑more" if top > 0 else ""
+        more_down = " ↓more" if top + body < len(rows) else ""
+        out = ["\r" + bold("lean-tools  ")
+               + dim("(up/down move, space toggle, enter save, q cancel)")
+               + dim(more_up + more_down) + "\033[K"]
+        for off, (kind, val) in enumerate(window):
+            i = top + off
+            pointer = cyan(">") if i == cur else " "
+            if kind == "group":
+                gs = gstate(val)
+                mark = green("x") if gs == "all" else (yellow("-") if gs == "partial" else " ")
+                out.append(f"\r{pointer} [{mark}] {bold(val or 'general')}\033[K")
+            else:
+                mark = green("x") if val in enabled else " "
+                ind = "  " if show_groups else ""
+                out.append(f"\r{pointer} {ind}[{mark}] {val}  {dim(manager.desc(val))}\033[K")
+        sys.stdout.write("\n".join(out))
+        return len(out) - 1
+
+    def on_key(k):
+        if k in (_K_UP, "k"):
+            st["cur"] = (st["cur"] - 1) % len(rows)
+        elif k in (_K_DOWN, "j"):
+            st["cur"] = (st["cur"] + 1) % len(rows)
+        elif k == _K_HOME:
+            st["cur"] = 0
+        elif k == _K_END:
+            st["cur"] = len(rows) - 1
+        elif k == _K_PGUP:
+            st["cur"] = max(0, st["cur"] - 10)
+        elif k == _K_PGDN:
+            st["cur"] = min(len(rows) - 1, st["cur"] + 10)
+        elif k == _K_SPACE:
+            toggle(st["cur"])
+        elif k == _K_ENTER:
+            return ("done", enabled)
+        elif k in (_K_CANCEL, "q"):
+            return ("cancel", None)
+        return None
+
+    res = run_picker(render, on_key)
+    return res[1] if res[0] == "done" else None
 
 # ----------------------------------------------------------------------------
 # Colors
@@ -8313,88 +8454,86 @@ _NO_TTY = object()   # _arrow_select sentinel: raw mode unavailable -> numbered 
 
 def _arrow_select(header, choices, current=None):
     """Inline arrow-key single-select picker (fzf/gum-style): up/down move, type to
-    filter, enter selects, esc/^C cancels. Bounded region drawn BELOW the cursor and
-    cleared on exit - no alternate screen, no curses, so it degrades identically in
-    any terminal (the caller falls back to the numbered prompt when this returns the
-    _NO_TTY sentinel: no termios, or stdin/stdout not a tty). Returns the chosen value,
-    None (cancel), or _NO_TTY (can't do raw mode - use the numbered fallback)."""
-    try:
-        import termios, tty
-    except ImportError:
-        return _NO_TTY
-    if not (sys.stdin.isatty() and _TTY):
+    filter, enter selects, esc/^C cancels, with a SCROLLING VIEWPORT so a long list
+    never overflows the screen. Drawn below the cursor, no alternate screen - degrades
+    identically in any terminal; the caller falls back to the numbered prompt when this
+    returns _NO_TTY (no tty / dumb term / forced plain). Built on the shared run_picker
+    engine. Returns the chosen value, None (cancel), or _NO_TTY."""
+    if not _picker_capable():
         return _NO_TTY
     labels = [str(c) for c in choices]
-    query = ""
-    cur = 0
-    # start the cursor on the current value if it's in the list
-    if current is not None and str(current) in labels:
-        cur = labels.index(str(current))
-    prev_lines = 0
+    st = {"query": "", "cur": 0, "top": 0}
+    if current is not None and str(current) in labels:    # start on the current value
+        st["cur"] = labels.index(str(current))
 
     def _filtered():
-        if not query:
+        q = st["query"].lower()
+        if not q:
             return list(range(len(choices)))
-        q = query.lower()
         return [i for i, lbl in enumerate(labels) if q in lbl.lower()]
 
-    def render(first):
-        nonlocal prev_lines
-        if not first and prev_lines:
-            sys.stdout.write(f"\033[{prev_lines}A")        # back to region top
-        hint = dim("(up/down, type to filter, enter select, esc cancel)")
-        q = (cyan(query) + dim("_")) if query else dim("(type to filter)")
-        out = ["\r" + bold(header) + "  " + hint + "\033[K",
-               "\r  " + dim("filter: ") + q + "\033[K"]
+    def render(rows_avail):
         fi = _filtered()
-        for i in fi:
-            sel = (i == fi[cur]) if fi else False
+        if fi:
+            st["cur"] %= len(fi)
+        body = max(1, rows_avail - 2)              # 2 rows: header + filter line
+        cur, top = st["cur"], st["top"]
+        if not fi:
+            top = 0
+        elif cur < top:
+            top = cur
+        elif cur >= top + body:
+            top = cur - body + 1
+        st["top"] = top
+        hint = dim("(up/down, type to filter, enter select, esc cancel)")
+        q = (cyan(st["query"]) + dim("_")) if st["query"] else dim("(type to filter)")
+        more_up   = " ↑more" if top > 0 else ""
+        more_down = " ↓more" if fi and top + body < len(fi) else ""
+        out = ["\r" + bold(header) + "  " + hint + "\033[K",
+               "\r  " + dim("filter: ") + q + dim(more_up + more_down) + "\033[K"]
+        for pos in range(top, min(top + body, len(fi))):
+            i = fi[pos]
+            sel = (pos == cur)
             pointer = cyan(">") if sel else " "
             mark = dim("  (current)") if current is not None and labels[i] == str(current) else ""
             line = f"{labels[i]}{mark}"
             out.append("\r" + pointer + " " + (cyan(line) if sel else line) + "\033[K")
         if not fi:
             out.append("\r  " + dim("(no match)") + "\033[K")
-        sys.stdout.write("\n".join(out) + "\033[J")        # clear anything below
-        sys.stdout.flush()
-        prev_lines = len(out) - 1                          # newlines between region rows
+        sys.stdout.write("\n".join(out))
+        return len(out) - 1
 
-    fd = sys.stdin.fileno()
-    old = termios.tcgetattr(fd)
-    render(True)
-    try:
-        tty.setraw(fd)
-        while True:
-            fi = _filtered()
-            if fi:
-                cur %= len(fi)
-            ch = sys.stdin.read(1)
-            if ch == "\x1b":
-                nxt = sys.stdin.read(1)
-                if nxt == "[":
-                    arrow = sys.stdin.read(1)
-                    if arrow == "A" and fi:
-                        cur = (cur - 1) % len(fi)
-                    elif arrow == "B" and fi:
-                        cur = (cur + 1) % len(fi)
-                else:                                      # bare ESC -> cancel
-                    return None
-            elif ch in ("\r", "\n"):
-                return choices[fi[cur]] if fi else None
-            elif ch == "\x03":                             # ^C
-                return None
-            elif ch in ("\x7f", "\x08"):                   # backspace
-                query = query[:-1]
-                cur = 0
-            elif ch >= " " and ch != "\x7f":               # printable -> filter
-                query += ch
-                cur = 0
-            termios.tcsetattr(fd, termios.TCSADRAIN, old)
-            render(False)
-            tty.setraw(fd)
-    finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old)
-        print()
+    def on_key(k):
+        fi = _filtered()
+        if k == _K_UP and fi:
+            st["cur"] = (st["cur"] - 1) % len(fi)
+        elif k == _K_DOWN and fi:
+            st["cur"] = (st["cur"] + 1) % len(fi)
+        elif k == _K_PGUP:
+            st["cur"] = max(0, st["cur"] - 10)
+        elif k == _K_PGDN and fi:
+            st["cur"] = min(len(fi) - 1, st["cur"] + 10)
+        elif k == _K_HOME:
+            st["cur"] = 0
+        elif k == _K_END and fi:
+            st["cur"] = len(fi) - 1
+        elif k == _K_ENTER:
+            return ("done", choices[fi[st["cur"]]] if fi else None)
+        elif k == _K_CANCEL:
+            return ("cancel", None)
+        elif k == _K_BACK:
+            st["query"] = st["query"][:-1]
+            st["cur"] = 0
+        elif k == _K_SPACE:
+            st["query"] += " "
+            st["cur"] = 0
+        elif isinstance(k, str) and len(k) == 1 and k >= " ":   # printable -> filter
+            st["query"] += k
+            st["cur"] = 0
+        return None
+
+    res = run_picker(render, on_key)
+    return res[1] if res[0] == "done" else None
 
 
 def _pick_value(header, choices, current=None, prompt=input):
@@ -9411,7 +9550,16 @@ def dispatch_command(agent, cfg, cmd, arg):
 
     Uniform command contract: `/<cmd> ?` (or `/<cmd> help`) prints that command's
     own help (its docstring) instead of running it - works for every builtin and
-    lean-tool command, so a user never has to guess a command's args."""
+    lean-tool command, so a user never has to guess a command's args.
+
+    Universal emergency escape: a leading `--plain`/`--fallback` on ANY command forces
+    the next interactive menu to use the bulletproof numbered fallback instead of the
+    raw-mode picker - the way out of a garbled render on a mis-detected terminal, with
+    no restart. The flag is stripped before the handler sees the arg."""
+    global _FORCE_PLAIN_ONCE
+    _plain, arg = _wants_plain(arg)
+    if _plain:
+        _FORCE_PLAIN_ONCE = True
     if arg.strip().lower() in ("?", "help") and cmd not in ("/help", "/h", "/?"):
         handler = _BUILTIN_COMMANDS_TABLE.get(cmd)
         if handler is not None:
