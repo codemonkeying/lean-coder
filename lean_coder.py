@@ -84,7 +84,7 @@ def _prehandover_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.5.3"
+__version__ = "0.5.4"
 
 
 def _prerelease_key(pre):
@@ -6253,6 +6253,10 @@ class Agent:
         # state (not in self.messages), so it would otherwise survive /new and
         # mislead the next task with a stale GOAL. /load restores its own plan.
         self.pinned_plan = ""
+        # Drop the /expand ring too: its calls (+ captured output) belong to the
+        # session we're leaving. Keeping them would linger in memory and let
+        # /expand N surface a stale call whose output already scrolled off.
+        self._tool_calls, self._tool_call_seq = [], 0
 
     def restore(self, messages):
         """Replace the live conversation with a loaded session. The stored system
@@ -6264,6 +6268,10 @@ class Agent:
         self.last_prompt_tokens = None
         self.tools.changed_files.clear()
         self.dirty = False               # now showing a saved session, not unsaved work
+        # The /expand ring is not persisted, so a loaded session brings no tool
+        # calls with it - clear the outgoing session's so /expand N can't surface
+        # a stale call from the conversation we just replaced.
+        self._tool_calls, self._tool_call_seq = [], 0
         return len(body)
 
     def _trim_tool_indices(self, indices):
