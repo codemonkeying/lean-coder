@@ -137,8 +137,8 @@ def setup(lc, cfg):                 # called once at startup, on the driver only
 - A lean-tool may define `setup` **instead of** or **alongside** `TOOL`+`run`. A
   setup-only lean-tool adds nothing to the model's tools.
 
-See the bundled [`lean-tools/session_info.py`](lean-tools/session_info.py) for a
-`/whoami` command built this way,
+See the example [`examples/lean-tools/session_info.py`](examples/lean-tools/session_info.py)
+for a `/whoami` command built this way,
 [`lean-tools/notify.py`](lean-tools/notify.py) for a driver-only
 lean-tool (no model tool: it hooks the turn/confirm flow to ring the bell, so it is
 deliberately setup-only rather than a pushed TOOL),
@@ -254,7 +254,7 @@ surfaces **passively**: its notice rides the *next turn you type*. If you never 
 the agent never sees it. That's fine when you're driving, but it means a long job
 that finishes while you're away just waits.
 
-Turn on **`wake_on_bg_finish`** (config, `/settings`, or `/set wake_on_bg_finish
+Turn on **`wake_on_bg_finish`** (config, or `/set wake_on_bg_finish
 true`) and a finish **wakes the agent itself** - it synthesises a turn carrying the
 result and an instruction to react, with **no operator input**. The agent inspects
 the result, decides the next step, and either acts or hands back. Off by default: an

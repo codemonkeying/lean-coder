@@ -11,8 +11,8 @@ protocol, no server, no core dependency - the lean alternative to MCP.
   `run_command`). Ships with the code, not toggleable. Each entry declares a leash
   `tier` (read / write / exec).
 - **`dispatch_worker.py`, `shell_session.py`, `update.py`** - other bundled tools.
-- The rest (`web_fetch`, `brave_search`, `git_summary`, `diagnostics`, `note`,
-  `word_count`, `ssh`, `notify`, `provision`, `lc_sync`, `session_info`) are bundled
+- The rest (`web_fetch`, `web_screenshot`, `brave_search`, `git_summary`,
+  `diagnostics`, `note`, `word_count`, `ssh`, `notify`, `provision`) are bundled
   extras, toggled with `/tools`.
 
 ## Writing one

@@ -120,7 +120,8 @@ The client holds the `cfg` it was built with and reads, at send time:
 
 - `cfg.active_model()` - the model to send (the provider's, not Ollama's).
 - `cfg.setting("thinking")`, `cfg.setting("effort")`, `cfg.setting("cache")`, ... -
-  any knob the provider declared, plus any free-form one the user `/set`. The client
+  any knob the provider declared, plus any free-form one the user set via `/provider
+  set`. The client
   interprets these; core only stores them.
 
 It does **not** mutate `cfg`.
@@ -129,9 +130,10 @@ It does **not** mutate `cfg`.
 
 `capabilities(model)` returns `{setting_key: [choices]}`. `thinking` and `effort` are
 the well-known keys (they get the friendly `/think` / `/effort` commands); any other
-key you declare is a first-class knob too - core lists it under `/set`, validates it
-against its choices, persists it, and menus it. A knob with no declared choices is
-still settable free-form via `/set <key> <value>` and read with `cfg.setting(key)`,
+key you declare is a first-class knob too - core lists it under `/provider set`,
+validates it against its choices, persists it, and menus it. A knob with no declared
+choices is still settable free-form via `/provider set <key> <value>` and read with
+`cfg.setting(key)`,
 so a provider can wire in something core has never heard of - **no core change**.
 
 ```python
@@ -180,8 +182,9 @@ So each backend stops re-implementing them:
 - `/think` / `/effort` - capability-aware pickers over the declared choices when the
   active provider declares them; a clear "not supported" otherwise. (Ollama keeps its
   boolean `/think`.)
-- `/set [key [value]]` - list the active provider's declared settings + values (no
-  args), menu a declared key (key only), or set any key including a free-form one.
+- `/provider set [key [value]]` - list the active provider's declared settings +
+  values (no args), menu a declared key (key only), or set any key including a
+  free-form one. (App-config knobs live in the separate `/set`.)
 - `/usage` - prints the active provider's `detail(agent, cfg) -> str` (its full
   account/billing view), or a core default (model, session tokens, context %, warm
   models) for a provider without `detail`.

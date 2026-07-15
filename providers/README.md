@@ -12,9 +12,9 @@ is **not** a lean-tool: it wires in through a native registry, never ships to a
   models. Also the worked reference: HTTP client, priority-pool host failover,
   per-host last-used model, num_ctx auto-detect + OOM cap, and its own `/ollama`
   command. Read this first when writing your own.
-- **`anthropic_api.py`, `gemini.py`, `groq.py`, `openai.py`, `openrouter.py`,
-  `anthropic_plan.py`** - bundled hosted providers, disabled until you enable + key
-  them (`/provider enable <name>`, then `/provider login <name>`).
+- **`anthropic_api.py`, `gemini.py`, `groq.py`, `openai.py`, `openrouter.py`** -
+  bundled hosted providers, disabled until you enable + key them
+  (`/provider enable <name>`, then `/provider login <name>`).
 
 ## Writing one
 
