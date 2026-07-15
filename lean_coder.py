@@ -1202,6 +1202,41 @@ def _term_rows():
         return 24
 
 
+def _term_cols():
+    """Visible terminal width in columns (best-effort; 80 when unknown)."""
+    try:
+        return os.get_terminal_size().columns or 80
+    except OSError:
+        return 80
+
+
+def _fit_line(s, width=None):
+    """Truncate a display string to `width` VISIBLE columns (ANSI colour codes don't
+    count), so a picker row can NEVER wrap onto a second physical line - wrapping is
+    what desyncs the cursor-up redraw math and smears the menu. Any colour left open
+    at the cut is closed with a reset. `width` defaults to the terminal width minus 1
+    (leave the last column free so no terminal auto-wraps on the final glyph)."""
+    if width is None:
+        width = max(1, _term_cols() - 1)
+    out, vis, i, n, truncated = [], 0, 0, len(s), False
+    while i < n:
+        m = _ANSI_RE.match(s, i)
+        if m:                                    # copy escape verbatim (0 visible width)
+            out.append(m.group())
+            i = m.end()
+            continue
+        if vis >= width:
+            truncated = True
+            break
+        out.append(s[i])
+        vis += 1
+        i += 1
+    res = "".join(out)
+    if truncated and "\x1b[" in res:             # close any colour left open by the cut
+        res += "\033[0m"
+    return res
+
+
 def lean_tools_menu(manager):
     """Interactive enable/disable: up/down move, space toggles, enter saves, q
     cancels. Tools in subdirs are shown under a group header whose own row toggles
@@ -1253,20 +1288,24 @@ def lean_tools_menu(manager):
         window = rows[top:top + body]
         more_up   = " ↑more" if top > 0 else ""
         more_down = " ↓more" if top + body < len(rows) else ""
-        out = ["\r" + bold("lean-tools  ")
-               + dim("(up/down move, space toggle, enter save, q cancel)")
-               + dim(more_up + more_down) + "\033[K"]
+
+        def row(content):                          # fit to width so nothing wraps
+            return "\r" + _fit_line(content) + "\033[K"
+
+        out = [row(bold("lean-tools  ")
+                   + dim("(up/down move, space toggle, enter save, q cancel)")
+                   + dim(more_up + more_down))]
         for off, (kind, val) in enumerate(window):
             i = top + off
             pointer = cyan(">") if i == cur else " "
             if kind == "group":
                 gs = gstate(val)
                 mark = green("x") if gs == "all" else (yellow("-") if gs == "partial" else " ")
-                out.append(f"\r{pointer} [{mark}] {bold(val or 'general')}\033[K")
+                out.append(row(f"{pointer} [{mark}] {bold(val or 'general')}"))
             else:
                 mark = green("x") if val in enabled else " "
                 ind = "  " if show_groups else ""
-                out.append(f"\r{pointer} {ind}[{mark}] {val}  {dim(manager.desc(val))}\033[K")
+                out.append(row(f"{pointer} {ind}[{mark}] {val}  {dim(manager.desc(val))}"))
         sys.stdout.write("\n".join(out))
         return len(out) - 1
 
@@ -8489,17 +8528,21 @@ def _arrow_select(header, choices, current=None):
         q = (cyan(st["query"]) + dim("_")) if st["query"] else dim("(type to filter)")
         more_up   = " ↑more" if top > 0 else ""
         more_down = " ↓more" if fi and top + body < len(fi) else ""
-        out = ["\r" + bold(header) + "  " + hint + "\033[K",
-               "\r  " + dim("filter: ") + q + dim(more_up + more_down) + "\033[K"]
+
+        def row(content):                          # fit to width so nothing wraps
+            return "\r" + _fit_line(content) + "\033[K"
+
+        out = [row(bold(header) + "  " + hint),
+               row("  " + dim("filter: ") + q + dim(more_up + more_down))]
         for pos in range(top, min(top + body, len(fi))):
             i = fi[pos]
             sel = (pos == cur)
             pointer = cyan(">") if sel else " "
             mark = dim("  (current)") if current is not None and labels[i] == str(current) else ""
             line = f"{labels[i]}{mark}"
-            out.append("\r" + pointer + " " + (cyan(line) if sel else line) + "\033[K")
+            out.append(row(pointer + " " + (cyan(line) if sel else line)))
         if not fi:
-            out.append("\r  " + dim("(no match)") + "\033[K")
+            out.append(row("  " + dim("(no match)")))
         sys.stdout.write("\n".join(out))
         return len(out) - 1
 
