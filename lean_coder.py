@@ -9018,36 +9018,79 @@ def _select_model_row(agent, cfg, row):
     print(dim(f"model -> {m}  {where}"))
 
 
-def pick_unified_model_menu(rows, prompt=input):
-    """Numbered picker over all backends' models, grouped by provider with its tag,
-    a green dot for warm/loaded models, and any model_status() hint dimmed. Returns
-    the chosen row or None. `prompt` injectable for tests."""
-    sel = [r for r in rows if r["model"]]
-    legend = dim("  (" + green("*") + " loaded)")
-    print(bold("models") + legend)
-    n = 0
-    last_p = None
-    index_of = []                                 # menu-number -> row
+def _unified_model_lines(rows):
+    """Build the display model for the grouped model picker: a flat list of
+    (kind, payload) display rows - ("group", header) non-selectable headers,
+    ("info", text) non-selectable info lines, ("item", row) selectable entries -
+    plus index_of (selectable rows in order, for number-jump). Shared by the rich
+    picker and the numbered fallback so both render identically. Returns
+    (lines, index_of)."""
+    lines, index_of, last_p = [], [], None
     for r in rows:
         if r["provider"] != last_p:
             last_p = r["provider"]
             head = r["provider"] + (f"  [{r['tag']}]" if r["tag"] != r["provider"] else "")
-            print(dim(f"  {head}:"))
+            lines.append(("group", head))
         if not r["model"]:
             if not r["available"]:                # logged-out -> selectable to log in
-                n += 1; index_of.append(r)
-                print(f"  {n}) " + dim(f"  (login) {r['status']}"))
+                index_of.append(r)
+                lines.append(("item", r))
             else:                                 # enabled but unreachable -> info only
-                print(dim(f"       {r['status']}"))
+                lines.append(("info", r["status"]))
             continue
-        n += 1; index_of.append(r)
-        dot = green("*") if r["warm"] else " "
-        mark = dim("  (current)") if r["current"] else ""
-        hint = dim(f"   {r['status']}") if r["status"] else ""
-        print(f"  {n}) {dot} {r['model']}{mark}{hint}")
-    print("  0) cancel")
+        index_of.append(r)
+        lines.append(("item", r))
+    return lines, index_of
+
+
+def _fmt_model_row(r, num):
+    """One selectable model row's text (number + dot + name + marks). `num` is its
+    1-based selection number (for number-jump), or None to omit."""
+    npart = dim(f"{num:>2}) ") if num is not None else ""
+    if not r["model"]:                            # a (login) row for a logged-out backend
+        return npart + dim(f"(login) {r['status']}")
+    dot = green("*") if r["warm"] else " "
+    mark = dim("  (current)") if r["current"] else ""
+    hint = dim(f"   {r['status']}") if r["status"] else ""
+    return f"{npart}{dot} {r['model']}{mark}{hint}"
+
+
+def pick_unified_model_menu(rows, prompt=input):
+    """Picker over all backends' models, grouped by provider with its tag, a green dot
+    for warm/loaded models, and any model_status() hint dimmed. Rich picker on a real
+    tty (arrow-keys + scrolling + number-type-then-Enter to jump-select fast + filter),
+    numbered fallback otherwise (or when a test passes its own `prompt`). Returns the
+    chosen row or None."""
+    lines, index_of = _unified_model_lines(rows)
     if not index_of:
+        legend = dim("  (" + green("*") + " loaded)")
+        print(bold("models") + legend)
+        for kind, payload in lines:
+            if kind == "group":
+                print(dim(f"  {payload}:"))
+            elif kind == "info":
+                print(dim(f"       {payload}"))
+        print(dim("  (no selectable models)"))
         return None
+    # number of each selectable item, keyed by id() of its row
+    num_of = {id(r): i + 1 for i, r in enumerate(index_of)}
+
+    if prompt is input and _picker_capable():
+        return _pick_grouped(rows_header="models" + dim("  (" + green("*")
+                             + " loaded, #=jump, arrows, type to filter)"),
+                             lines=lines, index_of=index_of, num_of=num_of)
+
+    # numbered fallback
+    legend = dim("  (" + green("*") + " loaded)")
+    print(bold("models") + legend)
+    for kind, payload in lines:
+        if kind == "group":
+            print(dim(f"  {payload}:"))
+        elif kind == "info":
+            print(dim(f"       {payload}"))
+        else:
+            print("  " + _fmt_model_row(payload, num_of[id(payload)]))
+    print("  0) cancel")
     try:
         s = prompt("choice: ")
     except (EOFError, KeyboardInterrupt):
@@ -9055,6 +9098,131 @@ def pick_unified_model_menu(rows, prompt=input):
         return None
     idx = _menu_index(s, len(index_of))
     return index_of[idx] if idx is not None else None
+
+
+def _pick_grouped(rows_header, lines, index_of, num_of):
+    """Rich raw-mode picker for a GROUPED list (group headers + selectable items),
+    on the shared run_picker engine. Cursor moves only over selectable items; group/
+    info rows scroll with them. Fast path: type a number (multi-digit accumulates) to
+    move the cursor to that item, Enter selects; a non-digit starts a text filter.
+    Arrows/pgup/pgdn/home/end also move. Returns the chosen row, or None."""
+    # positions of selectable lines within `lines`
+    item_pos = [i for i, (k, _) in enumerate(lines) if k == "item"]
+    st = {"sel": 0, "top": 0, "num": "", "query": ""}
+    # start the cursor on the current model if present
+    for si, r in enumerate(index_of):
+        if r.get("current"):
+            st["sel"] = si
+            break
+
+    def _visible():
+        """The lines to show given the filter: keep group headers whose section has a
+        matching item; drop non-matching items. Returns (vis_lines, vis_items) where
+        vis_items maps to index_of rows in display order."""
+        q = st["query"].lower()
+        if not q:
+            return lines, index_of
+        vis, vis_items, pending_group = [], [], None
+        for k, payload in lines:
+            if k == "group":
+                pending_group = (k, payload)
+            elif k == "item":
+                name = (payload.get("model") or payload.get("status") or "")
+                if q in name.lower():
+                    if pending_group:
+                        vis.append(pending_group); pending_group = None
+                    vis.append((k, payload)); vis_items.append(payload)
+        return vis, vis_items
+
+    def render(rows_avail):
+        vis_lines, vis_items = _visible()
+        if vis_items:
+            st["sel"] %= len(vis_items)
+        # map cursor (index into vis_items) to a line offset in vis_lines
+        sel_line = 0
+        seen = -1
+        for li, (k, _p) in enumerate(vis_lines):
+            if k == "item":
+                seen += 1
+                if seen == st["sel"]:
+                    sel_line = li
+                    break
+        body = max(1, rows_avail - 2)
+        top = st["top"]
+        if sel_line < top:
+            top = sel_line
+        elif sel_line >= top + body:
+            top = sel_line - body + 1
+        st["top"] = top
+        q = (cyan(st["query"]) + dim("_")) if st["query"] else dim("(type to filter)")
+        more_up   = " ↑more" if top > 0 else ""
+        more_down = " ↓more" if top + body < len(vis_lines) else ""
+
+        def row(content):
+            return "\r" + _fit_line(content) + "\033[K"
+
+        # precompute each line's item-index (into vis_items), -1 for non-items
+        item_index = []
+        seen = -1
+        for k, _p in vis_lines:
+            if k == "item":
+                seen += 1
+                item_index.append(seen)
+            else:
+                item_index.append(-1)
+
+        out = [row(bold(rows_header)),
+               row("  " + dim("filter: ") + q + dim(more_up + more_down))]
+        for li in range(top, min(top + body, len(vis_lines))):
+            k, payload = vis_lines[li]
+            if k == "group":
+                out.append(row("  " + dim(payload + ":")))
+            elif k == "info":
+                out.append(row("       " + dim(payload)))
+            else:
+                is_sel = (item_index[li] == st["sel"])
+                pointer = cyan(">") if is_sel else " "
+                text = _fmt_model_row(payload, num_of[id(payload)])
+                out.append(row(pointer + " " + (cyan(text) if is_sel else text)))
+        if not vis_items:
+            out.append(row("  " + dim("(no match)")))
+        sys.stdout.write("\n".join(out))
+        return len(out) - 1
+
+    def on_key(k):
+        _vl, vis_items = _visible()
+        n = len(vis_items)
+        if not st["query"] and isinstance(k, str) and k.isdigit():
+            st["num"] = (st["num"] + k)[-3:]
+            j = int(st["num"])
+            if n and 1 <= j <= n:
+                st["sel"] = j - 1
+            return None
+        st["num"] = ""
+        if k == _K_UP and n:
+            st["sel"] = (st["sel"] - 1) % n
+        elif k == _K_DOWN and n:
+            st["sel"] = (st["sel"] + 1) % n
+        elif k == _K_PGUP:
+            st["sel"] = max(0, st["sel"] - 10)
+        elif k == _K_PGDN and n:
+            st["sel"] = min(n - 1, st["sel"] + 10)
+        elif k == _K_HOME:
+            st["sel"] = 0
+        elif k == _K_END and n:
+            st["sel"] = n - 1
+        elif k == _K_ENTER:
+            return ("done", vis_items[st["sel"]] if n else None)
+        elif k == _K_CANCEL:
+            return ("cancel", None)
+        elif k == _K_BACK:
+            st["query"] = st["query"][:-1]; st["sel"] = 0
+        elif isinstance(k, str) and len(k) == 1 and k >= " ":
+            st["query"] += k; st["sel"] = 0
+        return None
+
+    res = run_picker(render, on_key)
+    return res[1] if res[0] == "done" else None
 
 
 def handle_model_command(agent, cfg, arg):
