@@ -2438,7 +2438,7 @@ class Config:
     max_iterations: int = 0          # tool-call rounds per user turn before the loop
                                      # stops and hands control back. 0 = unlimited (the
                                      # default): long agentic runs aren't cut off; set a
-                                     # 0 = unlimited) via /settings or config for fully
+                                     # 0 = unlimited) via /set or config for fully
                                      # autonomous runs. This is a power tool - the cap is
                                      # a guardrail, not a wall.
     cwd: Path = field(default_factory=Path.cwd)
@@ -6484,7 +6484,7 @@ class Agent:
         if trimmed:
             print(yellow(f"  {GLYPH['warn']} auto-compact at {used:,} tokens: stripped "
                          f"{trimmed} old tool result(s), ~{freed:,} tokens freed")
-                  + dim(f"  (every {interval:,} tokens; change: /settings auto_compact_interval)"))
+                  + dim(f"  (every {interval:,} tokens; change: /set auto_compact_interval)"))
             self._log_activity(
                 "auto-compact",
                 f"stripped {trimmed} old tool result(s), ~{freed:,} tokens freed",
@@ -6521,7 +6521,7 @@ class Agent:
         kind = "elective handover (clean break)" if elected and not forced else "auto-handover"
         print(yellow(f"  {GLYPH['warn']} context {used:,}/{limit:,} ({pct}%, {zone}) - "
                      f"{kind} (summarizing + resetting the cache prefix)…")
-              + dim("  (change: /settings handover_hard)"))
+              + dim("  (change: /set handover_hard)"))
         if self.auto_handover(zone) is None:
             # The agentic summary failed (model couldn't produce a usable handover -
             # common when history already overflows the window so the summarizing turn
@@ -6816,7 +6816,7 @@ class Agent:
                 self.messages.append(_tool_result_msg(name, result))
         print(yellow(f"\n{GLYPH['warn']} hit {cap}-iteration cap; stopping this turn. "
                      f"Refine your request or continue, or raise the limit: "
-                     f"/settings -> max_iterations (0 = unlimited), or set "
+                     f"/set -> max_iterations (0 = unlimited), or set "
                      f"max_iterations in {CONFIG_PATH}."))
         self._end_of_turn()
 
@@ -6970,7 +6970,7 @@ SLASH_COMMANDS = ["/clear", "/new", "/compact", "/handover", "/session", "/save"
                   "/prompt", "/sh", "/connect", "/local", "/tools", "/reload",
                   "/model", "/provider", "/think", "/effort",
                   "/set", "/usage", "/approve", "/leash", "/autosave", "/incognito",
-                  "/askread", "/bg", "/info", "/settings", "/ctx", "/activity", "/expand", "/help", "/quit"]
+                  "/askread", "/bg", "/info", "/ctx", "/activity", "/expand", "/help", "/quit"]
 
 # Built-in command names are the shadow-protection set: lean-tool commands can't claim
 # any of them. It is DERIVED from _BUILTIN_COMMANDS_TABLE (every builtin command + alias)
@@ -7172,7 +7172,7 @@ HELP_COMMANDS = [
     ("/usage", "session tokens + context / provider usage ('raw' dumps the full payload)"),
     ("/think [level]", "set thinking (no arg = menu)"),
     ("/effort [level]", "set reasoning effort (no arg = menu)"),
-    ("/set [key val]", "get/set a provider setting"),
+    ("/set [key val]", "edit app config (config.toml knobs; no arg = menu)"),
     ("/approve [mode]", "ask | session | auto"),
     ("/leash [level]", "ceiling: chat | r | rw | rwe"),
     ("/autosave [on|off]", "autosave + auto-load last on start"),
@@ -7180,7 +7180,6 @@ HELP_COMMANDS = [
     ("/askread [on|off]", "confirm read tools too"),
     ("/bg [kill <pid>]", "list/kill background tasks"),
     ("/info", "live session read-out"),
-    ("/settings [key val]", "edit config.toml knobs (no arg = menu)"),
     ("/ctx", "context-token estimate"),
     ("/activity [n|all]", "what the system did automatically (compaction, handover, fallback, ...)"),
     ("/expand [N]", "show a tool call's full (untruncated) args; bare = newest, N = the #id"),
@@ -7192,8 +7191,9 @@ HELP_FOOTER = ("Tab completes commands and their inline arguments. `/<cmd> ?` sh
                "command's own help (args, behaviour). ^C stops a running turn; "
                "at the prompt it cancels the line, and ^C twice in a row exits. "
                "Anything else goes to the model.\n"
-               "Config knobs (context/handover gates, sampling, etc.) live in /settings - "
-               "e.g. handover_soft/hard/emergency, auto_handover, auto_evict_keep.")
+               "App-config knobs (context/handover gates, sampling, etc.) live in /set - "
+               "e.g. handover_soft/hard/emergency, auto_handover, auto_evict_keep; "
+               "backend-specific knobs live in /provider set.")
 
 
 def render_help(extra=()):
@@ -7325,8 +7325,8 @@ def handle_prompt_command(agent, cfg, arg):
     _edit_prompt_file(agent, cfg, name)
 
 
-# Config fields /settings can edit directly. (model/host/num_ctx have dedicated
-# live commands - /model, /ollama host - that also re-init the client; /settings is the
+# Config fields /set can edit directly. (model/host/num_ctx have dedicated
+# live commands - /model, /ollama host - that also re-init the client; /set is the
 # granular editor for the rest of the persisted knobs.) kind: str|int|float|bool, or
 # a tuple of allowed values (picker).
 _SETTINGS_FIELDS = [
@@ -7373,8 +7373,8 @@ _SETTINGS_FIELDS = [
 ]
 _SETTINGS_BY_KEY = {k: (label, kind) for k, label, kind in _SETTINGS_FIELDS}
 # Settings that change the LIVE agent (its tool surface / system prompt), not just a
-# cfg value read each turn - editing these via /settings must re-apply them, exactly
-# as the dedicated command does, or the change is cosmetic (e.g. /settings leash r
+# cfg value read each turn - editing these via /set must re-apply them, exactly
+# as the dedicated command does, or the change is cosmetic (e.g. /set leash r
 # would show 'r' but leave the model holding the full tool surface). They announce
 # themselves on apply, so the generic "key -> value" echo is skipped for them.
 _LIVE_APPLY = {"leash"}
@@ -7392,7 +7392,7 @@ def _coerce_setting(raw, kind):
 
 
 def _set_setting_field(agent, cfg, key, raw):
-    """Set one /settings field from a raw string, APPLYING it to the live agent when
+    """Set one /set config field from a raw string, APPLYING it to the live agent when
     the field affects its tool surface or system prompt (leash, ask_user_to_run) -
     not just the cfg value. Returns True on success. `agent` may be None for headless
     callers (then live-apply is skipped)."""
@@ -7421,9 +7421,9 @@ def _set_setting_field(agent, cfg, key, raw):
 
 
 def _edit_one_setting(agent, cfg, k, label, kind):
-    """Interactively edit a single /settings field: flip a bool, pick a tuple value,
+    """Interactively edit a single /set config field: flip a bool, pick a tuple value,
     prompt a scalar. Routes through _set_setting_field (so live-apply settings take
-    effect), then persists + echoes. Shared by the /settings menu and `/settings <key>`
+    effect), then persists + echoes. Shared by the /set menu and `/set <key>`
     with no value (so a bare key edits like picking it in the menu)."""
     cur = getattr(cfg, k)
     if kind == "bool":
@@ -7470,8 +7470,9 @@ def _settings_sessions_view(agent, cfg):
 
 
 def handle_settings_command(agent, cfg, arg):
-    """/settings - granular editor over config.toml. No arg: interactive menu.
-    `key value`: set one field directly. Persists with save_config()."""
+    """/set - granular editor over the app config (config.toml). No arg: interactive
+    menu. `key value`: set one field directly. Persists with save_config().
+    (Provider-specific backend knobs live in /provider set.)"""
     if arg:
         parts = arg.split(maxsplit=1)
         if len(parts) == 2 and _set_setting_field(agent, cfg, parts[0], parts[1]):
@@ -7814,7 +7815,7 @@ def _arg_completions(agent, cfg, cmd):
         except Exception:
             return []
     if cmd in ("/provider", "/providers"):
-        return (["off", "on", "login", "clear", "list", "enable", "disable"]
+        return (["off", "on", "login", "clear", "list", "enable", "disable", "set"]
                 + provider_names())
     if cmd in ("/think", "/effort"):
         key = "thinking" if cmd == "/think" else "effort"
@@ -7837,22 +7838,22 @@ def _arg_completions(agent, cfg, cmd):
         return sorted(set(list(cfg.connect_hosts) + list(getattr(agent, "remotes", {}))))
     if cmd in ("/local", "/disconnect"):
         return list(getattr(agent, "remotes", {}))
-    if cmd == "/set":
-        spec = agent.active_provider()
-        return list(_safe_caps(spec, cfg)) if spec is not None else []
     if cmd == "/prompt":
         b, c = list_prompts(all_builtins=True)   # completion offers every system prompt by name
         return ["edit", "use", "reset"] + b + c
     if cmd == "/approve":
         return list(APPROVAL_MODES)
-    if cmd == "/settings":
+    if cmd == "/set":                             # app-config keys (was /settings)
         return [k for k, _, _ in _SETTINGS_FIELDS]
-    if cmd.startswith("/settings "):              # value completion for a chosen key
+    if cmd.startswith("/set "):                   # value completion for a chosen config key
         toks = cmd.split()
         _, kind = _SETTINGS_BY_KEY.get(toks[1], (None, None)) if len(toks) > 1 else (None, None)
         if isinstance(kind, tuple):
             return list(kind)
         return ["on", "off"] if kind == "bool" else []
+    if cmd in ("/provider set", "/providers set"):  # provider-declared backend knobs
+        spec = agent.active_provider()
+        return list(_safe_caps(spec, cfg)) if spec is not None else []
     if cmd in _lean_tool_completers:          # lean-tool-contributed completion
         try:
             return list(_lean_tool_completers[cmd](agent, cfg))
@@ -8382,14 +8383,14 @@ def _set_known(agent, cfg, key, arg) -> bool:
     return True
 
 
-def handle_set_command(agent, cfg, arg):
-    """/set [key [value]] - the extensible escape hatch. Lists/sets any knob the
-    active provider declares in capabilities(), and allows free-form keys the
+def handle_provider_set_command(agent, cfg, arg):
+    """/provider set [key [value]] - the extensible escape hatch. Lists/sets any knob
+    the active provider declares in capabilities(), and allows free-form keys the
     provider reads itself (tool format, prompt caching, whatever) without core
-    needing to know what they mean."""
+    needing to know what they mean. (App-config knobs live in /set.)"""
     spec = agent.active_provider()
     if spec is None:
-        print(dim("/set applies to an active provider; none active (see /provider)"))
+        print(dim("/provider set applies to an active provider; none active (see /provider)"))
         return
     caps = _safe_caps(spec, cfg)
     parts = arg.split(maxsplit=1)
@@ -8397,7 +8398,7 @@ def handle_set_command(agent, cfg, arg):
         cur = cfg.provider_settings.get(cfg.provider, {})
         if not caps:
             print(dim(f"provider '{cfg.provider}' declares no settings "
-                      f"(you can still /set <key> <value> a custom one)"))
+                      f"(you can still /provider set <key> <value> a custom one)"))
             return
         print(bold(f"{cfg.provider} settings:"))
         for k, ch in caps.items():
@@ -8506,8 +8507,10 @@ def handle_provider_command(agent, cfg, arg):
       /provider clear [name]    wipe a provider's credentials
       /provider enable <name>   enable a providers/ dir plugin
       /provider disable <name>  disable one
+      /provider set [key [val]] get/set a backend-specific knob (was /set)
     Switching the active MODEL (and its backend) is /model; bare /provider is the
-    catalog (what's on/off), matching the old /provider list."""
+    catalog (what's on/off), matching the old /provider list. App-config knobs
+    (handover gates, sampling, etc.) live in /set."""
     parts = arg.split()
     sub = parts[0] if parts else ""
     rest = parts[1] if len(parts) > 1 else ""
@@ -8516,6 +8519,9 @@ def handle_provider_command(agent, cfg, arg):
         return
     if sub == "clear":
         _provider_clear(agent, cfg, rest)
+        return
+    if sub == "set":                        # /provider set [key [value]] - backend knobs
+        handle_provider_set_command(agent, cfg, arg.split(maxsplit=1)[1] if len(parts) > 1 else "")
         return
     if sub in ("", "list"):                 # bare /provider == the catalog on/off menu
         handle_providers_command(agent, cfg, "")
@@ -9260,8 +9266,7 @@ _BUILTIN_COMMANDS_TABLE = {
     "/providers": handle_provider_command,
     "/usage": handle_usage_command,
     "/info": handle_info_command,
-    "/settings": handle_settings_command,
-    "/set": handle_set_command,
+    "/set": handle_settings_command,
     "/model": handle_model_command,
     "/models": handle_model_command,
     "/approve": handle_approve_command,
@@ -9306,7 +9311,7 @@ def dispatch_command(agent, cfg, cmd, arg):
     else 'unknown command'. Returns True iff the repl should exit (only /quit signals
     it, via the REPL_EXIT sentinel). Builtin handlers run unguarded (core code); a
     lean-tool handler is wrapped so a buggy plugin can't take the loop down. Folds in
-    the /provider + /set post-handler config autosave.
+    the /provider + /set post-handler config autosave (app-config + provider knobs).
 
     Uniform command contract: `/<cmd> ?` (or `/<cmd> help`) prints that command's
     own help (its docstring) instead of running it - works for every builtin and
