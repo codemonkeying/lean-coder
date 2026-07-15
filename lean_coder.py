@@ -8308,9 +8308,105 @@ def _do_connect(agent, cfg, rhost, rpath=".", offer_save=False):
             save_config(cfg)
 
 
+_NO_TTY = object()   # _arrow_select sentinel: raw mode unavailable -> numbered fallback
+
+
+def _arrow_select(header, choices, current=None):
+    """Inline arrow-key single-select picker (fzf/gum-style): up/down move, type to
+    filter, enter selects, esc/^C cancels. Bounded region drawn BELOW the cursor and
+    cleared on exit - no alternate screen, no curses, so it degrades identically in
+    any terminal (the caller falls back to the numbered prompt when this returns the
+    _NO_TTY sentinel: no termios, or stdin/stdout not a tty). Returns the chosen value,
+    None (cancel), or _NO_TTY (can't do raw mode - use the numbered fallback)."""
+    try:
+        import termios, tty
+    except ImportError:
+        return _NO_TTY
+    if not (sys.stdin.isatty() and _TTY):
+        return _NO_TTY
+    labels = [str(c) for c in choices]
+    query = ""
+    cur = 0
+    # start the cursor on the current value if it's in the list
+    if current is not None and str(current) in labels:
+        cur = labels.index(str(current))
+    prev_lines = 0
+
+    def _filtered():
+        if not query:
+            return list(range(len(choices)))
+        q = query.lower()
+        return [i for i, lbl in enumerate(labels) if q in lbl.lower()]
+
+    def render(first):
+        nonlocal prev_lines
+        if not first and prev_lines:
+            sys.stdout.write(f"\033[{prev_lines}A")        # back to region top
+        hint = dim("(up/down, type to filter, enter select, esc cancel)")
+        q = (cyan(query) + dim("_")) if query else dim("(type to filter)")
+        out = ["\r" + bold(header) + "  " + hint + "\033[K",
+               "\r  " + dim("filter: ") + q + "\033[K"]
+        fi = _filtered()
+        for i in fi:
+            sel = (i == fi[cur]) if fi else False
+            pointer = cyan(">") if sel else " "
+            mark = dim("  (current)") if current is not None and labels[i] == str(current) else ""
+            line = f"{labels[i]}{mark}"
+            out.append("\r" + pointer + " " + (cyan(line) if sel else line) + "\033[K")
+        if not fi:
+            out.append("\r  " + dim("(no match)") + "\033[K")
+        sys.stdout.write("\n".join(out) + "\033[J")        # clear anything below
+        sys.stdout.flush()
+        prev_lines = len(out) - 1                          # newlines between region rows
+
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    render(True)
+    try:
+        tty.setraw(fd)
+        while True:
+            fi = _filtered()
+            if fi:
+                cur %= len(fi)
+            ch = sys.stdin.read(1)
+            if ch == "\x1b":
+                nxt = sys.stdin.read(1)
+                if nxt == "[":
+                    arrow = sys.stdin.read(1)
+                    if arrow == "A" and fi:
+                        cur = (cur - 1) % len(fi)
+                    elif arrow == "B" and fi:
+                        cur = (cur + 1) % len(fi)
+                else:                                      # bare ESC -> cancel
+                    return None
+            elif ch in ("\r", "\n"):
+                return choices[fi[cur]] if fi else None
+            elif ch == "\x03":                             # ^C
+                return None
+            elif ch in ("\x7f", "\x08"):                   # backspace
+                query = query[:-1]
+                cur = 0
+            elif ch >= " " and ch != "\x7f":               # printable -> filter
+                query += ch
+                cur = 0
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+            render(False)
+            tty.setraw(fd)
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        print()
+
+
 def _pick_value(header, choices, current=None, prompt=input):
-    """Generic numbered picker for a small set of values. Returns the chosen
-    value or None (cancel). Sibling of pick_model_menu for settings/providers."""
+    """Generic single-select picker for a small set of values. Returns the chosen
+    value or None (cancel). Arrow-key inline picker on a real terminal (up/down +
+    type-to-filter + enter); falls back to the classic numbered prompt when there's
+    no tty or a caller passes its own `prompt` (tests, headless). Sibling of
+    pick_model_menu for settings/providers."""
+    if prompt is input:                              # only the default interactive path
+        chosen = _arrow_select(header, choices, current)
+        if chosen is not _NO_TTY:
+            return chosen
     print(bold(header))
     for i, c in enumerate(choices, 1):
         mark = dim("  (current)") if current is not None and str(c) == str(current) else ""
