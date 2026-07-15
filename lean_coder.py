@@ -2735,9 +2735,10 @@ class Config:
                                      # to its host automatically (off = ask first)
     lean_tools_dir: str = ""            # "" -> ~/.config/leancoder/lean-tools
     lean_tools_enabled: list = field(default_factory=list)  # enabled lean-tool names
-    always_expand: list = field(default_factory=lambda: ["apply_diff"])  # tool names
+    always_expand: list = field(default_factory=list)  # tool names
                                      # whose full args auto-print after the call line
-                                     # (see /expand); default shows diffs in full
+                                     # (see /expand); default = none (diffs stay
+                                     # collapsed to the call line; /expand shows them)
     show_snapshots: bool = False     # show pre-handover safety snapshots in the /load
                                      # picker + /session list (off = hidden so they don't
                                      # clog the menu; /load <exact-name> always works)
@@ -3114,7 +3115,7 @@ def save_config(cfg: Config, quiet: bool = False):
         lines.append(f"auto_compact_keep = {cfg.auto_compact_keep}")
     if cfg.wake_on_bg_finish:                  # default off; persist an opt-IN
         lines.append("wake_on_bg_finish = true")
-    if cfg.always_expand != ["apply_diff"]:    # default = diffs shown in full
+    if cfg.always_expand:                       # default = [] (diffs stay collapsed)
         lines.append("always_expand = [" + ", ".join(_toml_value(x) for x in cfg.always_expand) + "]")
     if cfg.show_snapshots:                      # default off (snapshots hidden in /load)
         lines.append("show_snapshots = true")
@@ -6611,8 +6612,8 @@ class Agent:
 
     def _maybe_auto_expand(self, name, call_id):
         """Auto-print the full args right after the call line when `name` is in the
-        cfg.always_expand list (default ["apply_diff"] - diffs shown in full even when
-        approval is auto/off). No-op otherwise."""
+        cfg.always_expand list (default [] - nothing auto-expands; diffs stay collapsed
+        to the call line and /expand shows them on demand). No-op otherwise."""
         if name not in getattr(self.cfg, "always_expand", []):
             return
         entry = next((e for e in self._tool_calls if e["id"] == call_id), None)
