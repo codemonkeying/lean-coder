@@ -9897,7 +9897,7 @@ def main():
     ap.add_argument("--window-messages", type=int, dest="window_messages",
                     help="send only the last N messages per request (default 30; 0 = unbounded)")
     ap.add_argument("--cwd", help="project directory (default: current dir)")
-    ap.add_argument("--resume", metavar="NAME",
+    ap.add_argument("-r", "--resume", metavar="NAME",
                     help="resume a saved session by name (see /load)")
     ap.add_argument("--approval", choices=APPROVAL_MODES,
                     help="approval mode: ask (default) | session | auto")
