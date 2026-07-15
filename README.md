@@ -305,7 +305,7 @@ hatch for anything `run_command` can't do itself: a command needing **sudo/root*
 agent hands the exact command back to *you* to run in your own terminal; only the
 command and its exit code return to the agent — **whatever you type (the password,
 the secret) never reaches the model**. You can also edit the command before running
-it, or decline. On by default; toggle with `/settings`. A batch of read-only calls in
+it, or decline. On by default; toggle with `/set`. A batch of read-only calls in
 one turn runs **concurrently**.
 
 ### Opt-in lean-tools
@@ -327,7 +327,6 @@ on with `/tools` and it costs context only from that point. These ship bundled i
 | `ssh`             | One-shot `ssh host cmd` (network egress, kept out of core). |
 | `note`            | Append a line to `NOTES.md`. |
 | `notify`          | Desktop notification when a long task finishes. |
-| `session_info`    | A `/whoami` command (setup-only lean-tool). |
 | `provision`       | `/provision` wizard: install lean-coder onto another box over SSH. |
 | `update`          | `/update` - self-update `lean_coder.py` to the latest published build. |
 | `word_count`      | Count lines / words / chars in a file. |
@@ -408,15 +407,15 @@ its documentation stays current instead of rotting.
   and hand over tidily; a **hard threshold** (~95%) that forces a handover at a
   boundary; and an **emergency** stop (~100%) that compacts immediately. A loop guard
   (~1/min) stops a compact->continue->compact spin. All thresholds are tunable per
-  model via `/settings` (`handover_soft`, `handover_hard`, `handover_emergency`,
+  model via `/set` (`handover_soft`, `handover_hard`, `handover_emergency`,
   `auto_handover`, `autostart_after_handover`), and the prompts themselves are editable.
 - **Autonomous wake on background finish (off by default).** With
-  `wake_on_bg_finish = true` (via `/settings`), a finished background task or worker
+  `wake_on_bg_finish = true` (via `/set`), a finished background task or worker
   wakes the agent with a synthesised turn so it reacts to the result with no operator
   input - otherwise the finish notice waits passively for your next turn. See
   LEAN_TOOLS.md for details.
 - **Bounded send-window (off by default).** For a very small local model, even the
-  handover flow can be too much history to hold. `window_messages = N` (via `/settings`)
+  handover flow can be too much history to hold. `window_messages = N` (via `/set`)
   caps each request to the last N messages, cut at a *whole-turn boundary* so the
   current task is never truncated - a hard token bound every turn, at the cost of the
   model seeing only recent turns. Most models are better served leaving this off and
@@ -467,8 +466,8 @@ can't exhaust memory; pass `--num-ctx` to go higher explicitly.
 /usage             session tokens + context / provider usage
 /think [level]     set thinking level (no arg = menu)
 /effort [level]    set reasoning effort (no arg = menu)
-/set [key val]     get/set a provider setting
-/settings [key val]edit config.toml knobs (no arg = menu)
+/set [key val]     edit app config (config.toml knobs; no arg = menu)
+/provider set [k v] get/set a backend-specific provider knob
 /approve [mode]    confirm cadence: ask | session | auto
 /leash [level]     capability ceiling: chat | r | rw | rwe
 /autosave [on|off] autosave + auto-load last on start
@@ -477,12 +476,18 @@ can't exhaust memory; pass `--num-ctx` to go higher explicitly.
 /bg [kill <pid>]   list/kill background tasks
 /ctx               context-token estimate
 /info              live session read-out
+/activity [n|all]  what the system did automatically (compaction, handover, fallback, …)
+/expand [N]        show a tool call's full (untruncated) args
 /help              list commands
 /quit              exit
 ```
 
-When stdlib `readline` is available, **Tab** completes commands and their arguments,
-and you get line history; it degrades to plain input if `readline` is missing.
+Any command answers **`/<cmd> ?`** (or `/<cmd> help`) with its own detailed help -
+args, aliases, and behaviour. When stdlib `readline` is available, **Tab** completes
+commands and their arguments (and offers `?`), and you get line history; it degrades
+to plain input if `readline` is missing. Menu pickers (`/set`, `/model`, `/think`, …)
+are arrow-key navigable with type-to-filter on a real terminal, and fall back to a
+numbered prompt when headless.
 
 ### Editable prompts
 
