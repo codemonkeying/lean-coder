@@ -1179,6 +1179,15 @@ def _pct_color(pct):
     return red if pct >= 85 else (yellow if pct >= 60 else blue)
 
 
+def _zone_color(zone):
+    """Colour for a context-budget zone (see ContextMeter.zone). When auto-handover is
+    on, the ctx meter colours by the zone that actually drives behaviour - soft (nudge)
+    -> yellow, hard/emergency (forced handover) -> red - instead of raw % of the max
+    window, which is misleading when the handover threshold is well below 100% (e.g.
+    handover_hard=0.25 forces a handover while a %-of-max meter still reads calm blue)."""
+    return {"ok": blue, "soft": yellow, "hard": red, "emergency": red}.get(zone, blue)
+
+
 def hr() -> str:
     """A full-width horizontal rule used to separate turns. Dim box-draw line on a
     capable TTY (U+2500, or ASCII '-' when the terminal isn't UTF-8); a short ASCII
@@ -5414,7 +5423,14 @@ class ContextMeter:
         used = self.used()
         window = self.cfg.ctx_window() or 1
         pct = used / window * 100
-        line = _pct_color(pct)(f"  ctx: ~{_fmt_tokens(used)}/{_fmt_tokens(window)} ({pct:.0f}%)")
+        # Colour by the auto-handover zone (soft->yellow, hard/emergency->red) when it's
+        # on, matching the status-row meter; plain %-of-max colour when handover is off.
+        if self.cfg.handover_for().get("auto"):
+            zlabel = self.zone()[0]
+            col = _zone_color(zlabel)
+        else:
+            col = _pct_color(pct)
+        line = col(f"  ctx: ~{_fmt_tokens(used)}/{_fmt_tokens(window)} ({pct:.0f}%)")
         extra = _provider_usage_str(self.agent, self.cfg)   # backend quota tail (shared)
         badge = approval_badge(self.cfg)      # persistent reminder when not "ask"
         if badge:
@@ -7685,7 +7701,11 @@ def _status_rows(agent, cfg):
     est = "~" if not getattr(agent, "last_prompt_tokens", 0) else ""
     # drop the 'ok' zone label - only surface a zone once it's noteworthy (soft/hard/emergency)
     zlabel = "" if zone == "ok" else f" {zone}"
-    ctx = _pct_color(pct)(f"ctx {est}{_fmt_tokens(used)}/{_fmt_tokens(window)} ({pct:.0f}%{zlabel})")
+    # Colour by the auto-handover ZONE (what actually drives behaviour) when it's on -
+    # so the meter goes yellow/red at the soft/hard thresholds, not at a fixed % of the
+    # max window. Falls back to plain %-of-max colour when auto-handover is off.
+    col = _zone_color(zone) if cfg.handover_for().get("auto") else _pct_color(pct)
+    ctx = col(f"ctx {est}{_fmt_tokens(used)}/{_fmt_tokens(window)} ({pct:.0f}%{zlabel})")
     quota = _provider_usage_str(agent, cfg)     # leading separator already, or "" if none
     # handovers is a live counter (row 3 reprints every turn); shown once any happened.
     hov = (d + f"{agent.handovers} handovers") if agent.handovers else ""
