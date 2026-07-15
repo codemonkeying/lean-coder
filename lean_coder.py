@@ -1237,6 +1237,23 @@ def _fit_line(s, width=None):
     return res
 
 
+def _wrap_detail(text, max_lines=3, width=None):
+    """Wrap a (plain, un-coloured) description to the terminal width for a picker's
+    detail footer - how you read the full text of a row that's been truncated to fit.
+    Capped at `max_lines`; the last shown line gets an ellipsis if more was cut."""
+    text = (text or "").strip()
+    if not text:
+        return []
+    import textwrap
+    if width is None:
+        width = max(20, _term_cols() - 6)         # indent room
+    lines = textwrap.wrap(text, width=width) or []
+    if len(lines) > max_lines:
+        lines = lines[:max_lines]
+        lines[-1] = _fit_line(lines[-1], width - 1) + "…"
+    return lines
+
+
 def lean_tools_menu(manager):
     """Interactive enable/disable: up/down move, space toggles, enter saves, q
     cancels. Tools in subdirs are shown under a group header whose own row toggles
@@ -1279,7 +1296,12 @@ def lean_tools_menu(manager):
 
     def render(rows_avail):
         cur, top = st["cur"], st["top"]
-        body = rows_avail - 1                      # 1 row for the header
+        # Reserve up to 3 rows at the bottom for the selected tool's full (wrapped)
+        # description - the rows are truncated to width so this is how you read the rest.
+        sel_kind, sel_val = rows[cur]
+        detail = _wrap_detail(manager.desc(sel_val)) if sel_kind == "tool" else []
+        body = rows_avail - 1 - len(detail)        # 1 header + detail footer
+        body = max(1, body)
         if cur < top:                              # keep the cursor in view
             top = cur
         elif cur >= top + body:
@@ -1306,6 +1328,8 @@ def lean_tools_menu(manager):
                 mark = green("x") if val in enabled else " "
                 ind = "  " if show_groups else ""
                 out.append(row(f"{pointer} {ind}[{mark}] {val}  {dim(manager.desc(val))}"))
+        for d in detail:                           # full desc of the selected tool
+            out.append(row("    " + dim(d)))
         sys.stdout.write("\n".join(out))
         return len(out) - 1
 
