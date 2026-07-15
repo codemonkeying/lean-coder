@@ -15,7 +15,6 @@ __pycache__/
 !/lean-tools/note.py
 !/lean-tools/notify.py
 !/lean-tools/provision.py
-!/lean-tools/session_info.py
 !/lean-tools/shell_session.py
 !/lean-tools/ssh.py
 !/lean-tools/web_fetch.py
