@@ -2716,7 +2716,7 @@ def load_config(args) -> Config:
                 "repeat_penalty", "ask_user_to_run", "composer", "autosave", "auto_update", "update_track",
                 "command_timeout", "bg_max_concurrent",
                 "worker_max_concurrent", "worker_idle_timeout", "worker_max_iterations", "editor",
-                "leash", "confirm_reads", "auto_reconnect", "statusline", "statusline_every",
+                "leash", "approval", "confirm_reads", "auto_reconnect", "statusline", "statusline_every",
                 "statusline_iter", "auto_evict", "auto_evict_keep",
                 "window_messages", "auto_handover", "handover_soft", "handover_hard",
                 "handover_emergency", "handover_min_interval", "autostart_after_handover",
@@ -2733,6 +2733,8 @@ def load_config(args) -> Config:
     if isinstance(_ov, dict):
         cfg.handover_overrides = {k: dict(v) for k, v in _ov.items() if isinstance(v, dict)}
     cfg.leash = _norm_leash(cfg.leash) or "rwe"     # validate the ceiling; junk -> full
+    if cfg.approval not in APPROVAL_MODES:          # validate the cadence; junk -> ask
+        cfg.approval = "ask"
     if isinstance(file_vals.get("lean_tools_enabled"), list):
         cfg.lean_tools_enabled = [p for p in file_vals["lean_tools_enabled"] if isinstance(p, str)]
     if isinstance(file_vals.get("always_expand"), list):
@@ -2954,6 +2956,8 @@ def save_config(cfg: Config, quiet: bool = False):
     # because some earlier session narrowed the leash and then any unrelated setting
     # change snapshotted it to disk. Pass --leash / --chat-only to start narrowed.
     # incognito is ephemeral too (persisting it would be a local trace).
+    if cfg.approval != "ask":              # default is ask; persist a non-default cadence
+        lines.append(f'approval = "{cfg.approval}"')
     if cfg.confirm_reads:
         lines.append("confirm_reads = true")
     if cfg.auto_reconnect:
