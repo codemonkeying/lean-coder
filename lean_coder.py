@@ -84,7 +84,7 @@ def _prehandover_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.5.2"
+__version__ = "0.5.3"
 
 
 def _prerelease_key(pre):
@@ -5979,7 +5979,7 @@ class Agent:
             cid = self.record_tool_call(name, args)
             print(_tool_call_line(name, args, cid))
             self._maybe_auto_expand(name, cid)
-            parsed.append((name, args))
+            parsed.append((name, args, cid))
         results = [None] * len(parsed)
 
         def work(idx, name, args):
@@ -5989,14 +5989,15 @@ class Agent:
                        cyan, interval=0.12).start()
         try:
             threads = [threading.Thread(target=work, args=(i, n, a), daemon=True)
-                       for i, (n, a) in enumerate(parsed)]
+                       for i, (n, a, _cid) in enumerate(parsed)]
             for t in threads:
                 t.start()
             for t in threads:
                 t.join()
         finally:
             spin.stop()
-        for (name, _args), result in zip(parsed, results):
+        for (name, _args, cid), result in zip(parsed, results):
+            self.record_tool_result(cid, result)
             self.messages.append(_tool_result_msg(name, result))
 
     @contextmanager
@@ -6637,10 +6638,32 @@ class Agent:
         self._tool_call_seq += 1
         self._tool_calls.append({"id": self._tool_call_seq,
                                  "name": name,
-                                 "args": dict(args) if isinstance(args, dict) else {}})
+                                 "args": dict(args) if isinstance(args, dict) else {},
+                                 "result": None})
         if len(self._tool_calls) > 100:
             del self._tool_calls[:-100]
         return self._tool_call_seq
+
+    def record_tool_result(self, call_id, result):
+        """Attach a tool call's RESULT to its ring entry so `/expand` can re-show
+        output the user scrolled past (a run_command's stdout, a status dump, ...).
+        Stored in the ring ONLY - never in self.messages - so it costs zero model
+        context and compaction/handover never touch it. Capped at EXPAND_MAX_CHARS
+        (head/tail) so a huge dump can't bloat local memory; the ring's own 100-entry
+        cap bounds the total. `result` may be a str or the {text,image_path} dict a
+        tool can return - we keep the text. Best-effort; never raises into the loop."""
+        if not call_id or not getattr(self, "_tool_calls", None):
+            return
+        text = result.get("text", "") if isinstance(result, dict) else str(result or "")
+        if len(text) > EXPAND_MAX_CHARS:
+            head, tail = EXPAND_MAX_CHARS * 2 // 3, EXPAND_MAX_CHARS // 3
+            text = (text[:head]
+                    + f"\n…[{len(text) - head - tail} chars hidden]…\n"
+                    + text[-tail:])
+        for e in reversed(self._tool_calls):
+            if e["id"] == call_id:
+                e["result"] = text
+                return
 
     def _maybe_auto_expand(self, name, call_id):
         """Auto-print the full args right after the call line when `name` is in the
@@ -7026,6 +7049,7 @@ class Agent:
                         result = self._run_tool(name, args)
                     finally:
                         spin.stop()
+                self.record_tool_result(cid, result)
                 self.messages.append(_tool_result_msg(name, result))
         print(yellow(f"\n{GLYPH['warn']} hit {cap}-iteration cap; stopping this turn. "
                      f"Refine your request or continue, or raise the limit: "
@@ -7172,6 +7196,16 @@ def _render_tool_call(entry: dict, cap: int = EXPAND_MAX_CHARS) -> str:
     if len(body) > cap:
         head, tail = cap * 2 // 3, cap // 3
         body = body[:head] + dim(f"\n…[{len(body) - head - tail} chars hidden]…\n") + body[-tail:]
+    # The stored RESULT (output), if we captured one - so /expand re-shows what
+    # scrolled past, not just the call's args. Already capped at record time.
+    if "result" in entry:
+        res = entry.get("result")
+        if res:
+            body += "\n" + dim("─ result ─") + "\n" + res
+        elif res == "":
+            body += "\n" + dim("─ result ─ (empty)")
+        else:
+            body += "\n" + dim("─ result ─ (not captured)")
     return body
 
 
@@ -7395,7 +7429,7 @@ HELP_COMMANDS = [
     ("/info", "live session read-out"),
     ("/ctx", "context-token estimate"),
     ("/activity [n|all]", "what the system did automatically (compaction, handover, fallback, ...)"),
-    ("/expand [N]", "show a tool call's full (untruncated) args; bare = newest, N = the #id"),
+    ("/expand [N]", "show a tool call's full args + captured output; bare = newest, N = the #id"),
     ("/help", "this help"),
     ("/quit", "exit"),
 ]
@@ -9712,10 +9746,11 @@ def handle_activity_command(agent, cfg, arg):
 
 
 def handle_expand_command(agent, cfg, arg):
-    """/expand [N] - re-print the FULL (untruncated) args of a recent tool call.
-    Bare /expand = the most recent call; /expand N = the call tagged '#N' on its
-    line. On-screen tool-call lines truncate args to 50 chars; this shows all of it
-    (a diff renders colorized), capped so it can't flood the terminal."""
+    """/expand [N] - re-print the FULL (untruncated) args AND captured result of a
+    recent tool call. Bare /expand = the most recent call; /expand N = the call
+    tagged '#N' on its line. On-screen tool-call lines truncate args to 50 chars;
+    this shows all of it (a diff renders colorized) plus the tool's output, capped
+    so it can't flood the terminal."""
     calls = getattr(agent, "_tool_calls", None)
     if not calls:
         print(dim("  no tool calls to expand yet this session."))
