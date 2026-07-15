@@ -4377,15 +4377,21 @@ def _confirm_action(cfg, kind: str, **info) -> bool:
     the LOCAL policy.)"""
     if kind == "write":
         path, original, new = info["path"], info["original"], info["new"]
+        # Auto-approved: the operator isn't deciding, so don't dump the full preview -
+        # it's just noise scrolling past. Collapse to a one-line note; /expand shows the
+        # diff on demand. The full preview is only rendered when we actually prompt (you
+        # need to SEE the change to approve it).
+        if auto_approved(cfg):
+            n = len((new or "").splitlines())
+            what = f"new file, {n} line{'s' if n != 1 else ''}" if original is None else "diff"
+            print(dim(f"  {GLYPH['edit']} {path}  ({what}; auto-approved, /expand to view)"))
+            return True
         print()
         if original is None:
             print(cyan(f"+++ new file: {path}"))
             _print_new_file(new)
         else:
             _print_diff(path, original, new)
-        if auto_approved(cfg):
-            print(dim("(auto-approved)"))
-            return True
         return ask_action(cfg, f"apply changes to {path}?")
     if kind == "exec":
         if auto_approved(cfg):
