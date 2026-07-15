@@ -1,6 +1,7 @@
-"""notify - ping the operator when a turn (or a single long command) finishes,
+"""notify - ping the operator when a whole TURN finishes (control returns to you),
 or when the agent needs your input (a confirmation prompt). So you can look away
-during a long task and get called back.
+during a long task and get called back. It pings once at the end of the turn - NOT
+per tool call/command the agent runs mid-turn.
 
 This is the canonical *driver-only* lean-tool: it hooks the machine you're sitting
 at, so it is a setup() lean-tool, NOT a pushed TOOL. A TOOL would be pushed to the
@@ -80,25 +81,7 @@ def setup(lc, cfg):
         return _orig_ask(question)
     lc["_ask"] = _ask
 
-    # 3) ping when a single long-running command finishes - more granular than
-    #    the whole-turn timer, so a long build/test or a /sh script pings the
-    #    moment it ends. Covers the model's local run_command and the operator's
-    #    /sh + ask_user_to_run path (run_direct_command). Remote commands run in
-    #    the executor, not here, so those still fall under the turn-end timer.
-    def _timed(fn, label="command finished"):
-        def wrapped(*a, **k):
-            t0 = time.monotonic()
-            r = fn(*a, **k)
-            if _state["on"] and (time.monotonic() - t0) >= NOTIFY_AFTER:
-                _ping("lean-coder", label)
-            return r
-        return wrapped
-
-    Tools = lc["Tools"]
-    Tools.run_command = _timed(Tools.run_command)
-    lc["run_direct_command"] = _timed(lc["run_direct_command"])
-
-    # 4) runtime toggle: "/notify" on/off; "/notify bell" opts into the sound
+    # 3) runtime toggle: "/notify" on/off; "/notify bell" opts into the sound
     def _toggle(agent, cfg, arg):
         if arg.strip().lower() == "bell":
             _state["bell"] = not _state["bell"]
