@@ -11,6 +11,7 @@ import base64
 import datetime
 import hashlib
 import atexit
+import inspect
 import itertools
 import json
 import os
@@ -7187,7 +7188,8 @@ HELP_COMMANDS = [
     ("/quit", "exit"),
 ]
 
-HELP_FOOTER = ("Tab completes commands and their inline arguments. ^C stops a running turn; "
+HELP_FOOTER = ("Tab completes commands and their inline arguments. `/<cmd> ?` shows that "
+               "command's own help (args, behaviour). ^C stops a running turn; "
                "at the prompt it cancels the line, and ^C twice in a row exits. "
                "Anything else goes to the model.\n"
                "Config knobs (context/handover gates, sampling, etc.) live in /settings - "
@@ -7874,6 +7876,10 @@ def _completion_options(agent, cfg, left):
         opts = _arg_completions(agent, cfg, key)
         if not opts and len(path) > 1:       # fall back to the bare command
             opts = _arg_completions(agent, cfg, path[0])
+        # `?` is a universal first-arg on every command (per-command help), so offer it
+        # alongside a command's own completions when the cursor is on its first argument.
+        if len(path) == 1 and path[0] != "/help":
+            opts = list(opts) + ["?"]
         return [o for o in opts if o.startswith(text)]
     if buf.startswith("/"):                  # still on the command itself
         return [c for c in SLASH_COMMANDS if c.startswith(text)]
@@ -9276,12 +9282,48 @@ _CMD_AUTOSAVE = frozenset({"/provider", "/providers", "/set"})
 _BUILTIN_COMMANDS = frozenset(_BUILTIN_COMMANDS_TABLE)
 
 
+def _command_help(cmd, handler, short):
+    """Per-command help for `/cmd ?` (or `/cmd help`). Single source of truth: the
+    handler's own docstring - no separate registry to drift. Prints the canonical
+    name + any aliases (both derived from the dispatch table), the one-line /help
+    description, then the full dedented docstring. `short` is the /help one-liner
+    (None for lean-tool commands - we fall back to the docstring alone)."""
+    aliases = sorted(a for a, h in _BUILTIN_COMMANDS_TABLE.items()
+                     if h is handler and a != cmd)
+    head = bold(cyan(cmd)) + (dim("  (aliases: " + ", ".join(aliases) + ")") if aliases else "")
+    print(head)
+    if short:
+        print("  " + dim(short))
+    doc = inspect.getdoc(handler) or ""
+    if doc:
+        print()
+        for ln in doc.splitlines():
+            print("  " + ln)
+
+
 def dispatch_command(agent, cfg, cmd, arg):
     """The one slash-command lookup: builtin table first, then the lean-tool registry,
     else 'unknown command'. Returns True iff the repl should exit (only /quit signals
     it, via the REPL_EXIT sentinel). Builtin handlers run unguarded (core code); a
     lean-tool handler is wrapped so a buggy plugin can't take the loop down. Folds in
-    the /provider + /set post-handler config autosave."""
+    the /provider + /set post-handler config autosave.
+
+    Uniform command contract: `/<cmd> ?` (or `/<cmd> help`) prints that command's
+    own help (its docstring) instead of running it - works for every builtin and
+    lean-tool command, so a user never has to guess a command's args."""
+    if arg.strip().lower() in ("?", "help") and cmd not in ("/help", "/h", "/?"):
+        handler = _BUILTIN_COMMANDS_TABLE.get(cmd)
+        if handler is not None:
+            short = dict(HELP_COMMANDS).get(cmd) or next(
+                (d for c, d in HELP_COMMANDS if c.split()[0] == cmd), None)
+            _command_help(cmd, handler, short)
+            return False
+        if cmd in _lean_tool_commands:
+            fn, hl = _lean_tool_commands[cmd]
+            _command_help(cmd, fn, hl)
+            return False
+        print(yellow(f"unknown command {cmd} - /help"))
+        return False
     handler = _BUILTIN_COMMANDS_TABLE.get(cmd)
     if handler is not None:
         if handler(agent, cfg, arg) is REPL_EXIT:
