@@ -30,7 +30,6 @@ __pycache__/
 !/providers/README.md
 !/providers/ollama.py
 !/providers/anthropic_api.py
-!/providers/anthropic_plan.py
 !/providers/gemini.py
 !/providers/groq.py
 !/providers/openai.py
