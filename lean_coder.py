@@ -48,8 +48,33 @@ HISTORY_PATH = CONFIG_DIR / "history"            # composer input history (one l
 HISTORY_MAX = 1000                               # trailing entries kept on disk
 AUTOSAVE_KEEP = 10               # rolling autosave sessions kept (oldest pruned)
 AUTOSAVE_PREFIX = "auto-"        # autosave session names; named snapshots have none
-PRECOMPACT_PREFIX = "pre-compact-"   # rolling pre-compaction safety snapshots (auto_compact)
-PRECOMPACT_KEEP = 3              # cap them too: safety nets, not named saves - newest few suffice
+# Pre-handover safety snapshots: written just before a handover REPLACES history, so
+# the full pre-handover conversation stays recoverable (via /load, and the grep-my-own-
+# context recall path). Named <origin-session>-prehandover-<N> so the snapshot is tied
+# to WHAT it snapshots. (Historically mislabelled "pre-compact-*" - it's a handover, not
+# a compact: compact() only stubs tool results in place and takes no snapshot.)
+PREHANDOVER_MARK = "-prehandover-"   # infix marking a pre-handover snapshot
+PREHANDOVER_KEEP = 3             # cap them: safety nets, not named saves - newest few suffice
+
+
+def _is_snapshot(name: str) -> bool:
+    """True for a rolling pre-handover safety snapshot (not a user/auto session)."""
+    return PREHANDOVER_MARK in name
+
+
+def _prehandover_name(origin: str, existing) -> str:
+    """A pre-handover snapshot name tied to its origin session: <origin>-prehandover-<N>,
+    N = the next free index for that origin among `existing` names. So a session's
+    snapshots read origin-prehandover-1, -2, ... and the recall path can find them by
+    globbing '<origin>-prehandover-*'."""
+    base = f"{origin}{PREHANDOVER_MARK}"
+    used = []
+    for nm in existing:
+        if nm.startswith(base):
+            tail = nm[len(base):]
+            if tail.isdigit():
+                used.append(int(tail))
+    return f"{base}{(max(used) + 1) if used else 1}"
 
 
 # Human-readable release version, SemVer (MAJOR.MINOR.PATCH[-prerelease]). Bump on a
@@ -2523,6 +2548,9 @@ class Config:
     always_expand: list = field(default_factory=lambda: ["apply_diff"])  # tool names
                                      # whose full args auto-print after the call line
                                      # (see /expand); default shows diffs in full
+    show_snapshots: bool = False     # show pre-handover safety snapshots in the /load
+                                     # picker + /session list (off = hidden so they don't
+                                     # clog the menu; /load <exact-name> always works)
     providers_dir: str = ""             # "" -> ~/.config/leancoder/providers
     providers_enabled: list = field(default_factory=list)  # enabled provider plugin names
     provider: str = "ollama"         # active backend - ALWAYS a registered provider now
@@ -2700,6 +2728,8 @@ def load_config(args) -> Config:
         cfg.lean_tools_enabled = [p for p in file_vals["lean_tools_enabled"] if isinstance(p, str)]
     if isinstance(file_vals.get("always_expand"), list):
         cfg.always_expand = [p for p in file_vals["always_expand"] if isinstance(p, str)]
+    if isinstance(file_vals.get("show_snapshots"), bool):
+        cfg.show_snapshots = file_vals["show_snapshots"]
     if isinstance(file_vals.get("providers_enabled"), list):
         cfg.providers_enabled = [p for p in file_vals["providers_enabled"] if isinstance(p, str)]
     else:
@@ -2894,6 +2924,8 @@ def save_config(cfg: Config, quiet: bool = False):
         lines.append("wake_on_bg_finish = true")
     if cfg.always_expand != ["apply_diff"]:    # default = diffs shown in full
         lines.append("always_expand = [" + ", ".join(_toml_value(x) for x in cfg.always_expand) + "]")
+    if cfg.show_snapshots:                      # default off (snapshots hidden in /load)
+        lines.append("show_snapshots = true")
     lines += [
         f"temperature = {cfg.temperature}",
         f"top_p = {cfg.top_p}",
@@ -3113,11 +3145,11 @@ def _session_rows():
 
 def _auto_resume_pick(rows):
     """The session that auto-load resumes on launch: the most-recently-used one
-    that isn't a pre-compact safety snapshot. `rows` is _session_rows() output
+    that isn't a pre-handover safety snapshot. `rows` is _session_rows() output
     (already most-recent first). Returns (name, meta, mtime) or None. Deliberately
     NOT cwd-scoped - scoping silently skipped the genuinely-most-recent session
     when it was last used from another dir. Pure -> unit-tested."""
-    return next((r for r in rows if not r[0].startswith(PRECOMPACT_PREFIX)), None)
+    return next((r for r in rows if not _is_snapshot(r[0])), None)
 
 
 _autosave_seq = 0
@@ -3129,7 +3161,10 @@ def _new_autosave_name() -> str:
     (e.g. /clear then immediately /handover) so neither clobbers the other."""
     global _autosave_seq
     _autosave_seq += 1
-    return f"{AUTOSAVE_PREFIX}{time.strftime('%Y-%m-%d-%H%M%S')}-{os.getpid()}-{_autosave_seq}"
+    # Short + readable: auto-<MMDD-HHMMSS>-<seq>. No PID (the seq keeps two names minted
+    # in the same second distinct within a launch; the session-lock system handles real
+    # cross-instance collisions). MMDD keeps it day-safe without a full timestamp.
+    return f"{AUTOSAVE_PREFIX}{time.strftime('%m%d-%H%M%S')}-{_autosave_seq}"
 
 
 # --- session locks: one live writer per session ----------------------------
@@ -3255,15 +3290,15 @@ def autosave_session(agent, cfg):
 
 def _prune_autosaves(keep: int = AUTOSAVE_KEEP):
     """Keep only the newest `keep` autosave sessions, and separately cap the rolling
-    pre-handover safety snapshots (auto_handover writes one every fire) to
-    PRECOMPACT_KEEP. Both are rolling/disposable; only USER-named snapshots (neither
-    prefix) are kept forever. Without the pre-compact cap they pile up unbounded and
-    flood /load (a busy session can leave dozens)."""
+    pre-handover safety snapshots (a handover writes one every fire) to
+    PREHANDOVER_KEEP. Both are rolling/disposable; only USER-named sessions are kept
+    forever. Without the snapshot cap they pile up unbounded and flood /load (a busy
+    session can leave dozens)."""
     if not SESSIONS_DIR.is_dir():
         return
 
-    def _cap(prefix, n):
-        files = list(SESSIONS_DIR.glob(f"{prefix}*.json"))
+    def _cap(match, n):
+        files = [p for p in SESSIONS_DIR.glob("*.json") if match(p.stem)]
         try:
             files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
         except OSError:
@@ -3274,8 +3309,11 @@ def _prune_autosaves(keep: int = AUTOSAVE_KEEP):
             except OSError:
                 pass
 
-    _cap(AUTOSAVE_PREFIX, keep)
-    _cap(PRECOMPACT_PREFIX, PRECOMPACT_KEEP)
+    # A prehandover snapshot of an auto- session starts with AUTOSAVE_PREFIX too, so
+    # match snapshots FIRST and exclude them from the autosave cap (else a snapshot
+    # would count against the autosave quota and skew both).
+    _cap(_is_snapshot, PREHANDOVER_KEEP)
+    _cap(lambda s: s.startswith(AUTOSAVE_PREFIX) and not _is_snapshot(s), keep)
 
 
 # ----------------------------------------------------------------------------
@@ -6223,14 +6261,17 @@ class Agent:
                 "handover",
                 f"degraded parse (tier {parsed['tier']}, {attempt} retr{'y' if attempt == 1 else 'ies'})",
                 "model dropped marker discipline; salvaged via tolerant parser + retry")
-        # Snapshot the pre-compaction history ONLY now that we have a usable summary and
-        # are about to replace it - so it stays recoverable via /load. Doing it here (not
-        # at the top) means a FAILED/futile compaction writes no snapshot: that unbounded
-        # per-turn snapshotting by a model that never summarized is what flooded /load.
+        # Snapshot the PRE-HANDOVER history ONLY now that we have a usable summary and are
+        # about to replace it - so it stays recoverable via /load (and greppable by the
+        # recall path). Doing it here (not at the top) means a FAILED/futile handover
+        # writes no snapshot: that unbounded per-turn snapshotting by a model that never
+        # summarized is what flooded /load. Named <origin>-prehandover-<N> so the snapshot
+        # is tied to the session it came from.
         try:
             rhost = self.remote.host if self.remote else None
-            save_session(pre, self.cfg,
-                         PRECOMPACT_PREFIX + time.strftime("%Y-%m-%d-%H%M%S"),
+            origin = getattr(self, "autosave_name", "") or "session"
+            existing = [nm for nm, _ in list_sessions()]
+            save_session(pre, self.cfg, _prehandover_name(origin, existing),
                          remote=rhost, pinned_plan=pre_plan)
         except Exception:
             pass
@@ -7287,6 +7328,7 @@ _SETTINGS_FIELDS = [
     ("leash", "capability ceiling", tuple(LEASH_LEVELS)),
     ("confirm_reads", "ask-on-read (confirm read tools too)", "bool"),
     ("auto_reconnect", "reconnect to a session's remote on load (off = ask)", "bool"),
+    ("show_snapshots", "show pre-handover safety snapshots in the /load picker + /session list", "bool"),
     ("statusline", "status rows above the prompt", "bool"),
     ("statusline_every", "reprint status every N prompts (1 = every turn, 0 = only on change)", "int"),
     ("statusline_iter", "reprint status every N model iterations within a long turn (0 = off)", "int"),
@@ -8090,10 +8132,14 @@ def _load_session_into(agent, cfg, name):
         agent._print_ctx()
 
 
-def _session_picker(prompt="load session:"):
+def _session_picker(prompt="load session:", show_snapshots=False):
     """Recent-first session picker (most-recently-used first, with a relative-age
-    column). Returns the chosen session name, or None if cancelled/empty."""
+    column). Returns the chosen session name, or None if cancelled/empty. Pre-handover
+    safety snapshots are hidden unless `show_snapshots` (they clog the menu; /load
+    <exact-name> reaches them regardless)."""
     rows = _session_rows()
+    if not show_snapshots:
+        rows = [r for r in rows if not _is_snapshot(r[0])]
     if not rows:
         print(dim(f"no saved sessions (/save [name]).  dir: {SESSIONS_DIR}"))
         return None
@@ -8111,7 +8157,7 @@ def _session_picker(prompt="load session:"):
 def handle_load_command(agent, cfg, arg):
     """/load [name] - resume a session. No arg opens the recent-first picker;
     a name (Tab-completes) loads directly."""
-    name = arg.strip() or _session_picker()
+    name = arg.strip() or _session_picker(show_snapshots=cfg.show_snapshots)
     if name:
         _load_session_into(agent, cfg, name)
 
@@ -8150,6 +8196,11 @@ def handle_session_command(agent, cfg, arg):
 
     if sub == "list":
         rows = _session_rows()
+        hidden = 0
+        if not cfg.show_snapshots:
+            kept = [r for r in rows if not _is_snapshot(r[0])]
+            hidden = len(rows) - len(kept)
+            rows = kept
         if not rows:
             print(dim(f"no saved sessions (/save [name]).  dir: {SESSIONS_DIR}"))
             return
@@ -8162,6 +8213,9 @@ def handle_session_command(agent, cfg, arg):
             title = meta.get("title", "")
             age = f"{_fmt_age(now - mtime)} ago" if mtime else "?"
             print(f"  {bold(cyan(name))}  {dim(f'{when} {d} {age} {d} {turns} turns {d} {title}')}")
+        if hidden:
+            print(dim(f"  ({hidden} pre-handover snapshot(s) hidden; "
+                      f"/set show_snapshots true to show)"))
         return
 
     if sub == "delete":
@@ -9363,7 +9417,7 @@ def repl(cfg: Config, resume=None):
                          f"(starting fresh; /load to see saved ones)"))
     elif cfg.autosave and not cfg.incognito:
         # Auto-load the session you were last actually in: the most-recently-used one,
-        # EXCLUDING pre-compact snapshots (those are safety checkpoints, not the live
+        # EXCLUDING pre-handover snapshots (those are safety checkpoints, not the live
         # thread). cwd is a HINT, not a hard filter - scoping auto-load by cwd silently
         # skipped the genuinely-most-recent session whenever it was last used from a
         # different dir (e.g. a session worked over a remote connection, or a synced
