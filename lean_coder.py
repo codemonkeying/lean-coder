@@ -4489,41 +4489,32 @@ def pick_connect_menu(connect_hosts, open_hosts=(), active=None, prompt=input):
                   "[connect] section to the config."))
         return None
     open_set = set(open_hosts)
-    print(bold("connect to:") + dim("  (" + green("*") + " open)"))
-    for i, (name, target) in enumerate(items, 1):
+    targets = [t for _n, t in items]
+    labels = []
+    for name, target in items:
         dot = green("*") if target in open_set else " "
         extra = dim("  " + target) if name != target else ""
-        mark = dim("  (active)") if target == active else ""
-        print(f"  {i}) {dot} {name}{extra}{mark}")
-    print("  0) cancel")
-    try:
-        sel = prompt("choice: ")
-    except (EOFError, KeyboardInterrupt):
-        print()
-        return None
-    idx = _menu_index(sel, len(items))
-    return items[idx][1] if idx is not None else None
+        labels.append(f"{dot} {name}{extra}")
+    return _pick_value("connect to:" + dim("  (" + green("*") + " open)"),
+                       targets, current=active, prompt=prompt, labels=labels)
 
 
 def pick_model_menu(available, current=None, warm=(), prompt=input):
-    """Numbered model picker; returns the chosen model name or None (cancel).
-    `warm` = names currently loaded in the server (shown green = instant first
-    token); `current` is marked. `prompt` injectable for tests."""
-    warm = set(warm)
-    legend = dim("  (" + green("*") + " loaded  " + dim("o") + " on disk)") if available else ""
-    print(bold("models on this host:") + legend)
-    for i, m in enumerate(available, 1):
-        dot = green("*") if m in warm else dim("o")
-        mark = dim("  (current)") if current is not None and model_available(current, [m]) else ""
-        print(f"  {i}) {dot} {m}{mark}")
-    print("  0) cancel")
-    try:
-        sel = prompt("choice: ")
-    except (EOFError, KeyboardInterrupt):
-        print()
+    """Model picker; returns the chosen model name or None (cancel). `warm` = names
+    currently loaded in the server (green dot = instant first token); `current` is
+    marked. Rich arrow/#-jump/filter picker on a real tty, numbered fallback otherwise
+    (or when a test passes its own `prompt`). `prompt` injectable for tests."""
+    if not available:
+        print(dim("no models on this host."))
         return None
-    idx = _menu_index(sel, len(available))
-    return available[idx] if idx is not None else None
+    warm = set(warm)
+    legend = dim("  (" + green("*") + " loaded  " + dim("o") + " on disk)")
+    labels = []
+    for m in available:
+        dot = green("*") if m in warm else dim("o")
+        labels.append(f"{dot} {m}")
+    return _pick_value("models on this host:" + legend, list(available),
+                       current=current, prompt=prompt, labels=labels)
 
 
 def model_available(want: str, available) -> bool:
@@ -8522,19 +8513,25 @@ def _do_connect(agent, cfg, rhost, rpath=".", offer_save=False):
 _NO_TTY = object()   # _arrow_select sentinel: raw mode unavailable -> numbered fallback
 
 
-def _arrow_select(header, choices, current=None):
+def _arrow_select(header, choices, current=None, labels=None):
     """Inline arrow-key single-select picker (fzf/gum-style): up/down move, type to
     filter, enter selects, esc/^C cancels, with a SCROLLING VIEWPORT so a long list
     never overflows the screen. Drawn below the cursor, no alternate screen - degrades
     identically in any terminal; the caller falls back to the numbered prompt when this
     returns _NO_TTY (no tty / dumb term / forced plain). Built on the shared run_picker
-    engine. Returns the chosen value, None (cancel), or _NO_TTY."""
+    engine. `labels` optionally supplies pre-styled display strings (e.g. model rows
+    with warm-dots/current marks) parallel to `choices`; filtering matches the plain
+    label text. Rows are numbered - typing digits jumps to that row (Enter selects it);
+    a non-digit character switches to filter mode. Returns the chosen value, None, or
+    _NO_TTY."""
     if not _picker_capable():
         return _NO_TTY
-    labels = [str(c) for c in choices]
+    plain = [str(c) for c in choices]                     # for filtering + current-match
+    disp = [str(l) for l in labels] if labels is not None else plain
     st = {"query": "", "cur": 0, "top": 0}
-    if current is not None and str(current) in labels:    # start on the current value
-        st["cur"] = labels.index(str(current))
+    if current is not None and str(current) in plain:     # start on the current value
+        st["cur"] = plain.index(str(current))
+    labels = plain                                        # _filtered() matches plain text
 
     def _filtered():
         q = st["query"].lower()
@@ -8555,7 +8552,7 @@ def _arrow_select(header, choices, current=None):
         elif cur >= top + body:
             top = cur - body + 1
         st["top"] = top
-        hint = dim("(up/down, type to filter, enter select, esc cancel)")
+        hint = dim("(up/down, #=jump, type to filter, enter select, esc cancel)")
         q = (cyan(st["query"]) + dim("_")) if st["query"] else dim("(type to filter)")
         more_up   = " ↑more" if top > 0 else ""
         more_down = " ↓more" if fi and top + body < len(fi) else ""
@@ -8569,9 +8566,10 @@ def _arrow_select(header, choices, current=None):
             i = fi[pos]
             sel = (pos == cur)
             pointer = cyan(">") if sel else " "
-            mark = dim("  (current)") if current is not None and labels[i] == str(current) else ""
-            line = f"{labels[i]}{mark}"
-            out.append(row(pointer + " " + (cyan(line) if sel else line)))
+            num = dim(f"{pos + 1:>2}) ")            # 1-based row number for #-jump
+            mark = dim("  (current)") if current is not None and plain[i] == str(current) else ""
+            line = f"{disp[i]}{mark}"
+            out.append(row(pointer + " " + num + (cyan(line) if sel else line)))
         if not fi:
             out.append(row("  " + dim("(no match)")))
         sys.stdout.write("\n".join(out))
@@ -8579,6 +8577,16 @@ def _arrow_select(header, choices, current=None):
 
     def on_key(k):
         fi = _filtered()
+        # Number-jump: while the query is empty, a digit moves the cursor to that
+        # 1-based visible row (multi-digit accumulates); Enter then selects it. Once
+        # a non-digit is typed the query is text and digits become filter characters.
+        if not st["query"] and isinstance(k, str) and k.isdigit():
+            st["numjump"] = (st.get("numjump", "") + k)[-3:]
+            n = int(st["numjump"])
+            if fi and 1 <= n <= len(fi):
+                st["cur"] = n - 1
+            return None
+        st["numjump"] = ""
         if k == _K_UP and fi:
             st["cur"] = (st["cur"] - 1) % len(fi)
         elif k == _K_DOWN and fi:
@@ -8610,20 +8618,23 @@ def _arrow_select(header, choices, current=None):
     return res[1] if res[0] == "done" else None
 
 
-def _pick_value(header, choices, current=None, prompt=input):
+def _pick_value(header, choices, current=None, prompt=input, labels=None):
     """Generic single-select picker for a small set of values. Returns the chosen
     value or None (cancel). Arrow-key inline picker on a real terminal (up/down +
-    type-to-filter + enter); falls back to the classic numbered prompt when there's
-    no tty or a caller passes its own `prompt` (tests, headless). Sibling of
-    pick_model_menu for settings/providers."""
+    #-to-jump + type-to-filter + enter); falls back to the classic numbered prompt
+    when there's no tty or a caller passes its own `prompt` (tests, headless).
+    `labels` optionally supplies pre-styled display strings parallel to `choices`
+    (e.g. model rows with warm-dots) - both the rich picker and the numbered fallback
+    render them, while selection/current-match still key off `choices`."""
+    disp = [str(l) for l in labels] if labels is not None else [str(c) for c in choices]
     if prompt is input:                              # only the default interactive path
-        chosen = _arrow_select(header, choices, current)
+        chosen = _arrow_select(header, choices, current, labels=labels)
         if chosen is not _NO_TTY:
             return chosen
     print(bold(header))
     for i, c in enumerate(choices, 1):
         mark = dim("  (current)") if current is not None and str(c) == str(current) else ""
-        print(f"  {i}) {c}{mark}")
+        print(f"  {i}) {disp[i - 1]}{mark}")
     print("  0) cancel")
     try:
         sel = prompt("choice: ")
