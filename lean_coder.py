@@ -1064,8 +1064,8 @@ def _lean_tools_rows(manager, show_groups):
 # Shared interactive-picker engine. ONE implementation of the raw-mode, scrolling,
 # type-to-filter menu that every picker (/tools multiselect, /set + /model + /session
 # single-select) drives - so there's no per-menu rewrite and no drift. Three layers:
-#   _picker_capable()  - the capability gate (real tty + termios + not TERM=dumb)
-#   _read_key()        - robust escape-tolerant single keypress -> a normalised token
+#   picker_capable()  - the capability gate (real tty + termios + not TERM=dumb)
+#   read_key()        - robust escape-tolerant single keypress -> a normalised token
 #   run_picker()       - the scrolling-viewport render + input loop (bounded to the
 #                        terminal height, so a long list can never overflow/corrupt)
 # A caller that can't/shouldn't go interactive (gate false, or the user forced plain
@@ -1076,7 +1076,7 @@ def _lean_tools_rows(manager, show_groups):
 # Set by a command's `--plain`/`--fallback` arg (see _wants_plain): a session-wide
 # escape hatch so a user stuck in a garbled render on a mis-detected terminal can
 # force the numbered fallback for the NEXT menu without restarting. One-shot: consumed
-# by the next _picker_capable() check.
+# by the next picker_capable() check.
 _FORCE_PLAIN_ONCE = False
 
 
@@ -1091,7 +1091,7 @@ def _wants_plain(arg):
     return False, (arg or "").strip()
 
 
-def _picker_capable():
+def picker_capable():
     """Can we safely run the rich raw-mode picker? Requires termios, both stdin AND
     stdout to be real ttys, and a non-dumb TERM. A one-shot force-plain flag (set by
     a `--plain` arg) overrides to False so a user on a mis-detected terminal can
@@ -1112,12 +1112,12 @@ def _picker_capable():
     return True
 
 
-# Normalised key tokens returned by _read_key.
+# Normalised key tokens returned by read_key.
 _K_UP, _K_DOWN, _K_ENTER, _K_CANCEL, _K_BACK, _K_SPACE, _K_PGUP, _K_PGDN, _K_HOME, _K_END = (
     "up", "down", "enter", "cancel", "back", "space", "pgup", "pgdn", "home", "end")
 
 
-def _read_key(stdin):
+def read_key(stdin):
     """Read ONE logical keypress from a raw-mode stdin and normalise it to a token.
     Tolerates partial/unknown escape sequences (an unrecognised sequence returns None
     -> caller just redraws, never crashes or mis-fires). Returns a token string, a
@@ -1162,7 +1162,7 @@ def run_picker(render, on_key, height_reserve=2):
     redraw, so the region is bounded to the screen and a long list scrolls instead of
     overflowing. `on_key(token)` handles one normalised key and returns either None
     (keep looping) or a ("done", value) / ("cancel", None) result. Restores the tty on
-    every exit. Assumes _picker_capable() already passed."""
+    every exit. Assumes picker_capable() already passed."""
     import termios, tty
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
@@ -1181,7 +1181,7 @@ def run_picker(render, on_key, height_reserve=2):
     try:
         tty.setraw(fd)
         while True:
-            token = _read_key(sys.stdin)
+            token = read_key(sys.stdin)
             termios.tcsetattr(fd, termios.TCSADRAIN, old)
             if token is not None:
                 res = on_key(token)
@@ -1270,7 +1270,7 @@ def lean_tools_menu(manager):
         on = sum(1 for n in ns if n in enabled)
         return "all" if ns and on == len(ns) else ("none" if on == 0 else "partial")
 
-    if not _picker_capable():                     # no tty / dumb term / forced plain
+    if not picker_capable():                     # no tty / dumb term / forced plain
         print(bold("lean-tools:"))
         for kind, val in rows:
             if kind == "group":
@@ -4495,7 +4495,7 @@ def pick_connect_menu(connect_hosts, open_hosts=(), active=None, prompt=input):
         dot = green("*") if target in open_set else " "
         extra = dim("  " + target) if name != target else ""
         labels.append(f"{dot} {name}{extra}")
-    return _pick_value("connect to:" + dim("  (" + green("*") + " open)"),
+    return pick_one("connect to:" + dim("  (" + green("*") + " open)"),
                        targets, current=active, prompt=prompt, labels=labels)
 
 
@@ -4513,7 +4513,7 @@ def pick_model_menu(available, current=None, warm=(), prompt=input):
     for m in available:
         dot = green("*") if m in warm else dim("o")
         labels.append(f"{dot} {m}")
-    return _pick_value("models on this host:" + legend, list(available),
+    return pick_one("models on this host:" + legend, list(available),
                        current=current, prompt=prompt, labels=labels)
 
 
@@ -7631,7 +7631,7 @@ def _edit_one_setting(agent, cfg, k, label, kind):
     if kind == "bool":
         ok = _set_setting_field(agent, cfg, k, "off" if cur else "on")
     elif isinstance(kind, tuple):
-        choice = _pick_value(label + ":", list(kind), cur)
+        choice = pick_one(label + ":", list(kind), cur)
         if not choice:
             return
         ok = _set_setting_field(agent, cfg, k, choice)
@@ -8383,7 +8383,7 @@ def _session_picker(prompt="load session:", show_snapshots=False):
         age = f"{_fmt_age(now - mtime)} ago" if mtime else "?"
         labels.append(f"{nm}  ({meta.get('saved_at', '?')} {d} "
                       f"{meta.get('turns', '?')} turns {d} {age})")
-    choice = _pick_value(prompt, labels)
+    choice = pick_one(prompt, labels)
     return rows[labels.index(choice)][0] if choice else None
 
 
@@ -8412,7 +8412,7 @@ def handle_session_command(agent, cfg, arg):
     opens the same load picker)."""
     parts = arg.split(maxsplit=1)
     if not parts:
-        sub = _pick_value("/session:", ["list", "load", "save", "delete"])
+        sub = pick_one("/session:", ["list", "load", "save", "delete"])
         if not sub:
             return
         rest = ""
@@ -8510,10 +8510,10 @@ def _do_connect(agent, cfg, rhost, rpath=".", offer_save=False):
             save_config(cfg)
 
 
-_NO_TTY = object()   # _arrow_select sentinel: raw mode unavailable -> numbered fallback
+_NO_TTY = object()   # _pick_one_tty sentinel: raw mode unavailable -> numbered fallback
 
 
-def _arrow_select(header, choices, current=None, labels=None):
+def _pick_one_tty(header, choices, current=None, labels=None):
     """Inline arrow-key single-select picker (fzf/gum-style): up/down move, type to
     filter, enter selects, esc/^C cancels, with a SCROLLING VIEWPORT so a long list
     never overflows the screen. Drawn below the cursor, no alternate screen - degrades
@@ -8524,7 +8524,7 @@ def _arrow_select(header, choices, current=None, labels=None):
     label text. Rows are numbered - typing digits jumps to that row (Enter selects it);
     a non-digit character switches to filter mode. Returns the chosen value, None, or
     _NO_TTY."""
-    if not _picker_capable():
+    if not picker_capable():
         return _NO_TTY
     plain = [str(c) for c in choices]                     # for filtering + current-match
     disp = [str(l) for l in labels] if labels is not None else plain
@@ -8618,17 +8618,18 @@ def _arrow_select(header, choices, current=None, labels=None):
     return res[1] if res[0] == "done" else None
 
 
-def _pick_value(header, choices, current=None, prompt=input, labels=None):
-    """Generic single-select picker for a small set of values. Returns the chosen
-    value or None (cancel). Arrow-key inline picker on a real terminal (up/down +
-    #-to-jump + type-to-filter + enter); falls back to the classic numbered prompt
-    when there's no tty or a caller passes its own `prompt` (tests, headless).
-    `labels` optionally supplies pre-styled display strings parallel to `choices`
-    (e.g. model rows with warm-dots) - both the rich picker and the numbered fallback
-    render them, while selection/current-match still key off `choices`."""
+def pick_one(header, choices, current=None, prompt=input, labels=None):
+    """PUBLIC single-select picker (reusable by features + lean-tools via lc['pick_one']).
+    Returns the chosen value or None (cancel). Rich inline picker on a real terminal
+    (up/down + #-to-jump + type-to-filter + enter, scrolling, no-wrap); falls back to
+    the classic numbered prompt when there's no tty, a dumb TERM, forced --plain, or a
+    caller passes its own `prompt` (tests, headless). `labels` optionally supplies
+    pre-styled display strings parallel to `choices` (e.g. model rows with warm-dots) -
+    both the rich picker and the numbered fallback render them, while selection/
+    current-match still key off `choices`."""
     disp = [str(l) for l in labels] if labels is not None else [str(c) for c in choices]
     if prompt is input:                              # only the default interactive path
-        chosen = _arrow_select(header, choices, current, labels=labels)
+        chosen = _pick_one_tty(header, choices, current, labels=labels)
         if chosen is not _NO_TTY:
             return chosen
     print(bold(header))
@@ -8676,7 +8677,7 @@ def _apply_setting(cfg, key, val, choices):
         cfg.set_setting(key, val)
         print(dim(f"{key}: {val}"))
     elif choices:
-        chosen = _pick_value(f"{key}:", list(choices), current=cfg.setting(key))
+        chosen = pick_one(f"{key}:", list(choices), current=cfg.setting(key))
         if chosen is not None:
             cfg.set_setting(key, chosen)
             print(dim(f"{key}: {chosen}"))
@@ -9075,8 +9076,8 @@ def pick_unified_model_menu(rows, prompt=input):
     # number of each selectable item, keyed by id() of its row
     num_of = {id(r): i + 1 for i, r in enumerate(index_of)}
 
-    if prompt is input and _picker_capable():
-        return _pick_grouped(rows_header="models" + dim("  (" + green("*")
+    if prompt is input and picker_capable():
+        return pick_grouped(rows_header="models" + dim("  (" + green("*")
                              + " loaded, #=jump, arrows, type to filter)"),
                              lines=lines, index_of=index_of, num_of=num_of)
 
@@ -9100,7 +9101,7 @@ def pick_unified_model_menu(rows, prompt=input):
     return index_of[idx] if idx is not None else None
 
 
-def _pick_grouped(rows_header, lines, index_of, num_of):
+def pick_grouped(rows_header, lines, index_of, num_of):
     """Rich raw-mode picker for a GROUPED list (group headers + selectable items),
     on the shared run_picker engine. Cursor moves only over selectable items; group/
     info rows scroll with them. Fast path: type a number (multi-digit accumulates) to
@@ -9366,7 +9367,7 @@ def handle_leash_command(agent, cfg, arg):
     = unattended editing; /leash rwe = full reach. No arg = a menu."""
     if not arg.strip():
         print(bold("leash") + dim(f"  (current: {cfg.leash} - {_LEASH_GRANTS[cfg.leash]})"))
-        chosen = _pick_value("leash:", list(LEASH_LEVELS), current=cfg.leash)
+        chosen = pick_one("leash:", list(LEASH_LEVELS), current=cfg.leash)
         if chosen is None:
             return
         want = chosen
@@ -9608,7 +9609,7 @@ def _apply_think(agent, cfg, arg, key):
             current = "off" if not cfg.think else "on"
         else:
             current = cfg.setting(key)
-        arg = _pick_value(f"{key}:", choices, current) or ""
+        arg = pick_one(f"{key}:", choices, current) or ""
     if arg:
         if not _set_known(agent, cfg, key, arg):
             if key == "thinking":
@@ -9634,7 +9635,7 @@ def handle_effort_command(agent, cfg, arg):
 def handle_approve_command(agent, cfg, arg):
     """/approve [mode] - set the confirm cadence (one of APPROVAL_MODES); no arg -> menu."""
     mode = arg.strip().lower() or (
-        _pick_value("approval:", list(APPROVAL_MODES), cfg.approval) or "")
+        pick_one("approval:", list(APPROVAL_MODES), cfg.approval) or "")
     if mode in APPROVAL_MODES:
         set_approval(cfg, mode)
         autosave_config(cfg)
