@@ -6140,6 +6140,36 @@ class Agent:
         return "\n".join(m.get("content") or "" for m in self.messages[self._handover_mark:]
                          if m.get("role") == "assistant")
 
+    def _solicit_handover(self, instr):
+        """Shared core of both compaction paths: inject the handover instruction `instr`,
+        give the model a turn to write the marked blocks (@#! summary + plan + next-step),
+        and - since there is no finalize tool, the turn ENDING is the trigger - tolerantly
+        parse it, re-soliciting any MISSING block BY NAME up to _HANDOVER_MAX_TRIES.
+        Returns (parsed, missing, attempt, turn_text). ONE place so handover() and
+        auto_handover() can't drift (they did: one used the tolerant parse, one a strict
+        re-extract, silently dropping the salvaged plan/next). Callers decide what to do
+        with the result (replace history now, snapshot first, autostart, etc.)."""
+        self.messages.append({"role": "user", "content": instr})
+        self.dirty = True
+        self._handover_capture = None
+        self._handover_mark = len(self.messages)
+        parsed, turn_text = None, ""
+        missing = ["handover"]
+        attempt = 0
+        for attempt in range(_HANDOVER_MAX_TRIES):
+            if attempt > 0:
+                nudge = (_handover_nudge_missing(missing) if attempt == 1
+                         else HANDOVER_RETRY_2)   # last try: the exact full template
+                self.messages.append({"role": "user", "content": nudge})
+            with self._sigint_guard():
+                self._loop()
+            turn_text = self._handover_turn_text()
+            parsed = _parse_handover(turn_text)
+            missing = _handover_missing(parsed)
+            if not missing:
+                break
+        return parsed, missing, attempt, turn_text
+
     def handover(self):
         """Agentic /handover: the model gets a real (tool-capable) turn to update +
         commit any durable docs, then write its future-self handover as marked text
@@ -6150,25 +6180,7 @@ class Agent:
         if len([m for m in self.messages if m["role"] != "system"]) == 0:
             return None
         instr = read_prompt("handover") or HANDOVER_INSTR
-        self.messages.append({"role": "user", "content": instr})
-        self.dirty = True
-        self._handover_capture = None
-        self._handover_mark = len(self.messages)
-        # No finalize tool: the model writes the marked blocks; the turn ending is the
-        # trigger. Re-solicit any missing block by name, up to _HANDOVER_MAX_TRIES.
-        parsed = None
-        missing = ["handover"]
-        for attempt in range(_HANDOVER_MAX_TRIES):
-            if attempt > 0:
-                nudge = (_handover_nudge_missing(missing) if attempt == 1
-                         else HANDOVER_RETRY_2)
-                self.messages.append({"role": "user", "content": nudge})
-            with self._sigint_guard():
-                self._loop()
-            parsed = _parse_handover(self._handover_turn_text())
-            missing = _handover_missing(parsed)
-            if not missing:
-                break
+        parsed, missing, attempt, _turn_text = self._solicit_handover(instr)
         block = parsed["handover"]
         if not block:        # no usable handover (truly empty) -> leave history untouched
             return None
@@ -6243,32 +6255,14 @@ class Agent:
         keep_from = self._keep_tail_start(pre, self.cfg.window_messages)
         tail      = pre[keep_from:] if keep_from is not None else []
 
-        self.messages.append({"role": "user",
-                              "content": read_prompt("auto_handover") or AUTO_HANDOVER_INSTR})
-        self.dirty = True
-        self._handover_capture = None
-        self._handover_mark = len(self.messages)
         saved = self.tool_defs
-        # No finalize tool: the model writes the marked blocks and the turn ENDING is
-        # the trigger. Parse tolerantly, then re-solicit any MISSING block BY NAME - up
-        # to _HANDOVER_MAX_TRIES total. This completeness retry (an incomplete-but-
-        # successful ANSWER) is a DIFFERENT layer from the send-level overload/429
-        # recovery inside _loop (a failed SEND): separate budgets, they compose.
-        block = parsed = None
-        missing = ["handover"]
-        for attempt in range(_HANDOVER_MAX_TRIES):
-            if attempt > 0:
-                nudge = (_handover_nudge_missing(missing) if attempt == 1
-                         else HANDOVER_RETRY_2)   # last try: the exact full template
-                self.messages.append({"role": "user", "content": nudge})
-            with self._sigint_guard():
-                self._loop()
-            turn_text = self._handover_turn_text()
-            parsed = _parse_handover(turn_text)
-            block = parsed["handover"]
-            missing = _handover_missing(parsed)
-            if not missing:
-                break
+        # Shared retry-parse core (see _solicit_handover): give the model a turn to write
+        # the marked blocks, tolerantly parse, re-solicit any missing one. The completeness
+        # retry (an incomplete-but-successful ANSWER) is a DIFFERENT layer from the send-
+        # level overload/429 recovery inside _loop (a failed SEND): separate budgets.
+        instr = read_prompt("auto_handover") or AUTO_HANDOVER_INSTR
+        parsed, missing, attempt, _turn_text = self._solicit_handover(instr)
+        block = parsed["handover"]
         self.tool_defs = saved
         if not block:                         # no usable summary -> don't nuke history
             self.messages = pre
