@@ -148,6 +148,40 @@ deliberately setup-only rather than a pushed TOOL),
 [`lean-tools/update.py`](lean-tools/update.py) for a `/update`
 command that self-updates `lean_coder.py` from the published build.
 
+### Interactive pickers (reusable menu API)
+
+A `setup()` lean-tool (or any feature) can offer the SAME native-feeling menu the
+built-ins use - arrow-keys, type-to-filter, number-type-then-Enter to jump-select,
+a scrolling viewport that never wraps/smears, and an automatic numbered-prompt
+fallback on a dumb/no-tty terminal. Reach them through `lc` in `setup(lc, cfg)`:
+
+```python
+def setup(lc, cfg):
+    def _handler(agent, cfg, arg):
+        colour = lc["pick_one"]("pick a colour:", ["red", "green", "blue"],
+                                current="green")
+        if colour is None:
+            return                      # user cancelled (esc / q / 0)
+        print(f"you chose {colour}")
+    lc["register_command"]("/colour", _handler, "pick a colour")
+```
+
+The public picker API (all in `lc`):
+
+- **`pick_one(header, choices, current=None, labels=None)`** - single-select. Returns
+  the chosen value from `choices`, or `None` on cancel. `current` is marked; `labels`
+  optionally supplies pre-styled display strings parallel to `choices` (e.g. a green
+  dot) while selection still keys off `choices`.
+- **`pick_grouped(header, lines, index_of, num_of)`** - the grouped variant (section
+  headers + selectable items), as `/model` uses across providers.
+- **`run_picker(render, on_key)`**, **`read_key(stdin)`**, **`picker_capable()`** - the
+  low-level engine, if you need a bespoke menu: `picker_capable()` gates rich vs. the
+  numbered fallback, `run_picker` drives the scrolling render+input loop, `read_key`
+  normalises one keypress to a token. Most tools only need `pick_one`.
+
+A user can force the numbered fallback on any menu command with a leading `--plain`
+(e.g. `/colour --plain`) - handled centrally, so your handler needs no extra code.
+
 ### Adding a model backend? That's a provider, not a lean-tool
 
 Talking to a different model backend (a hosted API, an OAuth subscription,
