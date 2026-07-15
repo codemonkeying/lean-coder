@@ -6295,8 +6295,14 @@ class Agent:
                          remote=rhost, pinned_plan=pre_plan)
         except Exception:
             pass
-        selfprompt = _extract_selfprompt(turn_text)
-        plan = _extract_plan(turn_text)
+        # Consume the already-computed tolerant parse (from the retry loop above), NOT a
+        # second strict fence-only re-extract: _parse_handover salvages plan/next from a
+        # degraded tier (## Plan header, JSON field) too, and _handover_missing already
+        # accepted that tier - so a strict _extract_* here would silently throw away the
+        # salvage for exactly the models the tolerant parser exists to rescue, dropping
+        # both the pinned plan and the autostart self-prompt. Same source as handover().
+        selfprompt = parsed["next"]
+        plan = parsed["plan"]
         if plan:
             self.pinned_plan = plan          # survives the handover (uncached send-time reminder)
         summary_msg = {"role": "user",
