@@ -84,7 +84,7 @@ def _prehandover_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.5.1"
+__version__ = "0.5.2"
 
 
 def _prerelease_key(pre):
@@ -1128,6 +1128,17 @@ def read_key(stdin):
     if not ch:
         return _K_CANCEL                       # EOF/^D
     if ch == "\x1b":                           # ESC or an escape sequence
+        # A bare ESC and the start of a CSI/SS3 sequence both begin with \x1b; in
+        # raw mode a blocking read(1) here would hang until the NEXT key, so a lone
+        # ESC never fires. Peek with a tiny select() timeout: nothing waiting ==
+        # the user pressed ESC on its own -> cancel.
+        import select
+        try:
+            waiting = bool(select.select([stdin], [], [], 0.05)[0])
+        except (ValueError, TypeError, OSError):
+            waiting = True                     # non-selectable stream (tests): fall through
+        if not waiting:
+            return _K_CANCEL                   # bare ESC
         nxt = stdin.read(1)
         if nxt == "":
             return _K_CANCEL                   # bare ESC
@@ -8305,11 +8316,27 @@ def _print_session_state(state):
 
 
 def _maybe_reconnect(agent, cfg, meta):
-    """If the loaded session ran on a remote host, restore that connection -
-    automatically when cfg.auto_reconnect is on, otherwise after a y/N prompt
-    (default off). No-op when the session was local or we're already on that host."""
+    """Realign the connection to where the loaded session last ran. If it ran on a
+    remote host, restore that connection; if it ran LOCAL but we're currently on a
+    remote, offer to disconnect back to local. Automatic when cfg.auto_reconnect is
+    on, otherwise a y/N prompt (default off). No-op when we're already in the right
+    place."""
     host = meta.get("remote")
-    if not host or (agent.remote and agent.remote.host == host):
+    cur = agent.remote.host if agent.remote else None
+    if (host or None) == cur:
+        return                                 # already where the session ran
+    if not host:                               # session was local, we're on a remote
+        if cfg.auto_reconnect:
+            print(dim(f"  detaching from {cur} - this session ran local "
+                      f"(auto_reconnect on)…"))
+            agent.set_remote(None)             # keep it open in the pool
+        elif _ask(f"this session ran local but you're on remote {cur} - "
+                  f"return to local?"):
+            agent.set_remote(None)
+            print(dim(f"  tools run locally again ({cur} still open - "
+                      f"/connect {cur} to switch back)."))
+        else:
+            print(dim(f"  staying on {cur} - /local to return to local."))
         return
     if cfg.auto_reconnect:
         print(dim(f"  reconnecting to remote {host} (auto_reconnect on)…"))
@@ -8331,7 +8358,12 @@ def _load_session_into(agent, cfg, name):
     except FileNotFoundError:
         print(red(f"no such session: {name}  (/load to list)"))
         return
-    if agent.dirty and any(m.get("role") != "system" for m in agent.messages):
+    # Only guard when the work would actually be LOST: autosave (non-incognito)
+    # has already persisted the current session to disk each turn, so there is
+    # nothing to discard - don't nag in that case.
+    persisted = cfg.autosave and not cfg.incognito
+    if (agent.dirty and not persisted
+            and any(m.get("role") != "system" for m in agent.messages)):
         if not _ask("current session has unsaved changes - discard them and load anyway?"):
             print(dim("load cancelled - '/save [name]' to keep them first."))
             return
