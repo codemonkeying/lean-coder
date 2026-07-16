@@ -11164,6 +11164,7 @@ def repl(cfg: Config, resume=None):
             continue
         if use_composer:
             comp = Composer()
+            comp.remote = bool(agent.remote)   # mid-turn input row shows » when remote
             interrupted = False
             with composer_session(comp) as engaged:
                 try:
