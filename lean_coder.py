@@ -1751,7 +1751,7 @@ def lean_tools_menu(manager):
             return "\r" + _fit_line(content) + "\033[K"
 
         out = [row(bold("lean-tools  ")
-                   + dim("(up/down move, space toggle, enter save, q cancel)")
+                   + dim("(up/down move, space toggle, a all, enter save, q cancel)")
                    + dim(more_up + more_down))]
         for off, (kind, val) in enumerate(window):
             i = top + off
@@ -1784,6 +1784,11 @@ def lean_tools_menu(manager):
             st["cur"] = min(len(rows) - 1, st["cur"] + 10)
         elif k == _K_SPACE:
             toggle(st["cur"])
+        elif k == "a":                           # bulk: all on, or all off if already all on
+            if enabled >= set(items):
+                enabled.clear()
+            else:
+                enabled.update(items)
         elif k == _K_ENTER:
             return ("done", enabled)
         elif k in (_K_CANCEL, "q"):
@@ -1840,7 +1845,7 @@ def mcp_servers_menu(manager):
             return "\r" + _fit_line(content) + "\033[K"
 
         out = [row(bold("MCP servers  ")
-                   + dim("(up/down move, space toggle, enter save, q cancel)")
+                   + dim("(up/down move, space toggle, a all, enter save, q cancel)")
                    + dim(more_up + more_down))]
         for off, name in enumerate(window):
             i = top + off
@@ -1862,6 +1867,11 @@ def mcp_servers_menu(manager):
         elif k == _K_SPACE:
             name = names[st["cur"]]
             enabled.discard(name) if name in enabled else enabled.add(name)
+        elif k == "a":                           # bulk: all on, or all off if already all on
+            if enabled >= set(names):
+                enabled.clear()
+            else:
+                enabled.update(names)
         elif k == _K_ENTER:
             return ("done", enabled)
         elif k in (_K_CANCEL, "q"):
@@ -7886,7 +7896,7 @@ SLASH_COMMANDS = ["/clear", "/new", "/compact", "/handover", "/session", "/save"
                   "/prompt", "/sh", "/connect", "/local", "/tools", "/reload",
                   "/model", "/provider", "/think", "/effort",
                   "/set", "/usage", "/approve", "/leash", "/autosave", "/incognito",
-                  "/askread", "/bg", "/info", "/ctx", "/activity", "/expand", "/help", "/quit"]
+                  "/askread", "/bg", "/mcp", "/info", "/ctx", "/activity", "/expand", "/help", "/quit"]
 
 # Built-in command names are the shadow-protection set: lean-tool commands can't claim
 # any of them. It is DERIVED from _BUILTIN_COMMANDS_TABLE (every builtin command + alias)
@@ -8752,6 +8762,13 @@ def _arg_completions(agent, cfg, cmd):
         return list(LEASH_LEVELS)
     if cmd == "/bg":
         return ["kill"]
+    if cmd == "/mcp":
+        return ["list", "add", "remove", "reconnect"]
+    if cmd in ("/mcp remove", "/mcp reconnect"):   # complete a configured server name
+        try:
+            return list(agent.mcp.names())
+        except Exception:
+            return []
     if cmd == "/connect":
         return sorted(set(list(cfg.connect_hosts) + list(getattr(agent, "remotes", {}))))
     if cmd in ("/local", "/disconnect"):
