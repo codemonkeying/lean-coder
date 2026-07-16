@@ -17,6 +17,7 @@ __pycache__/
 !/lean-tools/provision.py
 !/lean-tools/shell_session.py
 !/lean-tools/ssh.py
+!/lean-tools/symbols.py
 !/lean-tools/web_fetch.py
 !/lean-tools/web_screenshot.py
 !/lean-tools/word_count.py

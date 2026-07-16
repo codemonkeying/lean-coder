@@ -2,10 +2,12 @@
 findings, so the model SEES errors instead of parsing raw build output. This is
 the feedback-loop tool: lint the file you just edited, fix what it reports.
 
-Picks the first installed linter for the file's language:
-  Python: ruff -> pyflakes -> py_compile   JS/TS: tsc / eslint
+Picks the first installed linter for the file's language, richest first (a
+type-level one-shot checker like pyright/phpstan is preferred when present, else
+it falls through to the always-available basics):
+  Python: pyright -> ruff -> pyflakes -> py_compile   JS/TS: tsc / eslint
   Go: go vet                               Rust: cargo clippy
-  PHP: php -l                              Shell: shellcheck -> bash -n
+  PHP: phpstan -> psalm -> php -l          Shell: shellcheck -> bash -n
   Ruby: ruby -c                            C/C++: gcc/g++ -fsyntax-only
   Java: javac -Xlint                       CSS: stylelint
   JSON: python -m json.tool                YAML: yamllint
@@ -32,10 +34,16 @@ TOOL = {
 }
 
 _PY = sys.executable
+# Order = preference: a richer one-shot checker (type-level: pyright/phpstan/psalm)
+# is tried BEFORE the plain syntax check, so if the box has it the model gets deeper
+# findings; otherwise it falls through to the always-available basics. All must be
+# ONE-SHOT (run-and-exit) - a persistent LSP server is deliberately NOT here (wrong
+# shape for this stateless tool; see backlog 'tree-sitter / LSP navigation').
 _LINTERS = {
-    # Python
-    ".py":   [["ruff", "check"], [_PY, "-m", "pyflakes"], [_PY, "-m", "py_compile"]],
-    ".pyi":  [["ruff", "check"]],
+    # Python: pyright (types) -> ruff -> pyflakes -> py_compile (stdlib, always works)
+    ".py":   [["pyright", "--outputjson"], ["ruff", "check"],
+              [_PY, "-m", "pyflakes"], [_PY, "-m", "py_compile"]],
+    ".pyi":  [["pyright", "--outputjson"], ["ruff", "check"]],
     # JavaScript / TypeScript
     ".ts":   [["npx", "--no-install", "tsc", "--noEmit"]],
     ".tsx":  [["npx", "--no-install", "tsc", "--noEmit"]],
@@ -44,8 +52,9 @@ _LINTERS = {
     # Go / Rust
     ".go":   [["go", "vet"]],
     ".rs":   [["cargo", "clippy", "-q"]],
-    # PHP
-    ".php":  [["php", "-l"]],
+    # PHP: phpstan / psalm (static analysis) -> php -l (syntax only)
+    ".php":  [["phpstan", "analyse", "--no-progress"], ["psalm", "--no-progress"],
+              ["php", "-l"]],
     # Shell
     ".sh":   [["shellcheck"], ["bash", "-n"]],
     ".bash": [["shellcheck"], ["bash", "-n"]],
@@ -70,9 +79,12 @@ _LINTERS = {
     # Markdown
     ".md":   [["markdownlint"]],
 }
-# tried when the target is a directory (project-wide)
-_DIR_LINTERS = [["ruff", "check"], ["npx", "--no-install", "eslint", "."],
-                ["php", "-l"], ["shellcheck"]]
+# tried when the target is a directory (project-wide); richer checkers first
+_DIR_LINTERS = [["pyright", "--outputjson"], ["ruff", "check"],
+                ["npx", "--no-install", "tsc", "--noEmit"],
+                ["npx", "--no-install", "eslint", "."],
+                ["phpstan", "analyse", "--no-progress"], ["psalm", "--no-progress"],
+                ["shellcheck"]]
 
 
 def _module_available(mod):
