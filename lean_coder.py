@@ -11022,12 +11022,18 @@ def repl(cfg: Config, resume=None):
         # last used in another cwd, we say so rather than hide it.
         # (Incognito starts clean and leaves no trace, so it never auto-loads.)
         here = str(cfg.cwd)
-        cand = _auto_resume_pick(_session_rows())
-        if cand and _lock_is_live(cand[0]):
-            # Another live instance is using it - never steal it on a silent auto-load;
-            # start fresh here (explicit /load can still take it over).
-            print(dim(f"last session '{cand[0]}' is open in another instance - "
-                      f"starting fresh here (/load {cand[0]} to take it over)."))
+        # Most-recent-first, excluding snapshots. A session that's live in ANOTHER
+        # instance is skipped (never silently stolen) and we fall through to the next
+        # candidate - so restarting while an OLDER session is open elsewhere still
+        # resumes YOUR genuinely-most-recent one, not a fresh blank. Only start fresh
+        # when every candidate is either gone or locked.
+        _rows = [r for r in _session_rows() if not _is_snapshot(r[0])]
+        _busy = next((r for r in _rows if _lock_is_live(r[0])), None)
+        cand = next((r for r in _rows if not _lock_is_live(r[0])), None)
+        if not cand and _busy:
+            # Nothing free to resume; the only candidate(s) are open elsewhere.
+            print(dim(f"last session '{_busy[0]}' is open in another instance - "
+                      f"starting fresh here (/load {_busy[0]} to take it over)."))
         elif cand:
             last = cand[0]
             try:
