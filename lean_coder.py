@@ -86,7 +86,7 @@ def _prehandover_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.8.0"
+__version__ = "0.8.1"
 
 
 def _prerelease_key(pre):
@@ -7802,13 +7802,20 @@ def _result_status(text: str):
     return "ok", green
 
 
+# A run_command result opens with an 'exit N' / 'exit N (no output)' status line; the
+# status glyph already conveys pass/fail, so the preview skips this line to surface the
+# actual OUTPUT instead of a redundant 'exit 0'.
+_EXIT_LINE_RE = re.compile(r"^exit -?\d+(?: \(no output\))?$")
+
+
 def _first_meaningful_line(text: str) -> str:
     """The first non-empty, non-noise line of a tool result - the teaser shown under
-    the call line. Skips blank lines; collapses inner whitespace. '' for an empty
-    result (caller shows '(no output)')."""
+    the call line. Skips blank lines and a leading run_command 'exit N' status line
+    (the glyph already shows pass/fail), so the preview surfaces real output; collapses
+    inner whitespace. '' for an empty result (caller shows '(no output)')."""
     for ln in (text or "").splitlines():
         ln = ln.strip()
-        if ln:
+        if ln and not _EXIT_LINE_RE.match(ln):
             return " ".join(ln.split())
     return ""
 
@@ -7823,7 +7830,10 @@ def _tool_result_preview(name: str, result, call_id: int = 0) -> str:
     text = result.get("text", "") if isinstance(result, dict) else str(result or "")
     key, color = _result_status(text)
     first = _first_meaningful_line(text)
-    line_count = len(text.splitlines())
+    # Count lines the preview isn't showing, ignoring a skipped leading 'exit N'
+    # status line so the '+N more' tally matches what /expand actually reveals.
+    lines = [ln for ln in text.splitlines() if not _EXIT_LINE_RE.match(ln.strip())]
+    line_count = len(lines)
     body = first if first else dim("(no output)")
     if first and line_count > 1:
         body += dim(f"  (+{line_count - 1} more; /expand{f' {call_id}' if call_id else ''})")
