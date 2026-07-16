@@ -37,3 +37,4 @@ __pycache__/
 # For machine-specific ignores of your own (personal provider plugins, local tools,
 # scratch files) use .git/info/exclude - local, never committed - rather than naming
 # them in this shared file.
+/.mcp-ref/
