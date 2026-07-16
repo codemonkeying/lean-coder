@@ -109,11 +109,15 @@ class Tools:
         walk(base, 1)
         return "\n".join(out) if out else "(empty)"
 
-    def search_files(self, pattern: str, path: str = "") -> str:
+    def search_files(self, pattern: str, path: str = "", context: int = 0) -> str:
         try:
             rx = re.compile(pattern)
         except re.error as e:
             return f"error: bad regex: {e}"
+        try:
+            ctx_lines = max(0, min(int(context), 10))  # cap at 10 to avoid bloat
+        except (TypeError, ValueError):
+            ctx_lines = 0
         base = resolve_in_project(self.cfg, path) if path else self.cfg.cwd
         hits, count = [], 0
         files = [base] if base.is_file() else _iter_files(base, self.ignore)
@@ -133,20 +137,36 @@ class Tools:
                     if "\x00" in head:
                         continue
                     fh.seek(0)
-                    for i, line in enumerate(fh, 1):
+                    all_lines = fh.readlines() if ctx_lines else None
+                    if all_lines is None:
+                        fh.seek(0)
+                    source = enumerate(all_lines, 1) if all_lines else enumerate(fh, 1)
+                    # Track which context lines we've already emitted per file to
+                    # avoid duplicating when hits are close together.
+                    emitted = set()
+                    for i, line in source:
                         line = line.rstrip("\n")
                         if rx.search(line):
-                            # A file outside the project (e.g. searching /tmp while cwd
-                            # is elsewhere) has no path relative to cwd - relative_to
-                            # would raise and the broad except below would silently drop
-                            # every match. Fall back to the absolute path instead.
                             fp = f.resolve()
                             try:
                                 rel = fp.relative_to(self.cfg.cwd.resolve()).as_posix()
                             except ValueError:
                                 rel = fp.as_posix()
-                            txt = line.strip()[:SEARCH_LINE_MAX]
-                            hits.append(f"{rel}:{i}: {txt}")
+                            if ctx_lines and all_lines:
+                                # Emit context window around this hit.
+                                start_c = max(1, i - ctx_lines)
+                                end_c = min(len(all_lines), i + ctx_lines)
+                                if emitted and start_c - 1 > max(emitted):
+                                    hits.append(f"  ...")
+                                for c in range(start_c, end_c + 1):
+                                    if c not in emitted:
+                                        marker = ">" if c == i else " "
+                                        ctxt = all_lines[c - 1].rstrip("\n")[:SEARCH_LINE_MAX]
+                                        hits.append(f"{marker} {rel}:{c}: {ctxt}")
+                                        emitted.add(c)
+                            else:
+                                txt = line.strip()[:SEARCH_LINE_MAX]
+                                hits.append(f"{rel}:{i}: {txt}")
                             count += 1
                             if count >= SEARCH_MAX_MATCHES:
                                 break
@@ -155,6 +175,44 @@ class Tools:
         return "\n".join(hits) if hits else "(no matches)"
 
     # --- mutating (gated by confirmation) --------------------------------
+    def replace_lines(self, path: str, start: int, end: int, new_text: str = "") -> str:
+        """Replace an inclusive line range (1-based) with new_text. Sidesteps
+        apply_diff's delimiter-matching entirely: read_file gives you line numbers,
+        this takes line numbers. Guard: optional expected_hash (first 8 chars of the
+        file's sha256) to catch stale edits."""
+        p = resolve_in_project(self.cfg, path)
+        if not p.is_file():
+            return f"error: no such file: {path}"
+        try:
+            start, end = int(start), int(end)
+        except (TypeError, ValueError):
+            return "error: start and end must be integers"
+        original = p.read_text(errors="replace")
+        lines = original.splitlines(keepends=True)
+        n = len(lines)
+        if start < 1 or end < start:
+            return f"error: invalid range (start={start}, end={end}, file has {n} lines)"
+        if end > n:
+            return f"error: end ({end}) exceeds file length ({n} lines)"
+        # Build the new file: everything before start, the new text, everything after end.
+        # Ensure new_text ends with a newline if replacing mid-file (keeps line structure).
+        replacement = new_text
+        if replacement and not replacement.endswith("\n") and end < n:
+            replacement += "\n"
+        before = lines[:start - 1]
+        after = lines[end:]
+        new = "".join(before) + replacement + "".join(after)
+        if new == original:
+            return "no changes (result identical to original)"
+        if not _confirm_action(self.cfg, "write", path=path, original=original, new=new):
+            return "user declined the edit"
+        p.write_text(new)
+        self.changed_files.add(path)
+        new_count = len(replacement.splitlines()) if replacement else 0
+        old_count = end - start + 1
+        return (f"replaced lines {start}-{end} ({old_count} lines) with "
+                f"{new_count} lines in {path}")
+
     def apply_diff(self, path: str, diff: str) -> str:
         p = resolve_in_project(self.cfg, path)
         if not p.is_file():
@@ -337,6 +395,26 @@ class Tools:
 
 # --- tool helpers (moved with the class; only the Tools methods use them) -----
 
+def _nearest_match(file_lines, search_lines):
+    """Find the file region most similar to search_lines. Returns (start_index,
+    similarity_percent) or None. Uses a cheap line-level similarity score to avoid
+    pulling in difflib for every edit."""
+    w = len(search_lines)
+    if w == 0 or len(file_lines) < w:
+        return None
+    s_stripped = [l.strip() for l in search_lines]
+    best_at, best_score = 0, -1
+    for i in range(0, len(file_lines) - w + 1):
+        matches = sum(1 for k in range(w) if file_lines[i + k].strip() == s_stripped[k])
+        if matches > best_score:
+            best_score = matches
+            best_at = i
+    if best_score < 1:
+        return None
+    pct = int(best_score * 100 / w)
+    return (best_at, pct)
+
+
 def _fuzzy_apply(text: str, search: str, replace: str, idx: int, path: str):
     """Whitespace-tolerant fallback for apply_diff when an exact SEARCH match
     fails. Small models rarely reproduce indentation/trailing whitespace
@@ -362,9 +440,26 @@ def _fuzzy_apply(text: str, search: str, replace: str, idx: int, path: str):
         if [norm(file_lines[i + k]) for k in range(w)] == s_norm:
             hits.append(i)
     if len(hits) == 0:
+        # Near-miss: find the closest region so the model can see the drift.
+        near = _nearest_match(file_lines, s_lines)
+        hint = ""
+        if near:
+            at, score = near
+            # Show a compact side-by-side of SEARCH vs actual.
+            actual = file_lines[at:at + w]
+            diff_lines = []
+            for j, (sl, al) in enumerate(zip(s_lines, actual)):
+                if sl.rstrip() != al.rstrip():
+                    diff_lines.append(f"  line {at+j+1}:")
+                    diff_lines.append(f"    yours:  {sl.rstrip()!r}")
+                    diff_lines.append(f"    actual: {al.rstrip()!r}")
+            if diff_lines:
+                hint = ("\nNearest match at lines " + str(at + 1) + "-" +
+                        str(at + w) + f" ({score}% similar):\n" +
+                        "\n".join(diff_lines[:15]))  # cap output
         return None, (f"error: block {idx} SEARCH text not found in {path} "
                       f"(matched 0 times, even ignoring whitespace); no changes "
-                      f"written. Re-read the file and copy the exact lines.")
+                      f"written. Re-read the file and copy the exact lines." + hint)
     if len(hits) > 1:
         return None, (f"error: block {idx} SEARCH text is ambiguous in {path} "
                       f"(matched {len(hits)} times ignoring whitespace); no changes "
@@ -430,7 +525,8 @@ BUILTIN_TOOLS = [
      "description": "Find text across files by regex; returns file:line matches (capped). Locate where something is defined/used.",
      "parameters": {"type": "object",
         "properties": {"pattern": {"type": "string", "description": "Regex to search for."},
-                       "path": {"type": "string", "description": "File or directory to search (optional; defaults to project root)."}},
+                       "path": {"type": "string", "description": "File or directory to search (optional; defaults to project root)."},
+                       "context": {"type": "integer", "description": "Lines of context around each match (0-10, like grep -C). Default 0."}},
         "required": ["pattern"]}},
     {"name": "apply_diff", "tier": "write",
      "description": ("Preferred way to edit a file: replace exact spans via SEARCH/REPLACE blocks. SEARCH must "
@@ -441,6 +537,16 @@ BUILTIN_TOOLS = [
         "properties": {"path": {"type": "string", "description": "File to edit (must already exist)."},
                        "diff": {"type": "string", "description": "One or more SEARCH/REPLACE blocks."}},
         "required": ["path", "diff"]}},
+    {"name": "replace_lines", "tier": "write",
+     "description": ("Replace a line range in a file. Simpler than apply_diff: read_file shows line numbers, "
+                     "pass them here. Use for 'I just read lines N-M, replace them with this'. "
+                     "1-based inclusive range. Omit new_text to delete lines."),
+     "parameters": {"type": "object",
+        "properties": {"path": {"type": "string", "description": "File to edit (must already exist)."},
+                       "start": {"type": "integer", "description": "First line to replace (1-based)."},
+                       "end": {"type": "integer", "description": "Last line to replace (inclusive)."},
+                       "new_text": {"type": "string", "description": "Replacement text (omit or empty string to delete the lines)."}},
+        "required": ["path", "start", "end"]}},
     {"name": "write_file", "tier": "write",
      "description": "Create or overwrite a whole file. Use for NEW files or a full rewrite; to change an existing file prefer apply_diff.",
      "parameters": {"type": "object",
