@@ -1995,6 +1995,7 @@ def g(uni: str, alt: str) -> str:
 
 GLYPH = {
     "prompt":   g("›", ">"),
+    "prompt_remote": g("»", ">>"),  # prompt glyph when tools run on a REMOTE (like root's $ vs #)
     "bullet":   g("●", "*"),       # assistant message
     "tool":     g("⚙", "*"),       # a tool call (uncategorised / fallback)
     "bg":       g("⚡", "&"),       # a backgrounded (detached) run_command
@@ -2276,6 +2277,9 @@ class Composer:
         self._read_wake = threading.Event()   # reader thread -> read_line: line ready/EOF
         self.rule_label = ""             # STATIC idle-rule label (e.g. remote host);
                                          # never animated, unlike self.status (spinner)
+        self.remote = False              # True when tools run on a REMOTE: swaps the
+                                         # prompt glyph (› -> ») so the input row itself
+                                         # signals you're not local (like root's # vs $)
         self._resize_pending = False     # SIGWINCH sets this; the reader thread does
                                          # the actual resize (see on_resize / _reader)
 
@@ -2538,15 +2542,20 @@ class Composer:
         if self._pending is not None:
             return (f"{self._pending} [Y/n]", self.armed())
         if self.comp_display:
-            return (GLYPH["prompt"] + " " + "  ".join(self.comp_display), False)
+            return (self._prompt_glyph() + " " + "  ".join(self.comp_display), False)
         if self.status:
             return (f"{frame} {self.status}".strip(), False)
         if self.rule_label:                     # static label (no spinner frame)
             return (self.rule_label, False)
         return ("", False)
 
+    def _prompt_glyph(self) -> str:
+        """The input-row glyph: the remote variant when tools run on another box, so
+        the prompt itself shows you're not local (falls back like every GLYPH)."""
+        return GLYPH["prompt_remote"] if self.remote else GLYPH["prompt"]
+
     def input_text(self) -> str:
-        return GLYPH["prompt"] + " " + self.buf
+        return self._prompt_glyph() + " " + self.buf
 
     # --- Input stream parsing (pure; unit-tested headless) --------------------
     # Terminals in bracketed-paste mode wrap a paste in ESC[200~ ... ESC[201~.
@@ -11090,9 +11099,12 @@ def repl(cfg: Config, resume=None):
             status_shown_at = prompt_no
         # prompt shows the active location so you always know where you are
         indicator = f"[remote: {agent.remote.host}] " if agent.remote else ""
+        _pg = GLYPH["prompt_remote"] if agent.remote else GLYPH["prompt"]
+        if idle_comp is not None:
+            idle_comp.remote = bool(agent.remote)   # swap the input-row glyph when remote
         if agent._queued_turns:    # a command queued a full turn (e.g. /prompt use) - run it
             line = agent._queued_turns.pop(0)
-            print(bold(cyan(indicator + GLYPH["prompt"] + " ")) + dim("(queued prompt)"))
+            print(bold(cyan(indicator + _pg + " ")) + dim("(queued prompt)"))
         elif pending_inputs:       # drain composer typeahead before prompting anew
             line = pending_inputs.pop(0).strip()
             if line:
@@ -11117,11 +11129,11 @@ def repl(cfg: Config, resume=None):
                             print(_ind + _operator_turn_lines(cfg.user_name, line))
                     except RuntimeError:
                         line = _input_or_wake(
-                            _rl_safe(bold(cyan(indicator + GLYPH["prompt"] + " "))),
+                            _rl_safe(bold(cyan(indicator + _pg + " "))),
                             agent.bg_wake_turn if cfg.wake_on_bg_finish else None)
                 else:
                     line = _input_or_wake(
-                        _rl_safe(bold(cyan(indicator + GLYPH["prompt"] + " "))),
+                        _rl_safe(bold(cyan(indicator + _pg + " "))),
                         agent.bg_wake_turn if cfg.wake_on_bg_finish else None)
                 pending_exit = False   # any input (even empty) disarms the exit
             except EOFError:           # Ctrl-D
