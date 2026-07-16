@@ -369,7 +369,8 @@ auth = { type = "bearer", token_env = "GW_KEY" }
 MCP tools run on the **driver** (never a connected remote) and ride the **`rwe`** leash
 tier (they may have side effects), confirming like any non-safe tool unless approval is
 armed. Enabled servers connect at launch; a dead one just contributes no tools (its
-error shows in `/mcp list`).
+error shows in `/mcp list`). Full guide - transports, auth (bearer + OAuth 2.1), config,
+troubleshooting - in [MCP.md](MCP.md).
 
 ### `apply_diff` format
 

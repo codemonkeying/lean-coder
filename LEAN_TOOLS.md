@@ -3,7 +3,8 @@
 A lean-tool adds a tool to lean-coder. It is one `.py` file that defines a `TOOL`
 schema and a `run` function. Enabled lean-tools appear to the model as normal
 tools, local and remote alike. No protocol, no server, no dependency in the core
-- the lean alternative to MCP.
+- the lean alternative to MCP. (Want to connect an *existing* MCP server instead of
+writing a tool? lean-coder is also a generic MCP client - see [MCP.md](MCP.md).)
 
 ## The contract
 

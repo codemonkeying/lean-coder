@@ -45,7 +45,7 @@ TRACK_BRANCH = {"stable": "main", "beta": "beta"}
 # refreshed if present in the tarball; the two bundled plugin dirs get their *.py and
 # *.md refreshed. OVERLAY-ONLY: we only ever overwrite a path the tarball ships; we
 # never delete, so user drop-ins (and upstream-removed files) survive.
-_ROOT_FILES = ("lean_coder.py", "VERSION", "README.md", "LEAN_TOOLS.md",
+_ROOT_FILES = ("lean_coder.py", "VERSION", "README.md", "LEAN_TOOLS.md", "MCP.md",
                "PROVIDER_API.md", "CONTRIBUTING.md", "install.sh", "uninstall.sh")
 _OVERLAY_DIRS = ("providers", "lean-tools")
 _DIR_SUFFIXES = (".py", ".md")
