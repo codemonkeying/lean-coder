@@ -1590,6 +1590,23 @@ def read_key(stdin):
     return ch                                   # a printable char (or control) as-is
 
 
+class _RawFdReader:
+    """A minimal file-like over a raw tty fd: read()/select() go straight to the OS
+    (os.read), so no bytes ever hide in Python's stdin buffer. That buffering was the
+    arrow-key bug: read(1) on the buffered sys.stdin pulled a whole '\\x1b[A' burst into
+    the Python buffer, then read_key's select() peek saw the OS fd empty and treated it
+    as a bare ESC -> the menu cancelled on every arrow. Reading unbuffered fixes it."""
+    def __init__(self, fd):
+        self.fd = fd
+    def fileno(self):
+        return self.fd
+    def read(self, n=1):
+        try:
+            return os.read(self.fd, n).decode("utf-8", "replace")
+        except OSError:
+            return ""
+
+
 def run_picker(render, on_key, height_reserve=2):
     """The shared raw-mode render+input loop with a SCROLLING VIEWPORT. `render(top,
     rows_avail)` prints the menu (the callback decides what to draw within `rows_avail`
@@ -1602,6 +1619,8 @@ def run_picker(render, on_key, height_reserve=2):
     import termios, tty
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
+    reader = _RawFdReader(fd)      # unbuffered fd reads: keeps escape bursts off the
+                                   # Python stdin buffer so read_key's select() is honest
     prev_lines = [0]
 
     def _draw(first):
@@ -1617,7 +1636,7 @@ def run_picker(render, on_key, height_reserve=2):
     try:
         tty.setraw(fd)
         while True:
-            token = read_key(sys.stdin)
+            token = read_key(reader)
             termios.tcsetattr(fd, termios.TCSADRAIN, old)
             if token is not None:
                 res = on_key(token)
