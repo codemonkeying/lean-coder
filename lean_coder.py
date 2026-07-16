@@ -21,6 +21,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import types
@@ -1154,6 +1155,12 @@ class MCPConnection:
             ah = self._auth_header()
             if ah:
                 args += ["-H", f"Authorization: {ah}"]
+            for hk, hv in (self.config.get("headers") or {}).items():
+                # A raw header only wins where 'auth' didn't already set one (auth
+                # block takes precedence for Authorization), so both can coexist.
+                if hk.lower() == "authorization" and ah:
+                    continue
+                args += ["-H", f"{hk}: {hv}"]
             if self._session_id:
                 args += ["-H", f"Mcp-Session-Id: {self._session_id}"]
             args += ["-d", json.dumps(payload)]
