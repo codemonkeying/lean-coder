@@ -29,6 +29,9 @@ _RETRY_CODES = (500, 502, 503, 504, 529)   # 529 = Anthropic "Overloaded"
 # Privacy posture shown at the point of use (on connect + in /usage).
 _PRIVACY    = "commercial API - inputs & outputs are not used to train Anthropic's models"
 _PRIVACY_HI = False   # low risk -> dim
+# Show the on-activate identity + privacy banner? Off by default (the core
+# 'provider: <name>  model: <model>' line already announces the backend).
+_SHOW_BANNER = False
 
 
 def _retry_after_secs(headers):
@@ -674,10 +677,11 @@ def _on_activate(agent, cfg):
         cfg.set_setting("thinking", "adaptive")
     if cfg.setting("effort") is None and info.get("can_effort"):
         cfg.set_setting("effort", "low")
-    key     = _api_key()
-    masked  = f"{key[:12]}...{key[-4:]}" if key and len(key) > 16 else "(env)"
-    print(_lc["dim"](f"  API key auth  {masked}"))
-    print(_privacy_note())
+    if _SHOW_BANNER:
+        key     = _api_key()
+        masked  = f"{key[:12]}...{key[-4:]}" if key and len(key) > 16 else "(env)"
+        print(_lc["dim"](f"  API key auth  {masked}"))
+        print(_privacy_note())
     d = _cred_data()
     d["active"] = True
     if d.get("key") or _cred_path().is_file():

@@ -36,6 +36,10 @@ _PAID_KEYS = ("pro", "deep-research", "computer-use", "antigravity")  # sweep-ok
 # Privacy posture shown at the point of use (on connect + in /usage).
 _PRIVACY    = "free-tier prompts ARE used to train Google models & may be human-reviewed - don't send confidential code"
 _PRIVACY_HI = True   # high risk -> yellow
+# Show the on-activate identity + privacy banner? Off by default (the core
+# 'provider: <name>  model: <model>' line already announces the backend). NOTE:
+# this provider's privacy note is HIGH-risk - consider True to keep it visible.
+_SHOW_BANNER = False
 
 
 # ----------------------------------------------------------------------------
@@ -643,14 +647,16 @@ def _on_activate(agent, cfg):
         cfg.set_setting("thinking", "dynamic")
     if cfg.setting("tier") is None:
         cfg.set_setting("tier", "all")
-    key    = _api_key()
-    masked = f"{key[:6]}...{key[-4:]}" if key and len(key) > 12 else "(env)"
-    print(_lc["dim"](f"  Gemini API key  {masked}"))
+    if _SHOW_BANNER:
+        key    = _api_key()
+        masked = f"{key[:6]}...{key[-4:]}" if key and len(key) > 12 else "(env)"
+        print(_lc["dim"](f"  Gemini API key  {masked}"))
     if (cfg.setting("tier") or "all") != "all":
         print(_lc["dim"]("  free tier: paid models (pro/deep-research/...) hidden; /set tier all to show"))
     else:
         print(_lc["dim"]("  tier all: paid models (pro/deep-research/...) shown; /set tier free to hide (they 429 on a free key)"))
-    print(_privacy_note())
+    if _SHOW_BANNER:
+        print(_privacy_note())
     d = _cred_data()
     d["active"] = True
     if d.get("key") or _cred_path().is_file():

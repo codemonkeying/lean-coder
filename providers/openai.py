@@ -30,6 +30,9 @@ _UA = "lean-coder"  # sweep-ok
 # Privacy posture shown at the point of use (on connect + in /usage).
 _PRIVACY    = "API prompts are not used for training by default (opt-in only)"
 _PRIVACY_HI = False   # low risk -> dim, not a warning
+# Show the on-activate identity + privacy banner? Off by default (the core
+# 'provider: <name>  model: <model>' line already announces the backend).
+_SHOW_BANNER = False
 
 # Non-chat model families the /models endpoint returns (embeddings, audio,
 # image, moderation, realtime, search). They can't drive a coding agent, so
@@ -617,10 +620,11 @@ def _on_activate(agent, cfg):
     _ensure_models(force=True)
     if cfg.setting("effort") is None and _ensure_models().get(cfg.active_model(), {}).get("reason"):
         cfg.set_setting("effort", "med")
-    key    = _api_key()
-    masked = f"{key[:8]}...{key[-4:]}" if key and len(key) > 12 else "(env)"
-    print(_lc["dim"](f"  OpenAI API key  {masked}"))
-    print(_privacy_note())
+    if _SHOW_BANNER:
+        key    = _api_key()
+        masked = f"{key[:8]}...{key[-4:]}" if key and len(key) > 12 else "(env)"
+        print(_lc["dim"](f"  OpenAI API key  {masked}"))
+        print(_privacy_note())
     d = _cred_data()
     d["active"] = True
     if d.get("key") or _cred_path().is_file():
