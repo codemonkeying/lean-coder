@@ -11150,8 +11150,7 @@ def repl(cfg: Config, resume=None):
                         # submitted line into scrollback with the operator's yellow
                         # accent bar so a human turn stands out from AI + tool lines.
                         if line:
-                            _ind = (dim(indicator) if indicator else "")
-                            print(_ind + _operator_turn_lines(cfg.user_name, line))
+                            print(_operator_turn_lines(cfg.user_name, line))
                     except RuntimeError:
                         line = _input_or_wake(
                             _rl_safe(bold(cyan(indicator + _pg + " "))),
