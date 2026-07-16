@@ -6,6 +6,15 @@
   - full page:     web_screenshot(url=..., full_page=true)
                        captures the full scrollable page, not just the viewport
   - custom size:   web_screenshot(url=..., width=1440, height=900)
+  - mobile:        web_screenshot(url=..., mobile=true)
+                       390x844 viewport, mobile user-agent, touch enabled
+  - device:        web_screenshot(url=..., device="iPhone 14")
+                       full Playwright device emulation (viewport, UA, scale)
+  - dark mode:     web_screenshot(url=..., dark=true)
+                       emulates prefers-color-scheme: dark
+  - breakpoints:   web_screenshot(url=..., breakpoints=[375, 768, 1280])
+                       one call, multiple screenshots at different widths
+                       (auto-enables full_page unless explicitly false)
   - js wait:       web_screenshot(url=..., wait_for=".my-selector")
                        waits for a CSS selector to appear before capturing
   - dom snapshot:  web_screenshot(url=..., dom=true)
@@ -59,6 +68,23 @@ TOOL = {
             "height": {
                 "type": "integer",
                 "description": "Viewport height in pixels (default 800).",
+            },
+            "mobile": {
+                "type": "boolean",
+                "description": "Emulate a mobile device: 390x844 viewport, mobile user-agent, touch, 2x scale (default false). Overridden by device.",
+            },
+            "device": {
+                "type": "string",
+                "description": "Playwright device name for full emulation (e.g. 'iPhone 14', 'Pixel 7', 'iPad Mini'). Sets viewport, UA, scale, touch. See playwright.dev/python/docs/emulation#devices.",
+            },
+            "dark": {
+                "type": "boolean",
+                "description": "Emulate prefers-color-scheme: dark (default false = light).",
+            },
+            "breakpoints": {
+                "type": "array",
+                "items": {"type": "integer"},
+                "description": "List of viewport widths to capture (e.g. [375, 768, 1280]). One screenshot per width. Auto-enables full_page unless full_page is explicitly false.",
             },
             "wait_for": {
                 "type": "string",
@@ -172,6 +198,19 @@ def _a11y_snapshot(page, max_chars):
 
 ENGINES = ("chromium", "firefox", "webkit")
 
+# Generic mobile defaults (when mobile=true but no device specified).
+_MOBILE_DEFAULTS = {
+    "viewport": {"width": 390, "height": 844},
+    "user_agent": (
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+        "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 "
+        "Mobile/15E148 Safari/604.1"
+    ),
+    "is_mobile": True,
+    "has_touch": True,
+    "device_scale_factor": 2,
+}
+
 
 def _launch(p, engine):
     """Launch one engine. chromium takes hardening flags; others don't."""
@@ -179,6 +218,84 @@ def _launch(p, engine):
     if engine == "chromium":
         return launcher.launch(args=["--no-sandbox", "--disable-dev-shm-usage"])
     return launcher.launch()
+
+
+def _page_context_args(p, args):
+    """Build the kwargs dict for browser.new_context() from tool args.
+    Handles device, mobile, dark, and explicit width/height."""
+    ctx = {}
+
+    device_name = (args.get("device") or "").strip()
+    if device_name:
+        # Playwright ships a device registry; look up by name.
+        devices = p.devices
+        if device_name not in devices:
+            # Try case-insensitive match.
+            lower_map = {k.lower(): k for k in devices}
+            match = lower_map.get(device_name.lower())
+            if match:
+                device_name = match
+            else:
+                return None, f"error: unknown device {device_name!r}. Examples: 'iPhone 14', 'Pixel 7', 'iPad Mini'."
+        ctx.update(devices[device_name])
+    elif args.get("mobile"):
+        ctx.update(_MOBILE_DEFAULTS)
+
+    # Explicit width/height override device/mobile viewport.
+    w = args.get("width")
+    h = args.get("height")
+    if w or h:
+        vp = dict(ctx.get("viewport") or {"width": 1280, "height": 800})
+        if w: vp["width"] = int(w)
+        if h: vp["height"] = int(h)
+        ctx["viewport"] = vp
+    elif "viewport" not in ctx:
+        ctx["viewport"] = {"width": 1280, "height": 800}
+
+    if args.get("dark"):
+        ctx["color_scheme"] = "dark"
+
+    return ctx, None
+
+
+def _capture_one(browser, ctx_args, url, full_page, wait_for, want_dom, out_path, timeout):
+    """Capture a single screenshot with the given context args. Returns (result_dict, error_str)."""
+    from playwright.sync_api import TimeoutError as PWTimeout
+
+    context = browser.new_context(**ctx_args)
+    page = context.new_page()
+    page.set_default_timeout(timeout)
+
+    try:
+        page.goto(url, wait_until="networkidle", timeout=timeout)
+    except PWTimeout:
+        try:
+            page.goto(url, wait_until="load", timeout=timeout)
+        except PWTimeout:
+            pass
+
+    if wait_for:
+        try:
+            page.wait_for_selector(wait_for, timeout=5_000)
+        except PWTimeout:
+            pass
+
+    title = page.title() or "(no title)"
+    final_url = page.url
+    vp = ctx_args.get("viewport", {})
+
+    page.screenshot(path=str(out_path), full_page=full_page)
+
+    text = _visible_text(page, MAX_TEXT)
+    a11y = _a11y_snapshot(page, MAX_A11Y) if want_dom else None
+
+    context.close()
+
+    return {
+        "title": title, "final_url": final_url,
+        "text": text, "a11y": a11y, "out_path": out_path,
+        "viewport": vp, "full_page": full_page,
+    }, None
 
 
 def run(args, cwd):
@@ -201,18 +318,26 @@ def run(args, cwd):
     if not url:
         return "error: web_screenshot needs a url"
 
-    full_page = bool(args.get("full_page", False))
-    width = int(args.get("width") or 1280)
-    height = int(args.get("height") or 800)
     wait_for = args.get("wait_for") or None
     want_dom = bool(args.get("dom", False))
+    breakpoints = args.get("breakpoints") or None
+
+    # full_page: default false normally, default true for breakpoints.
+    if "full_page" in args:
+        full_page = bool(args["full_page"])
+    else:
+        full_page = bool(breakpoints)
 
     SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
     slug = _slug(url)
-    out_path = SCREENSHOT_DIR / f"{slug}.png"
 
     try:
         with sync_playwright() as p:
+            # Validate context args before launching browser.
+            ctx_args, err = _page_context_args(p, args)
+            if err:
+                return err
+
             browser = None
             engine_used = None
             launch_errors = []
@@ -243,68 +368,87 @@ def run(args, cwd):
                     f"{hint}\n"
                     f"launch attempts:\n{detail}"
                 )
+
             try:
-                page = browser.new_page(viewport={"width": width, "height": height})
-                page.set_default_timeout(TIMEOUT)
+                captures = []
 
-                try:
-                    page.goto(url, wait_until="networkidle", timeout=TIMEOUT)
-                except PWTimeout:
-                    # networkidle can time out on heavy WP pages - fall back to load
-                    try:
-                        page.goto(url, wait_until="load", timeout=TIMEOUT)
-                    except PWTimeout:
-                        pass  # capture whatever we have
-
-                if wait_for:
-                    try:
-                        page.wait_for_selector(wait_for, timeout=5_000)
-                    except PWTimeout:
-                        pass  # capture anyway; note below
-
-                title = page.title() or "(no title)"
-                final_url = page.url
-
-                page.screenshot(path=str(out_path), full_page=full_page)
-
-                text = _visible_text(page, MAX_TEXT)
-                a11y = _a11y_snapshot(page, MAX_A11Y) if want_dom else None
+                if breakpoints:
+                    # Multi-breakpoint: one screenshot per width.
+                    for bp_width in breakpoints:
+                        bp_args = dict(ctx_args)
+                        vp = dict(bp_args.get("viewport") or {"width": 1280, "height": 800})
+                        vp["width"] = int(bp_width)
+                        bp_args["viewport"] = vp
+                        bp_path = SCREENSHOT_DIR / f"{slug}_{bp_width}w.png"
+                        result, cap_err = _capture_one(
+                            browser, bp_args, url, full_page, wait_for, want_dom, bp_path, TIMEOUT)
+                        if cap_err:
+                            return cap_err
+                        captures.append(result)
+                else:
+                    # Single screenshot.
+                    out_path = SCREENSHOT_DIR / f"{slug}.png"
+                    result, cap_err = _capture_one(
+                        browser, ctx_args, url, full_page, wait_for, want_dom, out_path, TIMEOUT)
+                    if cap_err:
+                        return cap_err
+                    captures.append(result)
             finally:
                 browser.close()
     except Exception as e:
         return f"error running headless browser: {e}"
 
-    # Build result
-    lines = [
-        f"screenshot: {out_path}",
-        f"title: {title}",
-        f"url: {final_url}",
-        f"viewport: {width}x{height}" + (" (full page)" if full_page else ""),
-        f"engine: {engine_used}",
-    ]
-    if wait_for:
-        lines.append(f"wait_for: {wait_for!r}")
+    # Build result text.
+    all_lines = []
+    image_path = None  # for single-shot, return the image; for multi, return the first
 
-    if text:
-        lines.append("")
-        lines.append("--- visible text ---")
-        # wrap long lines for readability
-        for para in text.split("\n"):
-            para = para.strip()
-            if not para:
-                lines.append("")
-            elif len(para) > 120:
-                lines.extend(textwrap.wrap(para, 120))
-            else:
-                lines.append(para)
+    for i, cap in enumerate(captures):
+        vp = cap["viewport"]
+        w, h = vp.get("width", "?"), vp.get("height", "?")
+        if len(captures) > 1:
+            all_lines.append(f"=== breakpoint {i+1}/{len(captures)}: {w}px ===")
+        all_lines.append(f"screenshot: {cap['out_path']}")
+        all_lines.append(f"title: {cap['title']}")
+        all_lines.append(f"url: {cap['final_url']}")
+        vp_note = f"viewport: {w}x{h}"
+        if cap["full_page"]:
+            vp_note += " (full page)"
+        if ctx_args.get("is_mobile") or (args.get("device") or args.get("mobile")):
+            vp_note += " (mobile)"
+        if args.get("dark"):
+            vp_note += " (dark)"
+        all_lines.append(vp_note)
+        all_lines.append(f"engine: {engine_used}")
+        if args.get("device"):
+            all_lines.append(f"device: {args['device']}")
+        if wait_for:
+            all_lines.append(f"wait_for: {wait_for!r}")
 
-    if a11y:
-        lines.append("")
-        lines.append("--- accessibility tree ---")
-        lines.append(a11y)
+        if cap["text"]:
+            all_lines.append("")
+            all_lines.append("--- visible text ---")
+            for para in cap["text"].split("\n"):
+                para = para.strip()
+                if not para:
+                    all_lines.append("")
+                elif len(para) > 120:
+                    all_lines.extend(textwrap.wrap(para, 120))
+                else:
+                    all_lines.append(para)
+
+        if cap["a11y"]:
+            all_lines.append("")
+            all_lines.append("--- accessibility tree ---")
+            all_lines.append(cap["a11y"])
+
+        if i < len(captures) - 1:
+            all_lines.append("")
+
+        if image_path is None:
+            image_path = str(cap["out_path"])
 
     # Image tool-result contract: return {text, image_path}. On a vision model
     # (Anthropic v1) core base64s the PNG into the tool_result so the model SEES
     # the page; on any other model core uses `text` only (the path + extracted
     # text). A plain string would also work - the dict just adds the pixels.
-    return {"text": "\n".join(lines), "image_path": str(out_path)}
+    return {"text": "\n".join(all_lines), "image_path": image_path}
