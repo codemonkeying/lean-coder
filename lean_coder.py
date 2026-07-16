@@ -86,7 +86,7 @@ def _prehandover_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.7.0"
+__version__ = "0.8.0"
 
 
 def _prerelease_key(pre):
@@ -823,6 +823,14 @@ class LeanToolManager:
                     # worker brain runs on the driver). Never pushed to the executor,
                     # never routed remotely; see enabled_paths() + _run_tool routing.
                     entry["driver_only"] = bool(spec.get("driver_only"))
+                    # Optional call-line icon: a lean-tool may set TOOL["glyph"] to a
+                    # short display string (its own signature icon); it's registered so
+                    # _tool_glyph can honour it over the derived category. No glyph = the
+                    # category default (from `safe`/tier) still applies.
+                    gl = spec.get("glyph")
+                    if isinstance(gl, str) and gl.strip():
+                        entry["glyph"] = gl.strip()
+                        _LEAN_TOOL_GLYPHS[name] = gl.strip()
                 self.lean_tools[name] = entry
             except Exception as e:
                 print(yellow(f"lean-tool {f.name} failed to load: {e}"))
@@ -1983,6 +1991,7 @@ GLYPH = {
     "cat_net":  g("⇅", "@"),       # web_fetch, brave_search, ssh, web_screenshot
     "cat_mcp":  g("⧉", "m"),       # any mcp__* tool
     "cat_meta": g("◇", "-"),       # update_plan, note, request_handover
+    "userbar":  g("┃", "|"),       # left accent bar down the operator's own turn
     "ok":       g("✓", "+"),
     "no":       g("✗", "x"),
     "think":    g("💭", "..."),    # reasoning
@@ -3250,6 +3259,9 @@ class Config:
     worker_idle_timeout: int = 1800  # dispatch_worker: worker lease secs; unattended self-kill
     worker_max_iterations: int = 30  # dispatch_worker: agentic-loop cap per worker
     editor: str = ""                 # preferred editor for /prompt etc.; "" -> $EDITOR/nano
+    user_name: str = "operator"      # label on the operator's own turn in scrollback
+                                     # (yellow left-bar marker so a human turn is easy to
+                                     # find in a sea of AI + tool lines)
     leash: str = "rwe"               # capability ceiling: chat (no tools) | r | rw | rwe.
                                      # bounds what the agent is given AT ALL (never blocks
                                      # on something above the ceiling). chat folds in the
@@ -3443,7 +3455,7 @@ def load_config(args) -> Config:
                 "handover_emergency", "handover_min_interval", "autostart_after_handover",
                 "auto_compact_interval", "auto_compact_hysteresis", "auto_compact_keep",
                 "wake_on_bg_finish",
-                "lean_tools_dir", "providers_dir"):
+                "lean_tools_dir", "providers_dir", "user_name"):
         if key in file_vals:
             setattr(cfg, key, file_vals[key])
     # The self-managing mechanism is a HANDOVER (the model pulls the same lever
@@ -3696,6 +3708,8 @@ def save_config(cfg: Config, quiet: bool = False):
         lines.append(f"statusline_iter = {cfg.statusline_iter}")
     if cfg.editor:
         lines.append(f'editor = "{cfg.editor}"')
+    if cfg.user_name and cfg.user_name != "operator":
+        lines.append(f'user_name = "{cfg.user_name}"')
     if cfg.lean_tools_dir:
         lines.append(f'lean_tools_dir = "{cfg.lean_tools_dir}"')
     if cfg.lean_tools_enabled:
@@ -7706,6 +7720,12 @@ def _is_bg_call(name: str, args: dict) -> bool:
     return name == "run_command" and str(args.get("cmd", "")).rstrip().endswith("&")
 
 
+# name -> display glyph, populated from a lean-tool's optional TOOL["glyph"] as it
+# loads (see LeanToolManager._load_dir). An explicit glyph wins over the derived
+# category in _tool_glyph. Module-level so the pure _tool_glyph(name, args) can read
+# it without an agent handle (both print paths agree).
+_LEAN_TOOL_GLYPHS = {}
+
 # Lean-tools whose job is network egress (no core tier says so - they're plugins), so
 # the call line can show the 'net' category icon. A name not here just falls through to
 # its tier / the gear; missing one only costs a less-specific icon, never correctness.
@@ -7736,12 +7756,26 @@ def _tool_category(name: str, args: dict) -> str:
     return ""
 
 
+def _operator_turn_lines(name: str, text: str) -> str:
+    """Echo the operator's own submitted turn into scrollback with a yellow left
+    accent bar + their name, so a human turn is easy to spot in a sea of AI (blue ●)
+    and tool lines. The bar runs down every line of a multi-line paste. ASCII '|'
+    fallback on a non-UTF terminal; colour is _TTY-gated by the yellow() helper."""
+    bar = yellow(GLYPH["userbar"])
+    head = f"{bar} {yellow(bold(name))}"
+    body = "\n".join(f"{bar} {ln}" for ln in (text or "").splitlines()) or bar
+    return f"{head}\n{body}"
+
+
 def _tool_glyph(name: str, args: dict) -> str:
     """Icon for a tool call line: a distinct 'bg' glyph when this is a backgrounded
     (detached) run_command, else a per-CATEGORY icon (read/write/exec/net/mcp/meta)
     derived from the tool's tier, falling back to the gear for anything uncategorised."""
     if _is_bg_call(name, args):
         return GLYPH["bg"]
+    override = _LEAN_TOOL_GLYPHS.get(name)   # a lean-tool's own TOOL["glyph"] wins
+    if override:
+        return override
     cat = _tool_category(name, args)
     return GLYPH.get(f"cat_{cat}", GLYPH["tool"]) if cat else GLYPH["tool"]
 
@@ -8201,6 +8235,7 @@ _SETTINGS_FIELDS = [
     ("top_k", "top_k", "int"),
     ("repeat_penalty", "repeat_penalty", "float"),
     ("editor", "editor (for /prompt)", "str"),
+    ("user_name", "your name on your own turn in scrollback", "str"),
     ("approval", "approval mode", tuple(APPROVAL_MODES)),
     ("composer", "composer (pinned input)", "bool"),
     ("autosave", "autosave session (auto-load last on start)", "bool"),
@@ -10889,7 +10924,8 @@ def repl(cfg: Config, resume=None):
             print(bold(cyan(indicator + GLYPH["prompt"] + " ")) + dim("(queued prompt)"))
         elif pending_inputs:       # drain composer typeahead before prompting anew
             line = pending_inputs.pop(0).strip()
-            print(bold(cyan(indicator + GLYPH["prompt"] + " ")) + line)
+            if line:
+                print(_operator_turn_lines(cfg.user_name, line))
         else:
             try:
                 if idle_comp is not None:
@@ -10903,11 +10939,11 @@ def repl(cfg: Config, resume=None):
                             prompt_status=(indicator.strip() or None),
                             wake_check=_wake).strip()
                         # stop_tty() cleared the pinned input rows; echo the
-                        # submitted line into scrollback so the turn history reads
-                        # naturally (input() leaves the line on screen for free).
+                        # submitted line into scrollback with the operator's yellow
+                        # accent bar so a human turn stands out from AI + tool lines.
                         if line:
-                            print(bold(cyan(indicator + GLYPH["prompt"] + " "))
-                                  + line.replace("\n", GLYPH["ret"]))
+                            _ind = (dim(indicator) if indicator else "")
+                            print(_ind + _operator_turn_lines(cfg.user_name, line))
                     except RuntimeError:
                         line = _input_or_wake(
                             _rl_safe(bold(cyan(indicator + GLYPH["prompt"] + " "))),

@@ -45,6 +45,7 @@ read-only) and `weather.py` (API-backed with a key + network egress).
 | `description` | yes | **Keep it to one line.** It is sent in *every* request, so it is a direct context cost. |
 | `parameters` | yes | A JSON Schema object describing the arguments. Match what `run` reads. |
 | `safe` | no | `True` for a read-only tool: it runs without a confirmation prompt **and becomes eligible to run concurrently** (see below). Omit (or `False`) for anything that writes, runs commands, or holds state - lean-coder will ask first (auto-approve mode waives that) and always runs it serially. |
+| `glyph` | no | A short display string used as this tool's icon on its call line. Overrides the auto-derived category icon (see below). Give it an ASCII-safe or well-supported symbol; omit to use the category default. |
 
 ### `safe` also means concurrency-eligible
 
@@ -62,6 +63,46 @@ marking a lean-tool safe asserts more than "no prompt":
 If you can't guarantee all three, **omit `safe`**: a non-safe lean-tool always runs
 serially through the confirm gate, which is the correct default for anything with
 state or I/O beyond a pure read.
+
+### Call-line icons (glyphs)
+
+Every tool call prints a dim one-line summary led by an **icon**. lean-coder picks it
+automatically by **category**, so your lean-tool gets a sensible icon with no effort:
+
+| Category | Icon | Chosen when |
+|----------|------|-------------|
+| read  | `◎` | your tool is `safe: True` (read-only) |
+| write | `✎` | (built-in writers) |
+| exec  | `»` | (built-in `run_command`) / non-safe by default |
+| net   | `⇅` | the tool name is a known network tool (`web_fetch`, `ssh`, ...) |
+| meta  | `◇` | agent-internal (`update_plan`, `note`, ...) |
+| gear  | `⚙` | anything uncategorised (the fallback) |
+
+A **backgrounded** `run_command` (trailing `&`) always shows `⚡` regardless.
+
+To give your tool a **signature icon**, set `TOOL["glyph"]` - it wins over the derived
+category:
+
+```python
+TOOL = {
+    "name": "weather",
+    "description": "Current weather for a city.",
+    "glyph": "☂",            # shown on the call line instead of the category icon
+    "parameters": {...},
+    "safe": True,
+}
+```
+
+Pick a symbol your users' terminals can render. For output *inside* your tool's return
+value, the helper **`lc.g(unicode, ascii_fallback)`** and the **`lc.GLYPH`** dict are
+available via the `setup(lc, cfg)` hook (below) - use them so a non-UTF terminal gets a
+clean ASCII fallback instead of mojibake:
+
+```python
+def setup(lc, cfg):
+    global _tick
+    _tick = lc.g("✓", "+")   # ✓ on UTF-8 terminals, + otherwise
+```
 
 ### Built-in tools (`lean-tools/builtins.py`)
 
