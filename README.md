@@ -337,6 +337,40 @@ templates: `reverse_file.py` (a minimal local read-only tool) and `weather.py` (
 API-backed tool with a key + network egress). See [LEAN_TOOLS.md](LEAN_TOOLS.md);
 writing your own is a drop-in `.py` - [docs/BUILD_GUIDE.md](docs/BUILD_GUIDE.md).
 
+### MCP servers (Model Context Protocol)
+
+lean-coder is a **generic MCP client**, builtin - **no servers ship by default** (zero
+context, zero surface until you add one). Point it at any MCP server and its tools join
+the model's surface, namespaced `mcp__<server>__<tool>`:
+
+```
+/mcp add fs npx -y @modelcontextprotocol/server-filesystem /some/dir   # stdio server
+/mcp add gw https://mcp-gateway.example.com/mcp/handbook/mcp           # HTTP server
+/mcp                       # enable/disable menu (per server)
+/mcp list                  # servers + connection state
+/mcp reconnect [name]      # (re)connect
+/mcp remove <name>
+```
+
+Two transports, both stdlib-only: **stdio** (a spawned subprocess, JSON-RPC over its
+pipes - the Claude-Desktop shape: `command` + `args` + `env`) and **HTTP** (streamable
+MCP, tolerating SSE or plain-JSON responses). HTTP auth is one `Authorization: Bearer`
+header - a static token/env, or an **OAuth 2.1** client-credentials JWT fetched + cached
++ refreshed automatically. For auth/env, edit the `mcp_servers` table in `config.toml`:
+
+```toml
+[mcp_servers.gw]
+transport = "http"
+url = "https://mcp-gateway.example.com/mcp/handbook/mcp"
+auth = { type = "bearer", token_env = "GW_KEY" }
+# or: auth = { type = "oauth", token_url = "…/oauth/token", client_id = "…", client_secret_env = "GW_SECRET", scope = "mcp:access" }
+```
+
+MCP tools run on the **driver** (never a connected remote) and ride the **`rwe`** leash
+tier (they may have side effects), confirming like any non-safe tool unless approval is
+armed. Enabled servers connect at launch; a dead one just contributes no tools (its
+error shows in `/mcp list`).
+
 ### `apply_diff` format
 
 The `diff` argument is one or more SEARCH/REPLACE blocks:
@@ -460,6 +494,7 @@ can't exhaust memory; pass `--num-ctx` to go higher explicitly.
 /connect [host]    run tools on a remote box over SSH (no arg = pick saved/open)
 /local [host]      detach the active remote (keep it open to switch back)
 /tools             enable/disable lean-tools
+/mcp               manage MCP servers (add/remove/reconnect; no arg = enable/disable menu)
 /reload            reload lean-tools + pick up prompt edits
 /model [name]      switch model across enabled providers (no arg = list)
 /provider [name]   switch/manage the model provider

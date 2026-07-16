@@ -24,7 +24,9 @@ import sys
 import threading
 import time
 import types
+import shutil
 import urllib.error
+import urllib.parse
 import urllib.request
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -84,7 +86,7 @@ def _prehandover_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.5.4"
+__version__ = "0.6.0"
 
 
 def _prerelease_key(pre):
@@ -898,6 +900,410 @@ def _lean_tools_dirs(cfg):
     return dirs
 
 
+# ----------------------------------------------------------------------------
+# MCP (Model Context Protocol) client - builtin, generic, zero servers shipped
+# ----------------------------------------------------------------------------
+
+MCP_PROTOCOL_VERSION = "2025-06-18"
+MCP_NS = "mcp__"                 # tool-name namespace: mcp__<server>__<tool>
+_MCP_CONNECT_TIMEOUT = 30
+_MCP_CALL_TIMEOUT = 120
+
+
+def _mcp_tool_name(server, tool):
+    """Namespaced surface name for an MCP tool: mcp__<server>__<tool>. Keeps MCP
+    tools from colliding with core tools / lean-tools / each other."""
+    return f"{MCP_NS}{server}__{tool}"
+
+
+def _mcp_parse_tool_name(name):
+    """(server, tool) from a namespaced mcp__<server>__<tool>, or (None, None)."""
+    if not name.startswith(MCP_NS):
+        return None, None
+    rest = name[len(MCP_NS):]
+    server, _, tool = rest.partition("__")
+    return (server, tool) if server and tool else (None, None)
+
+
+def _mcp_result_text(result):
+    """Normalise an MCP tools/call result to the tool-result string contract.
+    Prefers structuredContent, then joins text content blocks, else JSON dumps."""
+    if not isinstance(result, dict):
+        return str(result)
+    if "structuredContent" in result and result["structuredContent"] is not None:
+        sc = result["structuredContent"]
+        return sc if isinstance(sc, str) else json.dumps(sc, indent=2, ensure_ascii=False)
+    content = result.get("content")
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if not isinstance(block, dict):
+                parts.append(str(block)); continue
+            if block.get("type") == "text":
+                parts.append(block.get("text", ""))
+            else:
+                parts.append(json.dumps(block, ensure_ascii=False))
+        joined = "\n".join(p for p in parts if p)
+        if joined:
+            return ("[tool error] " + joined) if result.get("isError") else joined
+    return json.dumps(result, indent=2, ensure_ascii=False)
+
+
+class MCPConnection:
+    """One live connection to a single MCP server. Two transports, both stdlib-only:
+      - stdio: a spawned subprocess, JSON-RPC framed newline-delimited over its stdin/
+        stdout (the Claude-Desktop shape: command + args + env).
+      - http:  streamable-HTTP via curl (initialize -> Mcp-Session-Id header ->
+        notifications/initialized -> tools/list|tools/call), tolerating an SSE or plain
+        JSON body. Auth is one Authorization: Bearer header - a static token/env, or an
+        OAuth2 client-credentials JWT fetched + cached + refreshed on 401.
+    Never raises into the agent loop: connect()/list_tools()/call() return ([]/error
+    string) on failure and stash .error. Proven shape lifted from mcp-probe.py."""
+
+    def __init__(self, name, config):
+        self.name = name
+        self.config = config or {}
+        self.transport = (self.config.get("transport") or "").lower() or (
+            "http" if self.config.get("url") else "stdio")
+        self.tools = []              # raw MCP tool dicts from tools/list
+        self.error = ""
+        self.connected = False
+        self._proc = None            # stdio subprocess
+        self._rpc_id = 0
+        self._session_id = None      # http: Mcp-Session-Id
+        self._token = None           # http: cached bearer/oauth token
+
+    # -- shared ---------------------------------------------------------------
+    def _next_id(self):
+        self._rpc_id += 1
+        return self._rpc_id
+
+    def connect(self, timeout=_MCP_CONNECT_TIMEOUT):
+        """Handshake + tools/list. Returns True on success. Idempotent-ish: a second
+        call reconnects. Sets .error (and returns False) on any failure."""
+        self.error = ""
+        try:
+            if self.transport == "stdio":
+                self._connect_stdio(timeout)
+            else:
+                self._connect_http(timeout)
+            self.connected = True
+            return True
+        except Exception as e:
+            self.error = str(e)
+            self.connected = False
+            self.close()
+            return False
+
+    def list_tools(self):
+        return list(self.tools)
+
+    def call(self, tool, arguments, timeout=_MCP_CALL_TIMEOUT):
+        """Invoke one tool. Returns the normalised result string. Never raises."""
+        if not self.connected and not self.connect():
+            return f"error: MCP server '{self.name}' not connected ({self.error})"
+        try:
+            if self.transport == "stdio":
+                res = self._rpc_stdio("tools/call",
+                                      {"name": tool, "arguments": arguments or {}}, timeout)
+            else:
+                res = self._rpc_http("tools/call",
+                                     {"name": tool, "arguments": arguments or {}}, timeout)
+            return _mcp_result_text(res)
+        except Exception as e:
+            return f"error calling MCP {self.name}.{tool}: {e}"
+
+    def close(self):
+        if self._proc is not None:
+            try:
+                self._proc.terminate()
+                try:
+                    self._proc.wait(timeout=3)
+                except Exception:
+                    self._proc.kill()
+            except Exception:
+                pass
+            self._proc = None
+        self.connected = False
+
+    # -- stdio transport ------------------------------------------------------
+    def _connect_stdio(self, timeout):
+        cmd = self.config.get("command")
+        if not cmd:
+            raise ValueError("stdio server needs a 'command'")
+        argv = [cmd] + list(self.config.get("args") or [])
+        env = dict(os.environ)
+        env.update({k: str(v) for k, v in (self.config.get("env") or {}).items()})
+        self._proc = subprocess.Popen(
+            argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, env=env, text=True, bufsize=1)
+        self._rpc_stdio("initialize", {
+            "protocolVersion": MCP_PROTOCOL_VERSION, "capabilities": {},
+            "clientInfo": {"name": "lean-coder", "version": __version__}}, timeout)
+        self._notify_stdio("notifications/initialized")
+        res = self._rpc_stdio("tools/list", {}, timeout)
+        self.tools = res.get("tools", []) if isinstance(res, dict) else []
+
+    def _send_stdio(self, payload):
+        if not self._proc or not self._proc.stdin:
+            raise ConnectionError("stdio server not running")
+        self._proc.stdin.write(json.dumps(payload) + "\n")
+        self._proc.stdin.flush()
+
+    def _notify_stdio(self, method, params=None):
+        self._send_stdio({"jsonrpc": "2.0", "method": method, "params": params or {}})
+
+    def _rpc_stdio(self, method, params, timeout):
+        rid = self._next_id()
+        self._send_stdio({"jsonrpc": "2.0", "id": rid, "method": method, "params": params})
+        deadline = time.time() + timeout
+        # Read newline-delimited JSON until we see our id (skip notifications / other ids).
+        while time.time() < deadline:
+            line = self._proc.stdout.readline()
+            if not line:
+                raise ConnectionError("stdio server closed the stream")
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                msg = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if msg.get("id") != rid:
+                continue
+            if "error" in msg:
+                raise RuntimeError(json.dumps(msg["error"])[:240])
+            return msg.get("result", {})
+        raise TimeoutError(f"no response to {method} within {timeout}s")
+
+    # -- http transport (streamable-HTTP via curl) ----------------------------
+    def _auth_header(self):
+        auth = self.config.get("auth") or {}
+        atype = (auth.get("type") or ("bearer" if (auth.get("token") or auth.get("token_env"))
+                                      else "")).lower()
+        if atype == "bearer":
+            tok = auth.get("token") or os.environ.get(auth.get("token_env", ""), "")
+            if not tok:
+                raise ValueError("bearer auth: no token / token_env")
+            return f"Bearer {tok}"
+        if atype == "oauth":
+            return f"Bearer {self._oauth_token(auth)}"
+        return ""     # no auth
+
+    def _oauth_token(self, auth, force=False):
+        """OAuth2 client-credentials: POST client_id/secret to token_url, cache the
+        access_token. Refetched on force (a 401 retry)."""
+        if self._token and not force:
+            return self._token
+        token_url = auth.get("token_url")
+        if not token_url:
+            raise ValueError("oauth auth: no token_url")
+        secret = auth.get("client_secret") or os.environ.get(
+            auth.get("client_secret_env", ""), "")
+        data = ("grant_type=client_credentials"
+                f"&client_id={urllib.parse.quote(auth.get('client_id', ''))}"
+                f"&client_secret={urllib.parse.quote(secret)}")
+        if auth.get("scope"):
+            data += f"&scope={urllib.parse.quote(auth['scope'])}"
+        out = self._curl(["-X", "POST", token_url,
+                          "-H", "Content-Type: application/x-www-form-urlencoded",
+                          "-d", data], _MCP_CONNECT_TIMEOUT)
+        try:
+            tok = json.loads(out).get("access_token")
+        except json.JSONDecodeError:
+            tok = None
+        if not tok:
+            raise RuntimeError(f"oauth token fetch failed: {out[:160]}")
+        self._token = tok
+        return tok
+
+    def _curl(self, extra_args, timeout, capture_headers=None):
+        if not shutil.which("curl"):
+            raise RuntimeError("http MCP transport needs curl on PATH")
+        cmd = ["curl", "-s", "--max-time", str(timeout)] + extra_args
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode != 0:
+            raise ConnectionError(r.stderr.strip() or f"curl exited {r.returncode}")
+        return r.stdout
+
+    def _http_url(self):
+        return self.config["url"]
+
+    def _post_http(self, payload, timeout):
+        """POST a JSON-RPC payload; return (headers dict, parsed json or None). Captures
+        the Mcp-Session-Id header. Tolerates an SSE ('data: {...}') or plain JSON body.
+        Retries once on a 401 by forcing an OAuth token refresh."""
+        for attempt in (0, 1):
+            hf = tempfile.mktemp()
+            args = ["-X", "POST", self._http_url(),
+                    "-H", "Content-Type: application/json",
+                    "-H", "Accept: application/json, text/event-stream",
+                    "-D", hf]
+            ah = self._auth_header()
+            if ah:
+                args += ["-H", f"Authorization: {ah}"]
+            if self._session_id:
+                args += ["-H", f"Mcp-Session-Id: {self._session_id}"]
+            args += ["-d", json.dumps(payload)]
+            try:
+                body = self._curl(args, timeout)
+            finally:
+                pass
+            headers, status = {}, 0
+            try:
+                with open(hf) as f:
+                    for line in f:
+                        if line.startswith("HTTP/"):
+                            parts = line.split()
+                            if len(parts) >= 2 and parts[1].isdigit():
+                                status = int(parts[1])
+                        elif ":" in line:
+                            k, _, v = line.partition(":")
+                            headers[k.strip().lower()] = v.strip()
+            except OSError:
+                pass
+            finally:
+                try: os.remove(hf)
+                except OSError: pass
+            if status == 401 and attempt == 0 and (self.config.get("auth") or {}).get("type") == "oauth":
+                self._oauth_token(self.config["auth"], force=True)
+                continue
+            return headers, self._sse_json(body)
+        return {}, None
+
+    @staticmethod
+    def _sse_json(out):
+        if not out:
+            return None
+        try:
+            body = out.split("data: ", 1)[1] if "data: " in out else out
+            return json.loads(body)
+        except Exception:
+            return None
+
+    def _connect_http(self, timeout):
+        if not self.config.get("url"):
+            raise ValueError("http server needs a 'url'")
+        self._session_id = None
+        headers, j = self._post_http({
+            "jsonrpc": "2.0", "id": self._next_id(), "method": "initialize", "params": {
+                "protocolVersion": MCP_PROTOCOL_VERSION, "capabilities": {},
+                "clientInfo": {"name": "lean-coder", "version": __version__}}}, timeout)
+        if isinstance(j, dict) and j.get("error"):
+            raise RuntimeError(json.dumps(j["error"])[:240])
+        self._session_id = headers.get("mcp-session-id")
+        if self._session_id:
+            self._post_http({"jsonrpc": "2.0", "method": "notifications/initialized"}, timeout)
+        res = self._rpc_http("tools/list", {}, timeout)
+        self.tools = res.get("tools", []) if isinstance(res, dict) else []
+
+    def _rpc_http(self, method, params, timeout):
+        _, j = self._post_http({"jsonrpc": "2.0", "id": self._next_id(),
+                                "method": method, "params": params}, timeout)
+        if j is None:
+            raise RuntimeError("could not parse gateway/MCP response")
+        if isinstance(j, dict) and "error" in j:
+            raise RuntimeError(json.dumps(j["error"])[:240])
+        return j.get("result", {}) if isinstance(j, dict) else {}
+
+
+class MCPManager:
+    """Owns the configured MCP servers and their live connections. Only ENABLED
+    servers are connected + contribute tools to the surface. Namespaced tool names
+    (mcp__<server>__<tool>) route back here via call(). Never raises into the loop -
+    a dead server just contributes no tools and stashes its error for /mcp."""
+
+    def __init__(self, servers=None, enabled=None):
+        self.servers = dict(servers or {})           # name -> config
+        self.enabled = set(enabled or [])
+        self.conns = {}                              # name -> MCPConnection (enabled only)
+
+    def _is_on(self, name):
+        return name in self.enabled
+
+    def names(self):
+        return sorted(self.servers)
+
+    def connect_enabled(self):
+        """(Re)connect every enabled server; drop connections for disabled/removed ones.
+        Returns {name: (ok, ntools_or_error)}. Safe to call repeatedly."""
+        report = {}
+        for name in list(self.conns):
+            if name not in self.enabled or name not in self.servers:
+                self.conns[name].close()
+                del self.conns[name]
+        for name in self.servers:
+            if not self._is_on(name):
+                continue
+            conn = self.conns.get(name)
+            if conn is None or not conn.connected:
+                conn = MCPConnection(name, self.servers[name])
+                ok = conn.connect()
+                self.conns[name] = conn
+                report[name] = (ok, len(conn.tools) if ok else conn.error)
+            else:
+                report[name] = (True, len(conn.tools))
+        return report
+
+    def schemas(self):
+        """(schema, is_safe) for every tool of every connected enabled server, in the
+        tool-schema shape active_tools expects. MCP tools may have side effects, so
+        they are NOT marked safe (ride at the rwe tier), same as a non-safe lean-tool."""
+        out = []
+        for name, conn in self.conns.items():
+            if not self._is_on(name):
+                continue
+            for t in conn.list_tools():
+                tn = t.get("name")
+                if not tn:
+                    continue
+                out.append(({"type": "function", "function": {
+                    "name": _mcp_tool_name(name, tn),
+                    "description": (t.get("description") or "").strip(),
+                    "parameters": t.get("inputSchema")
+                    or {"type": "object", "properties": {}}}}, False))
+        return out
+
+    def has_tool(self, surface_name):
+        server, tool = _mcp_parse_tool_name(surface_name)
+        return bool(server) and server in self.conns and any(
+            t.get("name") == tool for t in self.conns[server].list_tools())
+
+    def call(self, surface_name, args):
+        server, tool = _mcp_parse_tool_name(surface_name)
+        if not server:
+            return f"error: not an MCP tool name: {surface_name}"
+        conn = self.conns.get(server)
+        if conn is None:
+            return f"error: MCP server '{server}' is not enabled/connected"
+        return conn.call(tool, args)
+
+    def close(self):
+        for conn in self.conns.values():
+            conn.close()
+        self.conns.clear()
+
+
+def _connect_mcp_startup(agent):
+    """Connect the enabled MCP servers at launch and fold their tools into the
+    surface. Best-effort + quiet: a dead server just contributes nothing (its error
+    is visible via /mcp). No-op when nothing is enabled. Driver-only (never in the
+    remote executor)."""
+    mgr = getattr(agent, "mcp", None)
+    if not mgr or not mgr.enabled:
+        return
+    report = mgr.connect_enabled()
+    agent.refresh_tools()
+    ok = [n for n, (good, _) in report.items() if good]
+    bad = [(n, info) for n, (good, info) in report.items() if not good]
+    if ok:
+        ntools = sum(len(mgr.conns[n].list_tools()) for n in ok if n in mgr.conns)
+        print(dim(f"MCP: {len(ok)} server(s) connected, {ntools} tool(s) "
+                  f"({', '.join(ok)})"))
+    for n, info in bad:
+        print(yellow(f"MCP: '{n}' failed to connect: {info}"))
+
+
 # Names of lean-tools whose setup() has already run this session. setup() may
 # monkeypatch (not idempotent), so it runs AT MOST ONCE per tool per process -
 # whether at startup or when enabled mid-session via /tools.
@@ -1359,6 +1765,84 @@ def lean_tools_menu(manager):
             st["cur"] = min(len(rows) - 1, st["cur"] + 10)
         elif k == _K_SPACE:
             toggle(st["cur"])
+        elif k == _K_ENTER:
+            return ("done", enabled)
+        elif k in (_K_CANCEL, "q"):
+            return ("cancel", None)
+        return None
+
+    res = run_picker(render, on_key)
+    return res[1] if res[0] == "done" else None
+
+
+def mcp_servers_menu(manager):
+    """Interactive per-SERVER enable/disable for MCP: up/down move, space toggles,
+    enter saves, q cancels. Each row shows the server name, transport, connection
+    state (tool count or error), and enabled mark. Returns the new enabled set, or
+    None if cancelled. Falls back to a plain listing with no TTY."""
+    names = manager.names()
+    enabled = set(n for n in names if manager._is_on(n))
+
+    def _row_desc(name):
+        cfg = manager.servers.get(name, {})
+        tp = (cfg.get("transport") or ("http" if cfg.get("url") else "stdio"))
+        conn = manager.conns.get(name)
+        if conn and conn.connected:
+            state = f"{len(conn.list_tools())} tools"
+        elif conn and conn.error:
+            state = f"error: {conn.error[:40]}"
+        else:
+            state = "not connected"
+        target = cfg.get("url") or cfg.get("command") or "?"
+        return f"{tp} · {state} · {target}"
+
+    if not picker_capable():
+        print(bold("MCP servers:"))
+        for n in names:
+            print(f"  [{'x' if n in enabled else ' '}] {n}  {dim(_row_desc(n))}")
+        print(dim("  (no TTY: set mcp_enabled in the config file to change)"))
+        return None
+
+    st = {"cur": 0, "top": 0}
+
+    def render(rows_avail):
+        cur, top = st["cur"], st["top"]
+        body = max(1, rows_avail - 1)
+        if cur < top:
+            top = cur
+        elif cur >= top + body:
+            top = cur - body + 1
+        st["top"] = top
+        window = names[top:top + body]
+        more_up = " ↑more" if top > 0 else ""
+        more_down = " ↓more" if top + body < len(names) else ""
+
+        def row(content):
+            return "\r" + _fit_line(content) + "\033[K"
+
+        out = [row(bold("MCP servers  ")
+                   + dim("(up/down move, space toggle, enter save, q cancel)")
+                   + dim(more_up + more_down))]
+        for off, name in enumerate(window):
+            i = top + off
+            pointer = cyan(">") if i == cur else " "
+            mark = green("x") if name in enabled else " "
+            out.append(row(f"{pointer} [{mark}] {name}  {dim(_row_desc(name))}"))
+        sys.stdout.write("\n".join(out))
+        return len(out) - 1
+
+    def on_key(k):
+        if k in (_K_UP, "k"):
+            st["cur"] = (st["cur"] - 1) % len(names)
+        elif k in (_K_DOWN, "j"):
+            st["cur"] = (st["cur"] + 1) % len(names)
+        elif k == _K_HOME:
+            st["cur"] = 0
+        elif k == _K_END:
+            st["cur"] = len(names) - 1
+        elif k == _K_SPACE:
+            name = names[st["cur"]]
+            enabled.discard(name) if name in enabled else enabled.add(name)
         elif k == _K_ENTER:
             return ("done", enabled)
         elif k in (_K_CANCEL, "q"):
@@ -2778,6 +3262,14 @@ class Config:
                                      # picker + /session list (off = hidden so they don't
                                      # clog the menu; /load <exact-name> always works)
     providers_dir: str = ""             # "" -> ~/.config/leancoder/providers
+    # MCP (Model Context Protocol) client - builtin, ZERO servers shipped by default.
+    # mcp_servers: name -> config dict. A stdio server: {"transport":"stdio","command":..,
+    # "args":[..],"env":{..}}. An HTTP server: {"transport":"http","url":..,"auth":{..}}
+    # where auth is {"type":"bearer","token":..|"token_env":..} or {"type":"oauth",
+    # "token_url":..,"client_id":..,"client_secret":..|"client_secret_env":..,"scope":..}.
+    # mcp_enabled: server names whose tools are live on the surface (per-server gate).
+    mcp_servers: dict = field(default_factory=dict)
+    mcp_enabled: list = field(default_factory=list)
     providers_enabled: list = field(default_factory=list)  # enabled provider plugin names
     provider: str = "ollama"         # active backend - ALWAYS a registered provider now
     provider_settings: dict = field(default_factory=dict)  # name -> {model, num_ctx, thinking, effort, <custom>}
@@ -2954,6 +3446,11 @@ def load_config(args) -> Config:
         cfg.approval = "ask"
     if isinstance(file_vals.get("lean_tools_enabled"), list):
         cfg.lean_tools_enabled = [p for p in file_vals["lean_tools_enabled"] if isinstance(p, str)]
+    if isinstance(file_vals.get("mcp_servers"), dict):
+        cfg.mcp_servers = {k: dict(v) for k, v in file_vals["mcp_servers"].items()
+                           if isinstance(v, dict)}
+    if isinstance(file_vals.get("mcp_enabled"), list):
+        cfg.mcp_enabled = [p for p in file_vals["mcp_enabled"] if isinstance(p, str)]
     if isinstance(file_vals.get("always_expand"), list):
         cfg.always_expand = [p for p in file_vals["always_expand"] if isinstance(p, str)]
     if isinstance(file_vals.get("show_snapshots"), bool):
@@ -3194,6 +3691,9 @@ def save_config(cfg: Config, quiet: bool = False):
                      + ", ".join(f'"{p}"' for p in cfg.lean_tools_enabled) + "]")
     if cfg.providers_dir:
         lines.append(f'providers_dir = "{cfg.providers_dir}"')
+    if cfg.mcp_enabled:
+        lines.append("mcp_enabled = ["
+                     + ", ".join(f'"{p}"' for p in cfg.mcp_enabled) + "]")
     # Always persist the enabled set (even empty): an absent key is treated as "fresh -
     # seed ollama" on load, so an explicit empty/ollama-disabled set MUST be written to
     # stick (otherwise disabling your last provider would silently re-seed ollama).
@@ -5671,8 +6171,9 @@ class Agent:
         self.remote = None                   # the ACTIVE RemoteWorkspace, or None (local)
         self.remotes = {}                    # host -> RemoteWorkspace: the live pool
         self.lean_tools = LeanToolManager(_lean_tools_dirs(cfg), enabled=cfg.lean_tools_enabled)
+        self.mcp = MCPManager(cfg.mcp_servers, enabled=cfg.mcp_enabled)
         self.tool_defs = self._provider_tool_filter(
-            active_tools(cfg, lean_tool_schemas=self.lean_tools.schemas(),
+            active_tools(cfg, lean_tool_schemas=self._all_lean_schemas(),
                          model_tools=self._model_tool_support()))
         self.messages = [{"role": "system", "content": self._system()}]
         self.last_prompt_tokens = None
@@ -5793,7 +6294,7 @@ class Agent:
             self.remotes[ws.host] = ws
         self.tool_defs = self._provider_tool_filter(
             active_tools(self.cfg, remote=bool(ws),
-                         lean_tool_schemas=self.lean_tools.schemas(),
+                         lean_tool_schemas=self._all_lean_schemas(),
                          model_tools=self._model_tool_support(),
                          offer_handover=self._offer_handover()))
         self.messages[0] = {"role": "system", "content": self._system()}
@@ -5855,11 +6356,18 @@ class Agent:
             return False
         return self._ctx_zone()[0] == "soft"
 
+    def _all_lean_schemas(self):
+        """The lean-tool-shaped (schema, is_safe) list active_tools consumes: real
+        lean-tools PLUS every enabled+connected MCP server's tools (namespaced,
+        marked non-safe so they ride the rwe tier). One list so the surface, the
+        leash tiering, and dispatch all agree on what MCP contributes."""
+        return list(self.lean_tools.schemas()) + list(self.mcp.schemas())
+
     def refresh_tools(self):
         """Rebuild the model's tool surface (after a /tools toggle, leash or model change)."""
         self.tool_defs = self._provider_tool_filter(
             active_tools(self.cfg, remote=bool(self.remote),
-                         lean_tool_schemas=self.lean_tools.schemas(),
+                         lean_tool_schemas=self._all_lean_schemas(),
                          model_tools=self._model_tool_support(),
                          offer_handover=self._offer_handover()))
 
@@ -5879,6 +6387,7 @@ class Agent:
             return self._request_handover()
         if name == "update_plan":            # pinned-plan upkeep (local agent state, never remote)
             return self._update_plan(args.get("plan", ""))
+        is_mcp = name.startswith(MCP_NS)
         plug = self.lean_tools.get(name)
         safe = bool(plug and plug["safe"])
         # Model-level lock: a chat-only model (provider tool_support=False) has NO tools,
@@ -5893,10 +6402,13 @@ class Agent:
         # refuse to RUN anything above the current /leash, however the call arrived - a
         # hallucinated or injected tool_call, a replayed/loaded message, a leaked surface.
         # The model gets an instructive result; the operator sees the block.
-        if not _leash_allows_tool(self.cfg.leash, name, lean_safe=(safe if plug else None)):
+        # MCP tools carry no lean-tool plug; they ride the rwe tier (may have side
+        # effects), so pass lean_safe=False for them - matching the surface filter.
+        _leash_safe = (safe if plug else (False if is_mcp else None))
+        if not _leash_allows_tool(self.cfg.leash, name, lean_safe=_leash_safe):
             print(red(f"\n{GLYPH['warn']} blocked {name}: above the '{self.cfg.leash}' leash "
-                      f"(not run; raise with /leash {_min_leash_for(name, safe if plug else None)})"))
-            return _leash_block_msg(self.cfg.leash, name, lean_safe=(safe if plug else None))
+                      f"(not run; raise with /leash {_min_leash_for(name, _leash_safe)})"))
+            return _leash_block_msg(self.cfg.leash, name, lean_safe=_leash_safe)
         # ask-on-read: when confirm_reads is on, read-only tools (core reads + safe
         # lean-tools) confirm too, not just writers - for anyone who doesn't want it
         # reading files without an OK. auto/session-armed approval still skips it.
@@ -5944,6 +6456,12 @@ class Agent:
             print(yellow(f"\nlean-tool {name}({_fmt_args(args)})"))
             if not ask_action(self.cfg, f"run lean-tool {name}?"):
                 return "operator declined the lean-tool"
+        # MCP tools run on the DRIVER (never the remote executor) and may have side
+        # effects, so they confirm like a non-safe lean-tool unless approval is armed.
+        if is_mcp and not auto_approved(self.cfg):
+            print(yellow(f"\nMCP {name}({_fmt_args(args)})"))
+            if not ask_action(self.cfg, f"run MCP tool {name}?"):
+                return "operator declined the MCP tool"
         return self._dispatch(name, args)
 
     def _parallel_safe(self, call) -> bool:
@@ -6546,6 +7064,8 @@ class Agent:
         return block
 
     def _dispatch(self, name: str, args: dict) -> str:
+        if name.startswith(MCP_NS):
+            return self.mcp.call(name, args)
         plug = self.lean_tools.get(name)
         if plug:
             # Publish the live context budget so a lean-tool can size its output to
@@ -7421,6 +7941,7 @@ HELP_COMMANDS = [
     ("/connect [host]", "run tools on a remote over SSH"),
     ("/local [host]", "detach the active remote"),
     ("/tools", "enable/disable lean-tools"),
+    ("/mcp", "manage MCP servers (list/add/remove/reconnect; no arg = enable/disable menu)"),
     ("/reload", "reload lean-tools"),
     ("/model [name]", "switch model (no arg = list)"),
     ("/provider [name]", "switch/manage the model backend"),
@@ -9583,6 +10104,132 @@ def handle_tools_command(agent, cfg, arg):
                 print(yellow(f"connected - run /reload to push to {agent.remote.host}."))
 
 
+def _mcp_persist(agent, cfg):
+    """Push the manager's live server map + enabled set back into cfg and save."""
+    cfg.mcp_servers = dict(agent.mcp.servers)
+    cfg.mcp_enabled = sorted(agent.mcp.enabled)
+    save_config(cfg)
+
+
+def handle_mcp_command(agent, cfg, arg):
+    """/mcp - manage MCP (Model Context Protocol) servers. No servers ship by default.
+    Subcommands:
+      /mcp                     enable/disable menu (per server; live)
+      /mcp list                show configured servers + connection state
+      /mcp add <name> <spec>   add a server, then enable it. <spec> is either
+                                 a URL (https://…  -> http transport) or a shell
+                                 command (stdio transport, e.g. `npx -y foo-mcp`).
+                                 For auth/env, edit mcp_servers in config.toml.
+      /mcp remove <name>       forget a server
+      /mcp reconnect [name]    (re)connect all enabled servers, or just <name>
+    Enabled servers' tools appear to the model namespaced mcp__<server>__<tool>; they
+    run on the DRIVER (never a connected remote) and ride the rwe leash tier."""
+    parts = arg.split(None, 2)
+    sub = parts[0].lower() if parts else ""
+
+    if not sub:
+        if not agent.mcp.names():
+            print(dim("no MCP servers configured. Add one: /mcp add <name> <url|command>"))
+            return
+        new = mcp_servers_menu(agent.mcp)
+        if new is not None:
+            agent.mcp.enabled = set(new)
+            report = agent.mcp.connect_enabled()
+            agent.refresh_tools()
+            _mcp_persist(agent, cfg)
+            for n, (ok, info) in sorted(report.items()):
+                print((green(f"  ✓ {n}: {info} tools") if ok
+                       else yellow(f"  ✗ {n}: {info}")))
+            print(dim(f"enabled: {', '.join(sorted(agent.mcp.enabled)) or '(none)'}"))
+        return
+
+    if sub == "list":
+        if not agent.mcp.names():
+            print(dim("no MCP servers configured. /mcp add <name> <url|command>"))
+            return
+        print(bold("MCP servers:"))
+        for n in agent.mcp.names():
+            on = n in agent.mcp.enabled
+            c = agent.mcp.servers[n]
+            tp = c.get("transport") or ("http" if c.get("url") else "stdio")
+            conn = agent.mcp.conns.get(n)
+            if conn and conn.connected:
+                state = green(f"{len(conn.list_tools())} tools")
+            elif conn and conn.error:
+                state = red(f"error: {conn.error[:50]}")
+            else:
+                state = dim("not connected")
+            tgt = c.get("url") or c.get("command") or "?"
+            mark = green("●") if on else dim("○")
+            print(f"  {mark} {bold(n)}  {dim(tp)}  {state}  {dim(tgt)}")
+        return
+
+    if sub == "add":
+        if len(arg.split(None, 2)) < 3:
+            print(dim("usage: /mcp add <name> <url|command>"))
+            return
+        name = parts[1]
+        spec = parts[2]
+        if name in agent.mcp.servers:
+            print(yellow(f"'{name}' already exists - /mcp remove {name} first."))
+            return
+        if spec.startswith(("http://", "https://")):
+            server = {"transport": "http", "url": spec}
+            print(dim(f"added http server '{name}' -> {spec}"))
+            print(dim("  (auth? edit mcp_servers in config.toml: "
+                      'auth = {type="bearer", token_env="GW_KEY"})'))
+        else:
+            argv = spec.split()
+            server = {"transport": "stdio", "command": argv[0], "args": argv[1:]}
+            print(dim(f"added stdio server '{name}' -> {spec}"))
+        agent.mcp.servers[name] = server
+        agent.mcp.enabled.add(name)
+        report = agent.mcp.connect_enabled()
+        agent.refresh_tools()
+        _mcp_persist(agent, cfg)
+        good, info = report.get(name, (False, "?"))
+        print(green(f"  ✓ connected, {info} tools") if good
+              else yellow(f"  ✗ {info}  (still saved + enabled; fix + /mcp reconnect {name})"))
+        return
+
+    if sub == "remove":
+        if len(parts) < 2:
+            print(dim("usage: /mcp remove <name>"))
+            return
+        name = parts[1]
+        if name not in agent.mcp.servers:
+            print(yellow(f"no such server: {name}"))
+            return
+        conn = agent.mcp.conns.pop(name, None)
+        if conn:
+            conn.close()
+        del agent.mcp.servers[name]
+        agent.mcp.enabled.discard(name)
+        agent.refresh_tools()
+        _mcp_persist(agent, cfg)
+        print(dim(f"removed '{name}'."))
+        return
+
+    if sub == "reconnect":
+        target = parts[1] if len(parts) > 1 else None
+        if target and target not in agent.mcp.servers:
+            print(yellow(f"no such server: {target}"))
+            return
+        if target:                       # force this one to reconnect
+            c = agent.mcp.conns.pop(target, None)
+            if c:
+                c.close()
+        report = agent.mcp.connect_enabled()
+        agent.refresh_tools()
+        for n, (ok, info) in sorted(report.items()):
+            if target and n != target:
+                continue
+            print(green(f"  ✓ {n}: {info} tools") if ok else yellow(f"  ✗ {n}: {info}"))
+        return
+
+    print(dim(f"unknown /mcp subcommand: {sub}  (try /mcp ?)"))
+
+
 def handle_reload_command(agent, cfg, arg):
     """/reload - re-scan lean-tools and pick up system-prompt edits; if connected,
     re-push code + enabled tools to the remote (ssh kept). Local core changes still need
@@ -9812,6 +10459,7 @@ _BUILTIN_COMMANDS_TABLE = {
     "/sh": run_sh_command,
     "/connect": handle_connect_command,
     "/tools": handle_tools_command,
+    "/mcp": handle_mcp_command,
     "/reload": handle_reload_command,
     "/local": handle_local_command, "/disconnect": handle_local_command,
     "/compact": handle_compact_command,
@@ -9972,6 +10620,7 @@ def repl(cfg: Config, resume=None):
     # module globals (e.g. dispatch_worker's _H) needs the SAME module instance whose
     # run() later fires. _setup_done keeps it at most once per tool per process.
     _run_lean_tool_setup(cfg, agent.lean_tools)
+    _connect_mcp_startup(agent)   # connect enabled MCP servers + fold their tools in
     # Clear .lock files left by instances that were killed without a clean exit (they
     # age out logically after _LOCK_STALE_SECS but the files otherwise pile up forever).
     # Before we claim any session below, so it can never remove our own fresh lock.
