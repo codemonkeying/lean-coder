@@ -2042,7 +2042,7 @@ GLYPH = {
     # Per-CATEGORY call-line icons (derived from tool tiering, not per-tool): the eye
     # scans "read/write/run/net/mcp/meta" at a glance. Each has an ASCII fallback.
     "cat_read": g("◎", "r"),       # read_file, list_files, search_files, safe lean-tools
-    "cat_write": g("✎", "w"),      # apply_diff, write_file
+    "cat_write": g("✎", "w"),      # apply_diff, replace_lines, write_file
     "cat_exec": g("»", "$"),       # run_command, shell_session, ask_user_to_run
     "cat_net":  g("⇅", "@"),       # web_fetch, brave_search, ssh, web_screenshot
     "cat_mcp":  g("⧉", "m"),       # any mcp__* tool
@@ -5256,14 +5256,24 @@ def _encode_image_block(path, max_edge=1568):
     return media, base64.b64encode(raw).decode()
 
 
-def _tool_result_msg(name, result):
+def _tool_result_msg(name, result, tool_call_id=""):
     """Build a role:tool message from a tool's return. A str is stored as-is
     (unchanged legacy path). A dict {text, image_path?} stores the text as
     `content` (so eviction/compaction, which key on a string content, keep
     working untouched) and carries `image_path` as a sibling key that only the
     Anthropic serializers read. On a non-vision model those serializers ignore
-    it, so images auto-strip on a mid-session model switch."""
+    it, so images auto-strip on a mid-session model switch.
+
+    `tool_call_id` (the PROVIDER's call id, e.g. 'toolu_…'/'call_…', taken from
+    the assistant's tool_calls entry - NOT the internal /expand #N) binds this
+    result to its call EXPLICITLY. Every serializer already prefers it and only
+    falls back to positional order when it's absent, so setting it makes the
+    result<->call pairing order-independent (a batched/parallel result can never
+    mis-map) instead of relying on append order. Empty for a backend (ollama/text
+    fallback) whose calls carry no id - the positional path still covers those."""
     msg = {"role": "tool", "tool_name": name}
+    if tool_call_id:
+        msg["tool_call_id"] = tool_call_id
     if isinstance(result, dict) and "text" in result:
         msg["content"] = str(result.get("text", ""))
         ip = result.get("image_path")
@@ -5929,6 +5939,26 @@ def confirm_remote_tool(cfg, host, name, args, safe=False, fetch=None):
         else:
             _print_new_file(content)
         return ask_action(cfg, f"write {path} on {host}?")
+    if name == "replace_lines":
+        path = args.get("path", "")
+        start, end = args.get("start", "?"), args.get("end", "?")
+        new_text = args.get("new_text", "")
+        old = fetch(path) if fetch else None
+        print(f"\n{label} {cyan('replace lines ' + str(start) + '-' + str(end) + ' in ' + path)}:")
+        if old is not None:
+            lines = old.splitlines(keepends=True)
+            try:
+                s, e = int(start), int(end)
+                replacement = new_text
+                if replacement and not replacement.endswith("\n") and e < len(lines):
+                    replacement += "\n"
+                new = "".join(lines[:s-1]) + replacement + "".join(lines[e:])
+                _print_diff(path, old, new)
+            except (TypeError, ValueError):
+                print(dim(f"  new_text: {new_text[:500]}"))
+        else:
+            print(dim(f"  lines {start}-{end} -> {len(new_text.splitlines())} new lines"))
+        return ask_action(cfg, f"replace lines in {path} on {host}?")
     if name == "apply_diff":
         path, diff = args.get("path", ""), args.get("diff", "")
         old = fetch(path) if fetch else None
@@ -6536,7 +6566,7 @@ class Agent:
                 print(red(f"\n! remote {host} dropped ({e}); switched to LOCAL."))
                 return (f"error: remote {host} dropped mid-command (rebooted or link "
                         f"lost); the session is now LOCAL - retry the command.")
-            if name in ("apply_diff", "write_file") and not any(
+            if name in ("apply_diff", "write_file", "replace_lines") and not any(
                     result.startswith(p) for p in
                     ("error", "operator declined", "user declined", "no changes")):
                 if args.get("path"):
@@ -6588,7 +6618,7 @@ class Agent:
             cid = self.record_tool_call(name, args)
             print(_tool_call_line(name, args, cid))
             self._maybe_auto_expand(name, cid)
-            parsed.append((name, args, cid))
+            parsed.append((name, args, cid, call.get("id", "")))
         results = [None] * len(parsed)
 
         def work(idx, name, args):
@@ -6598,18 +6628,18 @@ class Agent:
                        cyan, interval=0.12).start()
         try:
             threads = [threading.Thread(target=work, args=(i, n, a), daemon=True)
-                       for i, (n, a, _cid) in enumerate(parsed)]
+                       for i, (n, a, _cid, _tcid) in enumerate(parsed)]
             for t in threads:
                 t.start()
             for t in threads:
                 t.join()
         finally:
             spin.stop()
-        for (name, _args, cid), result in zip(parsed, results):
+        for (name, _args, cid, tcid), result in zip(parsed, results):
             self.record_tool_result(cid, result)
             if _TTY:
                 print(_tool_result_preview(name, result, cid))
-            self.messages.append(_tool_result_msg(name, result))
+            self.messages.append(_tool_result_msg(name, result, tool_call_id=tcid))
 
     @contextmanager
     def _sigint_guard(self):
@@ -7673,7 +7703,8 @@ class Agent:
                 self.record_tool_result(cid, result)
                 if _TTY:
                     print(_tool_result_preview(name, result, cid))
-                self.messages.append(_tool_result_msg(name, result))
+                self.messages.append(_tool_result_msg(name, result,
+                                                      tool_call_id=call.get("id", "")))
         print(yellow(f"\n{GLYPH['warn']} hit {cap}-iteration cap; stopping this turn. "
                      f"Refine your request or continue, or raise the limit: "
                      f"/set -> max_iterations (0 = unlimited), or set "
@@ -7783,7 +7814,7 @@ def _fmt_args(args: dict) -> str:
 # confirms the outcome. Collapsed to a compact size hint (…Nc/ML) for EVERY tool,
 # so a custom lean-tool with a 'content'/'body' arg benefits too. /expand shows full.
 _BLOB_ARGS = frozenset({
-    "content", "diff", "plan", "new_str", "old_str", "text", "body", "patch"})
+    "content", "diff", "plan", "new_str", "old_str", "text", "body", "patch", "new_text"})
 # Where a write-tier tool keeps its target path (checked in order). The call line
 # shows just the BASENAME - the result preview carries the authoritative full path.
 _PATH_ARGS = ("path", "file_path", "filename", "file", "target")
