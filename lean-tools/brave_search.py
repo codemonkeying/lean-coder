@@ -27,6 +27,8 @@ TOOL = {
         "properties": {
             "query": {"type": "string"},
             "count": {"type": "integer", "description": "max results, default 8"},
+            "freshness": {"type": "string", "description": "time filter: 'pd' (past day), 'pw' (past week), 'pm' (past month), 'py' (past year), or a date range 'YYYY-MM-DDtoYYYY-MM-DD'."},
+            "offset": {"type": "integer", "description": "result offset for paging (default 0). Use to get the next page of results."},
         },
         "required": ["query"],
     },
@@ -92,19 +94,40 @@ def run(args, cwd):
         return (f"error: brave_search needs a Brave API key - put it in "
                 f"{KEY_FILE} (or set {KEY_ENV}). Free tier at "
                 f"search.brave.com/app/keys.")
-    url = BRAVE_URL + "?" + urlencode({"q": query, "count": count})
+    params = {"q": query, "count": count}
+    freshness = (args.get("freshness") or "").strip()
+    if freshness:
+        params["freshness"] = freshness
+    offset = args.get("offset")
+    if offset:
+        try:
+            params["offset"] = max(0, int(offset))
+        except (TypeError, ValueError):
+            pass
+    url = BRAVE_URL + "?" + urlencode(params)
     req = urllib.request.Request(url, headers={
         "Accept": "application/json",
         "Accept-Encoding": "identity",
         "X-Subscription-Token": key,
         "User-Agent": UA,
     })
-    try:
-        with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
-            payload = json.loads(r.read(2_000_000).decode("utf-8", "replace"))
-    except urllib.error.HTTPError as e:
-        hint = f" - check {KEY_ENV}" if e.code in (401, 403, 422) else ""
-        return f"error: Brave search HTTP {e.code} {e.reason}{hint}"
-    except Exception as e:
-        return f"error: Brave search failed: {e}"
+    import time
+    payload = None
+    last_err = None
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
+                payload = json.loads(r.read(2_000_000).decode("utf-8", "replace"))
+            break
+        except urllib.error.HTTPError as e:
+            if e.code == 429 and attempt < 2:
+                time.sleep(1.5 * (attempt + 1))
+                last_err = e
+                continue
+            hint = f" - check {KEY_ENV}" if e.code in (401, 403, 422) else ""
+            return f"error: Brave search HTTP {e.code} {e.reason}{hint}"
+        except Exception as e:
+            return f"error: Brave search failed: {e}"
+    if payload is None:
+        return f"error: Brave search rate-limited after retries (HTTP {last_err.code})"
     return f"[search] {query}\n{format_results(payload, count)}"
