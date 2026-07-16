@@ -2943,7 +2943,7 @@ class Composer:
         # input box: the buffer wrapped across INPUT_ROWS rows (grows to the cap
         # then scrolls to keep the cursor visible). Newlines render as a glyph so a
         # pasted multi-line buffer wraps by width instead of breaking the layout.
-        prompt = GLYPH["prompt"] + " "
+        prompt = self._prompt_glyph() + " "
         disp = self.buf.replace("\n", GLYPH["ret"])
         irows, cur_row, cur_col = self.wrap_buffer(disp, prompt, cols, self.INPUT_ROWS,
                                                    cursor=self.cur)
