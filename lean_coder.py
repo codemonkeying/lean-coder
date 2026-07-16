@@ -86,7 +86,7 @@ def _prehandover_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.6.0"
+__version__ = "0.7.0"
 
 
 def _prerelease_key(pre):
@@ -157,7 +157,11 @@ DEFAULT_IGNORES = [
 SYSTEM_PROMPT = (
     "You are a precise code editor. Read files, make targeted edits with "
     "apply_diff, and run commands when needed. Be concise - output only what "
-    "changed; don't explain unless asked."
+    "changed; don't explain unless asked. "
+    "The operator sees your prose and a ONE-LINE truncated preview of each tool "
+    "result - not the full output. When they ask for information a tool produced "
+    "(a status, a value, a file's contents), relay the relevant part in your reply; "
+    "never run a tool and then answer as if they saw its output."
 )
 
 HANDOVER_MARK = "===HANDOVER==="    # the visible delimiter the model wraps its handover in
@@ -1967,10 +1971,18 @@ def g(uni: str, alt: str) -> str:
 GLYPH = {
     "prompt":   g("›", ">"),
     "bullet":   g("●", "*"),       # assistant message
-    "tool":     g("⚙", "*"),       # a tool call
+    "tool":     g("⚙", "*"),       # a tool call (uncategorised / fallback)
     "bg":       g("⚡", "&"),       # a backgrounded (detached) run_command
     "warn":     g("⚠", "!"),
     "edit":     g("✎", "*"),       # files changed
+    # Per-CATEGORY call-line icons (derived from tool tiering, not per-tool): the eye
+    # scans "read/write/run/net/mcp/meta" at a glance. Each has an ASCII fallback.
+    "cat_read": g("◎", "r"),       # read_file, list_files, search_files, safe lean-tools
+    "cat_write": g("✎", "w"),      # apply_diff, write_file
+    "cat_exec": g("»", "$"),       # run_command, shell_session, ask_user_to_run
+    "cat_net":  g("⇅", "@"),       # web_fetch, brave_search, ssh, web_screenshot
+    "cat_mcp":  g("⧉", "m"),       # any mcp__* tool
+    "cat_meta": g("◇", "-"),       # update_plan, note, request_handover
     "ok":       g("✓", "+"),
     "no":       g("✗", "x"),
     "think":    g("💭", "..."),    # reasoning
@@ -4916,10 +4928,11 @@ def _confirm_action(cfg, kind: str, **info) -> bool:
         # it's just noise scrolling past. Collapse to a one-line note; /expand shows the
         # diff on demand. The full preview is only rendered when we actually prompt (you
         # need to SEE the change to approve it).
+        # Auto-approved: no preview here. The uniform result-preview line (printed
+        # under the call line for EVERY tool) already shows the outcome + /expand, so a
+        # separate pencil note would just double up. Only the interactive prompt below
+        # renders the full diff (you must SEE a change to approve it).
         if auto_approved(cfg):
-            n = len((new or "").splitlines())
-            what = f"new file, {n} line{'s' if n != 1 else ''}" if original is None else "diff"
-            print(dim(f"  {GLYPH['edit']} {path}  ({what}; auto-approved, /expand to view)"))
             return True
         print()
         if original is None:
@@ -6516,6 +6529,8 @@ class Agent:
             spin.stop()
         for (name, _args, cid), result in zip(parsed, results):
             self.record_tool_result(cid, result)
+            if _TTY:
+                print(_tool_result_preview(name, result, cid))
             self.messages.append(_tool_result_msg(name, result))
 
     @contextmanager
@@ -7578,6 +7593,8 @@ class Agent:
                     finally:
                         spin.stop()
                 self.record_tool_result(cid, result)
+                if _TTY:
+                    print(_tool_result_preview(name, result, cid))
                 self.messages.append(_tool_result_msg(name, result))
         print(yellow(f"\n{GLYPH['warn']} hit {cap}-iteration cap; stopping this turn. "
                      f"Refine your request or continue, or raise the limit: "
@@ -7689,11 +7706,44 @@ def _is_bg_call(name: str, args: dict) -> bool:
     return name == "run_command" and str(args.get("cmd", "")).rstrip().endswith("&")
 
 
+# Lean-tools whose job is network egress (no core tier says so - they're plugins), so
+# the call line can show the 'net' category icon. A name not here just falls through to
+# its tier / the gear; missing one only costs a less-specific icon, never correctness.
+_NET_TOOLS = frozenset({
+    "web_fetch", "web_search", "brave_search", "web_screenshot", "render_url", "ssh",
+    "fetch", "curl", "http_get"})
+# Agent-internal / bookkeeping tools: no fs, no exec, no net - a distinct 'meta' icon.
+_META_TOOLS = frozenset({"update_plan", "request_handover", "note", "bg_status"})
+
+
+def _tool_category(name: str, args: dict) -> str:
+    """Coarse CATEGORY for a tool call's icon, derived from the same tiering the leash
+    uses (single source of truth) plus two small plugin-name sets. Returns one of:
+    'mcp' | 'net' | 'meta' | 'write' | 'exec' | 'read' | ''. '' = uncategorised (gear).
+    Pure (name/args only) so both the sync and parallel print paths agree."""
+    if name.startswith(MCP_NS):
+        return "mcp"
+    if name in _NET_TOOLS:
+        return "net"
+    if name in _META_TOOLS:
+        return "meta"
+    if name in _WRITE_TIER:
+        return "write"
+    if name in _EXEC_TIER or name == "ask_user_to_run":
+        return "exec"
+    if name in SAFE_TOOLS:
+        return "read"
+    return ""
+
+
 def _tool_glyph(name: str, args: dict) -> str:
     """Icon for a tool call line: a distinct 'bg' glyph when this is a backgrounded
-    (detached) run_command - a trailing '&' on the cmd - so a launch-and-detach reads
-    differently from an ordinary blocking run. Everything else gets the gear."""
-    return GLYPH["bg"] if _is_bg_call(name, args) else GLYPH["tool"]
+    (detached) run_command, else a per-CATEGORY icon (read/write/exec/net/mcp/meta)
+    derived from the tool's tier, falling back to the gear for anything uncategorised."""
+    if _is_bg_call(name, args):
+        return GLYPH["bg"]
+    cat = _tool_category(name, args)
+    return GLYPH.get(f"cat_{cat}", GLYPH["tool"]) if cat else GLYPH["tool"]
 
 
 def _tool_call_line(name: str, args: dict, call_id: int = 0) -> str:
@@ -7705,6 +7755,46 @@ def _tool_call_line(name: str, args: dict, call_id: int = 0) -> str:
     tag = "  (background)" if _is_bg_call(name, args) else ""
     idt = dim(f"  #{call_id}") if call_id else ""
     return dim(f"  {_tool_glyph(name, args)} {name}({_fmt_args(args)}){tag}") + idt
+
+
+def _result_status(text: str):
+    """(glyph_key, color_fn) for a tool result's outcome, from its text. error/exit!=0/
+    [tool error] -> 'no' (red); everything else -> 'ok' (green). Pure -> tested."""
+    s = (text or "").lstrip().lower()
+    if (s.startswith(("error", "[tool error]", "operator declined", "user declined"))
+            or s.startswith("exit ") and not s.startswith("exit 0")
+            or "traceback (most recent call last)" in s):
+        return "no", red
+    return "ok", green
+
+
+def _first_meaningful_line(text: str) -> str:
+    """The first non-empty, non-noise line of a tool result - the teaser shown under
+    the call line. Skips blank lines; collapses inner whitespace. '' for an empty
+    result (caller shows '(no output)')."""
+    for ln in (text or "").splitlines():
+        ln = ln.strip()
+        if ln:
+            return " ".join(ln.split())
+    return ""
+
+
+def _tool_result_preview(name: str, result, call_id: int = 0) -> str:
+    """The uniform ONE-LINE result preview printed UNDER a tool's call line, for EVERY
+    tool (the operator never sees full tool output otherwise). Shape: 2-space indent,
+    a status glyph (✓/✗, coloured), then the first meaningful line of the result,
+    truncated to the terminal width so it never wraps (right edge lands like the call
+    line's). `/expand N` shows the full result. `result` may be the {text,image_path}
+    dict a tool can return. Returns "" only when there is genuinely nothing to show."""
+    text = result.get("text", "") if isinstance(result, dict) else str(result or "")
+    key, color = _result_status(text)
+    first = _first_meaningful_line(text)
+    line_count = len(text.splitlines())
+    body = first if first else dim("(no output)")
+    if first and line_count > 1:
+        body += dim(f"  (+{line_count - 1} more; /expand{f' {call_id}' if call_id else ''})")
+    lead = "  " + color(GLYPH[key]) + " "
+    return "\r" + _fit_line(lead + body) + "\033[K"
 
 
 EXPAND_MAX_CHARS = 4000     # cap on /expand output so it can't flood/hang the terminal
