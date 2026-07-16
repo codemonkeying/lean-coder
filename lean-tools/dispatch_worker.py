@@ -52,15 +52,27 @@ TOOL = {
     "name": "dispatch_worker",
     "description": (
         "Hand a self-contained sub-task to a background worker agent (own session + context); "
-        "returns a pid, collect the result via /worker. For scoped errands whose output would "
-        "bloat this session - e.g. 'scout this module, report where X is handled'. Default "
-        "READ-ONLY; leash='rw'/'rwe' to let it edit/run, never above YOUR capability."),
+        "returns a pid. It runs in the BACKGROUND and its result is delivered to you "
+        "AUTOMATICALLY on a later turn - do NOT poll it (bg_status won't show workers; "
+        "don't sleep/cat its file). For scoped errands whose output would bloat this "
+        "session - e.g. 'scout this module, report where X is handled'. Default READ-ONLY; "
+        "leash='rw'/'rwe' to let it edit/run, never above YOUR capability."),
     "parameters": {
         "type": "object",
         "properties": {
+            "action": {"type": "string", "enum": ["dispatch", "status", "cancel"],
+                       "description": "What to do (default 'dispatch'): 'dispatch' launches a "
+                                      "new worker from `task`; 'status' reports your dispatched "
+                                      "workers (state, runtime, whether a result is ready) - use "
+                                      "it if you must check on one, though finished results reach "
+                                      "you automatically; 'cancel' kills the worker named by `pid`."},
+            "pid": {"type": "integer",
+                    "description": "Worker pid to act on (required for action='cancel'; optional "
+                                   "for 'status' to show just one). From the dispatch return line."},
             "task": {"type": "string",
                      "description": "Full self-contained instruction: what to do and exactly "
-                                    "what to report back (the worker has no other context)."},
+                                    "what to report back (the worker has no other context). "
+                                    "Required for action='dispatch'."},
             "model": {"type": "string",
                       "description": "Optional model for the worker's brain - ANY model on an "
                                      "ENABLED provider (see /models); its provider is inferred "
@@ -86,7 +98,7 @@ TOOL = {
                       "description": "Worker capability: r=read-only (default), rw=edit, rwe=edit+run. "
                                      "Capped at your own leash."},
         },
-        "required": ["task"],
+        "required": [],
     },
     "driver_only": True,   # spawns the worker process on the driver; never pushed remotely
     # NOT safe: dispatching a worker spends quota + runs commands, so it confirms
@@ -174,12 +186,19 @@ def _self_argv():
 
 
 def run(args, cwd):
-    task = (args.get("task") or "").strip()
-    if not task:
-        return "error: dispatch_worker needs a non-empty task."
     if "bg_launch" not in _H:
         return ("error: dispatch_worker is not initialised (its setup() did not run; "
                 "it must be enabled as a driver lean-tool).")
+    action = (args.get("action") or "dispatch").strip().lower()
+    if action == "status":
+        return _worker_status(args.get("pid"))
+    if action == "cancel":
+        return _worker_cancel(args.get("pid"))
+    if action != "dispatch":
+        return f"error: unknown action {action!r} (use dispatch | status | cancel)."
+    task = (args.get("task") or "").strip()
+    if not task:
+        return "error: dispatch_worker action='dispatch' needs a non-empty task."
 
     # Operator ceiling: concurrency.
     bg_list = _H["bg_list"]
@@ -187,7 +206,8 @@ def run(args, cwd):
     live = bg_list(kind="worker")
     if max_conc and len(live) >= max_conc:
         return (f"error: at the worker limit ({max_conc} running). Wait for one to "
-                f"finish (/worker) or raise LEANCODER_WORKER_MAX_CONCURRENT.")
+                f"finish (its result reaches you automatically) or raise "
+                f"LEANCODER_WORKER_MAX_CONCURRENT.")
 
     # Model + provider. Default: inherit the driver's current model+provider (both
     # blank -> the worker keeps whatever it activates). A `model` may be ANY model on
@@ -337,8 +357,12 @@ def run(args, cwd):
     wnote = f"on {remote['host']}" if remote else "local (driver)"
     return (f"dispatched worker pid {launched['pid']} ({mstr}, {lstr}, tools {wnote}, "
             f"cwd {wcwd}){cap_note}.\n"
-            f"It runs in the background; check it with /worker (or you'll get a finish "
-            f"notice). Result -> {result_file}")
+            f"It runs in the BACKGROUND. You do NOT need to poll for it: when it "
+            f"finishes, its result is delivered to you automatically on a later turn. "
+            f"Do NOT call bg_status (workers are hidden from it by design) and do NOT "
+            f"sleep/cat the result file by hand - just carry on with other work, or if "
+            f"you have nothing else to do, end your turn and wait for the finish notice. "
+            f"(The human can run /worker to inspect it.)")
 
 
 def _read_result(path):
@@ -395,6 +419,70 @@ def _finished_notice():
     return "[" + "\n\n".join(lines) + "]"
 
 
+def _worker_rows():
+    """{pid: bg_status row} for this session's workers, keyed by pid. Empty if none."""
+    return {r["pid"]: r for r in _H["bg_status"](os.getpid(), kind="worker")}
+
+
+def _worker_status(pid=None):
+    """MODEL-facing status of dispatched workers (the tool's action='status'). One
+    line per worker: state, runtime, result-ready flag, task teaser. `pid` narrows to
+    one. Note: finished results reach the model automatically - this is for the rare
+    case it needs to check a slow/suspect one."""
+    workers = _H["workers"]
+    if not workers:
+        return "no workers dispatched this session."
+    rows = _worker_rows()
+    if pid is not None:
+        try:
+            pid = int(pid)
+        except (TypeError, ValueError):
+            return f"error: bad pid {pid!r}."
+        meta = workers.get(pid)
+        if not meta:
+            return f"no worker with pid {pid} this session."
+        workers = {pid: meta}
+    out = []
+    for wp, meta in workers.items():
+        row = rows.get(wp)
+        state = row["state"] if row else "gone"
+        runtime = row["runtime"] if row else "?"
+        ready = _read_result(meta["result"]) is not None
+        out.append(f"pid {wp}  {state}  (ran {runtime})  "
+                   f"result {'ready' if ready else 'pending'}  {meta['model']}  "
+                   f"task: {meta['task'][:80]}")
+    return "\n".join(out)
+
+
+def _worker_cancel(pid):
+    """MODEL-facing cancel (the tool's action='cancel'): kill a still-running worker
+    by pid. An already-finished worker is a no-op (its result stands - use it). Reuses
+    the same process-group kill the human /bg kill uses."""
+    workers = _H["workers"]
+    if pid is None:
+        return "error: action='cancel' needs a pid (the worker to kill)."
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return f"error: bad pid {pid!r}."
+    meta = workers.get(pid)
+    if not meta:
+        return f"no worker with pid {pid} this session (nothing to cancel)."
+    if _read_result(meta["result"]) is not None:
+        return (f"worker {pid} already finished - its result stands; nothing to cancel. "
+                f"Use action='status' or read the result it delivered.")
+    rows = _worker_rows()
+    row = rows.get(pid)
+    if row and row["state"] != "running":
+        return f"worker {pid} is not running ({row['state']}); nothing to cancel."
+    kill = _H.get("_bg_kill")
+    if not kill:
+        return "error: no kill hook available (core too old)."
+    kill(pid)
+    meta["announced"] = True    # suppress a finish notice for a worker we deliberately killed
+    return f"cancelled worker {pid} (SIGTERM to its process group). task: {meta['task'][:80]}"
+
+
 def _worker_cmd(agent, cfg, arg):
     """/worker - list dispatched workers with state + result; /worker <pid> prints
     that worker's full result."""
@@ -431,7 +519,7 @@ def setup(lc, cfg):
     # Capture the core hooks + helpers run()/the command need (a tool's run() gets
     # no lc). setup() is driver-only = exactly where a worker is launched, so these
     # are always present when run() fires.
-    for k in ("bg_launch", "bg_list", "bg_status", "_extract_marked", "CONFIG_DIR",
+    for k in ("bg_launch", "bg_list", "bg_status", "_bg_kill", "_extract_marked", "CONFIG_DIR",
               "BRIEF_MARK", "GRANT_MARK", "RESULT_MARK", "LEASH_LEVELS", "_norm_leash",
               "active_remote", "_ssh_master_alive", "ensure_worker_master",
               "resolve_host", "_norm_host",
