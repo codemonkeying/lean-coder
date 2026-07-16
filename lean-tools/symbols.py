@@ -26,7 +26,8 @@ TOOL = {
                     "class/def (line + signature) in a file or dir; mode='def' finds where "
                     "a named class/function/method is defined. Zero-dep (stdlib ast); Python "
                     "only. Faster + more exact than search_files for 'where is X / what's in "
-                    "this file'."),
+                    "this file'. Just pass a path - the defaults do the sensible thing; on a "
+                    "big file outline auto-summarizes to top-level classes/functions."),
     "parameters": {
         "type": "object",
         "properties": {
@@ -36,6 +37,13 @@ TOOL = {
                      "description": "outline (default) = structure; def = locate a definition."},
             "name": {"type": "string",
                      "description": "For mode='def': the class/function/method name to locate."},
+            "match": {"type": "string",
+                      "description": "Optional (outline): only show symbols whose name contains "
+                                     "this text (case-insensitive). Use it to focus a big file."},
+            "depth": {"type": "string", "enum": ["top", "full"],
+                      "description": "Optional (outline): 'top' = classes + module-level defs only "
+                                     "(compact); 'full' = include nested methods. Default: auto - "
+                                     "'full', but falls back to 'top' if the output is too big."},
         },
         "required": ["path"],
     },
@@ -81,16 +89,24 @@ def _py_files(target):
     return [target] if target.suffix in (".py", ".pyi") else []
 
 
-def _outline_one(path, rel):
+def _outline_one(path, rel, top_only=False, match=None):
     try:
         tree = ast.parse(path.read_text(errors="replace"))
     except SyntaxError as e:
         return [f"{rel}: syntax error line {e.lineno}: {e.msg}"]
+    m = match.lower() if match else None
     lines = [f"{rel}:"]
     for depth, node in _walk(tree):
+        if top_only and depth > 0:
+            continue
+        if m and m not in node.name.lower():
+            continue
         lines.append(f"  {'  ' * depth}{node.lineno}: {_sig(node)}")
     if len(lines) == 1:
-        lines.append("  (no classes or functions)")
+        if m:
+            lines.append(f"  (no class/function name contains {match!r})")
+        else:
+            lines.append("  (no classes or functions)")
     return lines
 
 
@@ -136,14 +152,29 @@ def run(args, cwd):
         if not hits:
             return f"symbols: no definition of '{name}' in {rel}"
         return "\n".join(hits)
-
     if mode != "outline":
         return f"error: unknown mode {mode!r} (use outline | def)."
 
-    out = []
-    for f in files:
-        out += _outline_one(f, _disp(f, cwd))
-    body = "\n".join(out)
+    match = (args.get("match") or "").strip() or None
+    depth = (args.get("depth") or "auto").strip().lower()
+    top_only = depth == "top"
+
+    def build(top):
+        out = []
+        for f in files:
+            out += _outline_one(f, _disp(f, cwd), top_only=top, match=match)
+        return "\n".join(out)
+
+    body = build(top_only)
+    # auto mode: if the full tree overflows, retry top-level-only rather than
+    # blunt-truncating mid-symbol - a compact whole beats a chopped fragment.
+    if depth == "auto" and len(body) > _MAX:
+        compact = build(True)
+        if len(compact) <= _MAX:
+            return (compact + "\n... (methods hidden to fit; re-run with depth='full' "
+                    "on a single class/file, or use match='name' to focus)")
+        body = compact
     if len(body) > _MAX:
-        body = body[:_MAX] + "\n... (truncated; narrow the path or use mode='def')"
+        body = body[:_MAX] + ("\n... (truncated; narrow the path, add match='name', "
+                              "or use mode='def')")
     return body
