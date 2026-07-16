@@ -161,8 +161,19 @@ class Tools:
             return f"error: no such file: {path} (use write_file for new files)"
         blocks, perr = _parse_search_replace(diff)
         if perr:
-            return ("error: " + perr + "\nExpected one or more blocks:\n"
-                    "<<<<<<< SEARCH\\n<old>\\n=======\\n<new>\\n>>>>>>> REPLACE")
+            # Actionable failure: the block didn't PARSE (delimiter recognition),
+            # so re-submitting the same thing loops. Echo back what the tool actually
+            # received (head-capped) so the model can SEE the mangling, then point at
+            # the escape hatch (rewrite the whole file) rather than a dead-end format
+            # reprint. Markers must each be ALONE on their own line.
+            got = diff if len(diff) <= 400 else diff[:400] + " …[+%d chars]" % (len(diff) - 400)
+            return ("error: " + perr + "\n"
+                    "Expected one or more blocks, each marker alone on its own line:\n"
+                    "<<<<<<< SEARCH\n<exact old text>\n=======\n<new text>\n>>>>>>> REPLACE\n"
+                    "--- what apply_diff received (verify the markers are on their own "
+                    "lines, not indented or fenced) ---\n" + got + "\n"
+                    "If the markers keep failing to parse, rewrite the whole file with "
+                    "write_file instead.")
         original = p.read_text(errors="replace")
         new = original
         applied = 0
@@ -404,7 +415,7 @@ def _truncate_output(s: str) -> str:
 #  TOOLS list. tier maps to the /leash ladder - see header.)
 BUILTIN_TOOLS = [
     {"name": "read_file", "tier": "read",
-     "description": "Read a file (line-numbered); read before editing. start/end read a slice; large reads truncate.",
+     "description": "Read a file (line-numbered); read before editing. start/end read a slice; large reads truncate - use start/end to page a specific portion, or search_files to locate first. Re-reading an unchanged file wastes context; only re-read if it may have changed.",
      "parameters": {"type": "object",
         "properties": {"path": {"type": "string", "description": "File path, relative to the project dir."},
                        "start": {"type": "integer", "description": "First line to read (1-based, optional)."},
@@ -424,8 +435,8 @@ BUILTIN_TOOLS = [
     {"name": "apply_diff", "tier": "write",
      "description": ("Preferred way to edit a file: replace exact spans via SEARCH/REPLACE blocks. SEARCH must "
                      "match verbatim (read_file first); on mismatch nothing is written - re-read and retry. "
-                     "Format per block: '<<<<<<< SEARCH', old text, '=======', new text, '>>>>>>> REPLACE'. "
-                     "Multiple blocks applied in order."),
+                     "Format per block, each marker ALONE on its own line: '<<<<<<< SEARCH', old text, "
+                     "'=======', new text, '>>>>>>> REPLACE'. Multiple blocks applied in order."),
      "parameters": {"type": "object",
         "properties": {"path": {"type": "string", "description": "File to edit (must already exist)."},
                        "diff": {"type": "string", "description": "One or more SEARCH/REPLACE blocks."}},
@@ -437,7 +448,7 @@ BUILTIN_TOOLS = [
                        "content": {"type": "string", "description": "Full new contents of the file."}},
         "required": ["path", "content"]}},
     {"name": "run_command", "tier": "exec",
-     "description": "Run a non-interactive shell command (builds, tests, git, file ops); returns truncated stdout/stderr. Fresh shell each call - cd/env don't persist, chain with '&&'. For sudo/password/interactive use ask_user_to_run; for a shell that stays open use shell_session.",
+     "description": "Run a non-interactive shell command (builds, tests, git, file ops); returns stdout/stderr (truncated - if clipped, pipe to a file or use grep/head/tail to read specific parts). Fresh shell each call - cd/env don't persist, chain with '&&'. Times out (raise command_timeout in /settings; end the command with ' &' to background a long/daemon process). For sudo/password/interactive use ask_user_to_run; for a shell that stays open use shell_session.",
      "parameters": {"type": "object",
         "properties": {"cmd": {"type": "string", "description": "The shell command to run."}},
         "required": ["cmd"]}},

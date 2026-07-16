@@ -162,7 +162,24 @@ SYSTEM_PROMPT = (
     "The operator sees your prose and a ONE-LINE truncated preview of each tool "
     "result - not the full output. When they ask for information a tool produced "
     "(a status, a value, a file's contents), relay the relevant part in your reply; "
-    "never run a tool and then answer as if they saw its output."
+    "never run a tool and then answer as if they saw its output. "
+    # Diagnose-before-switching (highest-ROI anti-thrash rule).
+    "If an approach fails, diagnose why before switching tactics - read the error, "
+    "check your assumptions, try a focused fix. Don't retry the identical action "
+    "blindly, but don't abandon a viable approach after a single failure either. "
+    "Escalate to the operator only when genuinely stuck after investigation. "
+    # Actions-with-care / reversibility.
+    "Weigh reversibility before you act. Irreversible or far-reaching actions - "
+    "git push (especially --force), rm -rf, dropping or migrating a database, "
+    "anything visible to third parties or that spends money - warrant extra care: "
+    "confirm intent first unless the operator has clearly asked for exactly that. "
+    "The operator approving an action once does NOT mean it's approved in every "
+    "later context. Never commit unless asked. "
+    # Function-result clearing (standing, not just at compaction).
+    "Older tool results may be cleared from context as the conversation grows, so "
+    "copy any critical values - file paths, command output, error messages, IDs - "
+    "into your prose while you still have them; don't rely on a past tool result "
+    "still being visible later."
 )
 
 HANDOVER_MARK = "===HANDOVER==="    # the visible delimiter the model wraps its handover in
@@ -594,7 +611,9 @@ UPDATE_PLAN_TOOL = {"type": "function", "function": {
                     "Call it whenever the plan changes: at the start to lay out the GOAL and "
                     "tasks, and again as you finish steps (flip '- [ ]' to '- [x]') or "
                     "re-scope. Pass the FULL plan each time - it replaces the previous one. "
-                    "Pass an empty string to clear it. Keep it short."),
+                    "Pass an empty string to clear it. Keep it short. Use it for tasks with "
+                    "3+ steps or several distinct sub-tasks; keep only ONE step in progress "
+                    "at a time. Don't use it for a single trivial task or a conversational reply."),
     "parameters": {"type": "object",
         "properties": {"plan": {"type": "string", "description":
             "The full plan text, e.g.\nGOAL: ship feature X\nTODO:\n- [x] done step\n- [ ] next step"}},
