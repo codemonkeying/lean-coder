@@ -106,6 +106,16 @@ def _def_one(path, rel, name):
     return hits
 
 
+def _disp(f, cwd):
+    """A short display path for a file: relative to cwd when it's under it, else the
+    path as-is. relative_to() raises for a file OUTSIDE cwd (e.g. an absolute /tmp
+    path while cwd is /home/user), so guard it - that ValueError was crashing the tool."""
+    try:
+        return str(f.relative_to(cwd))
+    except ValueError:
+        return str(f)
+
+
 def run(args, cwd):
     rel = (args.get("path") or "").strip()
     target = Path(cwd) / rel
@@ -122,7 +132,7 @@ def run(args, cwd):
             return "error: mode='def' needs a name (the definition to locate)."
         hits = []
         for f in files:
-            hits += _def_one(f, str(f.relative_to(cwd) if f.is_absolute() else f), name)
+            hits += _def_one(f, _disp(f, cwd), name)
         if not hits:
             return f"symbols: no definition of '{name}' in {rel}"
         return "\n".join(hits)
@@ -132,7 +142,7 @@ def run(args, cwd):
 
     out = []
     for f in files:
-        out += _outline_one(f, str(f.relative_to(cwd) if f.is_absolute() else f))
+        out += _outline_one(f, _disp(f, cwd))
     body = "\n".join(out)
     if len(body) > _MAX:
         body = body[:_MAX] + "\n... (truncated; narrow the path or use mode='def')"
