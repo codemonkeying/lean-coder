@@ -5,9 +5,14 @@ the feedback-loop tool: lint the file you just edited, fix what it reports.
 Picks the first installed linter for the file's language:
   Python: ruff -> pyflakes -> py_compile   JS/TS: tsc / eslint
   Go: go vet                               Rust: cargo clippy
+  PHP: php -l                              Shell: shellcheck -> bash -n
+  Ruby: ruby -c                            C/C++: gcc/g++ -fsyntax-only
+  Java: javac -Xlint                       CSS: stylelint
+  JSON: python -m json.tool                YAML: yamllint
+  Markdown: markdownlint
 Read-only (safe): it never modifies files. Whatever linters are installed on the
 machine that runs the tool (local, or the remote executor when /connect'd) are
-what it uses - so install ruff/eslint/etc. where the code lives.
+what it uses - no linters are pushed or installed, only what's already there.
 """
 import importlib.util
 import shutil
@@ -28,17 +33,46 @@ TOOL = {
 
 _PY = sys.executable
 _LINTERS = {
-    ".py":  [["ruff", "check"], [_PY, "-m", "pyflakes"], [_PY, "-m", "py_compile"]],
-    ".pyi": [["ruff", "check"]],
-    ".ts":  [["npx", "--no-install", "tsc", "--noEmit"]],
-    ".tsx": [["npx", "--no-install", "tsc", "--noEmit"]],
-    ".js":  [["npx", "--no-install", "eslint"], ["node", "--check"]],
-    ".jsx": [["npx", "--no-install", "eslint"]],
-    ".go":  [["go", "vet"]],
-    ".rs":  [["cargo", "clippy", "-q"]],
+    # Python
+    ".py":   [["ruff", "check"], [_PY, "-m", "pyflakes"], [_PY, "-m", "py_compile"]],
+    ".pyi":  [["ruff", "check"]],
+    # JavaScript / TypeScript
+    ".ts":   [["npx", "--no-install", "tsc", "--noEmit"]],
+    ".tsx":  [["npx", "--no-install", "tsc", "--noEmit"]],
+    ".js":   [["npx", "--no-install", "eslint"], ["node", "--check"]],
+    ".jsx":  [["npx", "--no-install", "eslint"]],
+    # Go / Rust
+    ".go":   [["go", "vet"]],
+    ".rs":   [["cargo", "clippy", "-q"]],
+    # PHP
+    ".php":  [["php", "-l"]],
+    # Shell
+    ".sh":   [["shellcheck"], ["bash", "-n"]],
+    ".bash": [["shellcheck"], ["bash", "-n"]],
+    ".zsh":  [["shellcheck", "-s", "bash"], ["zsh", "-n"]],
+    # Ruby
+    ".rb":   [["ruby", "-c"]],
+    # C / C++
+    ".c":    [["gcc", "-fsyntax-only", "-Wall"]],
+    ".h":    [["gcc", "-fsyntax-only", "-Wall"]],
+    ".cpp":  [["g++", "-fsyntax-only", "-Wall"]],
+    ".cc":   [["g++", "-fsyntax-only", "-Wall"]],
+    ".hpp":  [["g++", "-fsyntax-only", "-Wall"]],
+    # Java
+    ".java": [["javac", "-Xlint", "-d", "/tmp"]],
+    # CSS
+    ".css":  [["npx", "--no-install", "stylelint"]],
+    ".scss": [["npx", "--no-install", "stylelint"]],
+    # Data formats
+    ".json": [[_PY, "-m", "json.tool"]],
+    ".yaml": [["yamllint"]],
+    ".yml":  [["yamllint"]],
+    # Markdown
+    ".md":   [["markdownlint"]],
 }
 # tried when the target is a directory (project-wide)
-_DIR_LINTERS = [["ruff", "check"], ["npx", "--no-install", "eslint", "."]]
+_DIR_LINTERS = [["ruff", "check"], ["npx", "--no-install", "eslint", "."],
+                ["php", "-l"], ["shellcheck"]]
 
 
 def _module_available(mod):

@@ -34,6 +34,7 @@ TOOL = {
             "find": {"type": "string", "description": "return only sections matching this regex/substring"},
             "links": {"type": "boolean", "description": "return just the page's links"},
             "start": {"type": "integer", "description": "char offset into the text (page long docs)"},
+            "headers": {"type": "object", "description": "extra HTTP headers as {name: value} (e.g. Authorization, Cookie)."},
         },
         "required": ["url"],
     },
@@ -257,8 +258,11 @@ def normalize_url(url):
     return None
 
 
-def _fetch(url):
-    req = urllib.request.Request(url, headers={"User-Agent": UA})
+def _fetch(url, extra_headers=None):
+    hdrs = {"User-Agent": UA}
+    if extra_headers and isinstance(extra_headers, dict):
+        hdrs.update(extra_headers)
+    req = urllib.request.Request(url, headers=hdrs)
     with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
         return r.read(MAX_BYTES + 1), r.headers.get("Content-Type", "?"), r.geturl()
 
@@ -268,8 +272,9 @@ def run(args, cwd):
     if not url:
         return ("error: web_fetch needs a valid http(s) url "
                 "(use brave_search to find one).")
+    extra_headers = args.get("headers") or None
     try:
-        data, ctype, final = _fetch(url)
+        data, ctype, final = _fetch(url, extra_headers)
     except urllib.error.HTTPError as e:
         return f"error: HTTP {e.code} {e.reason}"
     except (urllib.error.URLError, OSError, ValueError) as e:

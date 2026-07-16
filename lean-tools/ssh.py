@@ -17,7 +17,13 @@ TOOL = {
     "description": "Run a non-interactive command on a remote host over SSH; returns stdout/stderr.",
     "parameters": {
         "type": "object",
-        "properties": {"host": {"type": "string"}, "cmd": {"type": "string"}},
+        "properties": {
+            "host": {"type": "string"},
+            "cmd": {"type": "string"},
+            "port": {"type": "integer", "description": "SSH port (default 22)."},
+            "identity": {"type": "string", "description": "Path to private key file (passed as -i)."},
+            "timeout": {"type": "integer", "description": "Command timeout in seconds (default 300)."},
+        },
         "required": ["host", "cmd"],
     },
     # no "safe": runs a remote command, so it goes through the confirm gate
@@ -28,14 +34,28 @@ def run(args, cwd):
     host, cmd = args.get("host", ""), args.get("cmd", "")
     if not host or not cmd:
         return "error: ssh needs both 'host' and 'cmd'"
+    port = args.get("port")
+    identity = (args.get("identity") or "").strip()
+    try:
+        cmd_timeout = max(10, int(args.get("timeout") or 300))
+    except (TypeError, ValueError):
+        cmd_timeout = 300
     # one-shot only: BatchMode fails fast instead of hanging on a prompt; no PTY.
-    argv = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
-            "-o", "StrictHostKeyChecking=accept-new", host, cmd]
+    argv = ["ssh", "-o", "BatchMode=yes", "-o", f"ConnectTimeout=10",
+            "-o", "StrictHostKeyChecking=accept-new"]
+    if port:
+        try:
+            argv += ["-p", str(int(port))]
+        except (TypeError, ValueError):
+            return f"error: invalid port {port!r}"
+    if identity:
+        argv += ["-i", identity]
+    argv += [host, cmd]
     try:
         r = subprocess.run(argv, shell=False, capture_output=True,
-                           text=True, timeout=300)
+                           text=True, timeout=cmd_timeout)
     except subprocess.TimeoutExpired:
-        return "error: ssh timed out after 300s"
+        return f"error: ssh timed out after {cmd_timeout}s"
     except Exception as e:
         return f"error running ssh: {e}"
     out = ""
