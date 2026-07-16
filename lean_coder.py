@@ -7939,7 +7939,7 @@ def _render_tool_call(entry: dict, cap: int = EXPAND_MAX_CHARS) -> str:
 # ----------------------------------------------------------------------------
 
 SLASH_COMMANDS = ["/clear", "/new", "/compact", "/handover", "/session", "/save", "/load",
-                  "/prompt", "/sh", "/connect", "/local", "/tools", "/reload",
+                  "/prompt", "/sh", "/connect", "/machines", "/local", "/tools", "/reload",
                   "/model", "/provider", "/think", "/effort",
                   "/set", "/usage", "/approve", "/leash", "/autosave", "/incognito",
                   "/askread", "/bg", "/mcp", "/info", "/ctx", "/activity", "/expand", "/help", "/quit"]
@@ -8816,7 +8816,13 @@ def _arg_completions(agent, cfg, cmd):
         except Exception:
             return []
     if cmd == "/connect":
-        return sorted(set(list(cfg.connect_hosts) + list(getattr(agent, "remotes", {}))))
+        return ["remove"] + sorted(set(list(cfg.connect_hosts) + list(getattr(agent, "remotes", {}))))
+    if cmd == "/connect remove":
+        return sorted(cfg.connect_hosts)
+    if cmd == "/machines":
+        return ["remove"]
+    if cmd == "/machines remove":
+        return sorted(cfg.machines)
     if cmd in ("/local", "/disconnect"):
         return list(getattr(agent, "remotes", {}))
     if cmd == "/prompt":
@@ -10283,7 +10289,8 @@ def handle_new_command(agent, cfg, arg):
 def handle_connect_command(agent, cfg, arg):
     """/connect <[user@]host> [remote-path] - enter/switch a remote workspace: all
     file/exec tools then run there, transparently to the model. Bare /connect with saved
-    [connect] hosts (or open ones) opens a menu. Any failure leaves you where you were."""
+    [connect] hosts (or open ones) opens a menu. /connect remove <name> forgets a saved
+    target. Any failure leaves you where you were."""
     if not arg:
         if cfg.connect_hosts or agent.remotes:
             active = agent.remote.host if agent.remote else None
@@ -10295,12 +10302,70 @@ def handle_connect_command(agent, cfg, arg):
         else:
             print(dim("usage: /connect <[user@]host> [remote-path]  "
                       "(or add a [connect] section to the config)"))
+    elif arg.split(maxsplit=1)[0] == "remove":
+        _connect_remove(agent, cfg, arg.split(maxsplit=1)[1].strip() if len(arg.split(maxsplit=1)) > 1 else "")
     else:
         sp = arg.split(maxsplit=1)
         # a bare token may be a saved [connect] name -> resolve to its target
         rhost = cfg.connect_hosts.get(sp[0], sp[0])
         rpath = sp[1] if len(sp) > 1 else "."
         _do_connect(agent, cfg, rhost, rpath, offer_save=True)
+
+
+def _connect_remove(agent, cfg, name):
+    """/connect remove <name> - forget a saved [connect] target. If it's the host the
+    session is CURRENTLY connected to, the live connection stays up (tools keep running
+    there); only the saved alias is dropped, with a note saying so."""
+    if not name:
+        if not cfg.connect_hosts:
+            print(dim("no saved connect targets to remove."))
+            return
+        print(dim("usage: /connect remove <name>   (saved: "
+                  + ", ".join(sorted(cfg.connect_hosts)) + ")"))
+        return
+    if name not in cfg.connect_hosts:
+        print(red(f"no saved connect target named {name!r} "
+                  f"(saved: {', '.join(sorted(cfg.connect_hosts)) or 'none'})."))
+        return
+    target = cfg.connect_hosts.pop(name)
+    save_config(cfg)
+    active = agent.remote.host if getattr(agent, "remote", None) else None
+    if active and active in (name, target):
+        print(green(f"removed saved connect target '{name}'."))
+        print(yellow(f"  note: still CONNECTED to {active} for this session "
+                     f"(tools keep running there); the alias is just no longer saved. "
+                     f"/local to detach."))
+    else:
+        print(green(f"removed saved connect target '{name}' -> {target}."))
+
+
+def handle_machines_command(agent, cfg, arg):
+    """/machines - list the saved [machines] name->url aliases; /machines remove <name>
+    forgets one. Aliases are added by editing the config's [machines] table; this command
+    exists so a saved alias can be dropped without hand-editing the TOML."""
+    sp = arg.split(maxsplit=1)
+    sub = sp[0] if sp else ""
+    if sub == "remove":
+        name = sp[1].strip() if len(sp) > 1 else ""
+        if not name:
+            print(dim("usage: /machines remove <name>   (saved: "
+                      + (", ".join(sorted(cfg.machines)) or "none") + ")"))
+            return
+        if name not in cfg.machines:
+            print(red(f"no machine alias named {name!r} "
+                      f"(saved: {', '.join(sorted(cfg.machines)) or 'none'})."))
+            return
+        url = cfg.machines.pop(name)
+        save_config(cfg)
+        print(green(f"removed machine alias '{name}' -> {url}."))
+        return
+    if not cfg.machines:
+        print(dim("no saved machine aliases. Add them via a [machines] table in the config."))
+        return
+    print(bold("machines:"))
+    for name, url in sorted(cfg.machines.items()):
+        print(f"  {cyan(name)}  {dim(url)}")
+    print(dim("  /machines remove <name> forgets one"))
 
 
 def handle_tools_command(agent, cfg, arg):
@@ -10676,6 +10741,7 @@ _BUILTIN_COMMANDS_TABLE = {
     "/prompt": handle_prompt_command,
     "/sh": run_sh_command,
     "/connect": handle_connect_command,
+    "/machines": handle_machines_command,
     "/tools": handle_tools_command,
     "/mcp": handle_mcp_command,
     "/reload": handle_reload_command,
