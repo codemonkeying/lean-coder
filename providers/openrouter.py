@@ -27,6 +27,10 @@ _cfg        = None   # read-only cfg ref (for the /model listing filter)
 # Privacy posture shown at the point of use (on connect + in /usage).
 _PRIVACY    = "OpenRouter won't train on prompts, but free models route to upstream providers whose terms vary - avoid sensitive code"
 _PRIVACY_HI = True   # medium risk -> yellow
+# Show the on-activate identity + privacy banner? Off by default (the core
+# 'provider: <name>  model: <model>' line already announces the backend). NOTE:
+# this provider's privacy note is medium-risk - consider True to keep it visible.
+_SHOW_BANNER = False
 
 
 # ----------------------------------------------------------------------------
@@ -616,9 +620,10 @@ def _on_activate(agent, cfg):
         cfg.set_setting("effort", "med")
     if cfg.setting("tier") is None:
         cfg.set_setting("tier", "all")
-    key    = _api_key()
-    masked = f"{key[:12]}...{key[-4:]}" if key and len(key) > 16 else "(env)"
-    print(_lc["dim"](f"  OpenRouter key  {masked}"))
+    if _SHOW_BANNER:
+        key    = _api_key()
+        masked = f"{key[:12]}...{key[-4:]}" if key and len(key) > 16 else "(env)"
+        print(_lc["dim"](f"  OpenRouter key  {masked}"))
     if (cfg.setting("tier") or "all") != "all":
         print(_lc["dim"]("  free tier: only :free models listed; /set tier all for paid, /set or_filter <text> to narrow"))
     else:
@@ -628,7 +633,8 @@ def _on_activate(agent, cfg):
         print(_lc["dim"](f"  fallback chain: {cfg.active_model()} -> {fb}  (/set or_fallback '' to disable)"))
     else:
         print(_lc["dim"]("  /set or_fallback 'openai/gpt-5,google/gemini-3-pro' for auto cross-model fallback on outage/ratelimit"))
-    print(_privacy_note())
+    if _SHOW_BANNER:
+        print(_privacy_note())
     d = _cred_data()
     d["active"] = True
     if d.get("key") or _cred_path().is_file():

@@ -7731,6 +7731,43 @@ def _fmt_args(args: dict) -> str:
     return ", ".join(parts)
 
 
+# Arg keys that carry a large content BLOB (file bodies, diffs, plans). On a call
+# line these are pure noise - the value is huge and the RESULT preview already
+# confirms the outcome. Collapsed to a compact size hint (…Nc/ML) for EVERY tool,
+# so a custom lean-tool with a 'content'/'body' arg benefits too. /expand shows full.
+_BLOB_ARGS = frozenset({
+    "content", "diff", "plan", "new_str", "old_str", "text", "body", "patch"})
+# Where a write-tier tool keeps its target path (checked in order). The call line
+# shows just the BASENAME - the result preview carries the authoritative full path.
+_PATH_ARGS = ("path", "file_path", "filename", "file", "target")
+
+
+def _fmt_call_args(name: str, args: dict) -> str:
+    """Category-aware TERSE args for a tool CALL line (not /expand, which is full).
+    WRITE-tier tools (write_file, apply_diff, …) collapse to just the target's
+    basename - the path + fact-of-write live on the result line, repeating them on
+    the call line is noise. Every other tier keeps its args (a read path, a
+    run_command cmd, a url are all load-bearing) but any large content BLOB
+    (content=/diff=/plan=…) collapses to a size hint so it can't swamp the line.
+    Uniform: driven by _tool_category + the blob-key set, no per-tool special-case."""
+    if _tool_category(name, args) == "write":
+        for k in _PATH_ARGS:
+            if args.get(k):
+                return os.path.basename(str(args[k]).rstrip("/")) or str(args[k])
+        # no recognisable path arg - fall through to the generic (blob-collapsed) form
+    parts = []
+    for k, v in args.items():
+        if k in _BLOB_ARGS:
+            s = str(v)
+            parts.append(f"{k}=…{len(s)}c/{s.count(chr(10)) + 1}L")
+            continue
+        s = str(v).replace("\n", GLYPH["ret"])
+        if len(s) > 50:
+            s = s[:50] + "…"
+        parts.append(f"{k}={s}")
+    return ", ".join(parts)
+
+
 def _is_bg_call(name: str, args: dict) -> bool:
     """True when this is a backgrounded (detached) run_command - a trailing '&' on
     the cmd."""
@@ -7804,8 +7841,17 @@ def _tool_call_line(name: str, args: dict, call_id: int = 0) -> str:
     >0) is shown as a '#N' tag so `/expand N` can re-render the full (untruncated)
     args; bare `/expand` targets the newest."""
     tag = "  (background)" if _is_bg_call(name, args) else ""
-    idt = dim(f"  #{call_id}") if call_id else ""
-    return dim(f"  {_tool_glyph(name, args)} {name}({_fmt_args(args)}){tag}") + idt
+    body = dim(f"  {_tool_glyph(name, args)} {name}({_fmt_call_args(name, args)}){tag}")
+    if not call_id:
+        return _fit_line(body)
+    # Pin '#N' to the right INSIDE the width budget: reserve its visible width
+    # ("  #N"), fit the rest to width-minus-that, then append it. So on a narrow
+    # line the args truncate with '…' but the '#N' (how /expand targets a call)
+    # always survives - it never orphans onto a wrapped second physical line.
+    idt = dim(f"  #{call_id}")
+    reserve = len(f"  #{call_id}")
+    width = max(1, _term_cols() - 1)
+    return _fit_line(body, max(1, width - reserve)) + idt
 
 
 def _result_status(text: str):
@@ -8859,10 +8905,23 @@ def handle_save_command(agent, cfg, arg):
     """/save [name] - snapshot the current conversation under a name. No arg
     prompts for one. Config persists automatically and is NOT what /save means
     any more (autosave handles it)."""
-    if not any(m.get("role") != "system" for m in agent.messages):
-        print(yellow("nothing to save (conversation is empty)."))
-        return
     name = arg.strip()
+    if not any(m.get("role") != "system" for m in agent.messages):
+        # Empty conversation: a bare `/save` has nothing to snapshot, but an
+        # explicit `/save <name>` CLAIMS that name - retarget autosave so the next
+        # real turn (and the on-exit autosave) lands under it. No empty file written.
+        if not name:
+            print(yellow("nothing to save (conversation is empty)."))
+            return
+        if not _session_name_ok(name):
+            print(red(f"invalid session name: {name!r}"))
+            return
+        if cfg.incognito:
+            print(yellow("incognito: not autosaving; name not claimed."))
+            return
+        agent.autosave_name = name
+        print(green(f"will autosave this session as '{name}' once it has content."))
+        return
     if not name:
         default = time.strftime("%Y-%m-%d-%H%M")
         try:
@@ -8952,7 +9011,7 @@ def _print_session_tail(messages, n: int = 4, width: int = 100):
     if not body:
         return
     tail = body[-n:]
-    print(dim(f"  recent context ({len(tail)} of {len(body)} messages):"))
+    print(yellow(f"  recent context ({len(tail)} of {len(body)} messages):"))
     for m in tail:
         role = m.get("role", "?")
         if role == "user":
@@ -10812,25 +10871,31 @@ def repl(cfg: Config, resume=None):
     _setup_readline(agent, cfg)
 
     location = _provider_label(cfg)
-    overhead = messages_tokens([agent.messages[0]], agent.tool_defs)
-    print(bold("lean-coder") + dim(f"  {cfg.active_model()} @ {location}"))
-    print(dim(f"  cwd: {cfg.cwd}"))
-    _badge = approval_badge(cfg)
-    print(dim(f"  num_ctx: {cfg.ctx_window():,} ({ctx_note})  {GLYPH['dot']}  baseline overhead "
-              f"(system + {len(agent.tool_defs)} tools): ~{overhead} tokens")
-          + (dim(f"  {GLYPH['dot']}  ") + _badge if _badge else ""))
-    if capped_from:
-        print(yellow(f"  note: model max is {capped_from:,}; capped to "
-                     f"{AUTO_CTX_CAP:,} to avoid OOM - pass --num-ctx to raise it."))
-    # Composer state on the banner: a broken input channel can't paste diagnostics
-    # back, so the program self-reports WHY the pinned input is or isn't active.
-    if not cfg.composer:
-        _comp_state = "off (composer=false / --no-composer)"
-    elif not (_TTY and sys.stdin.isatty()):
-        _comp_state = "off (no tty: stdout/stdin not a terminal)"
-    else:
-        _comp_state = "on (pinned input)"
-    print(dim(f"  composer: {_comp_state}"))
+
+    def _print_full_banner():
+        """The orientation banner (model, cwd, num_ctx, composer). Printed on a FRESH
+        start; SUPPRESSED when a session is resumed, since the always-on status rows
+        already carry model @ provider / session / tools / ctx - so a resume ends on the
+        'resumed …' line + the 3 status rows, not a wall of repeated state."""
+        overhead = messages_tokens([agent.messages[0]], agent.tool_defs)
+        print(bold("lean-coder") + dim(f"  {cfg.active_model()} @ {location}"))
+        print(dim(f"  cwd: {cfg.cwd}"))
+        _badge = approval_badge(cfg)
+        print(dim(f"  num_ctx: {cfg.ctx_window():,} ({ctx_note})  {GLYPH['dot']}  baseline overhead "
+                  f"(system + {len(agent.tool_defs)} tools): ~{overhead} tokens")
+              + (dim(f"  {GLYPH['dot']}  ") + _badge if _badge else ""))
+        if capped_from:
+            print(yellow(f"  note: model max is {capped_from:,}; capped to "
+                         f"{AUTO_CTX_CAP:,} to avoid OOM - pass --num-ctx to raise it."))
+        # Composer state: a broken input channel can't paste diagnostics back, so the
+        # program self-reports WHY the pinned input is or isn't active.
+        if not cfg.composer:
+            _comp_state = "off (composer=false / --no-composer)"
+        elif not (_TTY and sys.stdin.isatty()):
+            _comp_state = "off (no tty: stdout/stdin not a terminal)"
+        else:
+            _comp_state = "on (pinned input)"
+        print(dim(f"  composer: {_comp_state}"))
 
     def _take_over_or_fork(name) -> bool:
         """If `name` is held live by another instance, ask whether to take it over.
@@ -10844,14 +10909,19 @@ def repl(cfg: Config, resume=None):
         print(dim("  starting a fresh session here instead."))
         return False
 
-    state_shown = False
+    # A resumed session ENDS on the 'resumed …' instruction line (the last thing the
+    # user is likely to read), then the always-on 3-row status bar carries model /
+    # session / tools / ctx / perms - so we skip the full orientation banner, the
+    # per-session state read-out, and the trailing session/help lines (all of which
+    # the status rows already show). A FRESH start prints the full banner instead.
+    resumed = False
     if resume:
         try:
             if not _take_over_or_fork(resume):
                 raise FileNotFoundError  # decline -> fall through to a clean start
             data = load_session(resume)
             meta = data.get("meta", {})
-            state = _restore_session_state(agent, cfg, meta)  # backend/model/perms
+            _restore_session_state(agent, cfg, meta)  # backend/model/perms
             msgs = data.get("messages", [])
             n = agent.restore(msgs)
             # Continue IN the resumed session (named or auto-): further work autosaves
@@ -10859,11 +10929,11 @@ def repl(cfg: Config, resume=None):
             agent.autosave_name = _session_name_ok(resume)
             if not cfg.incognito:
                 _write_lock(agent.autosave_name)   # claim it now (take-over is real)
-            print(green(f"resumed '{_session_name_ok(resume)}'  {GLYPH['dot']}  {n} turns  "
-                        f"{GLYPH['dot']}  saved {meta.get('saved_at', '?')}"))
-            _print_session_tail(msgs)
-            _print_session_state(state); state_shown = True
             _maybe_reconnect(agent, cfg, meta)
+            _print_session_tail(msgs)
+            print(yellow(f"  resumed '{_session_name_ok(resume)}' ({n} turns) - "
+                         f"/clear for a fresh one, /load to switch.") + "\n")
+            resumed = True
         except FileNotFoundError:
             print(yellow(f"--resume: no such session '{resume}' "
                          f"(starting fresh; /load to see saved ones)"))
@@ -10888,34 +10958,35 @@ def repl(cfg: Config, resume=None):
             try:
                 data = load_session(last)
                 meta = data.get("meta", {})
-                state = _restore_session_state(agent, cfg, meta)
+                _restore_session_state(agent, cfg, meta)
                 msgs = data.get("messages", [])
                 n = agent.restore(msgs)
                 # Continue IN the resumed session (named or auto-) so it stays current;
                 # claim its lock now so the first autosave owns it.
                 agent.autosave_name = _session_name_ok(last)
                 _write_lock(agent.autosave_name)
-                print(dim(f"resumed last session '{last}' ({n} turns) - "
-                          f"/clear for a fresh one, /load to switch."))
-                other = meta.get("cwd")
-                if other and other != here:
-                    print(dim(f"  (last used in {other})"))
-                _print_session_tail(msgs)
-                _print_session_state(state); state_shown = True
                 _maybe_reconnect(agent, cfg, meta)
+                _print_session_tail(msgs)
+                other = meta.get("cwd")
+                cwd_note = f"  (last used in {other})" if other and other != here else ""
+                print(yellow(f"  resumed last session '{last}' ({n} turns) - "
+                             f"/clear for a fresh one, /load to switch.") + dim(cwd_note) + "\n")
+                resumed = True
             except (FileNotFoundError, OSError, json.JSONDecodeError):
                 pass
 
-    if cfg.incognito:
-        print(magenta(f"  session: {GLYPH['ghost']} incognito")
-              + dim(" (not saved locally; provider may still log)"))
-    else:
-        _sess_state = (f"autosaving -> {agent.autosave_name}" if cfg.autosave
-                       else "off (amnesic)  /autosave on to enable")
-        print(dim(f"  session: {_sess_state}"))
-    if not state_shown and cfg.leash != "rwe":   # resume already showed the full state
-        print(dim(f"  leash: {cfg.leash} ({_LEASH_GRANTS[cfg.leash]})"))
-    print(dim("  /help for commands, /quit to exit\n"))
+    if not resumed:                              # FRESH start: full orientation banner
+        _print_full_banner()
+        if cfg.incognito:
+            print(magenta(f"  session: {GLYPH['ghost']} incognito")
+                  + dim(" (not saved locally; provider may still log)"))
+        else:
+            _sess_state = (f"autosaving -> {agent.autosave_name}" if cfg.autosave
+                           else "off (amnesic)  /autosave on to enable")
+            print(dim(f"  session: {_sess_state}"))
+        if cfg.leash != "rwe":
+            print(dim(f"  leash: {cfg.leash} ({_LEASH_GRANTS[cfg.leash]})"))
+        print(dim("  /help for commands, /quit to exit\n"))
 
     pending_exit = False           # armed by one ^C at the prompt; a second exits
     pending_inputs = []            # lines the user typed via the composer mid-turn
