@@ -9,7 +9,7 @@
 ![Core dependencies: none](https://img.shields.io/badge/core%20dependencies-none%20(stdlib%20only)-brightgreen.svg)
 ![Baseline overhead: ~2k tokens](https://img.shields.io/badge/baseline%20overhead-~2k%20tokens-orange.svg)
 
-[Install](#install) &middot; [Providers](#providers-pick-a-model-backend) &middot; [Safety](#safety-two-axes) &middot; [Tools](#tools) &middot; [Handover](#handover-the-agent-documents-its-work-before-a-memory-wipe) &middot; [Why it exists](#why-it-exists)
+[Install](#install) &middot; [Quick start](#quick-start) &middot; [Why it exists](#why-it-exists) &middot; [Providers](#providers-pick-a-model-backend) &middot; [Safety](#safety-two-axes) &middot; [Tools](#tools) &middot; [Handover](#handover-the-agent-documents-its-work-before-a-memory-wipe)
 
 </div>
 
@@ -78,6 +78,66 @@ On Android / Termux:
 ```bash
 pkg install -y python curl && curl -fsSL https://raw.githubusercontent.com/codemonkeying/lean-coder/main/install.sh | bash
 ```
+
+## Quick start
+
+```bash
+lean_coder                       # uses your config, or localhost Ollama + default model
+```
+
+You get an interactive REPL. Type a request; the agent reads, edits, and runs as
+needed, **showing a diff before applying** and **confirming before running** shell
+commands (unless approval is `session`/`auto`). Type `/help` for the full command list.
+
+## Requirements
+
+- **Python 3.11+** (uses the stdlib `tomllib`). No third-party packages for the
+  core; a couple of opt-in lean-tools have their own (e.g. `web_screenshot` needs
+  Playwright) and are disabled by default.
+- A tool-calling model behind a provider:
+  - **Ollama** (local or self-hosted) - e.g. `ollama pull qwen3-coder:30b` - works
+    out of the box, or
+  - a **hosted API** - Anthropic, Gemini, Groq, OpenAI, or OpenRouter all ship
+    bundled; enable one with `/provider login <name>` (see [Providers](#providers-pick-a-model-backend)).
+
+## Install options
+
+The one-liners above fetch and run `install.sh`, which installs the code and
+symlinks `lean_coder` onto your `PATH`. On WSL it's a normal Linux install. On Termux
+there's no sudo/systemd, so it points you at a remote Ollama instead
+(`lean_coder --host http://HOST:11434`), so you don't need anything beyond Python
+there. If you want a local Ollama on Linux, pass `--with-ollama --pull` (see below).
+
+Prefer to inspect first? Clone and run it yourself:
+
+```bash
+git clone https://github.com/codemonkeying/lean-coder
+cd lean-coder
+./install.sh                     # install the code, symlink `lean_coder` onto PATH
+./install.sh --with-ollama --pull --model qwen3-coder:30b   # also install Ollama + pull a model
+./install.sh --dry-run           # show what it would do, change nothing
+./install.sh --help              # all options
+```
+
+It's idempotent and only does the heavy / privileged steps when you ask.
+`./uninstall.sh` does a full teardown.
+
+Or run it in place with no install at all (from a clone, so the bundled
+`lean-tools/` and `providers/` sit beside the script):
+
+```bash
+python3 lean_coder.py                         # local Ollama, default model
+python3 lean_coder.py --host http://box:11434 --model qwen3-coder:30b
+python3 lean_coder.py --cwd ~/myproject
+```
+
+**Updating:** re-run the one-liner (or `git pull && ./install.sh`) any time; it
+updates an install in place. Or enable the `update` lean-tool and run `/update`
+from inside the REPL: it compares this build's version against the published
+`VERSION` and only pulls a newer `lean_coder.py` (`/update check` reports without
+changing anything; `/update force` re-pulls regardless). Set `auto_update = true`
+to have that check run once at launch (off by default). Versions follow SemVer;
+`update_track` picks the `stable` (default) or `beta` release line.
 
 ## Why it exists
 
@@ -191,66 +251,6 @@ can drive reliably.
 - **Pinned input.** Type your next message while the model works - output scrolls
   above a fixed input line. Pure ANSI + stdlib; falls back on terminals that can't
   support it.
-
-## Requirements
-
-- **Python 3.11+** (uses the stdlib `tomllib`). No third-party packages for the
-  core; a couple of opt-in lean-tools have their own (e.g. `web_screenshot` needs
-  Playwright) and are disabled by default.
-- A tool-calling model behind a provider:
-  - **Ollama** (local or self-hosted) - e.g. `ollama pull qwen3-coder:30b` - works
-    out of the box, or
-  - a **hosted API** - Anthropic, Gemini, Groq, OpenAI, or OpenRouter all ship
-    bundled; enable one with `/provider login <name>` (see [Providers](#providers-pick-a-model-backend)).
-
-## Install options
-
-The one-liners above fetch and run `install.sh`, which installs the code and
-symlinks `lean_coder` onto your `PATH`. On WSL it's a normal Linux install. On Termux
-there's no sudo/systemd, so it points you at a remote Ollama instead
-(`lean_coder --host http://HOST:11434`), so you don't need anything beyond Python
-there. If you want a local Ollama on Linux, pass `--with-ollama --pull` (see below).
-
-Prefer to inspect first? Clone and run it yourself:
-
-```bash
-git clone https://github.com/codemonkeying/lean-coder
-cd lean-coder
-./install.sh                     # install the code, symlink `lean_coder` onto PATH
-./install.sh --with-ollama --pull --model qwen3-coder:30b   # also install Ollama + pull a model
-./install.sh --dry-run           # show what it would do, change nothing
-./install.sh --help              # all options
-```
-
-It's idempotent and only does the heavy / privileged steps when you ask.
-`./uninstall.sh` does a full teardown.
-
-Or run it in place with no install at all (from a clone, so the bundled
-`lean-tools/` and `providers/` sit beside the script):
-
-```bash
-python3 lean_coder.py                         # local Ollama, default model
-python3 lean_coder.py --host http://box:11434 --model qwen3-coder:30b
-python3 lean_coder.py --cwd ~/myproject
-```
-
-**Updating:** re-run the one-liner (or `git pull && ./install.sh`) any time; it
-updates an install in place. Or enable the `update` lean-tool and run `/update`
-from inside the REPL: it compares this build's version against the published
-`VERSION` and only pulls a newer `lean_coder.py` (`/update check` reports without
-changing anything; `/update force` re-pulls regardless). Set `auto_update = true`
-to have that check run once at launch (off by default). Versions follow SemVer;
-`update_track` picks the `stable` (default) or `beta` release line.
-
-## Quick start
-
-```bash
-lean_coder                       # uses your config, or localhost Ollama + default model
-```
-
-You get an interactive REPL. Type a request; the agent reads, edits, and runs as
-needed, **showing a diff before applying** and **confirming before running** shell
-commands (unless approval is `session`/`auto`). Type `/help` for the full command list.
 
 ## Providers: pick a model backend
 
