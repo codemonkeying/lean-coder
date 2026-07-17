@@ -22,6 +22,11 @@ __pycache__/
 /scripts/
 /tests/
 
+# Internal dev handover + import tooling - not public.
+/LEAN_TOOL_DEV_HANDOVER.md
+/import_lc.sh
+/.last_import.sha256
+
 # Live lean-tools working dir (point lean_tools_dir here to a separate one if you
 # want an isolated working set). We ignore the CONTENTS (leading slash anchors to the
 # repo root) then re-include the BUNDLED tools that ship and load out of the box, so
