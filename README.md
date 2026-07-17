@@ -38,10 +38,10 @@ The same tiny codebase scales across the whole range:
 
 It's a compact, **stdlib-only** Python codebase - no third-party packages. The core
 is one script (`lean_coder.py`); alongside it ship a required builtin-tools module
-(`lean-tools/builtins.py`) and a model provider adapter (`providers/ollama.py`).
-Point it at a local model via [Ollama](https://ollama.com) (bundled and default)
-and you get an interactive REPL that edits code, runs commands, and shows a diff
-before it touches anything.
+(`lean-tools/builtins.py`) and a set of model provider adapters in `providers/`
+(Ollama, Anthropic, Gemini, Groq, OpenAI, OpenRouter). Point it at a local model via
+[Ollama](https://ollama.com) (bundled and default-enabled) and you get an interactive
+REPL that edits code, runs commands, and shows a diff before it touches anything.
 
 What a session looks like:
 
@@ -191,7 +191,8 @@ can drive reliably.
 - A tool-calling model behind a provider:
   - **Ollama** (local or self-hosted) - e.g. `ollama pull qwen3-coder:30b` - works
     out of the box, or
-  - another backend via a provider plugin you supply (see [Providers](#providers-pick-a-model-backend)).
+  - a **hosted API** - Anthropic, Gemini, Groq, OpenAI, or OpenRouter all ship
+    bundled; enable one with `/provider login <name>` (see [Providers](#providers-pick-a-model-backend)).
 
 ## Install options
 
@@ -325,18 +326,19 @@ what the agent *attempts*; the **OS** (its file perms) bounds what it *can* do.
 
 Exposed to the model via native tool calling. Descriptions are one line each,
 because they are serialized into **every** request - keeping them terse is part of
-the context budget. Seven file/shell tools live in the required builtin-tools module
+the context budget. Eight file/shell tools live in the required builtin-tools module
 (`lean-tools/builtins.py`):
 
-| Tool           | What it does |
-|----------------|--------------|
-| `read_file`    | Line-numbered file contents; optional line range; large files truncated. |
-| `list_files`   | Directory / shallow project tree, honoring ignore rules. |
-| `search_files` | Regex search -> `file:line` matches (capped). |
-| `apply_diff`   | **Preferred edit tool.** SEARCH/REPLACE blocks - sends/returns only changed lines. |
-| `write_file`   | Create or overwrite a whole file (mainly for new files). |
-| `run_command`  | Run a shell command in the project dir; stdout/stderr truncated. |
-| `bg_status`    | Poll / reap background tasks started with a trailing `&`. |
+| Tool            | What it does |
+|-----------------|--------------|
+| `read_file`     | Line-numbered file contents; optional line range; large files truncated. |
+| `list_files`    | Directory / shallow project tree, honoring ignore rules. |
+| `search_files`  | Regex search -> `file:line` matches (capped). |
+| `apply_diff`    | **Preferred edit tool.** SEARCH/REPLACE blocks - sends/returns only changed lines. |
+| `replace_lines` | Replace a line range by number (simpler than a diff when you have the line numbers). |
+| `write_file`    | Create or overwrite a whole file (mainly for new files). |
+| `run_command`   | Run a shell command in the project dir; stdout/stderr truncated; trailing `&` backgrounds it (with optional notify/heartbeat/max-runtime watchdog). |
+| `bg_status`     | Poll / reap background tasks started with a trailing `&`. |
 
 Alongside these the model always has **`update_plan`** (maintains a pinned goal +
 TODO that survives compaction) and, by default, **`ask_user_to_run`** — the escape
@@ -357,7 +359,7 @@ on with `/tools` and it costs context only from that point. These ship bundled i
 
 | Lean-tool         | Adds |
 |-------------------|------|
-| `dispatch_worker` | Hand a scoped sub-task to a background worker agent; collect its result. |
+| `dispatch_worker` | Hand a scoped sub-task to a background worker agent; collect its result. Adds `/worker` (list workers / `/worker <pid>` = full result / cancel). |
 | `web_fetch`       | Read a URL as clean text. |
 | `web_screenshot`  | Screenshot a URL with a headless browser + return the page text (and, on a vision model, the image itself). **Needs [Playwright](https://playwright.dev/python/) + a browser** (`pip install playwright && playwright install firefox`); says so if absent. Disabled by default. |
 | `brave_search`    | Web search (Brave API). |
@@ -488,8 +490,10 @@ its documentation stays current instead of rotting.
 - **Autonomous wake on background finish (off by default).** With
   `wake_on_bg_finish = true` (via `/set`), a finished background task or worker
   wakes the agent with a synthesised turn so it reacts to the result with no operator
-  input - otherwise the finish notice waits passively for your next turn. See
-  LEAN_TOOLS.md for details.
+  input - otherwise the finish notice waits passively for your next turn. A single
+  job can opt in on its own with `run_command`'s `notify_on_exit` / `heartbeat_timeout`
+  / `max_runtime` args, which wake the agent for *that* job even when the global
+  setting is off. See LEAN_TOOLS.md for details.
 - **Bounded send-window (off by default).** For a very small local model, even the
   handover flow can be too much history to hold. `window_messages = N` (via `/set`)
   caps each request to the last N messages, cut at a *whole-turn boundary* so the
