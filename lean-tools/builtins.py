@@ -274,12 +274,16 @@ class Tools:
         verb = "overwrote" if original is not None else "created"
         return f"{verb} {path} ({len(content.splitlines())} lines)"
 
-    def run_command(self, cmd: str) -> str:
+    def run_command(self, cmd: str, notify_on_exit=None, heartbeat_timeout=None,
+                    max_runtime=None, kill_on_max=None) -> str:
         bg = cmd.rstrip().endswith("&")        # trailing & = "background this"
         if not _confirm_action(self.cfg, "exec", cmd=cmd):
             return "user declined to run the command"
         if bg:
-            return self._run_background(cmd.rstrip()[:-1].rstrip())
+            return self._run_background(
+                cmd.rstrip()[:-1].rstrip(),
+                notify_on_exit=notify_on_exit, heartbeat_timeout=heartbeat_timeout,
+                max_runtime=max_runtime, kill_on_max=kill_on_max)
         to = self.cfg.command_timeout
         try:
             # stdin=DEVNULL: never let a child read the live terminal. With the
@@ -302,7 +306,9 @@ class Tools:
         out = _truncate_output(out.rstrip())
         return f"exit {r.returncode}\n{out}" if out else f"exit {r.returncode} (no output)"
 
-    def _run_background(self, cmd: str, kind: str = "task", idle_timeout=None) -> str:
+    def _run_background(self, cmd: str, kind: str = "task", idle_timeout=None,
+                        notify_on_exit=None, heartbeat_timeout=None,
+                        max_runtime=None, kill_on_max=None) -> str:
         """Launch a detached background process and return immediately. Plain
         run_command captures stdout/stderr, so a backgrounded child keeps the pipe
         open until it dies and run_command would block until the 300s timeout - the
@@ -313,7 +319,15 @@ class Tools:
         `idle_timeout` (seconds) arms a self-terminating LEASE: an in-band watchdog
         kills the whole group if the '<log>.lease' file isn't bumped for that long
         (the parent bumps it once per turn - see _bg_bump_session). Caps runaway
-        quota burn by a task whose parent dropped. None = no lease (runs to done)."""
+        quota burn by a task whose parent dropped. None = no lease (runs to done).
+
+        WATCHDOG/NOTIFY args (all optional, all file-based so they survive a reconnect):
+          notify_on_exit  - push exit code + tail on completion even if the global
+                            wake_on_bg_finish is off (recorded on the registry row).
+          heartbeat_timeout (secs) - one-time '<log>.silent' alert if the log goes
+                            quiet that long; NEVER kills (silence != dead).
+          max_runtime (secs) - wall-clock ceiling; notify on trip, auto-kill unless
+                            kill_on_max is False (then notify-only, keep running)."""
         if not cmd:
             return "error: nothing to run in the background"
         cap = self.cfg.bg_max_concurrent
@@ -321,28 +335,54 @@ class Tools:
             return (f"error: at the background-task limit ({cap} running). Stop one first "
                     f"(/bg to list + kill, or `kill <pid>`), or raise bg_max_concurrent "
                     f"in /settings.")
+        def _posint(v):
+            try:
+                n = int(v)
+                return n if n > 0 else None
+            except (TypeError, ValueError):
+                return None
+        heartbeat_timeout = _posint(heartbeat_timeout)
+        max_runtime = _posint(max_runtime)
+        kill_on_max = True if kill_on_max is None else bool(kill_on_max)
+        notify_on_exit = bool(notify_on_exit)
         try:
             logdir = CONFIG_DIR / "bg"
             logdir.mkdir(parents=True, exist_ok=True)
             log = logdir / f"{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}.log"
             exitf = str(log) + ".exit"
-            wrapped = self._bg_wrap(cmd, exitf, str(log) + ".lease", idle_timeout)
+            wrapped = self._bg_wrap(cmd, exitf, str(log) + ".lease", idle_timeout,
+                                    logf=str(log), max_runtime=max_runtime,
+                                    kill_on_max=kill_on_max,
+                                    heartbeat_timeout=heartbeat_timeout)
             with open(log, "ab") as f:
                 p = subprocess.Popen(wrapped, shell=True, cwd=str(self.cfg.cwd),
                                      stdout=f, stderr=subprocess.STDOUT,
                                      stdin=subprocess.DEVNULL, start_new_session=True)
         except Exception as e:
             return f"error backgrounding command: {e}"
-        _bg_register(p.pid, cmd, log, kind=kind, idle_timeout=idle_timeout)
-        lease_note = (f"  ·  lease: self-terminates if unattended > {idle_timeout}s"
-                      if idle_timeout else "")
+        _bg_register(p.pid, cmd, log, kind=kind, idle_timeout=idle_timeout,
+                     notify_on_exit=notify_on_exit, heartbeat_timeout=heartbeat_timeout,
+                     max_runtime=max_runtime, kill_on_max=kill_on_max)
+        notes = []
+        if idle_timeout:
+            notes.append(f"lease: self-terminates if unattended > {idle_timeout}s")
+        if heartbeat_timeout:
+            notes.append(f"heartbeat: alerts if silent > {heartbeat_timeout}s (won't kill)")
+        if max_runtime:
+            notes.append(f"max_runtime {max_runtime}s"
+                         + ("; auto-kills on trip" if kill_on_max else "; notify-only"))
+        if notify_on_exit:
+            notes.append("notify_on_exit: pushes result on completion")
+        note = ("  ·  " + "  ·  ".join(notes)) if notes else ""
         return (f"started in background: pid {p.pid} (detached; killed when you exit "
                 f"lean-coder)\noutput -> {log}\n"
                 f"track: bg_status  (exit code -> '{exitf}')  ·  list/stop: /bg  "
-                f"·  stop now: kill {p.pid}{lease_note}")
+                f"·  stop now: kill {p.pid}{note}")
 
     @staticmethod
-    def _bg_wrap(cmd: str, exitf: str, leasef: str, idle_timeout=None) -> str:
+    def _bg_wrap(cmd: str, exitf: str, leasef: str, idle_timeout=None,
+                 logf=None, max_runtime=None, kill_on_max=True,
+                 heartbeat_timeout=None) -> str:
         """Build the shell wrapper for a backgrounded command.
 
         Base: run cmd in a SUBSHELL '( ... )' (contains the user's '&&'/pipes AND any
@@ -350,32 +390,68 @@ class Tools:
         '<log>.exit' sidecar - completion + pass/fail become discoverable by READING
         A FILE (survives an executor death / ssh reconnect; identical local/remote).
 
-        With idle_timeout: also run an in-band WATCHDOG that polls the lease file's
-        mtime; if it's gone unbumped for idle_timeout the watchdog writes the sidecar
-        (exit 137) and kills the whole process group ($$ is the detached session
-        leader => its pid is the pgid). All shell built-ins + `stat -c %Y` are
-        available on dash/bash/busybox/toybox; the `|| echo now` fallback means a
-        stat failure reads as 'just attended' (never a false kill)."""
+        With any WATCHDOG feature set, also run an in-band poller alongside the child.
+        All are FILE-based (sidecars), so they survive a reconnect and read identically
+        local/remote; all shell built-ins + `stat -c %Y` are on dash/bash/busybox/toybox
+        and a `|| echo now` fallback means a stat failure reads as 'just now' (never a
+        false trip). The watchdog channels:
+          - LEASE (idle_timeout): the parent bumps '<log>.lease' once per turn; if its
+            mtime goes unbumped for idle_timeout the parent is gone -> write exit 137 and
+            KILL the group. Caps runaway quota by an orphaned task.
+          - MAX_RUNTIME (max_runtime): wall-clock ceiling. On trip, write '<log>.maxrun'
+            (the elapsed secs, for the notice) and, if kill_on_max, write exit 137 + KILL;
+            else leave it running (notify-only). The ONLY output-independent kill.
+          - HEARTBEAT (heartbeat_timeout): if the LOG file's mtime (bumped whenever the
+            child writes) goes stale for heartbeat_timeout, write '<log>.silent' (the
+            silence secs) ONCE and keep running - a watchdog that BARKS, never bites.
+            Silence != dead (a long compile/network wait goes quiet), so it never kills;
+            the human/agent decides. Re-arms if output resumes.
+        $$ is the detached session leader => its pid is the pgid for the group kills."""
         # our own generated log path (no shell metachars) - safe to single-quote.
-        if not idle_timeout:
+        def _int(v, d):
+            try:
+                return int(v)
+            except (TypeError, ValueError):
+                return d
+        lease = _int(idle_timeout, 0) if idle_timeout else 0
+        maxrt = _int(max_runtime, 0) if max_runtime else 0
+        hb = _int(heartbeat_timeout, 0) if heartbeat_timeout else 0
+        if not (lease or maxrt or hb):
             return f"( {cmd} ); __rc=$?; printf %s \"$__rc\" > '{exitf}'; exit $__rc"
-        try:
-            to = int(idle_timeout)
-        except (TypeError, ValueError):
-            to = 1800
-        chk = max(5, min(30, to // 4))          # poll cadence: a few checks per window
-        return (
-            f"touch '{leasef}'; __pg=$$; "
+        silentf = str(logf) + ".silent" if logf else exitf + ".silent"
+        maxrunf = str(logf) + ".maxrun" if logf else exitf + ".maxrun"
+        wins = [w for w in (lease or None, maxrt or None, hb or None) if w]
+        chk = max(5, min(30, min(wins) // 4))     # a few checks per shortest window
+        checks = ["now=$(date +%s); "]
+        if lease:
+            checks.append(
+                f"m=$(stat -c %Y '{leasef}' 2>/dev/null || echo $now); "
+                f"if [ $((now - m)) -ge {lease} ]; then "
+                f"echo \"[lease expired: unattended > {lease}s; terminated]\"; "
+                f"printf %s 137 > '{exitf}'; kill -KILL -$__pg 2>/dev/null; exit; fi; ")
+        if maxrt:
+            act = (f"echo \"[max_runtime {maxrt}s reached; terminated]\"; "
+                   f"printf %s 137 > '{exitf}'; kill -KILL -$__pg 2>/dev/null; exit; "
+                   if kill_on_max else
+                   f"echo \"[max_runtime {maxrt}s reached; still running (kill_on_max=false)]\"; ")
+            checks.append(
+                f"if [ $((now - __t0)) -ge {maxrt} ] && [ $__mr -eq 0 ]; then __mr=1; "
+                f"printf %s {maxrt} > '{maxrunf}'; {act}fi; ")
+        if hb:
+            checks.append(
+                f"lm=$(stat -c %Y '{logf or exitf}' 2>/dev/null || echo $now); "
+                f"if [ $((now - lm)) -ge {hb} ]; then "
+                f"if [ $__hb -eq 0 ]; then __hb=1; printf %s $((now - lm)) > '{silentf}'; fi; "
+                f"else __hb=0; fi; ")     # re-arm once output resumes
+        loop = (
+            f"__t0=$(date +%s); __pg=$$; touch '{leasef}'; "
             f"( {cmd} ) & __cpid=$!; "
-            f"( while kill -0 $__cpid 2>/dev/null; do "
-            f"now=$(date +%s); m=$(stat -c %Y '{leasef}' 2>/dev/null || echo $now); "
-            f"if [ $((now - m)) -ge {to} ]; then "
-            f"echo \"[lease expired: unattended > {to}s; terminated]\"; "
-            f"printf %s 137 > '{exitf}'; kill -KILL -$__pg 2>/dev/null; exit; fi; "
-            f"sleep {chk}; done ) & __wpid=$!; "
+            f"( __hb=0; __mr=0; while kill -0 $__cpid 2>/dev/null; do "
+            + "".join(checks)
+            + f"sleep {chk}; done ) & __wpid=$!; "
             f"wait $__cpid; __rc=$?; kill $__wpid 2>/dev/null; "
-            f"[ -f '{exitf}' ] || printf %s \"$__rc\" > '{exitf}'; exit $__rc"
-        )
+            f"[ -f '{exitf}' ] || printf %s \"$__rc\" > '{exitf}'; exit $__rc")
+        return loop
 
     # --- read-only: check on backgrounded tasks ---------------------------
     def bg_status(self, pid=None) -> str:
@@ -556,7 +632,11 @@ BUILTIN_TOOLS = [
     {"name": "run_command", "tier": "exec",
      "description": "Run a non-interactive shell command (builds, tests, git, file ops); returns stdout/stderr (truncated - if clipped, pipe to a file or use grep/head/tail to read specific parts). Fresh shell each call - cd/env don't persist, chain with '&&'. Times out (raise command_timeout in /settings; end the command with ' &' to background a long/daemon process). For sudo/password/interactive use ask_user_to_run; for a shell that stays open use shell_session.",
      "parameters": {"type": "object",
-        "properties": {"cmd": {"type": "string", "description": "The shell command to run."}},
+        "properties": {"cmd": {"type": "string", "description": "The shell command to run."},
+                       "notify_on_exit": {"type": "boolean", "description": "Bg jobs (' &') only: push exit code + tail back to you on completion."},
+                       "heartbeat_timeout": {"type": "integer", "description": "Bg jobs only: alert once if no output for N secs. Never kills (silence != dead)."},
+                       "max_runtime": {"type": "integer", "description": "Bg jobs only: wall-clock ceiling (secs); notify + auto-kill on trip."},
+                       "kill_on_max": {"type": "boolean", "description": "With max_runtime: false = notify only, keep running (default true = kill)."}},
         "required": ["cmd"]}},
     {"name": "bg_status", "tier": "read",
      "description": "Poll background tasks (started with a trailing ' &' on run_command): state, runtime, last output. No pid = all; a pid = just that one.",

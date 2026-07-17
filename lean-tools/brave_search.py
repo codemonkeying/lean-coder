@@ -14,6 +14,7 @@ NETWORK EGRESS - not marked safe, so each search shows the query and confirms
 import json
 import os
 import re
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -111,7 +112,6 @@ def run(args, cwd):
         "X-Subscription-Token": key,
         "User-Agent": UA,
     })
-    import time
     payload = None
     last_err = None
     for attempt in range(3):

@@ -7,7 +7,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
 ![Core dependencies: none](https://img.shields.io/badge/core%20dependencies-none%20(stdlib%20only)-brightgreen.svg)
-![Baseline overhead: ~1.2k tokens](https://img.shields.io/badge/baseline%20overhead-~1.2k%20tokens-orange.svg)
+![Baseline overhead: ~2k tokens](https://img.shields.io/badge/baseline%20overhead-~2k%20tokens-orange.svg)
 
 [Install](#install) &middot; [Providers](#providers-pick-a-model-backend) &middot; [Safety](#safety-two-axes) &middot; [Tools](#tools) &middot; [Handover](#handover-the-agent-documents-its-work-before-a-memory-wipe) &middot; [Why it exists](#why-it-exists)
 
@@ -16,9 +16,18 @@
 It reads, edits, and runs code in a project directory through a model's native
 tool-calling API, with a design priority most agents ignore: **lean context usage**.
 
+That's *why* the tools are baked in as lightweight lean-tools instead of bolted on
+as MCP servers. We think a coding platform shouldn't spend half your token budget
+just describing itself before you've typed a word - and it definitely shouldn't only
+work if you can afford a frontier model. lean-coder's *entire* expanded tool surface
+plus its prompt costs about what a *single* typical MCP server does. If your model
+handles MCP well, brilliant - add all the servers you like on top, we're big fans.
+We just didn't want the platform *itself* to be the thing eating your context. This
+is open source, built for the folks running local and open models first.
+
 The same tiny codebase scales across the whole range:
 
-- drive a **small local model with a few thousand tokens of context** - the ~1.2k
+- drive a **small local model with a few thousand tokens of context** - the ~2k
   baseline leaves room to actually work;
 - point it at a **frontier model and let it spawn parallel background workers** on
   scoped sub-tasks, running a job far bigger than one context window;
@@ -39,7 +48,7 @@ What a session looks like:
 ```
 $ lean_coder
 lean-coder  <your-model> @ <your-provider>
-  cwd: ~/myproject   ·   baseline overhead (system + always-on tools): ~1.2k tokens
+  cwd: ~/myproject   ·   baseline overhead (system + always-on tools): ~2k tokens
 › add a --json flag to the export command and update the tests
 ● I'll look at the export command first.
   ⚙ read_file(path=src/export.py)
@@ -68,10 +77,41 @@ and the growing history - to the model. On a small local model with a 32k window
 a bloated system prompt or a verbose tool schema is context that can't hold your
 actual code. lean-coder treats context as the scarce resource it is:
 
-- **Baseline overhead around ~1.2k tokens** for the system prompt *and* the entire
+- **Baseline overhead around ~2k tokens** for the system prompt *and* the entire
   always-on tool surface combined (measured, with a test that enforces a ceiling).
-  That's the floor on a fresh session; enabling opt-in lean-tools or editing the
-  prompts adds to it - the meter always shows the real current figure.
+  The surface scales with the leash, so you only pay for what you've enabled:
+
+  | tier | ~tokens | what's in it |
+  |---|---|---|
+  | chat | ~500 | system prompt alone, no tools |
+  | read (`r`) | ~1.1k | + read_file, list_files, search_files, bg_status, update_plan |
+  | write (`rw`) | ~1.5k | + apply_diff, replace_lines, write_file |
+  | exec (`rwe`) | **~2k** | + run_command, ask_user_to_run — the fresh-session floor |
+
+  That **~2k** is the whole shipped agent: system prompt plus all ten always-on
+  builtin tools. On top, the **optional bundled lean-tools** are off by default and
+  cost nothing until you `/tools` them on - roughly:
+
+  | lean-tool | ~tokens | | lean-tool | ~tokens |
+  |---|---|---|---|---|
+  | dispatch_worker | 745 | | web_fetch | 180 |
+  | web_screenshot | 498 | | brave_search | 159 |
+  | symbols | 327 | | ssh | 134 |
+  | shell_session | 291 | | diagnostics | 65 |
+  | git_summary | 63 | | word_count | 56 |
+  | note | 54 | | | |
+
+  Turn on **every** one and the total is still **under ~5k tokens**. The meter always
+  shows the real current figure.
+
+  **For scale:** a *single* MCP server's tool definitions are commonly
+  [300–710 tokens **per tool**](https://dev.to/piotr_hajdas/mcp-token-limits-the-hidden-cost-of-tool-overload-2d5),
+  and a typical server (e.g. Slack, ~10–15 tools)
+  [runs ~2,000 tokens](https://www.mindstudio.ai/blog/claude-code-mcp-server-token-overhead) -
+  as much as lean-coder's *entire* shipped surface. Connect a few and you can burn
+  [50k+ tokens before the first question](https://dev.to/kenimo49/your-mcp-server-eats-55000-tokens-before-your-agent-says-a-word-i-measured-the-real-cost-19l8).
+  lean-coder is a generic MCP client too (see below) - the difference is you pay that
+  cost only for what you deliberately add.
 - **Truncated results** - a single big file read or noisy command can't blow the budget.
 - **Layered context management** - documented handover (automatic, on by default)
   plus opt-in continuous eviction and periodic compaction - reclaims space mid-task

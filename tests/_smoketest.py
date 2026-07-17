@@ -39,10 +39,11 @@ check("every canonical command is in HELP",
 check("/mcp fully wired (dispatch+slash+help)",
       "/mcp" in _tbl and "/mcp" in _slash and "/mcp" in _help)
 
-# 1. Fixed overhead budget (system prompt + 7 tool schemas) < 1500 tokens
+# 1. Fixed overhead budget (system prompt + always-on tool schemas). README claims
+# ~2k core; ceiling gives headroom for later additions without lying in the README.
 sys_msg = {"role": "system", "content": lc.SYSTEM_PROMPT + "\nWorking directory: /x"}
 overhead = lc.messages_tokens([sys_msg], lc.active_tools(lc.Config()))
-check("fixed overhead < 1500 tokens", overhead < 1500, f"~{overhead} tokens")
+check("fixed overhead < 2200 tokens (~2k README claim + headroom)", overhead < 2200, f"~{overhead} tokens")
 check("7 base tools (ssh moved to a lean-tool; bg_status added)", len(lc.TOOLS) == 7, f"{len(lc.TOOLS)}")
 check("bg_status is a core tool", "bg_status" in [t["function"]["name"] for t in lc.TOOLS])
 check("active_tools adds ask_user_to_run by default", len(lc.active_tools(lc.Config())) == 9)
