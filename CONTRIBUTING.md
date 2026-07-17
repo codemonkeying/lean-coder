@@ -16,8 +16,8 @@ design bias - keeping both intact is the main thing a change is judged on.
 - **Small and few beats big and many.** The tools are terse so a small local model
   can drive them reliably. Keep descriptions to one line.
 - **New capability = a plugin, not a core edit.** Adding a tool or a backend should
-  be a drop-in `.py` file. See [docs/BUILD_GUIDE.md](docs/BUILD_GUIDE.md),
-  [LEAN_TOOLS.md](LEAN_TOOLS.md), and [PROVIDER_API.md](PROVIDER_API.md).
+  be a drop-in `.py` file. See [LEAN_TOOLS.md](LEAN_TOOLS.md) and
+  [PROVIDER_API.md](PROVIDER_API.md).
 
 ## The gates
 
@@ -53,7 +53,7 @@ whether to pull.
 
 - Keep the diff focused; prefer small, reviewable changes.
 - Update the relevant doc when you change behaviour (README, LEAN_TOOLS,
-  PROVIDER_API, BUILD_GUIDE).
+  PROVIDER_API).
 - Describe what you changed and why, and note that the three gates pass.
 
 ## License

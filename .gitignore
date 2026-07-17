@@ -16,11 +16,21 @@ __pycache__/
 # Internal helper-CLI usage docs (eval/lmg/lpve/ltmile/lwrt) - not public.
 /lean-cli/
 
-# Internal-only: plugin/dev scaffolding, MCP reference scratch, dev scripts, tests.
+# Internal-only: plugin/dev scaffolding, MCP reference scratch, dev scripts.
 /plugin-dev/
 /.mcp-ref/
 /scripts/
-/tests/
+
+# Test suite: ship the offline gates (referenced by CONTRIBUTING), but NEVER the
+# live network test - it hardcodes real infra. Ignore the dir, whitelist the safe files.
+/tests/*
+/tests/fixtures/*
+!/tests/_smoketest.py
+!/tests/_mocktest.py
+!/tests/_smoketest_local.py
+!/tests/_sweep.sh
+!/tests/fixtures/
+!/tests/fixtures/echo_mcp_server.py
 
 # Internal dev handover + import tooling - not public.
 /LEAN_TOOL_DEV_HANDOVER.md
