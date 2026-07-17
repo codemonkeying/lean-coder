@@ -16,6 +16,12 @@ __pycache__/
 # Internal helper-CLI usage docs (eval/lmg/lpve/ltmile/lwrt) - not public.
 /lean-cli/
 
+# Internal-only: plugin/dev scaffolding, MCP reference scratch, dev scripts, tests.
+/plugin-dev/
+/.mcp-ref/
+/scripts/
+/tests/
+
 # Live lean-tools working dir (point lean_tools_dir here to a separate one if you
 # want an isolated working set). We ignore the CONTENTS (leading slash anchors to the
 # repo root) then re-include the BUNDLED tools that ship and load out of the box, so
@@ -53,4 +59,3 @@ __pycache__/
 # For machine-specific ignores of your own (personal provider plugins, local tools,
 # scratch files) use .git/info/exclude - local, never committed - rather than naming
 # them in this shared file.
-/.mcp-ref/
