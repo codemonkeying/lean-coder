@@ -13,6 +13,9 @@ __pycache__/
 # Model-evaluation harness + results - local research, not shipped.
 /model-eval/
 
+# Internal helper-CLI usage docs (eval/lmg/lpve/ltmile/lwrt) - not public.
+/lean-cli/
+
 # Live lean-tools working dir (point lean_tools_dir here to a separate one if you
 # want an isolated working set). We ignore the CONTENTS (leading slash anchors to the
 # repo root) then re-include the BUNDLED tools that ship and load out of the box, so
