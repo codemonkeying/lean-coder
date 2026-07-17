@@ -430,13 +430,18 @@ class Tools:
                 f"echo \"[lease expired: unattended > {lease}s; terminated]\"; "
                 f"printf %s 137 > '{exitf}'; kill -KILL -$__pg 2>/dev/null; exit; fi; ")
         if maxrt:
+            # On kill: write the exit sidecar + KILL - the finish scan reports it, so
+            # do NOT also write '.maxrun' (that's a still-running alert; a dead job with
+            # a leftover .maxrun would double-report as "still running"). On notify-only:
+            # write '.maxrun' (the alert channel) and let it keep running.
             act = (f"echo \"[max_runtime {maxrt}s reached; terminated]\"; "
                    f"printf %s 137 > '{exitf}'; kill -KILL -$__pg 2>/dev/null; exit; "
                    if kill_on_max else
+                   f"printf %s {maxrt} > '{maxrunf}'; "
                    f"echo \"[max_runtime {maxrt}s reached; still running (kill_on_max=false)]\"; ")
             checks.append(
                 f"if [ $((now - __t0)) -ge {maxrt} ] && [ $__mr -eq 0 ]; then __mr=1; "
-                f"printf %s {maxrt} > '{maxrunf}'; {act}fi; ")
+                f"{act}fi; ")
         if hb:
             checks.append(
                 f"lm=$(stat -c %Y '{logf or exitf}' 2>/dev/null || echo $now); "

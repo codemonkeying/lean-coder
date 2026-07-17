@@ -4435,12 +4435,22 @@ def _bg_alerts_here(owner):
         log = r.get("log")
         if not log:
             continue
+        alive = _proc_alive(pid)
         for suffix, akind in ((".silent", "silent"), (".maxrun", "maxrun")):
+            sc = Path(str(log) + suffix)
             try:
-                secs = Path(str(log) + suffix).read_text().strip()
+                secs = sc.read_text().strip()
             except (OSError, ValueError):
                 continue
             if not secs:
+                continue
+            # An alert means "still running". If the job is already dead, its finish
+            # notice covers it - drop the stale sidecar so it can't double-report.
+            if not alive:
+                try:
+                    sc.unlink()
+                except OSError:
+                    pass
                 continue
             out.append({"pid": pid, "cmd": r.get("cmd", "?"), "kind": akind,
                         "secs": secs, "tail": _bg_log_tail(log, 20), "log": log})
