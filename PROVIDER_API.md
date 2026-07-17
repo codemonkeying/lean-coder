@@ -8,7 +8,7 @@ to a `/connect` remote and exposes no model tool; it wires in through a native
 registry, so it never has to monkey-patch core or mutate `cfg`.
 
 Ollama is the bundled default (`provider = "ollama"`); several hosted providers ship
-bundled too (`anthropic_api`, `gemini`, `groq`, `openrouter`), disabled until you
+bundled too (`anthropic_api`, `gemini`, `groq`, `openai`, `openrouter`), disabled until you
 enable and key them. Config **autosaves** - no manual `/save` step.
 
 To start your own, copy the annotated template at

@@ -32,9 +32,11 @@ That is the whole interface. Many runnable lean-tools ship bundled in
 installed linter/typechecker for a file's language - the agent's feedback loop),
 `git_summary.py` (a one-call read-only repo snapshot: branch, status, diffstat,
 recent commits), `web_fetch.py` (GET an http(s) URL - network egress, never
-`safe`, off by default), and `ssh.py` (one-shot `ssh host cmd`, moved out of the
-core tool set because it's network egress rather than local editing). For learning
-the pattern, annotated templates live in
+`safe`, off by default), `symbols.py` (navigate Python code without grepping:
+`mode='outline'` lists a file/dir's classes+defs with line numbers, `mode='def'`
+locates a definition by name - zero-dep, stdlib `ast`), and `ssh.py` (one-shot
+`ssh host cmd`, moved out of the core tool set because it's network egress rather
+than local editing). For learning the pattern, annotated templates live in
 [`examples/lean-tools/`](examples/lean-tools/): `reverse_file.py` (minimal local
 read-only) and `weather.py` (API-backed with a key + network egress).
 
@@ -305,7 +307,10 @@ would bloat the main session ("scout this large module and report where X lives"
 
 How it works (it piggybacks the background-task machinery, no new transport):
 
-- The model calls `dispatch_worker(task=..., [model=...], [cwd=...], [leash=...])`.
+- The model calls `dispatch_worker(task=..., [model=...], [provider=...], [cwd=...],
+  [leash=...], [host=...])` to launch one. The same tool also manages workers via
+  `action`: `action='status'` reports dispatched workers, `action='cancel'` (with
+  `pid=...`) kills one; the default `action='dispatch'` launches from `task`.
 - The tool writes a **brief file** (the task + a grant header) and launches
   `lean_coder --agent-run` as a detached background task tagged `kind="worker"`,
   with a **lease** (it self-terminates if this session stops attending it, so a
@@ -365,7 +370,7 @@ authority.
 
 | env var | default | meaning |
 |---|---|---|
-| `LEANCODER_WORKER_MAX_CONCURRENT` | 2 | most workers alive at once |
+| `LEANCODER_WORKER_MAX_CONCURRENT` | 10 | most workers alive at once |
 | `LEANCODER_WORKER_IDLE_TIMEOUT` | 1800 | lease seconds; unattended worker self-terminates |
 | `LEANCODER_WORKER_MAX_ITER` | 30 | agentic-loop cap per worker |
 | `LEANCODER_WORKER_MODELS` | *(any)* | comma-list allowlist of dispatchable models |

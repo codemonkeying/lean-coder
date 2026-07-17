@@ -323,6 +323,7 @@ on with `/tools` and it costs context only from that point. These ship bundled i
 | `brave_search`    | Web search (Brave API). |
 | `git_summary`     | Read-only git snapshot (branch, status, diffstat, recent commits). |
 | `diagnostics`     | Run the installed linter / typechecker for a file. |
+| `symbols`         | Navigate Python code without grepping: outline a file/dir's classes+defs, or locate a definition by name (zero-dep, stdlib `ast`). |
 | `shell_session`   | A persistent interactive shell the model holds open across calls (REPL, ssh, etc.). |
 | `ssh`             | One-shot `ssh host cmd` (network egress, kept out of core). |
 | `note`            | Append a line to `NOTES.md`. |
@@ -335,7 +336,7 @@ Each is small enough to read in a sitting and usable by small models. For learni
 the pattern, [`examples/lean-tools/`](examples/lean-tools/) has two annotated
 templates: `reverse_file.py` (a minimal local read-only tool) and `weather.py` (an
 API-backed tool with a key + network egress). See [LEAN_TOOLS.md](LEAN_TOOLS.md);
-writing your own is a drop-in `.py` - [docs/BUILD_GUIDE.md](docs/BUILD_GUIDE.md).
+writing your own is a drop-in `.py` - [LEAN_TOOLS.md](LEAN_TOOLS.md) walks the pattern.
 
 ### MCP servers (Model Context Protocol)
 
@@ -494,6 +495,7 @@ can't exhaust memory; pass `--num-ctx` to go higher explicitly.
 /sh [cmd]          run a command yourself in a terminal (no arg = your $SHELL)
 /connect [host]    run tools on a remote box over SSH (no arg = pick saved/open)
 /local [host]      detach the active remote (keep it open to switch back)
+/machines          manage saved remote hosts (list/add/remove)
 /tools             enable/disable lean-tools
 /mcp               manage MCP servers (add/remove/reconnect; no arg = enable/disable menu)
 /reload            reload lean-tools + pick up prompt edits
@@ -576,8 +578,8 @@ python3 tests/_mocktest.py      # scripted end-to-end suite
 bash tests/_sweep.sh            # hygiene lint (stray unicode, likely secrets/PII, etc.)
 ```
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for the bar, and
-[docs/BUILD_GUIDE.md](docs/BUILD_GUIDE.md) for writing tools and providers.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the bar, [LEAN_TOOLS.md](LEAN_TOOLS.md)
+for writing tools, and [PROVIDER_API.md](PROVIDER_API.md) for providers.
 
 ## License
 
