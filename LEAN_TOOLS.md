@@ -76,7 +76,7 @@ automatically by **category**, so your lean-tool gets a sensible icon with no ef
 | read  | `◎` | your tool is `safe: True` (read-only) |
 | write | `✎` | (built-in writers) |
 | exec  | `»` | (built-in `run_command`) / non-safe by default |
-| net   | `⇅` | the tool name is a known network tool (`web_fetch`, `ssh`, ...) |
+| net   | `⇅` | the tool name is a known network tool (`web_fetch`, `ssh`, ...) | <!-- sweep-ok -->
 | meta  | `◇` | agent-internal (`update_plan`, `note`, ...) |
 | gear  | `⚙` | anything uncategorised (the fallback) |
 

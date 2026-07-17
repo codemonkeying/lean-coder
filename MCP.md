@@ -23,8 +23,8 @@ ecosystem.
 /mcp remove <name>         # forget a server
 ```
 
-`/mcp add <name> <spec>` infers the transport from the spec: a `http(s)://` URL →
-**HTTP**; anything else → a **stdio** command line. The server is saved to your config
+`/mcp add <name> <spec>` infers the transport from the spec: a `http(s)://` URL ->
+**HTTP**; anything else -> a **stdio** command line. The server is saved to your config
 and enabled immediately; its tools appear on the next turn.
 
 Every subcommand also answers `/mcp ?` with its full help.
@@ -50,8 +50,8 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/some/dir"]
 
 ### HTTP (streamable)
 
-The streamable-HTTP MCP flow: `initialize` → capture the `Mcp-Session-Id` header →
-`notifications/initialized` → `tools/list` / `tools/call`. Responses may be **SSE**
+The streamable-HTTP MCP flow: `initialize` -> capture the `Mcp-Session-Id` header ->
+`notifications/initialized` -> `tools/list` / `tools/call`. Responses may be **SSE**
 (`event: message` / `data: {…}`) or plain JSON - both are handled. Session-less servers
 (no `Mcp-Session-Id`) work too.
 

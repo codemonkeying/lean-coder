@@ -44,11 +44,11 @@ check("/mcp fully wired (dispatch+slash+help)",
 sys_msg = {"role": "system", "content": lc.SYSTEM_PROMPT + "\nWorking directory: /x"}
 overhead = lc.messages_tokens([sys_msg], lc.active_tools(lc.Config()))
 check("fixed overhead < 2200 tokens (~2k README claim + headroom)", overhead < 2200, f"~{overhead} tokens")
-check("7 base tools (ssh moved to a lean-tool; bg_status added)", len(lc.TOOLS) == 7, f"{len(lc.TOOLS)}")
+check("8 base tools (ssh moved to a lean-tool; bg_status added)", len(lc.TOOLS) == 8, f"{len(lc.TOOLS)}")
 check("bg_status is a core tool", "bg_status" in [t["function"]["name"] for t in lc.TOOLS])
-check("active_tools adds ask_user_to_run by default", len(lc.active_tools(lc.Config())) == 9)
+check("active_tools adds ask_user_to_run by default", len(lc.active_tools(lc.Config())) == 10)
 check("active_tools drops it when disabled",
-      len(lc.active_tools(lc.Config(ask_user_to_run=False))) == 8)
+      len(lc.active_tools(lc.Config(ask_user_to_run=False))) == 9)
 check("update_plan is on the surface at every non-chat tier",
       all("update_plan" in [t["function"]["name"] for t in lc.active_tools(lc.Config(leash=l))]
           for l in ("r", "rw", "rwe")))

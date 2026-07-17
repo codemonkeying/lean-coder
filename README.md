@@ -14,24 +14,23 @@
 </div>
 
 It reads, edits, and runs code in your project through a model's native tool-calling
-API - but it's built around one idea most agents ignore: **your context window is the
+API, and it's built around one idea most agents ignore: **your context window is the
 scarce resource, so don't waste it describing the tool.**
 
 Mainstream coding agents spend a lot of your window on themselves before you type a
-word: measurements put the big ones at tens of thousands of tokens of system prompt
-and built-in tool scaffolding per session - and that's *before* you connect any MCP
+word. Measurements put the big ones at tens of thousands of tokens of system prompt
+and built-in tool scaffolding per session, and that's *before* you connect any MCP
 servers, which add anywhere from hundreds to tens of thousands of tokens each on top.
 That's context that can't hold your actual code. lean-coder's *entire* shipped tool
-surface plus its system prompt costs about
-**~2k tokens**. It's just a different category: the platform stays out of the way so
-the window holds your work, and it's usable on small local models, not just frontier
-ones.
+surface plus its system prompt costs about **~2k tokens**. It's just a different
+category: the platform stays out of the way so the window holds your work, and it's
+usable on small local models, not just frontier ones.
 
-And when a long task *does* fill the window, it doesn't truncate and forget - the
-agent **documents its own work, pins a goal + plan, and hands over to a clean slate**,
-so the job continues instead of dying mid-run.
+And when a long task *does* fill the window, it doesn't truncate and forget. Instead
+the agent **documents its own work, pins a goal + plan, and hands over to a clean
+slate**, so the job continues instead of dying mid-run.
 
-If your model handles MCP well, brilliant - add all the servers you like on top, we're
+If your model handles MCP well, brilliant: add all the servers you like on top, we're
 big fans. We just didn't want the platform *itself* to be the thing eating your
 context. This is open source, built for the folks running local and open models first.
 
@@ -46,7 +45,7 @@ The same tiny codebase scales across the whole range:
 - or **`/connect` to a beefier box over SSH** and run every tool *there* through a
   hermetic, secret-free executor, from the same terminal.
 
-It's a compact, **stdlib-only** Python codebase - no third-party packages. The core
+It's a compact, **stdlib-only** Python codebase, no third-party packages. The core
 is one script (`lean_coder.py`); alongside it ship a required builtin-tools module
 (`lean-tools/builtins.py`) and a set of model provider adapters in `providers/`
 (Ollama, Anthropic, Gemini, Groq, OpenAI, OpenRouter). Point it at a local model via
@@ -82,8 +81,8 @@ pkg install -y python curl && curl -fsSL https://raw.githubusercontent.com/codem
 
 ## Why it exists
 
-Every agentic turn re-sends the whole conversation - system prompt, tool schemas,
-and the growing history - to the model. On a small local model with a 32k window,
+Every agentic turn re-sends the whole conversation (system prompt, tool schemas,
+and the growing history) to the model. On a small local model with a 32k window,
 a bloated system prompt or a verbose tool schema is context that can't hold your
 actual code. lean-coder treats context as the scarce resource it is:
 
@@ -100,7 +99,7 @@ actual code. lean-coder treats context as the scarce resource it is:
 
   That **~2k** is the whole shipped agent: system prompt plus all ten always-on
   builtin tools. On top, the **optional bundled lean-tools** are off by default and
-  cost nothing until you `/tools` them on - roughly:
+  cost nothing until you `/tools` them on. Roughly:
 
   | lean-tool | ~tokens | | lean-tool | ~tokens |
   |---|---|---|---|---|
@@ -120,11 +119,11 @@ actual code. lean-coder treats context as the scarce resource it is:
   [runs ~2,000 tokens](https://www.mindstudio.ai/blog/claude-code-mcp-server-token-overhead) -
   as much as lean-coder's *entire* shipped surface. Connect a few and you can burn
   [50k+ tokens before the first question](https://dev.to/kenimo49/your-mcp-server-eats-55000-tokens-before-your-agent-says-a-word-i-measured-the-real-cost-19l8).
-  lean-coder is a generic MCP client too (see below) - the difference is you pay that
+  lean-coder is a generic MCP client too (see below). The difference is you pay that
   cost only for what you deliberately add.
 - **Truncated results** - a single big file read or noisy command can't blow the budget.
 - **Layered context management** - documented handover (automatic, on by default)
-  plus opt-in continuous eviction and periodic compaction - reclaims space mid-task
+  plus opt-in continuous eviction and periodic compaction, reclaiming space mid-task
   without losing the thread (`/compact` and `/handover` are the manual levers). More below.
 
 The payoff: it stays usable on **small local models**, not just frontier hosted
@@ -134,14 +133,14 @@ can drive reliably.
 ## Highlights
 
 - **No third-party dependencies in the core.** `python3` (3.11+) is the entire
-  runtime - nothing to `pip install` to edit, run, and drive a model. (A few opt-in
-  lean-tools bring their own deps - e.g. `web_screenshot` needs Playwright - and say
+  runtime, nothing to `pip install` to edit, run, and drive a model. (A few opt-in
+  lean-tools bring their own deps (e.g. `web_screenshot` needs Playwright) and say
   so; they're disabled by default and cost nothing until you enable them.)
 - **Roll your own tools - one drop-in file.** A small always-on set covers
   read/edit/run. Everything else is an **opt-in "lean-tool"**: a single `.py` file
   with a `TOOL` schema and a `run` function, dropped in a directory and toggled on
   with `/tools`, costing zero context until enabled. No server, no schema registry,
-  no build step, no dependency - write it, drop it, `/reload`.
+  no build step, no dependency. Write it, drop it, `/reload`.
 - **Roll your own provider just as easily.** A model backend is a `.py` file with a
   `PROVIDER` dict in `providers/`. Ollama is bundled and default (a fresh install
   just works against `localhost:11434`); drop your own file in to talk to any other
@@ -152,41 +151,41 @@ can drive reliably.
   own work before a memory wipe*. As context fills (a **soft ~70%** nudge, a **hard
   ~95%** force, an **emergency ~100%** stop) it commits durable docs to disk, writes a
   handover to its future self, **pins a goal + TODO that survive the wipe**, and leaves
-  a self-prompt - then wipes and, by default, **auto-continues the same task from a
+  a self-prompt, then wipes and, by default, **auto-continues the same task from a
   clean slate** via that self-prompt. So a long-running job keeps going far past the
   window, with documentation that never goes stale and a plan that never gets lost.
   `/compact` complements it for lighter trimming. (More below.)
 - **Two independent safety axes:** a capability ceiling (`/leash`) and a confirm
-  cadence (`/approve`) that compose from supervised editing to full autonomy - see
+  cadence (`/approve`) that compose from supervised editing to full autonomy. See
   [Safety](#safety-two-axes) below.
 - **Remote workspace (the executor).** `/connect host` pushes a hermetic,
   secret-free **executor** onto another box over SSH; every tool then runs *there*,
-  on the remote's filesystem, transparently to the model - no install beyond
+  on the remote's filesystem, transparently to the model, with no install beyond
   `python3`, no config/model/keys/network on the remote. Edit from a phone in
   Termux while the code, builds and commands all execute on a workstation or server.
   Keep several boxes open and switch instantly; confirmations and diffs stay local.
 - **Parallel background workers.** With a capable model, `dispatch_worker` hands a
   scoped sub-task to a headless worker agent that runs in the background on its own
-  context, then reports just its result back - so the main session spends its window
+  context, then reports just its result back, so the main session spends its window
   on the plan, not the raw output. Run several at once.
 - **Any tool can return an image.** On a vision-capable model, a tool result can
-  carry a picture - a screenshot, a rendered chart, a diff image - and lean-coder
+  carry a picture (a screenshot, a rendered chart, a diff image) and lean-coder
   feeds it to the model the right way for each backend (Anthropic, OpenAI, Gemini).
   The image rides only in the request, never bloating saved history, and it's gated
   to models that can actually see. `web_screenshot` is the ready-made example.
 - **One conversation, any model.** The full history is re-sent each turn, so you can
   switch model or provider mid-session with `/model` (lists every enabled backend)
-  without starting over - drive a local Ollama for the cheap steps, jump to a
+  without starting over: drive a local Ollama for the cheap steps, jump to a
   frontier model for the hard one, and back.
 - **Nothing happens off-screen.** `/activity` replays what the system did on its own -
-  compaction, handover, model fallback, eviction - so the automatic context
+  compaction, handover, model fallback, eviction), so the automatic context
   management is auditable, not magic.
 - **Updates and spreads itself.** `/update` self-updates the script to the latest
   published build (`stable` or `beta` track; `auto_update` checks at launch), and
   `/provision` installs lean-coder onto another box over SSH.
 - **Sessions.** Conversations autosave each turn and the last one auto-loads on
   start, so a relaunch picks up where you left off. Keep as many as you like -
-  `/save <name>`, `/load` between them, `/session` to list - and because
+  `/save <name>`, `/load` between them, `/session` to list, and because
   `/connect` moves only the *executor*, a single saved session can drive your
   laptop one moment and a remote box the next without losing a thing.
 - **Pinned input.** Type your next message while the model works - output scrolls
@@ -209,7 +208,7 @@ can drive reliably.
 The one-liners above fetch and run `install.sh`, which installs the code and
 symlinks `lean_coder` onto your `PATH`. On WSL it's a normal Linux install. On Termux
 there's no sudo/systemd, so it points you at a remote Ollama instead
-(`lean_coder --host http://HOST:11434`) - so you don't need anything beyond Python
+(`lean_coder --host http://HOST:11434`), so you don't need anything beyond Python
 there. If you want a local Ollama on Linux, pass `--with-ollama --pull` (see below).
 
 Prefer to inspect first? Clone and run it yourself:
@@ -235,7 +234,7 @@ python3 lean_coder.py --host http://box:11434 --model qwen3-coder:30b
 python3 lean_coder.py --cwd ~/myproject
 ```
 
-**Updating:** re-run the one-liner (or `git pull && ./install.sh`) any time - it
+**Updating:** re-run the one-liner (or `git pull && ./install.sh`) any time; it
 updates an install in place. Or enable the `update` lean-tool and run `/update`
 from inside the REPL: it compares this build's version against the published
 `VERSION` and only pulls a newer `lean_coder.py` (`/update check` reports without
@@ -250,13 +249,13 @@ lean_coder                       # uses your config, or localhost Ollama + defau
 ```
 
 You get an interactive REPL. Type a request; the agent reads, edits, and runs as
-needed - **showing a diff before applying** and **confirming before running** shell
+needed, **showing a diff before applying** and **confirming before running** shell
 commands (unless approval is `session`/`auto`). Type `/help` for the full command list.
 
 ## Providers: pick a model backend
 
 A **provider** is the adapter that connects lean-coder to a model backend.
-**Ollama ships bundled and default-enabled** - a fresh install talks to a local
+**Ollama ships bundled and default-enabled.** A fresh install talks to a local
 Ollama at `localhost:11434` with zero config, so if you have Ollama running you're
 already done.
 
@@ -272,13 +271,13 @@ one and add a key):
 | `openai`        | OpenAI (gpt / o-series; paid) | [platform.openai.com](https://platform.openai.com/api-keys) |
 | `openrouter`    | OpenRouter (gateway to many models) | [openrouter.ai](https://openrouter.ai/keys) |
 
-**Setup is one step - just log in and paste your key:**
+**Setup is one step. Just log in and paste your key:**
 
 ```
 /provider login anthropic_api      # prompts for the key, saves it, switches to it
 ```
 
-That's it - `/provider login <name>` enables the backend, securely stores the key
+That's it. `/provider login <name>` enables the backend, securely stores the key
 (a `chmod 600` file under `~/.config/leancoder/`, **never** in `config.toml`), and
 makes it active. If you'd rather use an environment variable, export the provider's
 key var (e.g. `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `GROQ_API_KEY`,
@@ -293,11 +292,11 @@ Then:
 
 If you launch with no backend reachable, lean-coder tells you exactly these
 commands. And if a turn ever fails because a key is missing or rejected, it offers
-the login prompt right there and retries - you're never stranded.
+the login prompt right there and retries, so you're never stranded.
 
 To wire up any other backend, copy
-[`examples/providers/example.py`](examples/providers/example.py) - an annotated
-OpenAI-compatible template - into `providers/`. See
+[`examples/providers/example.py`](examples/providers/example.py), an annotated
+OpenAI-compatible template, into `providers/`. See
 [PROVIDER_API.md](PROVIDER_API.md) for the full interface. Sessions are portable
 across providers (the full history is re-sent each turn), so a conversation saved
 against one resumes against another.
@@ -315,7 +314,7 @@ against one resumes against another.
 
   The ceiling bounds what the model can even attempt, so it *cannot* act outside the
   fence. Drop to `r` or `rw` and walk away. The model is told its ceiling, so it says
-  "I'm read-only - `/leash rw` to let me edit" rather than failing opaquely.
+  "I'm read-only; `/leash rw` to let me edit" rather than failing opaquely.
 - **`/approve` - confirm cadence** (`ask` | `session` | `auto`, default `ask`).
   *When* to confirm within the ceiling:
   - `ask` - confirm every edit/command (the default; you see a diff / the command first).
@@ -335,7 +334,7 @@ what the agent *attempts*; the **OS** (its file perms) bounds what it *can* do.
 ### The always-on set
 
 Exposed to the model via native tool calling. Descriptions are one line each,
-because they are serialized into **every** request - keeping them terse is part of
+because they are serialized into **every** request, so keeping them terse is part of
 the context budget. Eight file/shell tools live in the required builtin-tools module
 (`lean-tools/builtins.py`):
 
@@ -351,11 +350,11 @@ the context budget. Eight file/shell tools live in the required builtin-tools mo
 | `bg_status`     | Poll / reap background tasks started with a trailing `&`. |
 
 Alongside these the model always has **`update_plan`** (maintains a pinned goal +
-TODO that survives compaction) and, by default, **`ask_user_to_run`** - the escape
+TODO that survives compaction) and, by default, **`ask_user_to_run`**, the escape
 hatch for anything `run_command` can't do itself: a command needing **sudo/root**, an
 **interactive prompt**, or a **typed password or secret**. Instead of running it, the
 agent hands the exact command back to *you* to run in your own terminal; only the
-command and its exit code return to the agent - **whatever you type (the password,
+command and its exit code return to the agent. **Whatever you type (the password,
 the secret) never reaches the model**. You can also edit the command before running
 it, or decline. On by default; toggle with `/set`. A batch of read-only calls in
 one turn runs **concurrently**.
@@ -384,29 +383,40 @@ on with `/tools` and it costs context only from that point. These ship bundled i
 | `update`          | `/update` - self-update `lean_coder.py` to the latest published build. |
 | `word_count`      | Count lines / words / chars in a file. |
 
-**Dependencies:** almost all of these are stdlib-only. The exceptions:
-`web_screenshot` needs [Playwright](https://playwright.dev/python/) + a browser, and
-`brave_search` needs a Brave API key. `diagnostics` is the special case - it has *no*
-deps of its own but opportunistically *uses* external linters if the box already has
-them (see its row). Every dep-bearing tool is disabled by default, costs nothing
-until enabled, and says so clearly if the dep is missing.
+**Dependencies:** almost all of these are stdlib-only. Two need a one-time setup, and
+each prints these exact steps if you enable it without them:
+
+- **`web_screenshot`** needs [Playwright](https://playwright.dev/python/) and a browser:
+  ```bash
+  pip3 install --user --break-system-packages playwright
+  python3 -m playwright install firefox        # or chromium / webkit
+  python3 -m playwright install-deps           # if the host is missing system libs (may need sudo)
+  ```
+- **`brave_search`** needs a free Brave Search API key (2,000 queries/month, no card)
+  from [search.brave.com/app/keys](https://search.brave.com/app/keys). Put it in
+  `~/.config/leancoder/brave.key` (chmod 600) or set `LEANCODER_BRAVE_KEY`.
+
+`diagnostics` is the special case: no deps of its own, but it opportunistically *uses*
+external linters if the box already has them (see its row). Every dep-bearing tool is
+disabled by default, costs nothing until enabled, and says so clearly if the dep is
+missing. Full per-tool notes live in [LEAN_TOOLS.md](LEAN_TOOLS.md).
 
 **Not built (yet):** there's no persistent **LSP** (Language Server Protocol)
-integration - that would be a heavy, dependency-per-language addition (great for
+integration. That would be a heavy, dependency-per-language addition (great for
 big PHP/Java/TS projects with go-to-definition, project-wide rename, live type
 errors). We haven't built it because we don't need it: `diagnostics` (one-shot lint)
 and `symbols` (stdlib `ast` navigation) cover our day-to-day. If you want proper LSP
-and would use it, open an issue - happy to build it.
+and would use it, open an issue and we'll build it.
 
 Each is small enough to read in a sitting and usable by small models. For learning
 the pattern, [`examples/lean-tools/`](examples/lean-tools/) has two annotated
 templates: `reverse_file.py` (a minimal local read-only tool) and `weather.py` (an
 API-backed tool with a key + network egress). See [LEAN_TOOLS.md](LEAN_TOOLS.md);
-writing your own is a drop-in `.py` - [LEAN_TOOLS.md](LEAN_TOOLS.md) walks the pattern.
+writing your own is a drop-in `.py`; [LEAN_TOOLS.md](LEAN_TOOLS.md) walks the pattern.
 
 ### MCP servers (Model Context Protocol)
 
-lean-coder is a **generic MCP client**, builtin - **no servers ship by default** (zero
+lean-coder is a **generic MCP client**, builtin, with **no servers shipped by default** (zero
 context, zero surface until you add one). Point it at any MCP server and its tools join
 the model's surface, namespaced `mcp__<server>__<tool>`:
 
@@ -420,9 +430,9 @@ the model's surface, namespaced `mcp__<server>__<tool>`:
 ```
 
 Two transports, both stdlib-only: **stdio** (a spawned subprocess, JSON-RPC over its
-pipes - the Claude-Desktop shape: `command` + `args` + `env`) and **HTTP** (streamable
+pipes, the Claude-Desktop shape: `command` + `args` + `env`), and **HTTP** (streamable
 MCP, tolerating SSE or plain-JSON responses). HTTP auth is one `Authorization: Bearer`
-header - a static token/env, or an **OAuth 2.1** client-credentials JWT fetched + cached
+header: a static token/env, or an **OAuth 2.1** client-credentials JWT fetched + cached
 + refreshed automatically. For auth/env, edit the `mcp_servers` table in `config.toml`:
 
 ```toml
@@ -436,8 +446,8 @@ auth = { type = "bearer", token_env = "GW_KEY" }
 MCP tools run on the **driver** (never a connected remote) and ride the **`rwe`** leash
 tier (they may have side effects), confirming like any non-safe tool unless approval is
 armed. Enabled servers connect at launch; a dead one just contributes no tools (its
-error shows in `/mcp list`). Full guide - transports, auth (bearer + OAuth 2.1), config,
-troubleshooting - in [MCP.md](MCP.md).
+error shows in `/mcp list`). Full guide (transports, auth (bearer + OAuth 2.1), config,
+troubleshooting) in [MCP.md](MCP.md).
 
 ### `apply_diff` format
 
@@ -468,30 +478,30 @@ conflict marker in the file.
   provider when available, else an estimate) prints against the window, colored as it
   climbs. `/ctx` and `/usage` report it on demand.
 - **`/compact [keep]`:** trims old tool results (file dumps, command output) to
-  one-line stubs, keeping the newest `keep` in full. The lighter tool - reclaims the
+  one-line stubs, keeping the newest `keep` in full. The lighter tool, reclaiming the
   biggest context consumer without touching the conversation or any edits.
 
 ### Handover: the agent documents its work before a memory wipe
 
 Handover is separate from compaction and is the feature that keeps a long-running
 task alive. The insight: **the agent knows what's in its own head**, so the sensible
-moment to update documentation is *right before* that memory is wiped - not after
+moment to update documentation is *right before* that memory is wiped, not after
 it's already gone stale.
 
-On `/handover` (or automatically - see below) the model gets a full tool-capable
+On `/handover` (or automatically, see below) the model gets a full tool-capable
 turn to:
 
 1. **Persist durable docs.** Update whatever the project already uses (a design doc,
    README, `HANDOVER.md`, notes) with its current understanding, and commit them if
    the project is already a git repo.
-2. **Write a handover to its future self** - the goal, key decisions, current state
+2. **Write a handover to its future self.** The goal, key decisions, current state
    (done / in progress / next), *where* the durable docs live, and a prompt to
    continue from.
 3. **Pin a goal + TODO** that survives the wipe.
-4. **Write a self-prompt** - the single next instruction.
+4. **Write a self-prompt.** The single next instruction.
 
-The conversation is then replaced with just that handover block - a "smart `/clear`"
-that keeps the thread - and, unless disabled, the self-prompt is **fed straight back
+The conversation is then replaced with just that handover block, a "smart `/clear`"
+that keeps the thread; and, unless disabled, the self-prompt is **fed straight back
 in as the next turn**, so the agent continues the same task from a clean slate (a
 5-second `^C`-to-cancel beat precedes it). Durable state lives on disk and in the
 pinned plan; the context window resets. That's how a task outruns the window while
@@ -501,7 +511,7 @@ its documentation stays current instead of rotting.
   agentic round, the bodies of tool results the model has *already acted on* are
   stubbed out, keeping the last few (`auto_evict_keep`, default 3) verbatim. The
   in-flight batch is never touched. Since the whole history is re-sent every round,
-  shrinking spent results shrinks every later call - so a long tool-heavy turn stops
+  shrinking spent results shrinks every later call, so a long tool-heavy turn stops
   paying for stale output. `auto_compact` does the same on a token interval as a
   one-shot strip; `/compact` is the manual version.
 - **Self-managing (on by default).** As context fills, the agent manages it in tiers:
@@ -514,14 +524,14 @@ its documentation stays current instead of rotting.
 - **Autonomous wake on background finish (off by default).** With
   `wake_on_bg_finish = true` (via `/set`), a finished background task or worker
   wakes the agent with a synthesised turn so it reacts to the result with no operator
-  input - otherwise the finish notice waits passively for your next turn. A single
+  input; otherwise the finish notice waits passively for your next turn. A single
   job can opt in on its own with `run_command`'s `notify_on_exit` / `heartbeat_timeout`
   / `max_runtime` args, which wake the agent for *that* job even when the global
   setting is off. See LEAN_TOOLS.md for details.
 - **Bounded send-window (off by default).** For a very small local model, even the
   handover flow can be too much history to hold. `window_messages = N` (via `/set`)
   caps each request to the last N messages, cut at a *whole-turn boundary* so the
-  current task is never truncated - a hard token bound every turn, at the cost of the
+  current task is never truncated, giving a hard token bound every turn, at the cost of the
   model seeing only recent turns. Most models are better served leaving this off and
   letting handover manage size; reach for it on tight local windows.
 
@@ -539,7 +549,7 @@ Precedence: **CLI flag > env var > config file > default**.
 | Capability      | `--leash`              | -                 | `rwe`                     |
 | Resume session  | `--resume <name>`      | -                 | auto-load last for cwd    |
 
-Config lives in `~/.config/leancoder/config.toml` and **autosaves** - any change
+Config lives in `~/.config/leancoder/config.toml` and **autosaves**: any change
 (`/set`, `/model`, `/provider`, `/approve`, …) is written back immediately. It also
 supports tiered host failover, memorable machine names, per-machine default models,
 and saved `/connect` targets; run the tool and see the config for the full set.
@@ -597,13 +607,13 @@ numbered prompt when headless.
 
 ### Editable prompts
 
-`/prompt` opens the prompt files in your editor. The built-ins - `system` (the system
-prompt), `handover`, `auto_handover`, `handover_nudge` - can be tuned to taste and take
+`/prompt` opens the prompt files in your editor. The built-ins (`system` (the system
+prompt), `handover`, `auto_handover`, `handover_nudge`) can be tuned to taste and take
 effect live (`/prompt reset <name>` reverts to the baked default). Overrides live in
 `~/.config/leancoder/prompts/`.
 
 You can also save your **own** named prompts (`/prompt <newname>` creates one) and fire
-one as a one-shot turn with **`/prompt use <name>`** - it's injected as your next
+one as a one-shot turn with **`/prompt use <name>`**; it's injected as your next
 message. Handy for reusable instructions you'd otherwise retype: a refactor brief, a
 review checklist, a commit-message style.
 
