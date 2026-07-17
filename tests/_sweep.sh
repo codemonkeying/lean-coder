@@ -9,9 +9,11 @@
 set -u
 cd "$(dirname "$0")/.." || exit 2   # repo root (this script lives in tests/)
 
-# Lines marked "# sweep-ok" are excluded from all checks - for a line that
-# legitimately needs a flagged token (a protocol constant, an example address).
-nosweep() { grep -Fv '# sweep-ok'; }
+# Lines marked "sweep-ok" are excluded from all checks - for a line that
+# legitimately needs a flagged token (a load-bearing TUI glyph, a protocol
+# constant, an example address). Works from a code comment (`# sweep-ok`) or a
+# markdown/HTML one (`<!-- sweep-ok -->`).
+nosweep() { grep -Fv 'sweep-ok'; }
 
 # Files to scan: git-tracked source/docs (includes anything staged for the commit).
 # Falls back to a full working-tree scan outside a git repo. The sweep excludes
@@ -40,11 +42,13 @@ report() {  # name, hits  (hits passed as an arg, not piped: keeps the counter
 }
 
 # --- ASCII hygiene ---------------------------------------------------------
+# No -o: keep the whole line so a `sweep-ok` marker on it survives to nosweep
+# (grep -o would emit only the glyph, and the marker filter could never see it).
 report "dash-like unicode (use ASCII -)" \
-  "$(grep -rnoP "[\x{2012}-\x{2015}\x{2212}\x{2500}]" "${FILES[@]}" | nosweep)"
+  "$(grep -rnP "[\x{2012}-\x{2015}\x{2212}\x{2500}]" "${FILES[@]}" | nosweep)"
 
 report "unicode arrows (use ASCII -> )" \
-  "$(grep -rnoP "[\x{2190}-\x{21FF}\x{2794}\x{27A1}]" "${FILES[@]}" | nosweep)"
+  "$(grep -rnP "[\x{2190}-\x{21FF}\x{2794}\x{27A1}]" "${FILES[@]}" | nosweep)"
 
 # --- likely secrets / PII --------------------------------------------------
 # Any dotted-quad that is NOT localhost, 0.0.0.0, or an RFC 5737 doc range

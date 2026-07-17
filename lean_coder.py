@@ -1783,8 +1783,8 @@ def lean_tools_menu(manager):
             top = cur - body + 1
         st["top"] = top
         window = rows[top:top + body]
-        more_up   = " ↑more" if top > 0 else ""
-        more_down = " ↓more" if top + body < len(rows) else ""
+        more_up   = " ↑more" if top > 0 else ""      # sweep-ok
+        more_down = " ↓more" if top + body < len(rows) else ""      # sweep-ok
 
         def row(content):                          # fit to width so nothing wraps
             return "\r" + _fit_line(content) + "\033[K"
@@ -1877,8 +1877,8 @@ def mcp_servers_menu(manager):
             top = cur - body + 1
         st["top"] = top
         window = names[top:top + body]
-        more_up = " ↑more" if top > 0 else ""
-        more_down = " ↓more" if top + body < len(names) else ""
+        more_up = " ↑more" if top > 0 else ""      # sweep-ok
+        more_down = " ↓more" if top + body < len(names) else ""      # sweep-ok
 
         def row(content):
             return "\r" + _fit_line(content) + "\033[K"
@@ -2045,7 +2045,7 @@ GLYPH = {
     "cat_read": g("◎", "r"),       # read_file, list_files, search_files, safe lean-tools
     "cat_write": g("✎", "w"),      # apply_diff, replace_lines, write_file
     "cat_exec": g("»", "$"),       # run_command, shell_session, ask_user_to_run
-    "cat_net":  g("⇅", "@"),       # web_fetch, brave_search, ssh, web_screenshot
+    "cat_net":  g("⇅", "@"),       # web_fetch, brave_search, ssh, web_screenshot  # sweep-ok
     "cat_mcp":  g("⧉", "m"),       # any mcp__* tool
     "cat_meta": g("◇", "-"),       # update_plan, note, request_handover
     "userbar":  g("┃", "|"),       # left accent bar down the operator's own turn
@@ -8261,11 +8261,11 @@ def _render_tool_call(entry: dict, cap: int = EXPAND_MAX_CHARS) -> str:
     if "result" in entry:
         res = entry.get("result")
         if res:
-            body += "\n" + dim("─ result ─") + "\n" + res
+            body += "\n" + dim("─ result ─") + "\n" + res      # sweep-ok
         elif res == "":
-            body += "\n" + dim("─ result ─ (empty)")
+            body += "\n" + dim("─ result ─ (empty)")      # sweep-ok
         else:
-            body += "\n" + dim("─ result ─ (not captured)")
+            body += "\n" + dim("─ result ─ (not captured)")      # sweep-ok
     return body
 
 
@@ -8471,6 +8471,7 @@ HELP_COMMANDS = [
     ("/prompt [name]", "view/edit prompt files"),
     ("/sh [cmd]", "run a command in a terminal (no arg: drop into your $SHELL)"),
     ("/connect [host]", "run tools on a remote over SSH"),
+    ("/machines", "manage saved remote hosts (list; remove <name>)"),
     ("/local [host]", "detach the active remote"),
     ("/tools", "enable/disable lean-tools"),
     ("/mcp", "manage MCP servers (list/add/remove/reconnect; no arg = enable/disable menu)"),
@@ -9708,8 +9709,8 @@ def _pick_one_tty(header, choices, current=None, labels=None):
         st["top"] = top
         hint = dim("(up/down, #=jump, type to filter, enter select, esc cancel)")
         q = (cyan(st["query"]) + dim("_")) if st["query"] else dim("(type to filter)")
-        more_up   = " ↑more" if top > 0 else ""
-        more_down = " ↓more" if fi and top + body < len(fi) else ""
+        more_up   = " ↑more" if top > 0 else ""      # sweep-ok
+        more_down = " ↓more" if fi and top + body < len(fi) else ""      # sweep-ok
 
         def row(content):                          # fit to width so nothing wraps
             return "\r" + _fit_line(content) + "\033[K"
@@ -10310,8 +10311,8 @@ def pick_grouped(rows_header, lines, index_of, num_of):
             top = sel_line - body + 1
         st["top"] = top
         q = (cyan(st["query"]) + dim("_")) if st["query"] else dim("(type to filter)")
-        more_up   = " ↑more" if top > 0 else ""
-        more_down = " ↓more" if top + body < len(vis_lines) else ""
+        more_up   = " ↑more" if top > 0 else ""      # sweep-ok
+        more_down = " ↓more" if top + body < len(vis_lines) else ""      # sweep-ok
 
         def row(content):
             return "\r" + _fit_line(content) + "\033[K"
