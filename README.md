@@ -13,17 +13,24 @@
 
 </div>
 
-It reads, edits, and runs code in a project directory through a model's native
-tool-calling API, with a design priority most agents ignore: **lean context usage**.
+It reads, edits, and runs code in your project through a model's native tool-calling
+API - but it's built around one idea most agents ignore: **your context window is the
+scarce resource, so don't waste it describing the tool.**
 
-That's *why* the tools are baked in as lightweight lean-tools instead of bolted on
-as MCP servers. We think a coding platform shouldn't spend half your token budget
-just describing itself before you've typed a word - and it definitely shouldn't only
-work if you can afford a frontier model. lean-coder's *entire* expanded tool surface
-plus its prompt costs about what a *single* typical MCP server does. If your model
-handles MCP well, brilliant - add all the servers you like on top, we're big fans.
-We just didn't want the platform *itself* to be the thing eating your context. This
-is open source, built for the folks running local and open models first.
+Connect a handful of MCP servers to a typical coding agent and their tool definitions
+alone can run to tens of thousands of tokens before you type a word - context that
+can't hold your actual code. lean-coder's *entire* shipped tool surface plus its
+system prompt costs about **~2k tokens**. It's just a different category: the platform
+stays out of the way so the window holds your work, and it's usable on small local
+models, not just frontier ones.
+
+And when a long task *does* fill the window, it doesn't truncate and forget - the
+agent **documents its own work, pins a goal + plan, and hands over to a clean slate**,
+so the job continues instead of dying mid-run.
+
+If your model handles MCP well, brilliant - add all the servers you like on top, we're
+big fans. We just didn't want the platform *itself* to be the thing eating your
+context. This is open source, built for the folks running local and open models first.
 
 The same tiny codebase scales across the whole range:
 
