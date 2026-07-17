@@ -177,7 +177,7 @@ def _apply(cfg, dest_root, dim, green, yellow, red, ask=None):
         tdp = Path(td)
         try:
             with tarfile.open(fileobj=io.BytesIO(blob), mode="r:gz") as tar:
-                tar.extractall(tdp)
+                tar.extractall(tdp, filter="data")
         except (tarfile.TarError, OSError) as e:
             print(red(f"could not unpack archive: {e}")); return False
         # GitHub wraps everything in a single 'lean-coder-<branch>/' dir.

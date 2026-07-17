@@ -22,6 +22,9 @@ def run(args, cwd):
     if not note:
         return "error: empty note"
     f = Path(cwd) / "NOTES.md"
-    with f.open("a") as fh:
-        fh.write(f"- {note}\n")
+    try:
+        with f.open("a", encoding="utf-8") as fh:
+            fh.write(f"- {note}\n")
+    except OSError as e:
+        return f"error: could not write {f.name}: {e}"
     return f"appended to {f.name}"

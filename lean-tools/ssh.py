@@ -41,7 +41,7 @@ def run(args, cwd):
     except (TypeError, ValueError):
         cmd_timeout = 300
     # one-shot only: BatchMode fails fast instead of hanging on a prompt; no PTY.
-    argv = ["ssh", "-o", "BatchMode=yes", "-o", f"ConnectTimeout=10",
+    argv = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
             "-o", "StrictHostKeyChecking=accept-new"]
     if port:
         try:

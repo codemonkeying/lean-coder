@@ -4168,7 +4168,9 @@ def _bg_registry_path():
     return CONFIG_DIR / "bg" / "tasks.jsonl"
 
 
-def _bg_register(pid, cmd, log, kind="task", idle_timeout=None):
+def _bg_register(pid, cmd, log, kind="task", idle_timeout=None,
+                 notify_on_exit=False, heartbeat_timeout=None,
+                 max_runtime=None, kill_on_max=True):
     """Record a backgrounded task (owner = this process's pid, host = this box).
     A bg task runs on whichever box the executor is on, so the registry lives on
     THAT box; the host field lets a reader tell 'my box' (pid is authoritative)
@@ -4192,6 +4194,9 @@ def _bg_register(pid, cmd, log, kind="task", idle_timeout=None):
         rec = {"pid": pid, "cmd": cmd, "log": str(log), "owner": os.getpid(),
                "host": socket.gethostname(), "kind": kind,
                "idle_timeout": idle_timeout,
+               "notify_on_exit": notify_on_exit,
+               "heartbeat_timeout": heartbeat_timeout,
+               "max_runtime": max_runtime, "kill_on_max": kill_on_max,
                "started": time.strftime("%Y-%m-%d %H:%M:%S"),
                "started_at": time.time()}
         with open(p, "a") as f:
@@ -4369,7 +4374,8 @@ def _bg_finished_here(owner):
         if code is None:
             continue
         out.append({"pid": pid, "cmd": r.get("cmd", "?"), "code": code,
-                    "tail": _bg_log_tail(r.get("log"), 20)})
+                    "tail": _bg_log_tail(r.get("log"), 20),
+                    "notify_on_exit": bool(r.get("notify_on_exit"))})
     return out
 
 
@@ -4410,6 +4416,67 @@ def _bg_log_tail(log, n=20) -> str:
         return ""
     tail = [ln[:500] for ln in lines[-n:]]
     return "\n".join(tail).strip()
+
+
+def _bg_alerts_here(owner):
+    """This-box RUNNING bg tasks launched by `owner` that have tripped a watchdog
+    ALERT sidecar ('<log>.silent' from a heartbeat, '<log>.maxrun' from a notify-only
+    max_runtime) - as [{pid, cmd, kind ('silent'|'maxrun'), secs, tail}]. Unlike a
+    finish, these fire while the job is STILL ALIVE (heartbeat never kills; a
+    kill_on_max=false ceiling notifies but keeps running), so they're a separate scan
+    from _bg_finished_here. Dedup (report each once) is the caller's job."""
+    out = []
+    for r in _bg_load():
+        pid = r.get("pid")
+        if r.get("owner") != owner or not _bg_here(r):
+            continue
+        if r.get("kind", "task") != "task":
+            continue
+        log = r.get("log")
+        if not log:
+            continue
+        for suffix, akind in ((".silent", "silent"), (".maxrun", "maxrun")):
+            try:
+                secs = Path(str(log) + suffix).read_text().strip()
+            except (OSError, ValueError):
+                continue
+            if not secs:
+                continue
+            out.append({"pid": pid, "cmd": r.get("cmd", "?"), "kind": akind,
+                        "secs": secs, "tail": _bg_log_tail(log, 20), "log": log})
+    return out
+
+
+def _bg_alert_msg(items):
+    """Format watchdog-alert dicts (from _bg_alerts_here) into the notice injected on
+    the next turn. "" for an empty list. These are ALERTS about a still-running job,
+    not a finish - the wording makes that explicit so the agent doesn't assume it's
+    done."""
+    lines = []
+    for it in items:
+        pid, cmd = it.get("pid"), it.get("cmd", "?")
+        if it.get("kind") == "silent":
+            head = (f"background task STILL RUNNING but silent: `{cmd}` (pid {pid}) has "
+                    f"produced no output for ~{it.get('secs')}s. It was NOT killed. "
+                    f"Check on it (bg_status), keep waiting, or `kill {pid}`.")
+        else:
+            head = (f"background task hit max_runtime: `{cmd}` (pid {pid}) ran past its "
+                    f"{it.get('secs')}s ceiling and is STILL RUNNING (kill_on_max=false). "
+                    f"Decide: let it continue or `kill {pid}`.")
+        tail = it.get("tail") or ""
+        lines.append(head + (f"\nlast output:\n{tail}" if tail else ""))
+    return "\n\n".join(lines)
+
+
+def _bg_clear_alert(log, akind):
+    """Remove a watchdog-alert sidecar once reported, so it fires once per trip. The
+    in-band watchdog re-writes it if the condition recurs (heartbeat re-arms when the
+    log resumes then goes quiet again). Best-effort."""
+    suffix = ".silent" if akind == "silent" else ".maxrun"
+    try:
+        Path(str(log) + suffix).unlink()
+    except OSError:
+        pass
 
 
 def _bg_status_items(owner, kind="task"):
@@ -6883,47 +6950,83 @@ class Agent:
         except Exception:
             pass
 
-    def _bg_finished_note(self) -> str:
+    def _bg_finished_note(self, only_notify=False) -> str:
         """A one-time notice for background tasks THIS session started that have
         finished since we last looked - so a long-running job the model fired and
         moved on from surfaces its result ('job done, exit N, last lines') on the
         next turn instead of needing a manual /bg poll. Works both LOCAL (scan our
         own sidecars) and REMOTE (ask the executor via BG_POLL - the sidecars live
         on that box). Reported once per pid, keyed by (host,pid) in _bg_announced
-        so a local and a remote task can't collide on a bare pid. "" when nothing
-        new finished."""
+        so a local and a remote task can't collide on a bare pid.
+
+        Also surfaces WATCHDOG ALERTS for still-running jobs (LOCAL only): a heartbeat
+        silence ('.silent') or a notify-only max_runtime ('.maxrun') trip. These are
+        opt-in (only exist if the job set those args), fire while the job is ALIVE, and
+        re-arm - so they dedup by unlinking the sidecar after reporting (not _bg_announced).
+
+        `only_notify` (for the wake path when global wake is OFF): restrict the FINISHED
+        notices to jobs that set notify_on_exit. Alerts are always included when set
+        (they're an explicit per-job opt-in). "" when nothing new to report."""
         remote = getattr(self, "remote", None)
         if remote is not None:
             host = remote.host
             items = remote.bg_poll()
+            alerts = []                       # remote watchdog alerts: follow-up
         else:
             host = socket.gethostname()
             items = _bg_finished_here(os.getpid())
+            alerts = _bg_alerts_here(os.getpid())
         lines = []
         for it in items:
             key = (host, it.get("pid"))
             if key in self._bg_announced:
                 continue
+            if only_notify and not it.get("notify_on_exit"):
+                continue
             self._bg_announced.add(key)
             lines.append(_bg_finished_msg([it]))
+        for al in alerts:
+            lines.append(_bg_alert_msg([al]))
+            _bg_clear_alert(al.get("log"), al.get("kind"))
         return "\n\n".join(l for l in lines if l)
+
+    def _has_bg_optins(self) -> bool:
+        """True if any live bg task THIS session owns opted into a per-job push
+        (notify_on_exit / heartbeat_timeout / max_runtime). Lets the wake path stay
+        armed for those jobs even when global wake_on_bg_finish is off - cheap
+        registry read, best-effort."""
+        try:
+            me = os.getpid()
+            for r in _bg_load():
+                if r.get("owner") != me or r.get("kind", "task") != "task":
+                    continue
+                if (r.get("notify_on_exit") or r.get("heartbeat_timeout")
+                        or r.get("max_runtime")):
+                    return True
+        except Exception:
+            pass
+        return False
 
     def bg_wake_turn(self):
         """AUTONOMY: a synthesised user turn describing any background job THIS session
-        started that has finished since we last looked - or "" if none. Aggregates two
-        sources, both using their OWN dedup so a job is claimed by whichever fires first
-        (this wake path when idle, or the passive turn-rider when the operator types):
-          1. plain bg TASKS via _bg_finished_note (_bg_finished_here + _bg_announced);
+        started that has finished / tripped a watchdog since we last looked - or "" if
+        none. Aggregates two sources, both using their OWN dedup so a job is claimed by
+        whichever fires first (this wake path when idle, or the passive turn-rider when
+        the operator types):
+          1. plain bg TASKS + watchdog alerts via _bg_finished_note;
           2. WORKERS via the wake-hook registry (_WAKE_HOOKS) - the dispatch_worker
              lean-tool registers its _finished_notice there, so worker finishes wake
              the agent too. Workers are hidden from the core bg notify (kind filter),
              so the hook is their only wake path; its own meta['announced'] dedup means
              a worker surfaced by wake won't re-report on the next real turn.
-        Only meaningful when cfg.wake_on_bg_finish is on (the caller gates on that).
-        Wrapped in autonomous-wake framing + an explicit react instruction, since no
-        operator prompt accompanies it."""
+        When global cfg.wake_on_bg_finish is ON, every finished plain task wakes. When
+        it's OFF this may still fire for a job that opted in per-job (notify_on_exit /
+        heartbeat_timeout / max_runtime) - only_notify restricts the finished notices to
+        those. Wrapped in autonomous-wake framing + an explicit react instruction, since
+        no operator prompt accompanies it."""
+        global_wake = bool(getattr(self.cfg, "wake_on_bg_finish", False))
         parts = []
-        note = self._bg_finished_note()
+        note = self._bg_finished_note(only_notify=not global_wake)
         if note:
             parts.append(note)
         for hook in list(_WAKE_HOOKS):
@@ -7943,11 +8046,100 @@ def _tool_category(name: str, args: dict) -> str:
     return ""
 
 
-def _operator_turn_lines(name: str, text: str) -> str:
+def _is_wake_turn(text: str) -> bool:
+    """A synthesised autonomous-wake turn (a bg task / worker finished with no
+    operator input) - it is NOT something the human typed. bg_wake_turn() always
+    frames it with this leading marker; the repl uses this to echo it distinctly
+    instead of dressing it up as an operator turn."""
+    return (text or "").lstrip().startswith("[autonomous wake")
+
+
+_WAKE_DISPLAY_CAP = 200   # chars of a wake/finish turn shown inline; full via /expand
+
+
+def _wake_display_body(text: str) -> str:
+    """The USER-facing body of an autonomous-wake turn: strip the model-facing
+    '[autonomous wake ... react now]' instruction preamble (that's an instruction to
+    the MODEL, not something the human needs to read), leaving just the event notice
+    (e.g. 'worker N finished: ...'). Also peels one pair of wrapping [] off the notice
+    so it reads as plain text, not a bracketed blob."""
+    t = (text or "").lstrip()
+    if t.startswith("[autonomous wake"):
+        end = t.find("]")
+        if end != -1:
+            t = t[end + 1:].lstrip()
+    if t.startswith("[") and t.endswith("]"):
+        t = t[1:-1].strip()
+    return t
+
+
+def _wake_label(body: str) -> str:
+    """The accent-bar label for a wake turn - names WHAT finished rather than the
+    generic 'auto', so the human reads 'worker' when a worker finished (the common
+    case), 'bg' for a background task, else 'auto'."""
+    head = body.lstrip().lower()
+    if head.startswith("worker"):
+        return "worker"
+    if head.startswith("bg ") or head.startswith("background") or "task" in head[:40]:
+        return "bg"
+    return "auto"
+
+
+def _wake_turn_lines(text: str, agent=None) -> str:
+    """Echo an autonomous-wake turn into scrollback with a dim cyan accent bar,
+    labelled by WHAT finished ('worker'/'bg'/'auto') - visually distinct from an
+    operator turn (yellow, named) and AI/tool lines, so it reads as 'the system woke
+    me', not 'the user said this'. The model-facing wake preamble is stripped (the
+    human just sees 'worker N finished: ...'), the body is truncated HARD inline, and
+    - when an agent is passed - the FULL text is stashed in the /expand ring so
+    `/expand N` shows all of it, exactly like a tool-call result."""
+    body = _wake_display_body(text)
+    label = _wake_label(body)
+    cid = None
+    if agent is not None:
+        try:
+            cid = agent.record_tool_call(f"{label} finished", {})
+            agent.record_tool_result(cid, body)
+        except Exception:
+            cid = None
+    # Show only the FIRST line, hard-capped - a wake turn is a headline, not the whole
+    # payload (that's what /expand is for). Keeps it to one tidy row in scrollback.
+    first = body.splitlines()[0] if body.splitlines() else body
+    shown = first
+    extra_lines = max(0, len(body.splitlines()) - 1)
+    if len(shown) > _WAKE_DISPLAY_CAP:
+        shown = shown[:_WAKE_DISPLAY_CAP].rstrip()
+    hidden = len(body) - len(shown)
+    if hidden > 0:
+        # Point at the command that renders the FULL result. A worker's full output
+        # lives in its result file (not this notice), so /worker <pid> is the real
+        # source; fall back to /expand for a plain (non-worker) wake turn.
+        m = re.match(r"worker\s+(\d+)", body.lstrip())
+        if m:
+            full_cmd = f"/worker {m.group(1)}"
+        elif cid:
+            full_cmd = f"/expand {cid}"
+        else:
+            full_cmd = None
+        tail = f" …[+{hidden} chars; {full_cmd} for the full result]" if full_cmd \
+            else f" …[+{hidden} chars]"
+        shown = shown + tail
+    bar = cyan(GLYPH["userbar"])
+    tag = dim(f"  #{cid}") if cid else ""
+    head = f"{bar} {cyan(bold(label + ' finished'))}{tag}"
+    return f"{head}\n{bar} {dim(shown)}"
+
+
+def _operator_turn_lines(name: str, text: str, agent=None) -> str:
     """Echo the operator's own submitted turn into scrollback with a yellow left
     accent bar + their name, so a human turn is easy to spot in a sea of AI (blue ●)
     and tool lines. The bar runs down every line of a multi-line paste. ASCII '|'
-    fallback on a non-UTF terminal; colour is _TTY-gated by the yellow() helper."""
+    fallback on a non-UTF terminal; colour is _TTY-gated by the yellow() helper.
+    A synthesised autonomous-wake turn is echoed distinctly (see _wake_turn_lines)
+    so it never masquerades as something the human typed; pass `agent` to make that
+    turn /expand-able."""
+    if _is_wake_turn(text):
+        return _wake_turn_lines(text, agent)
     bar = yellow(GLYPH["userbar"])
     head = f"{bar} {yellow(bold(name))}"
     body = "\n".join(f"{bar} {ln}" for ln in (text or "").splitlines()) or bar
@@ -11238,7 +11430,7 @@ def repl(cfg: Config, resume=None):
         elif pending_inputs:       # drain composer typeahead before prompting anew
             line = pending_inputs.pop(0).strip()
             if line:
-                print(_operator_turn_lines(cfg.user_name, line))
+                print(_operator_turn_lines(cfg.user_name, line, agent))
         else:
             try:
                 if idle_comp is not None:
@@ -11247,7 +11439,9 @@ def repl(cfg: Config, resume=None):
                     # the TTY (RuntimeError). The prompt glyph is drawn by the
                     # composer's own input row, so pass only the remote indicator.
                     try:
-                        _wake = (agent.bg_wake_turn if cfg.wake_on_bg_finish else None)
+                        _wake = (agent.bg_wake_turn
+                                 if (cfg.wake_on_bg_finish or agent._has_bg_optins())
+                                 else None)
                         line = idle_comp.read_line(
                             prompt_status=(indicator.strip() or None),
                             wake_check=_wake).strip()
@@ -11255,15 +11449,19 @@ def repl(cfg: Config, resume=None):
                         # submitted line into scrollback with the operator's yellow
                         # accent bar so a human turn stands out from AI + tool lines.
                         if line:
-                            print(_operator_turn_lines(cfg.user_name, line))
+                            print(_operator_turn_lines(cfg.user_name, line, agent))
                     except RuntimeError:
                         line = _input_or_wake(
                             _rl_safe(bold(cyan(indicator + _pg + " "))),
-                            agent.bg_wake_turn if cfg.wake_on_bg_finish else None)
+                            (agent.bg_wake_turn
+                             if (cfg.wake_on_bg_finish or agent._has_bg_optins())
+                             else None))
                 else:
                     line = _input_or_wake(
                         _rl_safe(bold(cyan(indicator + _pg + " "))),
-                        agent.bg_wake_turn if cfg.wake_on_bg_finish else None)
+                        (agent.bg_wake_turn
+                         if (cfg.wake_on_bg_finish or agent._has_bg_optins())
+                         else None))
                 pending_exit = False   # any input (even empty) disarms the exit
             except EOFError:           # Ctrl-D
                 agent.close_all_remotes()

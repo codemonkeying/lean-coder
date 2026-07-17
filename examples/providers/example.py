@@ -137,7 +137,18 @@ class ExampleClient:
         messages/tools are already in OpenAI shape. For a non-OpenAI backend,
         convert here and convert the response back into an assistant dict with
         `content` and optional `tool_calls`.
+
+        should_abort: an optional zero-arg predicate core passes so a turn stays
+        ^C-able. It goes true when the user hits Ctrl-C mid-request. Check it BEFORE
+        the network call (cheap early-out, done below); and if you STREAM the reply
+        (the bundled providers do - see openai.py's _consume), poll should_abort()
+        inside the read loop and stop as soon as it returns true. Returning
+        aborted=True (the 3rd tuple slot) tells core to drop the half-turn cleanly.
+        A single blocking urlopen like this template can't be interrupted mid-flight,
+        so we at least honour it at the boundary.
         """
+        if should_abort and should_abort():
+            return {"role": "assistant", "content": ""}, None, True
         key = _api_key()
         if not key:
             # Raise (don't return a content string) with "no API key" in the text: core

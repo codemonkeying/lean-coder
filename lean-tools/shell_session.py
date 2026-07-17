@@ -228,7 +228,10 @@ def _send(args, cwd):
         os.write(sess["fd"], text.encode("utf-8", "replace"))
     except OSError as e:
         return f"error: write to session {sid} failed: {e}"
-    timeout = float(args.get("timeout") or _READ_DEFAULT)
+    try:
+        timeout = float(args.get("timeout") or _READ_DEFAULT)
+    except (TypeError, ValueError):
+        timeout = _READ_DEFAULT
     out = _clean(_drain(sess["fd"], timeout))
     if not _alive(sess):
         _reap(sid, sess)
@@ -241,7 +244,10 @@ def _read(args, cwd):
     if err:
         return err
     sid, sess = got
-    timeout = float(args.get("timeout") or _READ_DEFAULT)
+    try:
+        timeout = float(args.get("timeout") or _READ_DEFAULT)
+    except (TypeError, ValueError):
+        timeout = _READ_DEFAULT
     out = _clean(_drain(sess["fd"], timeout))
     if not _alive(sess):
         _reap(sid, sess)

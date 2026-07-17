@@ -114,6 +114,7 @@ TIMEOUT = 30_000   # ms for playwright operations
 SCREENSHOT_DIR = Path.home() / "screenshots"
 MAX_TEXT = 6_000   # chars of visible text returned
 MAX_A11Y = 10_000  # chars of accessibility tree if dom=true
+MAX_AGGREGATE = 20_000  # total text cap across all breakpoints
 
 
 def _normalise_url(raw):
@@ -446,6 +447,14 @@ def run(args, cwd):
 
         if image_path is None:
             image_path = str(cap["out_path"])
+
+        # Aggregate cap: stop adding text if we've blown the budget.
+        if len(captures) > 1 and len("\n".join(all_lines)) > MAX_AGGREGATE:
+            remaining = len(captures) - i - 1
+            if remaining > 0:
+                all_lines.append(f"\n... ({remaining} more breakpoint(s) truncated from text; "
+                                 f"screenshots still saved to ~/screenshots/)")
+            break
 
     # Image tool-result contract: return {text, image_path}. On a vision model
     # (Anthropic v1) core base64s the PNG into the tool_result so the model SEES

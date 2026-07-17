@@ -52,20 +52,25 @@ TOOL = {
     "name": "dispatch_worker",
     "description": (
         "Hand a self-contained sub-task to a background worker agent (own session + context); "
-        "returns a pid. It runs in the BACKGROUND and its result is delivered to you "
-        "AUTOMATICALLY on a later turn - do NOT poll it (bg_status won't show workers; "
-        "don't sleep/cat its file). For scoped errands whose output would bloat this "
-        "session - e.g. 'scout this module, report where X is handled'. Default READ-ONLY; "
-        "leash='rw'/'rwe' to let it edit/run, never above YOUR capability."),
+        "returns a pid. It runs in the BACKGROUND and you are NOTIFIED AUTOMATICALLY when it "
+        "finishes (a finish notice arrives on a later turn) - so DON'T sit and poll it; just "
+        "carry on with other work or end your turn. If you genuinely need to check before then, "
+        "action='status' gives a one-shot state read (don't call it repeatedly - nothing changes "
+        "in seconds; bg_status won't show workers, don't sleep/cat its file). The finish notice "
+        "truncates a long result, so action='result' (pid=) pulls the FULL output. For scoped "
+        "errands whose output would bloat this session - e.g. 'scout this module, report where X "
+        "is handled'. Default READ-ONLY; leash='rw'/'rwe' to let it edit/run, never above YOUR "
+        "capability."),
     "parameters": {
         "type": "object",
         "properties": {
-            "action": {"type": "string", "enum": ["dispatch", "status", "cancel"],
+            "action": {"type": "string", "enum": ["dispatch", "status", "result", "cancel"],
                        "description": "What to do (default 'dispatch'): 'dispatch' launches a "
                                       "new worker from `task`; 'status' reports your dispatched "
-                                      "workers (state, runtime, whether a result is ready) - use "
-                                      "it if you must check on one, though finished results reach "
-                                      "you automatically; 'cancel' kills the worker named by `pid`."},
+                                      "workers (state, runtime, whether a result is ready); "
+                                      "'result' (pid=) returns a worker's FULL result untruncated "
+                                      "(the auto finish notice truncates a long one); 'cancel' "
+                                      "kills the worker named by `pid`."},
             "pid": {"type": "integer",
                     "description": "Worker pid to act on (required for action='cancel'; optional "
                                    "for 'status' to show just one). From the dispatch return line."},
@@ -192,10 +197,12 @@ def run(args, cwd):
     action = (args.get("action") or "dispatch").strip().lower()
     if action == "status":
         return _worker_status(args.get("pid"))
+    if action == "result":
+        return _worker_result(args.get("pid"))
     if action == "cancel":
         return _worker_cancel(args.get("pid"))
     if action != "dispatch":
-        return f"error: unknown action {action!r} (use dispatch | status | cancel)."
+        return f"error: unknown action {action!r} (use dispatch | status | result | cancel)."
     task = (args.get("task") or "").strip()
     if not task:
         return "error: dispatch_worker action='dispatch' needs a non-empty task."
@@ -454,6 +461,35 @@ def _worker_status(pid=None):
     return "\n".join(out)
 
 
+def _worker_result(pid):
+    """MODEL-facing full result (the tool's action='result'): return a worker's
+    COMPLETE ===RESULT=== block, untruncated. The turn-rider finish notice caps the
+    result at 1500 chars to avoid flooding the turn; this is how the model pulls the
+    rest without a human running /worker. `pid` is required (which worker); with no
+    pid, if exactly one worker exists, use it, else ask which."""
+    workers = _H["workers"]
+    if not workers:
+        return "no workers dispatched this session."
+    if pid is None:
+        if len(workers) == 1:
+            pid = next(iter(workers))
+        else:
+            return ("error: action='result' needs a pid (which worker). "
+                    "Use action='status' to list them.")
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return f"error: bad pid {pid!r}."
+    meta = workers.get(pid)
+    if not meta:
+        return f"no worker with pid {pid} this session."
+    res = _read_result(meta["result"])
+    if res is None:
+        return (f"worker {pid} has no result yet (still running or terminated before "
+                f"writing one). Use action='status' to check its state.")
+    return f"worker {pid} result (task: {meta['task'][:100]}):\n{res.strip()}"
+
+
 def _worker_cancel(pid):
     """MODEL-facing cancel (the tool's action='cancel'): kill a still-running worker
     by pid. An already-finished worker is a no-op (its result stands - use it). Reuses
@@ -484,8 +520,13 @@ def _worker_cancel(pid):
 
 
 def _worker_cmd(agent, cfg, arg):
-    """/worker - list dispatched workers with state + result; /worker <pid> prints
-    that worker's full result."""
+    """/worker - human command, at PARITY with the model's dispatch_worker actions:
+      /worker                list dispatched workers (state + result-ready)
+      /worker <pid>          print that worker's full result
+      /worker status [pid]   the model-facing status view (state/runtime/ready)
+      /worker cancel <pid>   kill a still-running worker
+    Subcommands reuse the same _worker_status/_worker_result/_worker_cancel the tool
+    uses, so the human and the model see identical behaviour."""
     workers = _H["workers"]
     if not workers:
         print(_H["dim"]("no workers dispatched this session."))
@@ -493,6 +534,20 @@ def _worker_cmd(agent, cfg, arg):
     bg_status = _H["bg_status"]
     rows = {r["pid"]: r for r in bg_status(os.getpid(), kind="worker")}
     arg = (arg or "").strip()
+    parts = arg.split()
+
+    # Subcommands (parity with the model tool). A bare pid stays the result shortcut.
+    if parts and parts[0].lower() in ("status", "cancel", "result"):
+        sub = parts[0].lower()
+        pid = parts[1] if len(parts) > 1 else None
+        if sub == "status":
+            print(_worker_status(pid))
+        elif sub == "result":
+            print(_worker_result(pid))
+        else:  # cancel
+            print(_worker_cancel(pid))
+        return
+
     if arg.isdigit():
         pid = int(arg)
         meta = workers.get(pid)
@@ -512,7 +567,17 @@ def _worker_cmd(agent, cfg, arg):
         tag = _H["green"]("result ready") if done else _H["dim"](state)
         print(f"  {_H['cyan'](str(pid))}  {tag}  (ran {runtime})  "
               f"{meta['model']}  {_H['dim'](meta['task'][:60])}")
-    print(_H["dim"]("  /worker <pid> prints that worker's full result"))
+    print(_H["dim"]("  /worker <pid> = full result · /worker status [pid] · "
+                    "/worker cancel <pid>"))
+
+
+def _worker_completer(agent, cfg):
+    """Tab-completion for /worker's first argument: the subcommand verbs plus every
+    live worker pid (so `cancel <Tab>` / a bare `<Tab>` offers real pids). Matches the
+    menu contract of other multi-verb commands (e.g. /mcp)."""
+    opts = ["status", "result", "cancel"]
+    opts += [str(pid) for pid in _H.get("workers", {})]
+    return opts
 
 
 def setup(lc, cfg):
@@ -588,5 +653,6 @@ def setup(lc, cfg):
     _H["enabled_provider_models"] = _enabled_provider_models
 
     lc["register_command"]("/worker", _worker_cmd,
-                           "list dispatched worker agents (+ results); /worker <pid> "
-                           "prints a worker's full result")
+                           "list workers (+ results); /worker <pid> = full result, "
+                           "/worker status [pid], /worker cancel <pid>",
+                           _worker_completer)
