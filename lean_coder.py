@@ -16,6 +16,7 @@ import itertools
 import json
 import os
 import re
+import select
 import shlex
 import signal
 import socket
@@ -2138,6 +2139,15 @@ _active_spinner = None             # so _ask() can pause it before prompting
 
 WATCHDOG_ELAPSED_AT = 6      # s before the status starts showing an elapsed counter
 WATCHDOG_HINT_AT = 25        # s before it adds the "how to bail out" hint
+
+# A remote round-trip (over the ssh master) can STALL - not die - when the link
+# blips (you muck with network settings, roaming, NAT rebind): the socket neither
+# delivers data nor EOFs, so the read just waits. We ride it out (a blip usually
+# recovers, and the reconnect path only fires on a real drop/EOF), but after this
+# many seconds we surface a spinner ('waiting on <host> ...') so a stall never
+# looks like a dead blank screen, and ^C stays live to bail. Not a timeout - it
+# never forces a teardown (that would fight reconnect on a link about to recover).
+REMOTE_WAIT_GRACE = 5        # s of silence before showing the 'waiting on remote' spinner
 
 
 def _activity_label(base, elapsed, pid=None):
@@ -5425,29 +5435,68 @@ class ExecutorClient:
             argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=stderr, text=True, bufsize=1)
         self._id = 0
+        self.host = None                # set by RemoteWorkspace for wait-spinner labels
         self.ready = self._read_obj()   # consume the {"ready": ...} handshake
 
-    def _read_obj(self):
-        while True:
-            line = self.proc.stdout.readline()
-            if not line:
-                raise ConnectionError("executor closed before responding")
-            try:
-                return json.loads(line)
-            except json.JSONDecodeError:
-                continue
+    def _read_obj(self, should_abort=None, deadline=None):
+        """Read the next JSON object from the executor's stdout.
 
-    def request(self, tool, args=None):
-        """Send a tool request; return the full response object."""
+        Blocks until a line arrives - but WAKES periodically (via select) so a
+        stalled read isn't a dead, uninterruptible freeze. A remote round-trip
+        can STALL (not die) when the link blips: the socket neither delivers nor
+        EOFs. We ride that out (a blip recovers, and the caller's reconnect only
+        fires on a real drop/EOF) while staying responsive:
+          - after REMOTE_WAIT_GRACE seconds of silence, show a 'waiting on <host>'
+            spinner so it never looks like a hung blank screen;
+          - if should_abort() goes true (^C during the wait), raise _TurnAbort to
+            drop cleanly back to the prompt - the master is left intact;
+          - if deadline (monotonic) passes, raise TimeoutError - a soft, caller-set
+            budget for non-critical calls (e.g. bg_poll) that must never block a turn.
+        None of these tear the connection down; that stays the caller's job."""
+        fd = self.proc.stdout.fileno()
+        t0 = time.monotonic()
+        spin = None
+        try:
+            while True:
+                if should_abort is not None and should_abort():
+                    raise _TurnAbort()
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise TimeoutError("remote did not respond within the budget")
+                # select() when the stream is a real fd (remote pipe / local proc);
+                # a non-selectable stream (test doubles) falls through to a plain read.
+                try:
+                    ready = select.select([fd], [], [], 0.25)[0]
+                except (OSError, ValueError):
+                    ready = True
+                if not ready:
+                    if spin is None and time.monotonic() - t0 >= REMOTE_WAIT_GRACE:
+                        where = f" on {self.host}" if self.host else ""
+                        spin = Spinner(f"waiting for remote{where} (link slow? ^C to abort)",
+                                       TOOL_FRAMES, yellow, interval=0.12).start()
+                    continue
+                line = self.proc.stdout.readline()
+                if not line:
+                    raise ConnectionError("executor closed before responding")
+                try:
+                    return json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+        finally:
+            if spin is not None:
+                spin.stop()
+
+    def request(self, tool, args=None, should_abort=None, deadline=None):
+        """Send a tool request; return the full response object. should_abort/deadline
+        are threaded to _read_obj so a stalled reply stays interruptible + bounded."""
         self._id += 1
         _emit_json(self.proc.stdin, {"id": self._id, "tool": tool, "args": args or {}})
         while True:
-            obj = self._read_obj()
+            obj = self._read_obj(should_abort=should_abort, deadline=deadline)
             if obj.get("id") == self._id:
                 return obj
 
-    def call(self, tool, args=None):
-        obj = self.request(tool, args)
+    def call(self, tool, args=None, should_abort=None):
+        obj = self.request(tool, args, should_abort=should_abort)
         return obj["result"] if obj.get("ok") else f"error: {obj.get('error')}"
 
     def close(self):
@@ -5757,6 +5806,7 @@ class RemoteWorkspace:
         self.client = ExecutorClient(
             _ssh_exec_argv(self.host, self.ctl, exec_cmd, self.cwd, lean_tools_remote),
             stderr=subprocess.DEVNULL)
+        self.client.host = self.host          # label the wait-spinner with the box
         self.remote_cwd = self.client.ready.get("cwd")
 
     def read_raw(self, path):
@@ -5775,10 +5825,13 @@ class RemoteWorkspace:
         """Finished bg tasks the REMOTE executor owns (its sidecars live on that
         box), as [{pid, cmd, code, tail}] - so a long-running remote job surfaces
         its result on the next turn just like a local one. [] on any error (never
-        break a turn over a poll)."""
+        break a turn over a poll). This is NON-CRITICAL housekeeping that runs
+        BEFORE inference every turn, so it gets a short soft deadline: if the link
+        is stalled (a blip), skip the note this turn rather than block the user's
+        actual message behind it - it'll report on the next turn instead."""
         try:
-            obj = self.client.request(BG_POLL)
-        except (ConnectionError, OSError):
+            obj = self.client.request(BG_POLL, deadline=time.monotonic() + 3)
+        except (ConnectionError, OSError, TimeoutError):
             return []
         return obj.get("result") or [] if obj.get("ok") else []
 
@@ -5855,8 +5908,8 @@ class RemoteWorkspace:
         if not out.strip():
             raise ConnectionError(f"python3 still missing on {self.host} after install")
 
-    def call(self, tool, args=None):
-        return self.client.call(tool, args)
+    def call(self, tool, args=None, should_abort=None):
+        return self.client.call(tool, args, should_abort=should_abort)
 
     def close(self):
         if self.client:
@@ -6544,7 +6597,8 @@ class Agent:
                                            safe=safe, fetch=self.remote.read_raw):
                     return "operator declined the remote command"
                 try:
-                    result = self.remote.call(name, args)
+                    result = self.remote.call(name, args,
+                                              should_abort=lambda: self._abort)
                 except (ConnectionError, OSError) as e:
                     # The exec channel died - almost always a transient master drop
                     # (idle NAT/keepalive timeout, a brief link blip), NOT a reboot.
@@ -6558,7 +6612,8 @@ class Agent:
                     # caught below and dropped to LOCAL (operator re-/connect to prompt).
                     print(dim(f"\n  remote {host} link lost ({e}); reconnecting ..."))
                     self.remote.connect(batch=True)
-                    result = self.remote.call(name, args)
+                    result = self.remote.call(name, args,
+                                              should_abort=lambda: self._abort)
             except (ConnectionError, OSError) as e:
                 # reconnect failed too: the box rebooted or the link is truly down.
                 # Fall back to local and tell the model, instead of crashing.

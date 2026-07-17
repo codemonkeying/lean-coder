@@ -1,5 +1,17 @@
 *.bak
+*.orig
+*~
+*.swp
+*.pyc
 __pycache__/
+.pre-sync.bak/
+*.pre-sync.bak/
+
+# Internal dev notes, handovers, design docs, backlog - never public.
+/docs/
+
+# Model-evaluation harness + results - local research, not shipped.
+/model-eval/
 
 # Live lean-tools working dir (point lean_tools_dir here to a separate one if you
 # want an isolated working set). We ignore the CONTENTS (leading slash anchors to the
