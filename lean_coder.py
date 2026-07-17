@@ -88,7 +88,7 @@ def _prehandover_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.8.2"
+__version__ = "0.8.3"
 
 
 def _prerelease_key(pre):
@@ -11476,16 +11476,17 @@ def repl(cfg: Config, resume=None):
                 pending_exit = False   # any input (even empty) disarms the exit
             except EOFError:           # Ctrl-D
                 agent.close_all_remotes()
-                if idle_comp is not None:
-                    idle_comp.save_history()
+                if idle_comp is not None and not cfg.incognito:
+                    idle_comp.save_history()   # incognito leaves no on-disk input trace
                 print("\nbye")
                 return
             except KeyboardInterrupt:  # ^C at the prompt: first cancels, second exits
                 if pending_exit:
                     agent.close_all_remotes()
-                    if idle_comp is not None:
-                        idle_comp.save_history()
+                    if idle_comp is not None and not cfg.incognito:
+                        idle_comp.save_history()   # incognito leaves no on-disk input trace
                     print("\nbye")
+                    return
                     return
                 pending_exit = True
                 print(yellow("\npress ^C again to exit"))
