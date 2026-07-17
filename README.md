@@ -17,12 +17,15 @@ It reads, edits, and runs code in your project through a model's native tool-cal
 API - but it's built around one idea most agents ignore: **your context window is the
 scarce resource, so don't waste it describing the tool.**
 
-Connect a handful of MCP servers to a typical coding agent and their tool definitions
-alone can run to tens of thousands of tokens before you type a word - context that
-can't hold your actual code. lean-coder's *entire* shipped tool surface plus its
-system prompt costs about **~2k tokens**. It's just a different category: the platform
-stays out of the way so the window holds your work, and it's usable on small local
-models, not just frontier ones.
+Mainstream coding agents spend a lot of your window on themselves before you type a
+word: measurements put the big ones at tens of thousands of tokens of system prompt
+and built-in tool scaffolding per session - and that's *before* you connect any MCP
+servers, which add anywhere from hundreds to tens of thousands of tokens each on top.
+That's context that can't hold your actual code. lean-coder's *entire* shipped tool
+surface plus its system prompt costs about
+**~2k tokens**. It's just a different category: the platform stays out of the way so
+the window holds your work, and it's usable on small local models, not just frontier
+ones.
 
 And when a long task *does* fill the window, it doesn't truncate and forget - the
 agent **documents its own work, pins a goal + plan, and hands over to a clean slate**,
@@ -93,7 +96,7 @@ actual code. lean-coder treats context as the scarce resource it is:
   | chat | ~500 | system prompt alone, no tools |
   | read (`r`) | ~1.1k | + read_file, list_files, search_files, bg_status, update_plan |
   | write (`rw`) | ~1.5k | + apply_diff, replace_lines, write_file |
-  | exec (`rwe`) | **~2k** | + run_command, ask_user_to_run — the fresh-session floor |
+  | exec (`rwe`) | **~2k** | + run_command, ask_user_to_run - the fresh-session floor |
 
   That **~2k** is the whole shipped agent: system prompt plus all ten always-on
   builtin tools. On top, the **optional bundled lean-tools** are off by default and
@@ -112,8 +115,8 @@ actual code. lean-coder treats context as the scarce resource it is:
   shows the real current figure.
 
   **For scale:** a *single* MCP server's tool definitions are commonly
-  [300–710 tokens **per tool**](https://dev.to/piotr_hajdas/mcp-token-limits-the-hidden-cost-of-tool-overload-2d5),
-  and a typical server (e.g. Slack, ~10–15 tools)
+  [300-710 tokens **per tool**](https://dev.to/piotr_hajdas/mcp-token-limits-the-hidden-cost-of-tool-overload-2d5),
+  and a typical server (e.g. Slack, ~10-15 tools)
   [runs ~2,000 tokens](https://www.mindstudio.ai/blog/claude-code-mcp-server-token-overhead) -
   as much as lean-coder's *entire* shipped surface. Connect a few and you can burn
   [50k+ tokens before the first question](https://dev.to/kenimo49/your-mcp-server-eats-55000-tokens-before-your-agent-says-a-word-i-measured-the-real-cost-19l8).
@@ -348,11 +351,11 @@ the context budget. Eight file/shell tools live in the required builtin-tools mo
 | `bg_status`     | Poll / reap background tasks started with a trailing `&`. |
 
 Alongside these the model always has **`update_plan`** (maintains a pinned goal +
-TODO that survives compaction) and, by default, **`ask_user_to_run`** — the escape
+TODO that survives compaction) and, by default, **`ask_user_to_run`** - the escape
 hatch for anything `run_command` can't do itself: a command needing **sudo/root**, an
 **interactive prompt**, or a **typed password or secret**. Instead of running it, the
 agent hands the exact command back to *you* to run in your own terminal; only the
-command and its exit code return to the agent — **whatever you type (the password,
+command and its exit code return to the agent - **whatever you type (the password,
 the secret) never reaches the model**. You can also edit the command before running
 it, or decline. On by default; toggle with `/set`. A batch of read-only calls in
 one turn runs **concurrently**.
