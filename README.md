@@ -364,7 +364,7 @@ on with `/tools` and it costs context only from that point. These ship bundled i
 | `web_screenshot`  | Screenshot a URL with a headless browser + return the page text (and, on a vision model, the image itself). **Needs [Playwright](https://playwright.dev/python/) + a browser** (`pip install playwright && playwright install firefox`); says so if absent. Disabled by default. |
 | `brave_search`    | Web search (Brave API). |
 | `git_summary`     | Read-only git snapshot (branch, status, diffstat, recent commits). |
-| `diagnostics`     | Run the installed linter / typechecker for a file. |
+| `diagnostics`     | Lint/typecheck a file with **whatever's already installed** on the box (or the remote executor when `/connect`'d). Zero deps of its own: it uses a richer checker if present (pyright, ruff, tsc, eslint, phpstan, clippy, shellcheck…) and falls through to always-available basics (`py_compile`, `bash -n`, `gcc -fsyntax-only`, stdlib JSON…). Never installs or pushes anything. |
 | `symbols`         | Navigate Python code without grepping: outline a file/dir's classes+defs, or locate a definition by name (zero-dep, stdlib `ast`). |
 | `shell_session`   | A persistent interactive shell the model holds open across calls (REPL, ssh, etc.). |
 | `ssh`             | One-shot `ssh host cmd` (network egress, kept out of core). |
@@ -373,6 +373,20 @@ on with `/tools` and it costs context only from that point. These ship bundled i
 | `provision`       | `/provision` wizard: install lean-coder onto another box over SSH. |
 | `update`          | `/update` - self-update `lean_coder.py` to the latest published build. |
 | `word_count`      | Count lines / words / chars in a file. |
+
+**Dependencies:** almost all of these are stdlib-only. The exceptions:
+`web_screenshot` needs [Playwright](https://playwright.dev/python/) + a browser, and
+`brave_search` needs a Brave API key. `diagnostics` is the special case - it has *no*
+deps of its own but opportunistically *uses* external linters if the box already has
+them (see its row). Every dep-bearing tool is disabled by default, costs nothing
+until enabled, and says so clearly if the dep is missing.
+
+**Not built (yet):** there's no persistent **LSP** (Language Server Protocol)
+integration - that would be a heavy, dependency-per-language addition (great for
+big PHP/Java/TS projects with go-to-definition, project-wide rename, live type
+errors). We haven't built it because we don't need it: `diagnostics` (one-shot lint)
+and `symbols` (stdlib `ast` navigation) cover our day-to-day. If you want proper LSP
+and would use it, open an issue - happy to build it.
 
 Each is small enough to read in a sitting and usable by small models. For learning
 the pattern, [`examples/lean-tools/`](examples/lean-tools/) has two annotated
