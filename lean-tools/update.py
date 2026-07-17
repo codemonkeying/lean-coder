@@ -47,8 +47,9 @@ TRACK_BRANCH = {"stable": "main", "beta": "beta"}
 # never delete, so user drop-ins (and upstream-removed files) survive.
 _ROOT_FILES = ("lean_coder.py", "VERSION", "README.md", "LEAN_TOOLS.md", "MCP.md",
                "PROVIDER_API.md", "CONTRIBUTING.md", "install.sh", "uninstall.sh")
-_OVERLAY_DIRS = ("providers", "lean-tools")
-_DIR_SUFFIXES = (".py", ".md")
+_OVERLAY_DIRS = ("providers", "lean-tools", "demos")
+# .gif ships the README demo asset (under demos/); .py/.md cover the plugin dirs.
+_DIR_SUFFIXES = (".py", ".md", ".gif")
 
 
 # Env flag set on the self-heal re-exec so the freshly-overlaid updater doesn't

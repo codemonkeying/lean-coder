@@ -330,6 +330,11 @@ if [ "$SCRIPT_DIR" != "$DIR" ]; then
       run "cp -f '$SCRIPT_DIR/$d/'*.py '$DIR/$d/'"
     fi
   done
+  # demo asset for the README (the top-of-page GIF). Best-effort; not load-bearing.
+  if [ -d "$SCRIPT_DIR/demos" ]; then
+    run "mkdir -p '$DIR/demos'"
+    run "cp -f '$SCRIPT_DIR/demos/'*.gif '$DIR/demos/' 2>/dev/null || true"
+  fi
 fi
 run "chmod +x '$DIR/lean_coder.py'"
 ok "copied and made executable"

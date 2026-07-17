@@ -11,6 +11,10 @@
 
 [Install](#install) &middot; [Quick start](#quick-start) &middot; [Why it exists](#why-it-exists) &middot; [Providers](#providers-pick-a-model-backend) &middot; [Safety](#safety-two-axes) &middot; [Tools](#tools) &middot; [Handover](#handover-the-agent-documents-its-work-before-a-memory-wipe)
 
+![lean-coder auditing and fixing a real bug on a local model](demos/demo.gif)
+
+<sub>A local model (Qwen3-Coder:30b via Ollama) auditing a Python package, finding the root cause of a bug, and fixing it.</sub>
+
 </div>
 
 It reads, edits, and runs code in your project through a model's native tool-calling
