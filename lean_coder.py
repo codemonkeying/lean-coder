@@ -3317,6 +3317,42 @@ def est_tokens(text: str) -> int:
     return int(((len(text) + 3) // 4) * _TOK_FACTOR)
 
 
+# Tool-schema token cost is STATIC within a session load (the tool list only changes
+# on refresh_tools(), which builds a fresh list object). Re-json.dumps'ing the whole
+# schema list on every _raw_messages_tokens call - which runs per tool call, many times
+# a turn - is pure waste, so memoize it on the list's identity (id + len guards against
+# id reuse after a rebuild). Cheap drop-in; no API change.
+_TOOLS_TOK_CACHE = (None, 0, 0)   # (id(tools), len(tools), token_cost)
+
+
+def _tools_tokens(tools) -> int:
+    global _TOOLS_TOK_CACHE
+    key_id, key_len = id(tools), len(tools or [])
+    cid, clen, cost = _TOOLS_TOK_CACHE
+    if cid == key_id and clen == key_len:
+        return cost
+    cost = (len(json.dumps(tools)) + 3) // 4
+    _TOOLS_TOK_CACHE = (key_id, key_len, cost)
+    return cost
+
+
+# User-turn count feeds the status line + /info, both HOT (status prints many times a
+# turn). Re-scanning the whole message list each time is an O(n) waste; memoize on the
+# list identity + length so it recomputes only when history actually grows/shrinks.
+_TURNS_CACHE = (None, 0, 0)   # (id(messages), len(messages), user_turn_count)
+
+
+def _user_turns(messages) -> int:
+    global _TURNS_CACHE
+    key_id, key_len = id(messages), len(messages)
+    cid, clen, count = _TURNS_CACHE
+    if cid == key_id and clen == key_len:
+        return count
+    count = sum(1 for m in messages if m.get("role") == "user")
+    _TURNS_CACHE = (key_id, key_len, count)
+    return count
+
+
 def _raw_messages_tokens(messages, tools) -> int:
     """UNCALIBRATED char-based size of a full send (messages + tool schemas), including
     per-message framing. This is the quantity we compare against the provider's real
@@ -3327,7 +3363,7 @@ def _raw_messages_tokens(messages, tools) -> int:
         total += _PER_MSG_OVERHEAD
         for tc in m.get("tool_calls", []) or []:
             total += (len(json.dumps(tc.get("function", {}))) + 3) // 4
-    total += (len(json.dumps(tools)) + 3) // 4
+    total += _tools_tokens(tools)
     return total
 
 
@@ -9287,7 +9323,7 @@ def _status_rows(agent, cfg):
     # 1) session + model (at the top - what/where you're running). The live turn
     # counter sits where 'autosaving' used to (autosave state -> /info now); it's a
     # volatile token _status_key strips so 'changed-only' mode still gates correctly.
-    turns = sum(1 for m in agent.messages if m.get("role") == "user")
+    turns = _user_turns(agent.messages)
     if cfg.incognito:
         s = [magenta(f"{GLYPH['ghost']} incognito")]
     elif cfg.autosave:
@@ -9373,7 +9409,7 @@ def handle_info_command(agent, cfg, arg=""):
     where = f"remote {agent.remote.host}" if agent.remote else "local"
     backend = _provider_label(cfg)
     used, window = agent._ctx_used(), cfg.ctx_window() or 1
-    turns = sum(1 for m in agent.messages if m.get("role") == "user")
+    turns = _user_turns(agent.messages)
     if _provider_uses_settings(cfg):
         think, effort = cfg.setting("thinking") or "off", cfg.setting("effort") or "-"
     else:
