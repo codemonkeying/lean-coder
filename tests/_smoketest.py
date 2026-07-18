@@ -2728,6 +2728,15 @@ _sd = lc.load_session("alpha")
 check("load_session: round-trips messages", _sd["messages"] == _smsgs)
 check("load_session: missing -> FileNotFoundError",
       _raises(lambda: lc.load_session("nope"), FileNotFoundError))
+# atomic save: no torn file left behind, and no leftover .tmp sidecar (matters for
+# per-turn autosave across dide's mid-session reboots - a truncated JSON breaks resume)
+check("save_session: no leftover .tmp sidecar after save",
+      not any(p.name.startswith("alpha.json.tmp") for p in lc.SESSIONS_DIR.iterdir()))
+# a corrupt session file must raise JSONDecodeError (the callers catch it and degrade
+# to a fresh start / 'unreadable' notice rather than crashing the launch)
+(lc.SESSIONS_DIR / "torn.json").write_text('{"meta": {"model": "x"')  # truncated mid-write
+check("load_session: corrupt file -> JSONDecodeError (callers degrade gracefully)",
+      _raises(lambda: lc.load_session("torn"), __import__("json").JSONDecodeError))
 # name sanitization: no path separators survive, traversal impossible
 _sp2, _ = lc.save_session(_smsgs, _scfg, "a/b/../c")
 check("save_session: sanitized name has no separators",
