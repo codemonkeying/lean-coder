@@ -91,7 +91,7 @@ def _prehandover_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.8.12"
+__version__ = "0.8.13"
 
 
 def _prerelease_key(pre):
@@ -3391,7 +3391,21 @@ def _raw_messages_tokens(messages, tools) -> int:
         return cost
     total = 0
     for m in messages:
-        total += (len(m.get("content") or "") + 3) // 4
+        c = m.get("content")
+        # content is normally a string, but can be a block LIST (image parts) or, from
+        # a loaded/synthesised history, a non-string. Size a string by chars; anything
+        # else by its JSON length - so len() never crashes on an int and a list of
+        # blocks isn't mis-measured as its element COUNT (2) instead of its size.
+        if isinstance(c, str):
+            clen = len(c)
+        elif c is None:
+            clen = 0
+        else:
+            try:
+                clen = len(json.dumps(c))
+            except (TypeError, ValueError):
+                clen = len(str(c))
+        total += (clen + 3) // 4
         total += _PER_MSG_OVERHEAD
         for tc in m.get("tool_calls", []) or []:
             total += (len(json.dumps(tc.get("function", {}))) + 3) // 4

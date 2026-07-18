@@ -44,6 +44,16 @@ check("/mcp fully wired (dispatch+slash+help)",
 sys_msg = {"role": "system", "content": lc.SYSTEM_PROMPT + "\nWorking directory: /x"}
 overhead = lc.messages_tokens([sys_msg], lc.active_tools(lc.Config()))
 check("fixed overhead < 2200 tokens (~2k README claim + headroom)", overhead < 2200, f"~{overhead} tokens")
+# the hot metering path must survive non-string content (int/None from a loaded or
+# synthesised history) and size a block LIST by its JSON length, not its element count
+# (a crash/skew here would feed a bad ctx meter into handover decisions).
+_mt_msgs = [{"role": "system", "content": "s"}, {"role": "user", "content": 42},
+            {"role": "assistant", "content": None}]
+check("_raw_messages_tokens: non-string content doesn't crash the meter",
+      isinstance(lc._raw_messages_tokens(_mt_msgs, []), int))
+check("_raw_messages_tokens: block list sized by JSON, not element count",
+      lc._raw_messages_tokens([{"role": "user", "content": [{"type": "text", "text": "x" * 400}]}], [])
+      > lc._raw_messages_tokens([{"role": "user", "content": [{"type": "text", "text": "x"}]}], []) + 50)
 check("8 base tools (ssh moved to a lean-tool; bg_status added)", len(lc.TOOLS) == 8, f"{len(lc.TOOLS)}")
 check("bg_status is a core tool", "bg_status" in [t["function"]["name"] for t in lc.TOOLS])
 check("active_tools adds ask_user_to_run by default", len(lc.active_tools(lc.Config())) == 10)
