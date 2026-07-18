@@ -21,11 +21,20 @@ ecosystem.
 /mcp list                  # configured servers + connection state
 /mcp reconnect [name]      # (re)connect all enabled, or just one
 /mcp remove <name>         # forget a server
+/mcp clean [name]          # drop stale entries (enabled but never defined)
 ```
 
 `/mcp add <name> <spec>` infers the transport from the spec: a `http(s)://` URL ->
 **HTTP**; anything else -> a **stdio** command line. The server is saved to your config
 and enabled immediately; its tools appear on the next turn.
+
+**Guided auth.** If an HTTP server you add (or reconnect) answers `401`/`403`, lean-coder
+does not just dump a red error - it offers an inline auth walkthrough (the same shape as a
+provider that needs a login): pick **OAuth 2.1** or **static bearer**, answer a couple of
+prompts, and it wires the auth up and reconnects. For OAuth against a gateway that supports
+dynamic client registration this is fully hands-off - see
+[Guided OAuth (auto-registration)](#guided-oauth-auto-registration) below. No TTY (piped /
+headless)? It prints the exact config block to add instead.
 
 Every subcommand also answers `/mcp ?` with its full help.
 
@@ -101,6 +110,41 @@ auth = { type = "oauth", token_url = "https://…/oauth/token", client_id = "my-
 `client_secret_env` (env lookup) is preferred; `client_secret` (literal) is accepted.
 `scope` is optional. Both `bearer`-static and `oauth` end as the same one Bearer header,
 so a gateway that accepts either kind Just Works.
+
+### Guided OAuth (auto-registration)
+
+You rarely need to hand-write the `oauth` block above. When an HTTP server returns
+`401`/`403`, the guided walkthrough can set the whole thing up for you, including
+**dynamic client registration (DCR, RFC 7591)** so you never have to mint a client by
+hand. Choosing OAuth in the prompt does:
+
+1. **Discovery** - fetches the gateway's `/.well-known/oauth-protected-resource`
+   (RFC 9728) then `/.well-known/oauth-authorization-server` (RFC 8414) to find the
+   `token_endpoint` and `registration_endpoint`.
+2. **Registration** - if a `registration_endpoint` exists, it POSTs a client-credentials
+   registration (passing a registration key as a Bearer header if the endpoint is guarded
+   - it asks you for one, blank if the endpoint is open) and gets back a
+   `client_id` + `client_secret`.
+3. **Storage** - writes those to a **mode-0600 sidecar** at
+   `~/.config/leancoder/mcp_auth/<server>.json`, and sets `config.toml` to just
+   `auth = { type = "oauth" }`. **The secret never touches `config.toml`.**
+4. **Connect** - fetches the first token, caches it (with its expiry) back into the
+   sidecar, and reconnects.
+
+If the gateway has no DCR endpoint, the walkthrough falls back to asking for the
+`token_url` / `client_id` / secret manually; you can put the secret in an env var
+(`client_secret_env`) or let lean-coder store it in the same 0600 sidecar.
+
+**Where secrets live (the rule).** Anything *you supply* (a static bearer token, a
+pre-existing OAuth client secret) belongs in an **environment variable** referenced by
+`token_env` / `client_secret_env` - never written to disk by lean-coder. Anything
+lean-coder *mints itself* (a DCR client secret, cached access tokens) goes in the
+**0600 sidecar** under the config dir, the same convention the `anthropic_plan` provider
+uses for `auth.json`. Either way, `config.toml` stays free of secrets.
+
+The sidecar (`~/.config/leancoder/mcp_auth/<server>.json`) holds
+`{client_id, client_secret, token_endpoint, registration_endpoint, scope}` plus the
+cached `{access_token, expires_at}`; delete the file to force a fresh registration.
 
 ---
 
