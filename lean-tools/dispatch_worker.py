@@ -763,7 +763,7 @@ def setup(lc, cfg):
     # Capture the core hooks + helpers run()/the command need (a tool's run() gets
     # no lc). setup() is driver-only = exactly where a worker is launched, so these
     # are always present when run() fires.
-    for k in ("bg_launch", "bg_list", "bg_status", "_bg_kill", "_extract_marked", "CONFIG_DIR",
+    for k in ("bg_launch", "bg_list", "bg_status", "_bg_kill", "_bg_log_tail", "_extract_marked", "CONFIG_DIR",
               "BRIEF_MARK", "GRANT_MARK", "RESULT_MARK", "LEASH_LEVELS", "_norm_leash",
               "active_remote", "_ssh_master_alive", "ensure_worker_master",
               "resolve_host", "_norm_host",
