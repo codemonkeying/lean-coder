@@ -88,7 +88,7 @@ def _prehandover_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.8.5"
+__version__ = "0.8.6"
 
 
 def _prerelease_key(pre):
@@ -12278,6 +12278,12 @@ def run_agent_brief(args) -> int:
         f"{RESULT_MARK} would make the tool call be ignored (your action would not run). "
         "Finish every tool call FIRST, wait for its result, confirm the change (re-read if "
         f"you edited), and only THEN write the {RESULT_MARK} block on its own.\n"
+        "HOW YOUR RUN ENDS: a message from you that calls NO tool ENDS your run immediately. "
+        "So never send a bare transition like 'now I'll compile the findings' or 'let me write "
+        "that up' on its own - that message has no tool call, so your run stops right there and "
+        f"whatever you meant to write next is lost. Every message must either (a) call a tool to "
+        f"keep working, or (b) BE your final answer in the {RESULT_MARK} block. There is no "
+        "in-between 'thinking out loud' message.\n"
         "MID-TASK MESSAGES: the operator or the agent that dispatched you may send you a "
         "message while you work (it arrives as a new turn prefixed [operator inject] or "
         "[parent-agent inject]). Treat it as a correction/steer that OUTRANKS your original "
@@ -12412,6 +12418,23 @@ def run_agent_brief(args) -> int:
                 f"{RESULT_MARK} block alone.")
         except Exception as e:
             return _fail(f"worker corrective turn failed: {e}")
+
+    # Missing-RESULT rescue: the loop ends the moment the model emits an assistant
+    # message with no tool call - but a worker sometimes stops on a bare "let me compile
+    # the findings" preamble WITHOUT ever writing the RESULT block, so the harvest below
+    # would capture that stub as the whole answer. If the final text carries no marker,
+    # nudge it to actually produce the RESULT (at most 2 turns), then re-harvest.
+    for _ in range(2):
+        if RESULT_MARK in _final_asst_content():
+            break
+        try:
+            agent.run_turn(
+                f"You stopped without writing your {RESULT_MARK} block, so no answer was "
+                f"captured. Write your COMPLETE final answer now, wrapped between two "
+                f"{RESULT_MARK} markers, as your entire message (no tool call in it). Do not "
+                f"summarize that you will - write the actual content.")
+        except Exception as e:
+            return _fail(f"worker result-rescue turn failed: {e}")
 
     # Harvest: the last assistant text -> its RESULT block, or the whole message.
     final = ""
