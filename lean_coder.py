@@ -88,7 +88,7 @@ def _prehandover_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.8.4"
+__version__ = "0.8.5"
 
 
 def _prerelease_key(pre):
@@ -318,14 +318,13 @@ def _json_field(text, names):
     (case-insensitive). Value may be str or list (a TODO). Returns str or None."""
     if not text or "{" not in text:
         return None
-    import json as _json
     # try the largest brace-balanced span
     start = text.find("{")
     end = text.rfind("}")
     if start == -1 or end <= start:
         return None
     try:
-        obj = _json.loads(text[start:end + 1])
+        obj = json.loads(text[start:end + 1])
     except Exception:
         return None
     if not isinstance(obj, dict):
@@ -1301,7 +1300,8 @@ class MCPConnection:
         the Mcp-Session-Id header. Tolerates an SSE ('data: {...}') or plain JSON body.
         Retries once on a 401 by forcing an OAuth token refresh."""
         for attempt in (0, 1):
-            hf = tempfile.mktemp()
+            _hfd, hf = tempfile.mkstemp()
+            os.close(_hfd)
             args = ["-X", "POST", self._http_url(),
                     "-H", "Content-Type: application/json",
                     "-H", "Accept: application/json, text/event-stream",
@@ -1318,10 +1318,7 @@ class MCPConnection:
             if self._session_id:
                 args += ["-H", f"Mcp-Session-Id: {self._session_id}"]
             args += ["-d", json.dumps(payload)]
-            try:
-                body = self._curl(args, timeout)
-            finally:
-                pass
+            body = self._curl(args, timeout)
             headers, status = {}, 0
             try:
                 with open(hf) as f:
@@ -8254,6 +8251,17 @@ class Agent:
     def _ctx_zone(self):
         return self.ctx.zone()
 
+    def _ctx_summary(self, cfg):
+        """Shared context read-out math for /info and the status meter (kept in one
+        place so their used/window/zone/pct never drift). Returns
+        (used, window, zone, pct). Callers pick their own label strings."""
+        used, window = self._ctx_used(), cfg.ctx_window() or 1
+        try:
+            zone = self._ctx_zone()[0]
+        except Exception:
+            zone = "ok"
+        return used, window, zone, used / window * 100
+
     def _compact_allowed(self, zone) -> bool:
         return self.ctx.compact_allowed(zone)
 
@@ -9360,12 +9368,7 @@ def _status_rows(agent, cfg):
         think, effort = cfg.setting("thinking") or "na", cfg.setting("effort") or "na"
     else:
         think, effort = {True: "on", False: "off"}.get(cfg.think, "na"), "na"
-    used, window = agent._ctx_used(), cfg.ctx_window() or 1
-    try:
-        zone = agent._ctx_zone()[0]
-    except Exception:
-        zone = "ok"
-    pct = used / window * 100
+    used, window, zone, pct = agent._ctx_summary(cfg)
     # '~' marks a pre-call ESTIMATE (no live API measurement yet, e.g. right after a
     # load): _ctx_used falls back to a transcript estimate that reads lower than the
     # cache-inclusive measured size. Without the marker a fresh load looks like ctx
@@ -9408,7 +9411,7 @@ def handle_info_command(agent, cfg, arg=""):
     point is that nothing about the session's behaviour is invisible."""
     where = f"remote {agent.remote.host}" if agent.remote else "local"
     backend = _provider_label(cfg)
-    used, window = agent._ctx_used(), cfg.ctx_window() or 1
+    used, window, zone, _pct = agent._ctx_summary(cfg)
     turns = _user_turns(agent.messages)
     if _provider_uses_settings(cfg):
         think, effort = cfg.setting("thinking") or "off", cfg.setting("effort") or "-"
@@ -9416,10 +9419,6 @@ def handle_info_command(agent, cfg, arg=""):
         think, effort = {True: "on", False: "off"}.get(cfg.think, "unset"), "-"
     dot = f"  {GLYPH['dot']}  "
     badge = approval_badge(cfg)
-    try:
-        zone = agent._ctx_zone()[0]
-    except Exception:
-        zone = "ok"
     print(f"  model:    {cfg.active_model()}")
     print(f"  provider: {backend}  ({where})")
     hov = f", {agent.handovers} handovers" if agent.handovers else ""
@@ -12024,7 +12023,6 @@ def repl(cfg: Config, resume=None):
                     if idle_comp is not None and not cfg.incognito:
                         idle_comp.save_history()   # incognito leaves no on-disk input trace
                     print("\nbye")
-                    return
                     return
                 pending_exit = True
                 print(yellow("\npress ^C again to exit"))
