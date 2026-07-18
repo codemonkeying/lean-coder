@@ -7590,11 +7590,19 @@ class Agent:
         trimmed, freed = 0, 0
         for i in indices:
             m = self.messages[i]
-            if m["content"].startswith("[trimmed"):
+            # Content is normally a string, but a loaded/older/hand-edited session
+            # could carry a non-string (or missing) tool content. Coerce defensively
+            # so compaction (which auto-fires under handover) can never crash the
+            # whole turn on one odd message.
+            content = m.get("content")
+            if not isinstance(content, str):
+                content = "" if content is None else str(content)
+                m["content"] = content
+            if content.startswith("[trimmed"):
                 continue
-            n = len(m["content"].splitlines())
+            n = len(content.splitlines())
             stub = f"[trimmed {m.get('tool_name', 'tool')} result - {n} lines]"
-            freed += est_tokens(m["content"]) - est_tokens(stub)
+            freed += est_tokens(content) - est_tokens(stub)
             m["content"] = stub
             # An evicted result drops its image too - the big cost. The file
             # stays on disk (path is in the stubbed text), so it can be re-fetched
