@@ -437,7 +437,9 @@ Two transports, both stdlib-only: **stdio** (a spawned subprocess, JSON-RPC over
 pipes, the Claude-Desktop shape: `command` + `args` + `env`), and **HTTP** (streamable
 MCP, tolerating SSE or plain-JSON responses). HTTP auth is one `Authorization: Bearer`
 header: a static token/env, or an **OAuth 2.1** client-credentials JWT fetched + cached
-+ refreshed automatically. For auth/env, edit the `mcp_servers` table in `config.toml`:
++ refreshed automatically. Prefer **OAuth 2.1** where the gateway offers it (short-lived
+tokens that self-expire and auto-refresh); use a static bearer only when there is no OAuth
+endpoint. For auth/env, edit the `mcp_servers` table in `config.toml`:
 
 ```toml
 [mcp_servers.gw]

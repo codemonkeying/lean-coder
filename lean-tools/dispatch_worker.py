@@ -50,6 +50,7 @@ _ENV = {"max_concurrent": "LEANCODER_WORKER_MAX_CONCURRENT",
 
 TOOL = {
     "name": "dispatch_worker",
+    "glyph": "\u2691",   # flag: a dispatched sub-agent (distinct from bg's bolt; bigger blast radius - own context/leash, tracked via /worker)
     "description": (
         "Hand a self-contained sub-task to a background worker agent (own session + context); "
         "returns a pid. It runs in the BACKGROUND and you are NOTIFIED AUTOMATICALLY when it "
@@ -64,13 +65,17 @@ TOOL = {
     "parameters": {
         "type": "object",
         "properties": {
-            "action": {"type": "string", "enum": ["dispatch", "status", "result", "cancel"],
+            "action": {"type": "string",
+                       "enum": ["dispatch", "status", "result", "cancel", "inject"],
                        "description": "What to do (default 'dispatch'): 'dispatch' launches a "
                                       "new worker from `task`; 'status' reports your dispatched "
                                       "workers (state, runtime, whether a result is ready); "
                                       "'result' (pid=) returns a worker's FULL result untruncated "
                                       "(the auto finish notice truncates a long one); 'cancel' "
-                                      "kills the worker named by `pid`."},
+                                      "kills the worker named by `pid`; 'inject' (pid=, text=) "
+                                      "sends a mid-task correction/steer to a RUNNING worker - it "
+                                      "arrives on the worker's next reasoning step (does NOT "
+                                      "interrupt a running command; use 'cancel' to stop hard)."},
             "pid": {"type": "integer",
                     "description": "Worker pid to act on (required for action='cancel'; optional "
                                    "for 'status' to show just one). From the dispatch return line."},
@@ -78,6 +83,10 @@ TOOL = {
                      "description": "Full self-contained instruction: what to do and exactly "
                                     "what to report back (the worker has no other context). "
                                     "Required for action='dispatch'."},
+            "text": {"type": "string",
+                     "description": "The mid-task message for action='inject' (pid=): a "
+                                    "correction or steer the running worker sees on its next "
+                                    "reasoning step. Required for action='inject'."},
             "model": {"type": "string",
                       "description": "Optional model for the worker's brain - ANY model on an "
                                      "ENABLED provider (see /models); its provider is inferred "
@@ -201,8 +210,11 @@ def run(args, cwd):
         return _worker_result(args.get("pid"))
     if action == "cancel":
         return _worker_cancel(args.get("pid"))
+    if action == "inject":
+        return _worker_inject(args.get("pid"), args.get("text"), source="parent-agent")
     if action != "dispatch":
-        return f"error: unknown action {action!r} (use dispatch | status | result | cancel)."
+        return ("error: unknown action %r (use dispatch | status | result | cancel | inject)."
+                % action)
     task = (args.get("task") or "").strip()
     if not task:
         return "error: dispatch_worker action='dispatch' needs a non-empty task."
@@ -312,6 +324,12 @@ def run(args, cwd):
 
     max_iter = _ceiling("max_iterations")
     idle_timeout = _ceiling("idle_timeout")
+    # Progress-staleness watchdog: bark (alert the parent), never bite. The worker bumps
+    # its .progress file every iteration, so if that mtime goes stale the worker is stuck
+    # (model looping / hung tool) rather than just quiet - distinct from idle_timeout,
+    # which fires on the PARENT dying. Default = half the idle timeout, floored at 300s;
+    # silence != dead, so it only alerts and the operator decides (cancel/inject).
+    hb_timeout = max(300, idle_timeout // 2) if idle_timeout else 0
 
     # Write the brief + result-file targets under CONFIG_DIR/workers.
     wdir = _workers_dir()
@@ -349,7 +367,9 @@ def run(args, cwd):
         # Point the worker's INFERENCE at a different ollama endpoint than the driver.
         # (Distinct from --remote-host, which relocates the worker's TOOLS.)
         cmd += f" --host {shlex.quote(brain_host)}"
-    launched = _H["bg_launch"](cmd, cwd=launch_cwd, kind="worker", idle_timeout=idle_timeout)
+    launched = _H["bg_launch"](cmd, cwd=launch_cwd, kind="worker", idle_timeout=idle_timeout,
+                               heartbeat_timeout=hb_timeout,
+                               heartbeat_file=str(brief_file) + ".progress")
     if "error" in launched:
         return f"error: could not launch worker: {launched['error']}"
 
@@ -379,6 +399,30 @@ def _read_result(path):
         return _H["_extract_marked"](Path(path).read_text(), _H["RESULT_MARK"])
     except OSError:
         return None
+
+
+def _read_progress(result_path):
+    """The worker's deterministic progress heartbeat (iter/elapsed/last-tool/intent),
+    written each iteration to <brief>.progress by run_agent_brief. Returns the text
+    (stripped) or "" if none yet. Facts only - no tokens, no model cooperation."""
+    try:
+        return Path(_brief_from_result(result_path) + ".progress").read_text().strip()
+    except OSError:
+        return ""
+
+
+def _inject_count(result_path):
+    """How many injects this worker has CONSUMED (lines in <brief>.injects.log), and the
+    last one's teaser - the delivery ack for action='inject'. (0, "") if none."""
+    try:
+        lines = [l for l in Path(_brief_from_result(result_path) + ".injects.log")
+                 .read_text().splitlines() if l.strip()]
+    except OSError:
+        return 0, ""
+    if not lines:
+        return 0, ""
+    last = lines[-1].split("consumed:", 1)[-1].strip()
+    return len(lines), last
 
 
 def _finished_notice():
@@ -455,9 +499,16 @@ def _worker_status(pid=None):
         state = row["state"] if row else "gone"
         runtime = row["runtime"] if row else "?"
         ready = _read_result(meta["result"]) is not None
-        out.append(f"pid {wp}  {state}  (ran {runtime})  "
-                   f"result {'ready' if ready else 'pending'}  {meta['model']}  "
-                   f"task: {meta['task'][:80]}")
+        line = (f"pid {wp}  {state}  (ran {runtime})  "
+                f"result {'ready' if ready else 'pending'}  {meta['model']}  "
+                f"task: {meta['task'][:80]}")
+        prog = _read_progress(meta["result"])
+        if prog and not ready:
+            line += "\n  progress: " + " | ".join(prog.splitlines())
+        n_inj, last_inj = _inject_count(meta["result"])
+        if n_inj:
+            line += f"\n  injects delivered: {n_inj} (last: {last_inj[:80]})"
+        out.append(line)
     return "\n".join(out)
 
 
@@ -519,6 +570,54 @@ def _worker_cancel(pid):
     return f"cancelled worker {pid} (SIGTERM to its process group). task: {meta['task'][:80]}"
 
 
+def _brief_from_result(result_path):
+    """The worker's brief-file path from its result path (they share a stamp: the tool
+    writes <stamp>.brief + <stamp>.result). The inject sidecar lives beside the brief
+    (<stamp>.brief.inject), driver-side even for a remote worker."""
+    r = str(result_path)
+    return r[:-len(".result")] + ".brief" if r.endswith(".result") else r + ".brief"
+
+
+def _worker_inject(pid, text, source="operator"):
+    """Deliver a mid-task message to a RUNNING worker. Writes (append-safe, NUL-
+    separated so two quick injects can't clobber) to the worker's <brief>.inject
+    sidecar; the worker drains it at its next between-iteration boundary and appends it
+    as a user turn (see run_agent_brief's _drain_injects). `source` prefixes the message
+    ([operator inject] / [parent-agent inject]) so the worker can weight it. Does NOT
+    interrupt a running tool call - it lands on the next reasoning step; use cancel to
+    stop hard. A finished/gone worker can't receive one."""
+    workers = _H["workers"]
+    if pid is None:
+        return "error: action='inject' needs a pid (which worker) and text."
+    msg = (text or "").strip()
+    if not msg:
+        return "error: action='inject' needs non-empty text (the message to send)."
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return f"error: bad pid {pid!r}."
+    meta = workers.get(pid)
+    if not meta:
+        return f"no worker with pid {pid} this session (nothing to inject into)."
+    if _read_result(meta["result"]) is not None:
+        return (f"worker {pid} already finished - too late to inject; its result stands. "
+                f"Read it, or dispatch a fresh worker for the change.")
+    rows = _worker_rows()
+    row = rows.get(pid)
+    if row and row["state"] != "running":
+        return f"worker {pid} is not running ({row['state']}); can't inject."
+    inject_path = Path(_brief_from_result(meta["result"]) + ".inject")
+    labelled = f"[{source} inject] {msg}"
+    try:
+        with inject_path.open("a") as f:
+            f.write(labelled + "\0")
+    except OSError as e:
+        return f"error: could not write inject for worker {pid}: {e}"
+    return (f"injected into worker {pid} (as [{source} inject]). It arrives on the worker's "
+            f"NEXT reasoning step (not an interrupt - a running command finishes first); the "
+            f"worker is prompted to briefly acknowledge it. Check delivery with action='status'.")
+
+
 def _worker_cmd(agent, cfg, arg):
     """/worker - human command, at PARITY with the model's dispatch_worker actions:
       /worker                list dispatched workers (state + result-ready)
@@ -537,13 +636,17 @@ def _worker_cmd(agent, cfg, arg):
     parts = arg.split()
 
     # Subcommands (parity with the model tool). A bare pid stays the result shortcut.
-    if parts and parts[0].lower() in ("status", "cancel", "result"):
+    if parts and parts[0].lower() in ("status", "cancel", "result", "inject"):
         sub = parts[0].lower()
         pid = parts[1] if len(parts) > 1 else None
         if sub == "status":
             print(_worker_status(pid))
         elif sub == "result":
             print(_worker_result(pid))
+        elif sub == "inject":
+            # /worker inject <pid> <message...> - the rest of the line is the message.
+            text = arg.split(None, 2)[2] if len(parts) > 2 else ""
+            print(_worker_inject(pid, text, source="operator"))
         else:  # cancel
             print(_worker_cancel(pid))
         return
@@ -556,7 +659,21 @@ def _worker_cmd(agent, cfg, arg):
             return
         res = _read_result(meta["result"])
         print(_H["bold"](f"worker {pid}") + _H["dim"](f"  {meta['task'][:80]}"))
-        print(res if res else _H["dim"]("(no result yet - still running or terminated)"))
+        if res:
+            print(res)
+        else:
+            print(_H["dim"]("  (running - no result yet)"))
+            prog = _read_progress(meta["result"])
+            if prog:
+                for pl in prog.splitlines():
+                    if pl.lower().startswith("intent:"):
+                        # Intent is prose; print label dim, value normal so it reads.
+                        print(_H["dim"]("  intent:  ") + pl.split(":", 1)[1].strip())
+                    else:
+                        print(_H["dim"]("  " + pl))
+        n_inj, last_inj = _inject_count(meta["result"])
+        if n_inj:
+            print(_H["dim"](f"  injects: {n_inj} delivered (last: {last_inj[:80]})"))
         return
     print(_H["bold"]("workers:"))
     for pid, meta in workers.items():
@@ -566,16 +683,34 @@ def _worker_cmd(agent, cfg, arg):
         done = _read_result(meta["result"]) is not None
         tag = _H["green"]("result ready") if done else _H["dim"](state)
         print(f"  {_H['cyan'](str(pid))}  {tag}  (ran {runtime})  "
-              f"{meta['model']}  {_H['dim'](meta['task'][:60])}")
-    print(_H["dim"]("  /worker <pid> = full result · /worker status [pid] · "
-                    "/worker cancel <pid>"))
+              f"{meta['model']}  {_H['dim'](meta['task'][:56])}")
+        if not done:
+            # Compact heartbeat only (iter + last tool); full progress + intent via
+            # /worker <pid>. Keep it to one short line so the list stays scannable.
+            prog = _read_progress(meta["result"])
+            if prog:
+                pl = {k.strip().lower(): v.strip()
+                      for k, v in (x.split(":", 1) for x in prog.splitlines() if ":" in x)}
+                bits = []
+                first = prog.splitlines()[0] if prog.splitlines() else ""
+                if first.startswith("iter "):
+                    bits.append(first)
+                if pl.get("last"):
+                    bits.append("last " + pl["last"][:40])
+                n_inj, _last = _inject_count(meta["result"])
+                if n_inj:
+                    bits.append(f"{n_inj} inject" + ("s" if n_inj > 1 else ""))
+                if bits:
+                    print(_H["dim"]("        " + "  ".join(bits)))
+    print(_H["dim"]("  /worker <pid> = full result + progress/intent · status [pid] · "
+                    "cancel <pid> · inject <pid> <msg>"))
 
 
 def _worker_completer(agent, cfg):
     """Tab-completion for /worker's first argument: the subcommand verbs plus every
     live worker pid (so `cancel <Tab>` / a bare `<Tab>` offers real pids). Matches the
     menu contract of other multi-verb commands (e.g. /mcp)."""
-    opts = ["status", "result", "cancel"]
+    opts = ["status", "result", "cancel", "inject"]
     opts += [str(pid) for pid in _H.get("workers", {})]
     return opts
 
@@ -654,5 +789,6 @@ def setup(lc, cfg):
 
     lc["register_command"]("/worker", _worker_cmd,
                            "list workers (+ results); /worker <pid> = full result, "
-                           "/worker status [pid], /worker cancel <pid>",
+                           "/worker status [pid], /worker cancel <pid>, "
+                           "/worker inject <pid> <message>",
                            _worker_completer)
