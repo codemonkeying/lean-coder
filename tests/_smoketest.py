@@ -920,6 +920,26 @@ check("_drain_choice: d/n -> discard", lc._drain_choice("d") == "discard"
 check("_drain_choice: default (Enter / c / junk) -> combine",
       lc._drain_choice("") == "combine" and lc._drain_choice("c") == "combine"
       and lc._drain_choice("zzz") == "combine")
+# text-tool-call schema coercion: the Qwen XML channel stringifies every arg, so a
+# declared boolean/integer must be coerced back (else bool('false') is truthy -> a
+# notify_on_exit=false silently becomes ON). string params must NOT be coerced.
+_tt_schemas = {t["function"]["name"]: t["function"]["parameters"]["properties"] for t in lc.TOOLS}
+_tt_xml = ("<function=run_command><parameter=cmd>sleep 5 &</parameter>"
+           "<parameter=notify_on_exit>false</parameter>"
+           "<parameter=heartbeat_timeout>30</parameter></function>")
+_tt_calls, _ = lc.parse_text_tool_calls(_tt_xml, known_names={"run_command"}, schemas=_tt_schemas)
+_tt_a = _tt_calls[0]["function"]["arguments"]
+check("text-tool-call: XML bool 'false' coerced to real False",
+      _tt_a.get("notify_on_exit") is False, repr(_tt_a))
+check("text-tool-call: XML integer arg coerced to int", _tt_a.get("heartbeat_timeout") == 30)
+_tt_wf, _ = lc.parse_text_tool_calls(
+    "<function=write_file><parameter=path>x</parameter><parameter=content>true</parameter></function>",
+    known_names={"write_file"}, schemas=_tt_schemas)
+check("text-tool-call: string param NEVER coerced (content stays 'true')",
+      _tt_wf[0]["function"]["arguments"].get("content") == "true")
+_tt_np, _ = lc.parse_text_tool_calls(_tt_xml, known_names={"run_command"})  # no schemas
+check("text-tool-call: no-schema pass-through unchanged (back-compat)",
+      _tt_np[0]["function"]["arguments"].get("notify_on_exit") == "false")
 # mid-turn slash commands are peeled out (run as commands, never sent to the model)
 _qc, _qm = lc._split_queued_commands(["/help", "fix the bug", "  /tools", "run /help please"])
 check("_split_queued_commands: commands peeled (incl. leading-space)",

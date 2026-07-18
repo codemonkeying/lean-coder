@@ -5313,6 +5313,42 @@ def _tc_from_obj(obj):
     return {"function": {"name": name, "arguments": args}}
 
 
+def _coerce_args_to_schema(name, args, schemas):
+    """Coerce STRING arg values to the type the tool's JSON schema declares, for
+    calls parsed from a text channel that stringifies everything (Qwen's XML
+    <parameter=> form). Only boolean/integer/number params are touched, and only
+    when the value is a string that cleanly converts - a string param (e.g.
+    write_file's content="true") is NEVER coerced, and an unconvertible value is
+    left as-is for the tool's own validation to report. `schemas` maps tool name ->
+    properties dict; a missing tool/param is a no-op (pass-through)."""
+    if not schemas or not isinstance(args, dict):
+        return args
+    props = schemas.get(name)
+    if not isinstance(props, dict):
+        return args
+    for k, v in list(args.items()):
+        if not isinstance(v, str):
+            continue
+        spec = props.get(k)
+        typ = spec.get("type") if isinstance(spec, dict) else None
+        s = v.strip()
+        if typ == "boolean":
+            low = s.lower()
+            if low in ("true", "false"):
+                args[k] = (low == "true")
+        elif typ == "integer":
+            try:
+                args[k] = int(s)
+            except ValueError:
+                pass
+        elif typ == "number":
+            try:
+                args[k] = float(s)
+            except ValueError:
+                pass
+    return args
+
+
 def _json_objects_from_text(text):
     """Yield (obj, start, end) for every complete top-level JSON object in `text`,
     scanning brace-depth while RESPECTING string literals + escapes so a '{' or a
@@ -5351,7 +5387,7 @@ def _json_objects_from_text(text):
         i = j + 1
 
 
-def parse_text_tool_calls(content: str, known_names=None):
+def parse_text_tool_calls(content: str, known_names=None, schemas=None):
     """Parse text-encoded tool calls from assistant content (small local models
     that fall out of the native tool_calls channel and emit the call as TEXT).
     Returns (calls, cleaned_content) where calls is a list of
@@ -5364,7 +5400,12 @@ def parse_text_tool_calls(content: str, known_names=None):
     Hermes <tool_call>{...}</tool_call>, bare JSON {"name","arguments"}, the
     OpenAI {"function":{...}} wrapper, a tool_calls:[...] array, and fenced
     ```json blocks - all scanned brace/string-aware so backticks or braces inside
-    a string arg can't break boundary detection."""
+    a string arg can't break boundary detection.
+
+    `schemas`, if given, maps tool name -> its parameter `properties` dict; it is
+    used to coerce STRING args from the Qwen XML form (which stringifies every
+    value) back to the declared boolean/integer/number type - so e.g.
+    notify_on_exit=false is a real False, not the truthy string 'false'."""
     calls = []
     if not content:
         return calls, content
@@ -5376,13 +5417,16 @@ def parse_text_tool_calls(content: str, known_names=None):
             return True
         return False
 
-    # Format A: Qwen XML function/parameter tags.
+    # Format A: Qwen XML function/parameter tags. This channel stringifies every
+    # value, so coerce against the schema (booleans/ints/numbers) - the JSON
+    # formats below already carry real types and are left untouched.
     for m in _FN_RE.finditer(content):
         name = m.group(1).strip()
         if not name:
             continue
         args = {pm.group(1).strip(): _strip_one_nl(pm.group(2))
                 for pm in _PARAM_RE.finditer(m.group(2))}
+        args = _coerce_args_to_schema(name, args, schemas)
         _accept({"function": {"name": name, "arguments": args}})
 
     # Format B: JSON object inside <tool_call> tags.
