@@ -332,9 +332,9 @@ class Tools:
             return "error: nothing to run in the background"
         cap = self.cfg.bg_max_concurrent
         if cap and len(_bg_running(kind=None)) >= cap:
-            return (f"error: at the background-task limit ({cap} running). Stop one first "
-                    f"(/bg to list + kill, or `kill <pid>`), or raise bg_max_concurrent "
-                    f"in /settings.")
+            return (f"error: at the background-task limit ({cap} running). Free a slot by "
+                    f"stopping a finished/unneeded one with `kill <pid>` (use bg_status to "
+                    f"list them), then retry.")
         def _posint(v):
             try:
                 n = int(v)
@@ -635,7 +635,7 @@ BUILTIN_TOOLS = [
                        "content": {"type": "string", "description": "Full new contents of the file."}},
         "required": ["path", "content"]}},
     {"name": "run_command", "tier": "exec",
-     "description": "Run a non-interactive shell command (builds, tests, git, file ops); returns stdout/stderr (truncated - if clipped, pipe to a file or use grep/head/tail to read specific parts). Fresh shell each call - cd/env don't persist, chain with '&&'. Times out (raise command_timeout in /settings; end the command with ' &' to background a long/daemon process). For sudo/password/interactive use ask_user_to_run; for a shell that stays open use shell_session.",
+     "description": "Run a non-interactive shell command (builds, tests, git, file ops); returns stdout/stderr (truncated - if clipped, pipe to a file or use grep/head/tail to read specific parts). Fresh shell each call - cd/env don't persist, chain with '&&'. Times out after a fixed limit - for a long-running or daemon process end the command with ' &' to background it (returns a pid immediately; poll with bg_status). For sudo/password/interactive use ask_user_to_run; for a shell that stays open use shell_session.",
      "parameters": {"type": "object",
         "properties": {"cmd": {"type": "string", "description": "The shell command to run."},
                        "notify_on_exit": {"type": "boolean", "description": "Bg jobs (' &') only: push exit code + tail back to you on completion."},
