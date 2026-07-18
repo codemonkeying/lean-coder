@@ -365,7 +365,17 @@ class OllamaClient:
             # model that merely lists/quotes a tool in prose from being fired).
             known = {(_t.get("function") or _t).get("name") for _t in (tools or [])}
             known.discard(None)
-            parsed, cleaned = parse_text_tool_calls(content, known_names=known or None)
+            # name -> param properties, so the text parser can coerce Qwen-XML
+            # string args to their declared boolean/integer/number types.
+            _schemas = {}
+            for _t in (tools or []):
+                _fn = _t.get("function") or _t
+                _nm = _fn.get("name")
+                _props = (_fn.get("parameters") or {}).get("properties")
+                if _nm and isinstance(_props, dict):
+                    _schemas[_nm] = _props
+            parsed, cleaned = parse_text_tool_calls(
+                content, known_names=known or None, schemas=_schemas or None)
             if parsed:
                 print(dim(f"(parsed {len(parsed)} tool call(s) from text)"))
                 tool_calls = parsed
