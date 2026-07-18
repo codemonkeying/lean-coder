@@ -91,7 +91,7 @@ def _prehandover_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.8.8"
+__version__ = "0.8.9"
 
 
 def _prerelease_key(pre):
@@ -3367,10 +3367,28 @@ def _user_turns(messages) -> int:
     return count
 
 
+# The message-content scan is O(n) over the whole history plus a json.dumps per stored
+# tool_call, and runs several times a turn (ctx meter, zones, status line). Memoize on
+# the list identity + length like _tools_tokens/_user_turns. Messages are otherwise
+# append-only; the ONE in-place content mutation (_trim_tool_indices stubbing an evicted
+# tool result, same length) explicitly busts this cache alongside last_prompt_tokens.
+_MSG_TOK_CACHE = (None, 0, None, 0, 0)  # (id(msgs), len(msgs), id(tools), len(tools), cost)
+
+
+def _invalidate_msg_tokens():
+    global _MSG_TOK_CACHE
+    _MSG_TOK_CACHE = (None, 0, None, 0, 0)
+
+
 def _raw_messages_tokens(messages, tools) -> int:
     """UNCALIBRATED char-based size of a full send (messages + tool schemas), including
     per-message framing. This is the quantity we compare against the provider's real
     count to learn the calibration factor, so it must NOT itself be calibrated."""
+    global _MSG_TOK_CACHE
+    mid, mlen, tid, tlen = id(messages), len(messages), id(tools), len(tools or [])
+    cmid, cmlen, ctid, ctlen, cost = _MSG_TOK_CACHE
+    if cmid == mid and cmlen == mlen and ctid == tid and ctlen == tlen:
+        return cost
     total = 0
     for m in messages:
         total += (len(m.get("content") or "") + 3) // 4
@@ -3378,6 +3396,7 @@ def _raw_messages_tokens(messages, tools) -> int:
         for tc in m.get("tool_calls", []) or []:
             total += (len(json.dumps(tc.get("function", {}))) + 3) // 4
     total += _tools_tokens(tools)
+    _MSG_TOK_CACHE = (mid, mlen, tid, tlen, total)
     return total
 
 
@@ -7484,6 +7503,9 @@ class Agent:
             # pre-trim prompt). Clear it so the meter shows the trimmed estimate
             # instead of a misleading unchanged figure until the next model turn.
             self.last_prompt_tokens = None
+            # This is the one in-place content mutation (stubs keep list length), so
+            # the (id,len)-keyed message-token cache would go stale - bust it here.
+            _invalidate_msg_tokens()
         return trimmed, freed
 
     def compact(self, keep: int = COMPACT_KEEP):
@@ -12336,6 +12358,7 @@ def run_agent_brief(args) -> int:
     _progress_path = Path(str(brief_file) + ".progress")
     _wstart = time.time()
     _witer = {"n": 0}
+    _intent_cache = {"v": ""}   # the first assistant prose line; set once, never changes
 
     def _drain_injects():
         try:
@@ -12363,12 +12386,14 @@ def run_agent_brief(args) -> int:
         # call - see preamble). Overwritten each iteration; surfaced via /worker status
         # so an operator/parent can see where it is and catch a total misread early.
         try:
-            intent = ""
-            for m in agent.messages:
-                if (m.get("role") == "assistant" and isinstance(m.get("content"), str)
-                        and m["content"].strip()):
-                    intent = " ".join(m["content"].split())[:200]
-                    break
+            intent = _intent_cache["v"]
+            if not intent:                          # scan only until first found, then cache
+                for m in agent.messages:
+                    if (m.get("role") == "assistant" and isinstance(m.get("content"), str)
+                            and m["content"].strip()):
+                        intent = " ".join(m["content"].split())[:200]
+                        _intent_cache["v"] = intent
+                        break
             last_tool = ""
             for m in reversed(agent.messages):
                 if m.get("role") == "assistant" and m.get("tool_calls"):
