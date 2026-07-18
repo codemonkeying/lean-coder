@@ -4194,6 +4194,30 @@ def _session_title(messages) -> str:
     return "(no user messages)"
 
 
+def _atomic_write_text(path: Path, text: str):
+    """Write text to `path` atomically: write a temp file in the same dir, fsync it,
+    then os.replace() over the target (a single rename - never a half-written file).
+    Matters for the per-turn autosave: a reboot/crash MID-WRITE otherwise truncates
+    the session JSON, and the next launch's auto-resume fails to parse it. os.replace
+    is atomic on the same filesystem, so a reader always sees the old OR new file
+    whole, never a torn one. Falls back to a plain write if the temp/replace dance
+    itself errors (better a non-atomic write than no write)."""
+    path = Path(path)
+    tmp = path.with_name(path.name + f".tmp{os.getpid()}")
+    try:
+        with open(tmp, "w") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        path.write_text(text)
+
+
 def save_session(messages, cfg, name: str, remote=None, pinned_plan=""):
     """Write the conversation to ~/.config/leancoder/sessions/<name>.json with a
     metadata header. Returns (path, meta). Raises ValueError on a bad name.
@@ -4225,7 +4249,7 @@ def save_session(messages, cfg, name: str, remote=None, pinned_plan=""):
         "tok_factor": _tok_factor(),         # learned estimate->actual factor (calibrated meter)
     }
     path = _session_path(safe)
-    path.write_text(json.dumps({"meta": meta, "messages": messages}, indent=2))
+    _atomic_write_text(path, json.dumps({"meta": meta, "messages": messages}, indent=2))
     return path, meta
 
 
@@ -9996,6 +10020,11 @@ def _load_session_into(agent, cfg, name):
     except FileNotFoundError:
         print(red(f"no such session: {name}  (/load to list)"))
         return
+    except (json.JSONDecodeError, OSError) as e:
+        print(red(f"session '{name}' is unreadable ({type(e).__name__}) - "
+                  f"the file may be corrupt (e.g. a crash mid-save). Not loaded; "
+                  f"your current session is untouched."))
+        return
     # Only guard when the work would actually be LOST: autosave (non-incognito)
     # has already persisted the current session to disk each turn, so there is
     # nothing to discard - don't nag in that case.
@@ -12019,6 +12048,9 @@ def repl(cfg: Config, resume=None):
         except FileNotFoundError:
             print(yellow(f"--resume: no such session '{resume}' "
                          f"(starting fresh; /load to see saved ones)"))
+        except (json.JSONDecodeError, OSError) as e:
+            print(yellow(f"--resume: session '{resume}' is unreadable "
+                         f"({type(e).__name__}; file may be corrupt) - starting fresh."))
     elif cfg.autosave and not cfg.incognito:
         # Auto-load the session you were last actually in: the most-recently-used one,
         # EXCLUDING pre-handover snapshots (those are safety checkpoints, not the live
