@@ -88,7 +88,7 @@ def _prehandover_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.8.3"
+__version__ = "0.8.4"
 
 
 def _prerelease_key(pre):
@@ -982,6 +982,116 @@ def _mcp_result_text(result):
     return json.dumps(result, indent=2, ensure_ascii=False)
 
 
+# ---------------------------------------------------------------------------
+# MCP OAuth: sidecar credential store + discovery + dynamic client registration
+#
+# A DCR-minted client_secret and cached tokens are MACHINE-obtained, so - matching
+# the anthropic_plan provider's auth.json - they live in a mode-0600 sidecar under the
+# config dir, NOT in config.toml and NOT in an env var. config.toml just carries
+# `auth = { type = "oauth" }`; the sidecar mcp_auth/<name>.json holds
+# {client_id, client_secret, token_endpoint, registration_endpoint, scope} plus a
+# cached {access_token, expires_at}. Human-supplied secrets (static bearer, a
+# pre-existing oauth secret) still use *_env and are never written by us.
+# ---------------------------------------------------------------------------
+
+def _mcp_auth_dir():
+    return CONFIG_DIR / "mcp_auth"
+
+
+def _mcp_sidecar_path(name):
+    return _mcp_auth_dir() / f"{name}.json"
+
+
+def load_mcp_client(name):
+    p = _mcp_sidecar_path(name)
+    if not p.is_file():
+        return None
+    try:
+        return json.loads(p.read_text())
+    except Exception:
+        return None
+
+
+def save_mcp_client(name, data):
+    d = _mcp_auth_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    p = _mcp_sidecar_path(name)
+    p.write_text(json.dumps(data, indent=2))
+    try:
+        p.chmod(0o600)
+    except OSError:
+        pass
+
+
+def delete_mcp_client(name):
+    p = _mcp_sidecar_path(name)
+    if p.is_file():
+        try:
+            p.unlink()
+        except OSError:
+            pass
+
+
+def _mcp_curl_json(args, timeout=15):
+    """Run curl with the given extra args, return parsed JSON or None. stdlib-only."""
+    if not shutil.which("curl"):
+        raise RuntimeError("MCP OAuth needs curl on PATH")
+    r = subprocess.run(["curl", "-s", "--max-time", str(timeout)] + args,
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        return None
+    try:
+        return json.loads(r.stdout)
+    except (json.JSONDecodeError, ValueError):
+        return None
+
+
+def mcp_discover_auth(mcp_url, timeout=10):
+    """RFC 9728 -> RFC 8414 discovery. From an MCP endpoint URL, find the authorization
+    server metadata (token_endpoint, registration_endpoint). Tries the URL's root origin
+    for the well-known docs (gateway URLs look like http://host/mcp/svc/mcp). Returns the
+    auth-server metadata dict, or None if discovery fails."""
+    parsed = urllib.parse.urlparse(mcp_url)
+    root = f"{parsed.scheme}://{parsed.netloc}"
+    stripped = mcp_url.rstrip("/").rsplit("/mcp", 1)[0]
+    as_url = root
+    # RFC 9728: protected-resource metadata points at the authorization server(s).
+    for base in dict.fromkeys([root, stripped]):
+        meta = _mcp_curl_json(["-L", f"{base}/.well-known/oauth-protected-resource"], timeout)
+        if isinstance(meta, dict):
+            servers = meta.get("authorization_servers") or []
+            if servers:
+                as_url = servers[0].rstrip("/")
+            break
+    # RFC 8414: authorization server metadata (token + registration endpoints).
+    for base in dict.fromkeys([as_url, root]):
+        meta = _mcp_curl_json(["-L", f"{base}/.well-known/oauth-authorization-server"], timeout)
+        if isinstance(meta, dict) and meta.get("token_endpoint"):
+            return meta
+    return None
+
+
+def mcp_register_client(reg_endpoint, registration_key=None, client_name="lean-coder",
+                        scope="mcp:access", timeout=10):
+    """RFC 7591 dynamic client registration for the client-credentials grant. Returns the
+    registration response dict ({client_id, client_secret, ...}) or None. If the endpoint
+    is guarded, `registration_key` is sent as a Bearer header."""
+    body = {"client_name": client_name,
+            "grant_types": ["client_credentials"],
+            "token_endpoint_auth_method": "client_secret_post"}
+    if scope:
+        body["scope"] = scope
+    args = ["-X", "POST", reg_endpoint,
+            "-H", "Content-Type: application/json",
+            "-d", json.dumps(body)]
+    if registration_key:
+        args += ["-H", f"Authorization: Bearer {registration_key}"]
+    resp = _mcp_curl_json(args, timeout)
+    if isinstance(resp, dict) and resp.get("client_id"):
+        return resp
+    return None
+
+
 class MCPConnection:
     """One live connection to a single MCP server. Two transports, both stdlib-only:
       - stdio: a spawned subprocess, JSON-RPC framed newline-delimited over its stdin/
@@ -1121,33 +1231,57 @@ class MCPConnection:
             return f"Bearer {tok}"
         if atype == "oauth":
             return f"Bearer {self._oauth_token(auth)}"
+        # No auth block, but a DCR sidecar exists -> treat as oauth (creds live in sidecar).
+        if not atype and load_mcp_client(self.name):
+            return f"Bearer {self._oauth_token({'type': 'oauth'})}"
         return ""     # no auth
 
     def _oauth_token(self, auth, force=False):
-        """OAuth2 client-credentials: POST client_id/secret to token_url, cache the
-        access_token. Refetched on force (a 401 retry)."""
-        if self._token and not force:
-            return self._token
-        token_url = auth.get("token_url")
+        """OAuth2 client-credentials: POST client_id/secret to the token endpoint, cache
+        the access_token (in-memory + a 0600 sidecar with its expiry). Credentials come
+        from the sidecar (DCR-minted, preferred) or from config (client_id + a literal/
+        client_secret_env). Refetched on force (a 401 retry) or when the cached token is
+        near expiry."""
+        side = load_mcp_client(self.name) or {}
+        # In-memory cache first, then a still-valid sidecar token.
+        if not force:
+            if self._token:
+                return self._token
+            cached = side.get("access_token")
+            exp = side.get("expires_at", 0)
+            if cached and (not exp or time.time() < exp - 60):
+                self._token = cached
+                return cached
+        token_url = (auth.get("token_url") or side.get("token_endpoint"))
         if not token_url:
-            raise ValueError("oauth auth: no token_url")
-        secret = auth.get("client_secret") or os.environ.get(
-            auth.get("client_secret_env", ""), "")
+            raise ValueError("oauth auth: no token_url (config) or token_endpoint (sidecar)")
+        client_id = auth.get("client_id") or side.get("client_id", "")
+        secret = (auth.get("client_secret") or os.environ.get(auth.get("client_secret_env", ""), "")
+                  or side.get("client_secret", ""))
+        scope = auth.get("scope") or side.get("scope")
         data = ("grant_type=client_credentials"
-                f"&client_id={urllib.parse.quote(auth.get('client_id', ''))}"
+                f"&client_id={urllib.parse.quote(client_id)}"
                 f"&client_secret={urllib.parse.quote(secret)}")
-        if auth.get("scope"):
-            data += f"&scope={urllib.parse.quote(auth['scope'])}"
+        if scope:
+            data += f"&scope={urllib.parse.quote(scope)}"
         out = self._curl(["-X", "POST", token_url,
                           "-H", "Content-Type: application/x-www-form-urlencoded",
                           "-d", data], _MCP_CONNECT_TIMEOUT)
         try:
-            tok = json.loads(out).get("access_token")
+            parsed = json.loads(out)
+            tok = parsed.get("access_token")
         except json.JSONDecodeError:
-            tok = None
+            parsed, tok = {}, None
         if not tok:
             raise RuntimeError(f"oauth token fetch failed: {out[:160]}")
         self._token = tok
+        # Persist the token + expiry back to the sidecar (only if one already exists, i.e.
+        # a DCR/oauth-managed server), so a restart reuses it until expiry.
+        if side:
+            side["access_token"] = tok
+            if parsed.get("expires_in"):
+                side["expires_at"] = time.time() + int(parsed["expires_in"])
+            save_mcp_client(self.name, side)
         return tok
 
     def _curl(self, extra_args, timeout, capture_headers=None):
@@ -1262,6 +1396,25 @@ class MCPManager:
 
     def names(self):
         return sorted(self.servers)
+
+    def stale_enabled(self):
+        """Names that are ENABLED but have no server DEFINITION - orphaned config (e.g. a
+        server whose mcp_servers entry was removed/lost, leaving a dangling mcp_enabled
+        name). These contribute zero tools but linger confusingly; /mcp surfaces them as
+        'stale' and offers a one-touch nuke. Sorted for stable output."""
+        return sorted(n for n in self.enabled if n not in self.servers)
+
+    def drop_stale(self, only=None):
+        """Forget enabled-but-undefined names. With `only` (a name or iterable of
+        names), drop just those (ignoring any that aren't actually stale); otherwise
+        drop every stale name. Returns the list actually dropped."""
+        stale = self.stale_enabled()
+        if only is not None:
+            want = {only} if isinstance(only, str) else set(only)
+            stale = [n for n in stale if n in want]
+        for n in stale:
+            self.enabled.discard(n)
+        return stale
 
     def connect_enabled(self):
         """(Re)connect every enabled server; drop connections for disabled/removed ones.
@@ -3111,21 +3264,76 @@ def open_in_editor(path, cfg=None) -> bool:
 
 
 # ----------------------------------------------------------------------------
-# Token estimate (no tokenizer dep) - ~4 chars/token heuristic
+# Token estimate (no tokenizer dep) - char heuristic, SELF-CALIBRATING
+#
+# Base heuristic is chars/4, but two things made the raw estimate under-report
+# (worst on a restored/fresh session, before the first real prompt_eval lands):
+#   1. no PER-MESSAGE framing - every message costs the provider a few tokens of
+#      role/delimiter wrapping the char count misses; on a long history this
+#      compounds into the ~2x gap seen on restore.
+#   2. JSON (tool schemas, tool_call args, tool results) tokenizes DENSER than
+#      prose - lots of punctuation/short tokens - so chars/4 undercounts it.
+# Rather than hard-code a magic divisor (wrong per model/tokenizer), we CALIBRATE:
+# each turn the provider returns a real prompt token count for a history we can
+# also estimate, so we learn the true estimate->actual ratio (EMA, clamped) and
+# apply it everywhere messages_tokens/est_tokens are used - including the pre-first
+# -turn estimate, since the factor is persisted with the session. Converges to the
+# real tokenizer within a turn or two and travels across restores.
 # ----------------------------------------------------------------------------
 
+_PER_MSG_OVERHEAD = 4        # ~role + delimiter framing tokens the char count misses
+_TOK_FACTOR = 1.0            # learned estimate->actual multiplier (see calibrate_tokens)
+_TOK_FACTOR_MIN, _TOK_FACTOR_MAX = 0.7, 3.0
+
+
+def _tok_factor() -> float:
+    return _TOK_FACTOR
+
+
+def set_tok_factor(f) -> None:
+    """Restore a persisted calibration factor (e.g. on session load), clamped."""
+    global _TOK_FACTOR
+    try:
+        _TOK_FACTOR = max(_TOK_FACTOR_MIN, min(_TOK_FACTOR_MAX, float(f)))
+    except (TypeError, ValueError):
+        pass
+
+
+def calibrate_tokens(raw_estimate: int, actual: int) -> None:
+    """Nudge the calibration factor toward actual/raw_estimate for the same history.
+    EMA-smoothed (slow, so a single cached/sliced turn can't swing it) and clamped.
+    Called with the provider's real prompt count (incl. cache) vs our raw estimate of
+    what was sent. No-op on a degenerate input."""
+    global _TOK_FACTOR
+    if raw_estimate <= 0 or actual <= 0:
+        return
+    observed = actual / raw_estimate
+    observed = max(_TOK_FACTOR_MIN, min(_TOK_FACTOR_MAX, observed))
+    _TOK_FACTOR = round(0.7 * _TOK_FACTOR + 0.3 * observed, 4)
+
+
 def est_tokens(text: str) -> int:
-    return (len(text) + 3) // 4
+    """Calibrated token estimate for a plain string (chars/4 * learned factor)."""
+    return int(((len(text) + 3) // 4) * _TOK_FACTOR)
+
+
+def _raw_messages_tokens(messages, tools) -> int:
+    """UNCALIBRATED char-based size of a full send (messages + tool schemas), including
+    per-message framing. This is the quantity we compare against the provider's real
+    count to learn the calibration factor, so it must NOT itself be calibrated."""
+    total = 0
+    for m in messages:
+        total += (len(m.get("content") or "") + 3) // 4
+        total += _PER_MSG_OVERHEAD
+        for tc in m.get("tool_calls", []) or []:
+            total += (len(json.dumps(tc.get("function", {}))) + 3) // 4
+    total += (len(json.dumps(tools)) + 3) // 4
+    return total
 
 
 def messages_tokens(messages, tools) -> int:
-    total = 0
-    for m in messages:
-        total += est_tokens(m.get("content") or "")
-        for tc in m.get("tool_calls", []) or []:
-            total += est_tokens(json.dumps(tc.get("function", {})))
-    total += est_tokens(json.dumps(tools))
-    return total
+    """Calibrated estimate of a full send (messages + tool schemas)."""
+    return int(_raw_messages_tokens(messages, tools) * _TOK_FACTOR)
 
 
 def repair_tool_pairs(messages):
@@ -3913,6 +4121,7 @@ def save_session(messages, cfg, name: str, remote=None, pinned_plan=""):
         "title": _session_title(messages),
         "turns": len(body),
         "pinned_plan": pinned_plan or "",
+        "tok_factor": _tok_factor(),         # learned estimate->actual factor (calibrated meter)
     }
     path = _session_path(safe)
     path.write_text(json.dumps({"meta": meta, "messages": messages}, indent=2))
@@ -4533,7 +4742,8 @@ def _bg_status_msg(rows, pid=None) -> str:
     return "\n\n".join(out)
 
 
-def _bg_launch(cmd, cwd=None, kind="task", idle_timeout=None):
+def _bg_launch(cmd, cwd=None, kind="task", idle_timeout=None,
+               heartbeat_timeout=None, heartbeat_file=None):
     """Launch a detached background process on THIS box and register it, returning
     {pid, log, exitf, leasef} or {"error": msg}. The lean-tool-facing bg spawn hook
     (exposed as lc["bg_launch"]): a tool - e.g. dispatch_worker - can start + track a
@@ -4552,14 +4762,22 @@ def _bg_launch(cmd, cwd=None, kind="task", idle_timeout=None):
         log = logdir / f"{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}-{kind}.log"
         exitf = str(log) + ".exit"
         leasef = str(log) + ".lease"
-        wrapped = _BUILTINS.Tools._bg_wrap(cmd, exitf, leasef, idle_timeout)
+        # heartbeat_file lets a worker point the (bark-not-bite) staleness watchdog at
+        # its OWN progress file (bumped each iteration) instead of the bg log, so a worker
+        # that's genuinely stuck (model looping, hung tool) - not merely quiet - trips the
+        # alert. logf carries that path into _bg_wrap's HEARTBEAT channel.
+        hb_watch = heartbeat_file or log
+        wrapped = _BUILTINS.Tools._bg_wrap(cmd, exitf, leasef, idle_timeout,
+                                           logf=hb_watch,
+                                           heartbeat_timeout=heartbeat_timeout)
         with open(log, "ab") as f:
             p = subprocess.Popen(wrapped, shell=True, cwd=str(cwd) if cwd else None,
                                  stdout=f, stderr=subprocess.STDOUT,
                                  stdin=subprocess.DEVNULL, start_new_session=True)
     except Exception as e:
         return {"error": f"launch failed: {e}"}
-    _bg_register(p.pid, cmd, log, kind=kind, idle_timeout=idle_timeout)
+    _bg_register(p.pid, cmd, log, kind=kind, idle_timeout=idle_timeout,
+                 heartbeat_timeout=heartbeat_timeout)
     return {"pid": p.pid, "log": str(log), "exitf": exitf, "leasef": leasef}
 
 
@@ -4672,17 +4890,98 @@ def _close_worker_masters():
     _worker_masters.clear()
 
 
-def _bg_clean_sidecars(rec):
-    """Remove a finished/killed task's log + '.exit' sidecar so bg/ doesn't grow
-    without bound. Best-effort; a missing file is fine."""
-    log = rec.get("log")
-    if not log:
+# Worker sidecar scheme (MIRRORS dispatch_worker's file naming - a stable contract):
+# a worker with brief path '<stamp>.brief' owns exactly this family, all driver-side
+# under CONFIG_DIR/workers (never remote - the worker process is local, only its tools
+# reach an executor). Centralised here so every cleanup path nukes the WHOLE family and
+# leaves zero mess/trace.
+def _worker_brief_from_cmd(cmd):
+    """The '--brief-file' path from a worker record's launch cmd, or None. This is the
+    crash-survivable link from a bg record to its on-disk worker files."""
+    try:
+        parts = shlex.split(cmd or "")
+        if "--brief-file" in parts:
+            return parts[parts.index("--brief-file") + 1]
+    except (ValueError, IndexError):
+        pass
+    return None
+
+
+def _clean_worker_sidecars(brief):
+    """Unlink a worker's entire sidecar family given its '<stamp>.brief' path: the brief,
+    its .result, and the .progress/.inject/.injects.log heartbeat+inject files. Best-
+    effort; a missing file is fine."""
+    if not brief:
         return
-    for p in (Path(log), Path(str(log) + ".exit"), _bg_lease_path(log)):
+    b = str(brief)
+    base = b[:-len(".brief")] if b.endswith(".brief") else b
+    for p in (b, base + ".result", b + ".progress", b + ".inject", b + ".injects.log"):
         try:
-            p.unlink()
+            Path(p).unlink()
         except OSError:
             pass
+
+
+def _bg_clean_sidecars(rec):
+    """Remove a finished/killed task's sidecars so CONFIG_DIR doesn't grow without
+    bound. Covers the bg family (log/.exit/.lease and the watchdog .silent/.maxrun
+    alert files) AND, for a worker record, its full worker sidecar family. Best-effort;
+    a missing file is fine."""
+    log = rec.get("log")
+    if log:
+        for p in (Path(log), Path(str(log) + ".exit"), _bg_lease_path(log),
+                  Path(str(log) + ".silent"), Path(str(log) + ".maxrun")):
+            try:
+                p.unlink()
+            except OSError:
+                pass
+    if rec.get("kind") == "worker":
+        _clean_worker_sidecars(_worker_brief_from_cmd(rec.get("cmd")))
+
+
+def _worker_dir_sweep(grace=3600):
+    """Startup: remove ORPHANED worker sidecar files under CONFIG_DIR/workers - the
+    residue of a worker hard-killed by a reboot/SIGKILL where even the bg registry was
+    lost, so the normal reap paths never saw it. Two guards make this safe when dide is
+    running many concurrent sessions on the box:
+      1. a file still referenced by a LIVE bg worker record (any owner, THIS box) is
+         kept - never delete another session's running worker's files;
+      2. a `grace` window (default 1h) protects a worker just launched by another
+         session whose record this process hasn't observed yet.
+    Zero remote concern: these are driver-side only; the executor dir is wiped by
+    _wipe_remote. Host-gated via _bg_here on the reference check. Best-effort."""
+    wdir = CONFIG_DIR / "workers"
+    if not wdir.is_dir():
+        return
+    referenced = set()
+    for r in _bg_load():
+        if r.get("kind") == "worker" and _bg_here(r):
+            b = _worker_brief_from_cmd(r.get("cmd"))
+            if b:
+                referenced.add(os.path.abspath(b))
+    now = time.time()
+    # Anchor on the brief: clean the whole family for any unreferenced, aged-out brief.
+    for f in wdir.glob("*.brief"):
+        if os.path.abspath(str(f)) in referenced:
+            continue
+        try:
+            if now - f.stat().st_mtime < grace:
+                continue
+        except OSError:
+            continue
+        _clean_worker_sidecars(str(f))
+    # Belt-and-braces: a stray .result/.progress/.inject/.injects.log whose .brief is
+    # already gone (partial prior cleanup) - drop it once aged out.
+    for suf in (".brief.injects.log", ".brief.inject", ".brief.progress", ".result"):
+        for f in wdir.glob("*" + suf):
+            stamp = f.name[:-len(suf)]
+            if (wdir / (stamp + ".brief")).exists():
+                continue
+            try:
+                if now - f.stat().st_mtime >= grace:
+                    f.unlink()
+            except OSError:
+                pass
 
 
 def _bg_reap_orphans():
@@ -7774,6 +8073,17 @@ class Agent:
         i = 0
         while cap <= 0 or i < cap:
             i += 1
+            # Pre-iteration hook (worker inject path only; None in interactive sessions).
+            # A headless worker sets this to a poller that, at this clean between-iteration
+            # boundary, drains any pending inject sidecar and appends it as a user turn so
+            # the worker sees an operator/parent mid-task message on its next think. Never
+            # interrupts a running tool call; best-effort, never raises into the loop.
+            _hook = getattr(self, "_pre_iter_hook", None)
+            if _hook:
+                try:
+                    _hook()
+                except Exception:
+                    pass
             # Periodic in-turn status: a constantly-iterating model can run many
             # loops without ever returning to the prompt (where the status block
             # normally prints), so ctx/quota/perms go stale on screen. When
@@ -7812,6 +8122,15 @@ class Agent:
                 print(yellow("\n^C - stopped mid-inference; back to prompt"))
                 return
             if prompt_eval:
+                # Self-calibrate the estimator: compare the provider's REAL prompt count
+                # (incl. cache read/write, so it reflects the whole context) against our
+                # uncalibrated char estimate of the same send, and nudge the factor. This
+                # is what fixes the pre-first-turn / restore under-report going forward.
+                client = getattr(self, "client", None)
+                cr = getattr(client, "last_cache_read", 0) or 0
+                cw = getattr(client, "last_cache_write", 0) or 0
+                raw = _raw_messages_tokens(self.messages, self.tool_defs)
+                calibrate_tokens(raw, prompt_eval + cr + cw)
                 self.last_prompt_tokens = prompt_eval
                 self.session_in += prompt_eval
             # Output tokens are reported by the client (Ollama eval_count / API
@@ -8274,7 +8593,7 @@ def _render_tool_call(entry: dict, cap: int = EXPAND_MAX_CHARS) -> str:
 # ----------------------------------------------------------------------------
 
 SLASH_COMMANDS = ["/clear", "/new", "/compact", "/handover", "/session", "/save", "/load",
-                  "/prompt", "/sh", "/connect", "/machines", "/local", "/tools", "/reload",
+                  "/prompt", "/sh", "/connect", "/machines", "/local", "/disconnect", "/tools", "/reload",
                   "/model", "/provider", "/think", "/effort",
                   "/set", "/usage", "/approve", "/leash", "/autosave", "/incognito",
                   "/askread", "/bg", "/mcp", "/info", "/ctx", "/activity", "/expand", "/help", "/quit"]
@@ -9145,10 +9464,15 @@ def _arg_completions(agent, cfg, cmd):
     if cmd == "/bg":
         return ["kill"]
     if cmd == "/mcp":
-        return ["list", "add", "remove", "reconnect"]
+        return ["list", "add", "remove", "reconnect", "clean"]
     if cmd in ("/mcp remove", "/mcp reconnect"):   # complete a configured server name
         try:
             return list(agent.mcp.names())
+        except Exception:
+            return []
+    if cmd == "/mcp clean":                         # complete a stale (orphaned) server name
+        try:
+            return list(agent.mcp.stale_enabled())
         except Exception:
             return []
     if cmd == "/connect":
@@ -9391,6 +9715,13 @@ def _restore_session_state(agent, cfg, meta):
     plan = meta.get("pinned_plan")
     if plan is not None:
         agent.pinned_plan = plan
+
+    # Restore the learned token calibration factor so the meter is accurate on the very
+    # first (pre-prompt_eval) render after a load, instead of under-reporting until the
+    # first turn re-learns it. Absent in older sessions -> keep the live factor.
+    tf = meta.get("tok_factor")
+    if tf is not None:
+        set_tok_factor(tf)
 
     for key in ("thinking", "effort"):                     # provider-scoped settings
         val = meta.get(key)
@@ -10730,6 +11061,132 @@ def _mcp_persist(agent, cfg):
     save_config(cfg)
 
 
+def _mcp_looks_unauthorized(info):
+    """Heuristic: does a connect error string smell like a missing/bad credential
+    (401/403/unauthorized/forbidden/auth) rather than a network/parse failure? Used to
+    decide whether to offer the guided auth setup, same shape as provider login recovery."""
+    s = (info or "").lower()
+    return any(k in s for k in ("401", "403", "unauthorized", "forbidden",
+                                "authentication", "not authenticated", "invalid token",
+                                "missing token", "no token"))
+
+
+def _mcp_guided_auth(agent, cfg, name):
+    """Walk the user through adding auth to an HTTP MCP server that connected but was
+    refused (or that they know needs a credential). Mirrors the provider login flow:
+    offer bearer vs OAuth 2.1, write the auth block into the server config, remind them
+    to export the secret env var (never store it in the file), then reconnect. Returns
+    True if it reconnected with tools, False otherwise. No-op (returns None) with no TTY."""
+    server = agent.mcp.servers.get(name)
+    if not server or (server.get("transport") or "http") != "http":
+        return None
+    if not sys.stdin.isatty():
+        print(dim(f"  auth needed for '{name}'. Add an auth block to "
+                  "[mcp_servers." + name + "] in config.toml (see MCP.md), "
+                  "then /mcp reconnect " + name + "."))
+        return None
+    print(yellow(f"  '{name}' needs authentication."))
+    choice = pick_one("Auth method:",
+                      ["OAuth 2.1 (recommended - short-lived, auto-refreshed)",
+                       "Static bearer token",
+                       "skip (set it up later in config.toml)"])
+    if not choice or choice.startswith("skip"):
+        print(dim("  skipped. Edit [mcp_servers." + name + "] in config.toml when ready "
+                  "(guide: MCP.md), then /mcp reconnect " + name + "."))
+        return None
+
+    if choice.startswith("Static bearer"):
+        env = _ask_line("  env var holding the token [UNE_PPT_KEY-style name]: ").strip()
+        if not env:
+            print(dim("  no env var given; aborted."))
+            return None
+        server["auth"] = {"type": "bearer", "token_env": env}
+        if not os.environ.get(env):
+            print(yellow(f"  reminder: export {env}=<token> in your shell "
+                         "(never stored in config.toml), then rerun this."))
+    else:
+        url = server.get("url", "")
+        print(dim("  discovering OAuth endpoints (.well-known)..."))
+        meta = None
+        try:
+            meta = mcp_discover_auth(url)
+        except Exception as e:
+            print(dim(f"  discovery error: {e}"))
+        reg_endpoint = (meta or {}).get("registration_endpoint")
+        token_endpoint = (meta or {}).get("token_endpoint")
+
+        # Path 1: dynamic client registration (DCR) - mint a client inline, no hand-curl.
+        if reg_endpoint:
+            print(dim(f"  registration endpoint: {reg_endpoint}"))
+            regkey = _ask_line("  registration key if the endpoint is guarded "
+                               "(blank if open): ").strip()
+            scope = _ask_line("  scope [mcp:access]: ").strip() or "mcp:access"
+            print(dim("  registering client..."))
+            try:
+                reg = mcp_register_client(reg_endpoint, registration_key=regkey or None,
+                                          client_name=f"lean-coder ({name})", scope=scope)
+            except Exception as e:
+                reg = None
+                print(dim(f"  registration error: {e}"))
+            if not reg:
+                print(yellow("  DCR failed (bad/missing registration key, or endpoint "
+                             "refused). Falling back to manual client entry."))
+            else:
+                side = {"client_id": reg["client_id"],
+                        "client_secret": reg.get("client_secret", ""),
+                        "token_endpoint": reg.get("token_endpoint") or token_endpoint,
+                        "registration_endpoint": reg_endpoint,
+                        "scope": scope}
+                if not side["token_endpoint"]:
+                    side["token_endpoint"] = _ask_line("  token endpoint: ").strip()
+                save_mcp_client(name, side)   # 0600 sidecar; secret never in config.toml
+                server["auth"] = {"type": "oauth"}   # creds live in the sidecar
+                print(green(f"  registered client {side['client_id']} "
+                            f"(stored 0600 in mcp_auth/{name}.json)"))
+
+        # Path 2: no DCR (or it failed) - collect the OAuth fields manually. A machine-
+        # minted secret goes in the sidecar; a human-supplied one stays in an env var.
+        if server.get("auth", {}).get("type") != "oauth" or not load_mcp_client(name):
+            token_url = (token_endpoint or _ask_line("  OAuth token_url: ").strip())
+            client_id = _ask_line("  client_id: ").strip()
+            env = _ask_line("  env var holding the client secret "
+                            "(blank to store the secret in the 0600 sidecar instead): ").strip()
+            scope = _ask_line("  scope [mcp:access]: ").strip() or "mcp:access"
+            if not (token_url and client_id):
+                print(dim("  token_url and client_id are required; aborted."))
+                return None
+            if env:
+                auth = {"type": "oauth", "token_url": token_url, "client_id": client_id,
+                        "client_secret_env": env, "scope": scope}
+                server["auth"] = auth
+                if not os.environ.get(env):
+                    print(yellow(f"  reminder: export {env}=<client-secret> in your shell "
+                                 "(never stored in config.toml), then rerun this."))
+            else:
+                secret = _ask_line("  client secret (stored 0600 in the sidecar): ").strip()
+                save_mcp_client(name, {"client_id": client_id, "client_secret": secret,
+                                       "token_endpoint": token_url, "scope": scope})
+                server["auth"] = {"type": "oauth"}
+
+    _mcp_persist(agent, cfg)
+    c = agent.mcp.conns.pop(name, None)
+    if c:
+        c.close()
+    report = agent.mcp.connect_enabled()
+    agent.refresh_tools()
+    ok, info = report.get(name, (False, "?"))
+    print(green(f"  ✓ {name}: {info} tools") if ok
+          else yellow(f"  ✗ {name}: {info}  (fix env/config + /mcp reconnect {name})"))
+    return ok
+
+
+def _ask_line(prompt):
+    try:
+        return input(_rl_safe(prompt))
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return ""
+
 def handle_mcp_command(agent, cfg, arg):
     """/mcp - manage MCP (Model Context Protocol) servers. No servers ship by default.
     Subcommands:
@@ -10741,14 +11198,45 @@ def handle_mcp_command(agent, cfg, arg):
                                  For auth/env, edit mcp_servers in config.toml.
       /mcp remove <name>       forget a server
       /mcp reconnect [name]    (re)connect all enabled servers, or just <name>
+      /mcp clean               drop stale entries (enabled but no definition)
     Enabled servers' tools appear to the model namespaced mcp__<server>__<tool>; they
     run on the DRIVER (never a connected remote) and ride the rwe leash tier."""
     parts = arg.split(None, 2)
     sub = parts[0].lower() if parts else ""
 
+    # Surface orphaned enables (enabled but no server definition) on every /mcp entry -
+    # they contribute nothing and confuse ("config says enabled, /mcp shows none").
+    stale = agent.mcp.stale_enabled()
+    if stale and sub not in ("add", "remove", "reconnect", "clean"):
+        print(yellow(f"  stale (enabled but not defined): {', '.join(stale)}"))
+        print(dim(f"  -> /mcp clean [name]  removes them  {GLYPH['dot']}  or re-add with "
+                  f"/mcp add <name> <url|command> to keep using it"))
+
+    if sub == "clean":
+        if not stale:
+            print(dim("no stale MCP entries to clean."))
+            return
+        name = parts[1] if len(parts) > 1 else None
+        if name is None and len(stale) > 1 and picker_capable():
+            name = _pick_one_tty("Clean which stale MCP entry?", stale)
+            if name in (None, _NO_TTY):
+                return                                # cancelled / no tty
+        if name is not None and name not in stale:
+            print(yellow(f"'{name}' is not a stale MCP entry. stale: {', '.join(stale)}"))
+            return
+        dropped = agent.mcp.drop_stale(only=name)     # name=None -> drop all
+        if not dropped:
+            print(dim("no stale MCP entries to clean."))
+            return
+        agent.refresh_tools()
+        _mcp_persist(agent, cfg)
+        print(green(f"cleaned stale MCP entries: {', '.join(dropped)}"))
+        return
+
     if not sub:
         if not agent.mcp.names():
-            print(dim("no MCP servers configured. Add one: /mcp add <name> <url|command>"))
+            if not stale:
+                print(dim("no MCP servers configured. Add one: /mcp add <name> <url|command>"))
             return
         new = mcp_servers_menu(agent.mcp)
         if new is not None:
@@ -10763,10 +11251,13 @@ def handle_mcp_command(agent, cfg, arg):
         return
 
     if sub == "list":
-        if not agent.mcp.names():
+        if not agent.mcp.names() and not stale:
             print(dim("no MCP servers configured. /mcp add <name> <url|command>"))
             return
         print(bold("MCP servers:"))
+        for n in stale:
+            print(f"  {yellow('!')} {bold(n)}  {yellow('stale (enabled, not defined)')}  "
+                  f"{dim('/mcp clean to remove, or /mcp add to re-add')}")
         for n in agent.mcp.names():
             on = n in agent.mcp.enabled
             c = agent.mcp.servers[n]
@@ -10795,8 +11286,6 @@ def handle_mcp_command(agent, cfg, arg):
         if spec.startswith(("http://", "https://")):
             server = {"transport": "http", "url": spec}
             print(dim(f"added http server '{name}' -> {spec}"))
-            print(dim("  (auth? edit mcp_servers in config.toml: "
-                      'auth = {type="bearer", token_env="GW_KEY"})'))
         else:
             argv = spec.split()
             server = {"transport": "stdio", "command": argv[0], "args": argv[1:]}
@@ -10807,8 +11296,15 @@ def handle_mcp_command(agent, cfg, arg):
         agent.refresh_tools()
         _mcp_persist(agent, cfg)
         good, info = report.get(name, (False, "?"))
-        print(green(f"  ✓ connected, {info} tools") if good
-              else yellow(f"  ✗ {info}  (still saved + enabled; fix + /mcp reconnect {name})"))
+        if good:
+            print(green(f"  ✓ connected, {info} tools"))
+        elif server.get("transport", "http") == "http" and _mcp_looks_unauthorized(info):
+            # Connected but refused -> offer the guided auth setup inline, the same way
+            # a provider that 401s offers its login flow (rather than a dead red error).
+            print(yellow(f"  ✗ {info}"))
+            _mcp_guided_auth(agent, cfg, name)
+        else:
+            print(yellow(f"  ✗ {info}  (still saved + enabled; fix + /mcp reconnect {name})"))
         return
 
     if sub == "remove":
@@ -10843,7 +11339,13 @@ def handle_mcp_command(agent, cfg, arg):
         for n, (ok, info) in sorted(report.items()):
             if target and n != target:
                 continue
-            print(green(f"  ✓ {n}: {info} tools") if ok else yellow(f"  ✗ {n}: {info}"))
+            if ok:
+                print(green(f"  ✓ {n}: {info} tools"))
+            else:
+                print(yellow(f"  ✗ {n}: {info}"))
+                srv = agent.mcp.servers.get(n, {})
+                if (srv.get("transport") or "http") == "http" and _mcp_looks_unauthorized(info):
+                    _mcp_guided_auth(agent, cfg, n)
         return
 
     print(dim(f"unknown /mcp subcommand: {sub}  (try /mcp ?)"))
@@ -11736,8 +12238,92 @@ def run_agent_brief(args) -> int:
         "message - a message that also calls a tool is NOT your final answer, and the "
         f"{RESULT_MARK} would make the tool call be ignored (your action would not run). "
         "Finish every tool call FIRST, wait for its result, confirm the change (re-read if "
-        f"you edited), and only THEN write the {RESULT_MARK} block on its own.\n\nTASK:\n"
+        f"you edited), and only THEN write the {RESULT_MARK} block on its own.\n"
+        "MID-TASK MESSAGES: the operator or the agent that dispatched you may send you a "
+        "message while you work (it arrives as a new turn prefixed [operator inject] or "
+        "[parent-agent inject]). Treat it as a correction/steer that OUTRANKS your original "
+        "task where they conflict (e.g. a changed constraint, a stop-and-redirect). When one "
+        "arrives, briefly acknowledge it - aim for about one sentence confirming you got it "
+        "and what you'll change - then carry on. (Keep the ack short, but do not truncate a "
+        "thought to hit a length.)\n"
+        "FIRST, before your first tool call, state your understanding of the task in about one "
+        "sentence (what you're going to do). This stated intent lets whoever dispatched you "
+        "catch a misread early and stop or redirect you. Keep it short, but don't truncate a "
+        "thought to hit a length.\n\nTASK:\n"
         + brief)
+
+    # Wire the inject poller: at each between-iteration boundary the worker drains any
+    # pending inject sidecar (written by dispatch_worker action='inject' / '/worker inject')
+    # and appends it as a user turn, so an operator/parent mid-task message lands on the
+    # worker's next think without interrupting a running tool call. Sidecar lives beside the
+    # brief file (driver-side, even for a remote worker). Consumption is logged to
+    # '<brief>.injects.log' so status can confirm delivery. Best-effort; never raises.
+    _inject_path = Path(str(brief_file) + ".inject")
+    _inject_log = Path(str(brief_file) + ".injects.log")
+    _progress_path = Path(str(brief_file) + ".progress")
+    _wstart = time.time()
+    _witer = {"n": 0}
+
+    def _drain_injects():
+        try:
+            if not _inject_path.exists():
+                return
+            raw = _inject_path.read_text()
+            _inject_path.unlink()
+        except OSError:
+            return
+        for block in raw.split("\0"):
+            msg = block.strip()
+            if not msg:
+                continue
+            agent.messages.append({"role": "user", "content": msg})
+            try:
+                with _inject_log.open("a") as f:
+                    f.write(f"{int(time.time())} consumed: {msg[:120]}\n")
+            except OSError:
+                pass
+
+    def _write_progress():
+        # Deterministic heartbeat (facts the harness already has - zero tokens, zero
+        # model cooperation): iteration N, elapsed, the last tool it ran, and its stated
+        # INTENT (the one-line understanding the worker writes alongside its first tool
+        # call - see preamble). Overwritten each iteration; surfaced via /worker status
+        # so an operator/parent can see where it is and catch a total misread early.
+        try:
+            intent = ""
+            for m in agent.messages:
+                if (m.get("role") == "assistant" and isinstance(m.get("content"), str)
+                        and m["content"].strip()):
+                    intent = " ".join(m["content"].split())[:200]
+                    break
+            last_tool = ""
+            for m in reversed(agent.messages):
+                if m.get("role") == "assistant" and m.get("tool_calls"):
+                    fn = (m["tool_calls"][0].get("function") or {})
+                    a = fn.get("arguments")
+                    astr = ""
+                    if isinstance(a, dict):
+                        astr = ", ".join(f"{k}={str(v)[:30]}" for k, v in list(a.items())[:2])
+                    last_tool = f"{fn.get('name', '?')}({astr})"
+                    break
+            el = int(time.time() - _wstart)
+            elapsed = f"{el}s" if el < 60 else f"{el // 60}m{el % 60:02d}s"
+            capstr = f"/{cfg.max_iterations}" if getattr(cfg, "max_iterations", 0) else ""
+            lines = [f"iter {_witer['n']}{capstr} - {elapsed}"]
+            if last_tool:
+                lines.append(f"last: {last_tool}")
+            if intent:
+                lines.append(f"intent: {intent}")
+            _progress_path.write_text("\n".join(lines) + "\n")
+        except Exception:
+            pass
+
+    def _pre_iter():
+        _witer["n"] += 1
+        _drain_injects()
+        _write_progress()
+    agent._pre_iter_hook = _pre_iter
+
     try:
         agent.run_turn(preamble)
     except Exception as e:
@@ -11898,6 +12484,7 @@ def main():
         sys.exit(1)
     _register_dir_providers(cfg)          # register enabled providers/ plugins (bundled ollama + user)
     _bg_reap_orphans()                    # kill background tasks left by a crashed session
+    _worker_dir_sweep()                   # nuke orphaned worker sidecars (reboot/SIGKILL residue)
     atexit.register(_bg_kill_session)     # peg this session's bg tasks to it: kill on exit
     atexit.register(_close_worker_masters)  # tear down masters opened just to carry workers
     try:

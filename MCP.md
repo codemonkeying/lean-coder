@@ -67,6 +67,13 @@ url = "https://mcp-gateway.example.com/mcp/handbook/mcp"
 
 Auth reduces to a single `Authorization: Bearer <token>` header. Two ways to produce it:
 
+**Prefer OAuth 2.1 where the gateway offers it.** A static bearer token is a long-lived
+secret: if it leaks it works until someone rotates it by hand. OAuth 2.1 client
+credentials issue a short-lived JWT (typically ~1h) that lean-coder fetches, caches, and
+refetches automatically, so a leaked token expires on its own and the client secret never
+rides on the wire per request. Use a static bearer only when the server has no OAuth
+endpoint.
+
 ### Static bearer token
 
 ```toml
