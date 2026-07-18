@@ -1027,6 +1027,20 @@ check("compact keeps last N in full", not tmsgs[-1]["content"].startswith("[trim
       and len(tmsgs[-1]["content"].splitlines()) == 100)
 check("compact frees tokens", freed > 0 and after < before, f"freed~{freed}")
 check("compact is idempotent (re-run trims 0)", ag.compact(keep=1)[0] == 0)
+# compact must survive a tool message with non-string content (an older/hand-edited
+# session, or an image-only result) - it auto-fires under handover, so a crash here
+# would take down the whole turn.
+_ncx = lc.Agent.__new__(lc.Agent)
+_ncx.messages = [{"role": "system", "content": "s"},
+                 {"role": "user", "content": "hi"},
+                 {"role": "assistant", "content": "", "tool_calls": [{}]},
+                 {"role": "tool", "tool_name": "read_file", "content": None},
+                 {"role": "assistant", "content": "", "tool_calls": [{}]},
+                 {"role": "tool", "tool_name": "x", "content": "a\nb\nc"}]
+_ncx.last_prompt_tokens = None
+_nc_tr, _ = _ncx.compact(keep=1)
+check("compact survives non-string tool content (no crash, coerced)",
+      _nc_tr == 1 and _ncx.messages[3]["content"].startswith("[trimmed"))
 
 # 12b. auto_compact (NEW): programmatic strip fired at token intervals, w/ hysteresis
 acx = lc.Agent.__new__(lc.Agent)
