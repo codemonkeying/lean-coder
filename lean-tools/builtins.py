@@ -293,9 +293,9 @@ class Tools:
                                capture_output=True, text=True, timeout=to,
                                stdin=subprocess.DEVNULL)
         except subprocess.TimeoutExpired:
-            return (f"error: command timed out after {to}s (no output captured). For a "
-                    f"long-running or daemon process, end the command with ' &' to launch "
-                    f"it detached instead of blocking; or raise command_timeout in /settings.")
+            return (f"error: command timed out after {to}s (no output captured). "
+                    f"For a long-running command, end it with ' &' to run it in the "
+                    f"background - returns a pid immediately; poll with bg_status.")
         except Exception as e:
             return f"error running command: {e}"
         out = ""
