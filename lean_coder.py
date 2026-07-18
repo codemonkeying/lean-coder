@@ -91,7 +91,7 @@ def _prehandover_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.8.9"
+__version__ = "0.8.10"
 
 
 def _prerelease_key(pre):
@@ -12244,6 +12244,10 @@ def run_agent_brief(args) -> int:
     cfg.composer = False
     cfg.autosave = False                  # a worker doesn't autosave/auto-load sessions
     cfg.auto_handover = False             # one brief, no self-compaction handover
+    # Mark this process a headless worker: no human is watching, so a provider that
+    # would fast-fail an interactive turn on a transient throttle should instead wait
+    # it out (see anthropic_plan _send_with_retry - it backs off 429 in worker mode).
+    os.environ["LEANCODER_HEADLESS_WORKER"] = "1"
     if grant.get("leash"):
         cfg.leash = _norm_leash(grant["leash"]) or cfg.leash
     # The worker attaches its TOOLS to the parent's remote when one is passed. In that
