@@ -84,7 +84,17 @@ class Tools:
         if base.is_file():
             return path
         out, count = [], 0
-        rootlen = len(self.cfg.cwd.resolve().as_posix())
+        root = self.cfg.cwd.resolve()
+
+        def _rel(p):
+            # cwd-relative when the entry is inside the project (the common case);
+            # otherwise the absolute path. A naive rootlen-slice mangled names for a
+            # listing OUTSIDE cwd (e.g. an absolute /var/log) into garbage like 'g/f'.
+            rp = p.resolve()
+            try:
+                return rp.relative_to(root).as_posix()
+            except ValueError:
+                return rp.as_posix()
 
         def walk(d, depth: int):
             nonlocal count
@@ -100,7 +110,7 @@ class Tools:
                     return
                 if self.ignore.ignored(e):
                     continue
-                rel = e.resolve().as_posix()[rootlen:].lstrip("/")
+                rel = _rel(e)
                 out.append(rel + ("/" if e.is_dir() else ""))
                 count += 1
                 if e.is_dir():

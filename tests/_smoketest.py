@@ -481,6 +481,17 @@ shutil.rmtree(_outside, ignore_errors=True)
 lst = tools.list_files()
 check("list_files hides node_modules", "node_modules" not in lst)
 check("list_files shows src/", any(l.startswith("src") for l in lst.splitlines()))
+# listing an ABSOLUTE path OUTSIDE cwd must yield usable absolute names, not a
+# rootlen-sliced mangle (regression: '/tmp/x/g.txt' under cwd '/tmp/y' -> 'g.txt').
+_ext = Path(tempfile.mkdtemp(prefix="lc_extlist_"))
+(_ext / "deep").mkdir()
+(_ext / "top.txt").write_text("x")
+(_ext / "deep" / "inner.txt").write_text("y")
+_extlst = tools.list_files(str(_ext))
+check("list_files outside cwd yields real absolute paths (no mangle)",
+      all(l.rstrip("/").startswith(str(_ext)) for l in _extlst.splitlines() if "truncated" not in l)
+      and f"{_ext}/top.txt" in _extlst, repr(_extlst))
+shutil.rmtree(_ext, ignore_errors=True)
 
 # 10. run_command
 rc = tools.run_command("echo hello && exit 0")
