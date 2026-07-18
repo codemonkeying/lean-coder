@@ -11,6 +11,7 @@ import base64
 import datetime
 import hashlib
 import atexit
+import fnmatch
 import inspect
 import itertools
 import json
@@ -23,6 +24,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import textwrap
 import threading
 import time
 import types
@@ -44,6 +46,7 @@ except ImportError:  # pragma: no cover - not present on some platforms
 # Constants / tunables
 # ----------------------------------------------------------------------------
 
+_HOSTNAME = socket.gethostname()                 # cached: never changes in-process
 CONFIG_PATH = Path.home() / ".config" / "leancoder" / "config.toml"
 CONFIG_DIR = CONFIG_PATH.parent                  # ~/.config/leancoder; providers read
                                                  # this via lc["CONFIG_DIR"] for secrets
@@ -88,7 +91,7 @@ def _prehandover_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.8.6"
+__version__ = "0.8.7"
 
 
 def _prerelease_key(pre):
@@ -1731,7 +1734,6 @@ def read_key(stdin):
         # raw mode a blocking read(1) here would hang until the NEXT key, so a lone
         # ESC never fires. Peek with a tiny select() timeout: nothing waiting ==
         # the user pressed ESC on its own -> cancel.
-        import select
         try:
             waiting = bool(select.select([stdin], [], [], 0.05)[0])
         except (ValueError, TypeError, OSError):
@@ -1873,7 +1875,6 @@ def _wrap_detail(text, max_lines=3, width=None):
     text = (text or "").strip()
     if not text:
         return []
-    import textwrap
     if width is None:
         width = max(20, _term_cols() - 6)         # indent room
     lines = textwrap.wrap(text, width=width) or []
@@ -2212,6 +2213,10 @@ GLYPH = {
     "ret":      g("⏎", "<"),       # newline shown inline
     "rule":     g(chr(0x2500), "-"),  # U+2500 box-draw; chr() keeps it out of the sweep
 }
+
+# precompiled once (GLYPH["dot"] is fixed at import): strips the volatile 'N turns'
+# token from the status key, which _status_key runs on every prompt.
+_STATUS_TURNS_RE = re.compile(r"\s*" + re.escape(GLYPH["dot"]) + r"\s*\d+ turns")
 
 
 # ----------------------------------------------------------------------------
@@ -3072,7 +3077,6 @@ class Composer:
         return changed
 
     def _reader(self):
-        import select
         while self._running:
             try:
                 r, _, _ = select.select([self._fd], [], [], 0.12)
@@ -3246,7 +3250,6 @@ def open_in_editor(path, cfg=None) -> bool:
     cfg.editor, then $EDITOR, then nano/vi/vim. Returns True if one ran; False if
     none is installed or there's no TTY - the caller should then print the path so
     the user can edit it manually. Hands the terminal over via composer_suspended."""
-    import shutil
     cands = []
     if cfg is not None and getattr(cfg, "editor", ""):
         cands.append(cfg.editor)
@@ -3418,6 +3421,7 @@ def repair_tool_pairs(messages):
 class IgnoreMatcher:
     def __init__(self, root: Path):
         self.root = root
+        self._root_resolved = root.resolve()   # cached: root never changes after init
         self.patterns = list(DEFAULT_IGNORES)
         for name in (".gitignore", ".leancoderignore"):
             f = root / name
@@ -3429,7 +3433,7 @@ class IgnoreMatcher:
 
     def ignored(self, path: Path) -> bool:
         try:
-            rel = path.resolve().relative_to(self.root.resolve()).as_posix()
+            rel = path.resolve().relative_to(self._root_resolved).as_posix()
         except ValueError:
             return False
         if not rel or rel == ".":
@@ -3461,7 +3465,6 @@ class IgnoreMatcher:
 
 
 def _fnmatch(name: str, pat: str) -> bool:
-    import fnmatch
     return fnmatch.fnmatch(name, pat)
 
 
@@ -4290,7 +4293,7 @@ def _lock_is_live(name: str) -> bool:
     info = _read_lock(name)
     if not info or info.get("pid") == os.getpid():
         return False
-    if info.get("host") == socket.gethostname():
+    if info.get("host") == _HOSTNAME:
         return _pid_alive(info.get("pid", -1))
     return (time.time() - info.get("ts", 0)) <= _LOCK_STALE_SECS
 
@@ -4298,14 +4301,14 @@ def _write_lock(name: str):
     try:
         SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
         _lock_path(name).write_text(json.dumps(
-            {"pid": os.getpid(), "host": socket.gethostname(), "ts": time.time()}))
+            {"pid": os.getpid(), "host": _HOSTNAME, "ts": time.time()}))
     except OSError:
         pass
 
 def _own_lock(name: str) -> bool:
     info = _read_lock(name)
     return bool(info and info.get("pid") == os.getpid()
-                and info.get("host") == socket.gethostname())
+                and info.get("host") == _HOSTNAME)
 
 def _release_lock(name: str):
     if _own_lock(name):
@@ -4323,7 +4326,7 @@ def _prune_stale_locks():
     running instance) or our own. Called at startup so dead locks don't accumulate."""
     if not SESSIONS_DIR.is_dir():
         return
-    me, host = os.getpid(), socket.gethostname()
+    me, host = os.getpid(), _HOSTNAME
     for lk in SESSIONS_DIR.glob("*.lock"):
         info = _read_lock(lk.stem)
         if info and info.get("pid") == me and info.get("host") == host:
@@ -4438,7 +4441,7 @@ def _bg_register(pid, cmd, log, kind="task", idle_timeout=None,
         p = _bg_registry_path()
         p.parent.mkdir(parents=True, exist_ok=True)
         rec = {"pid": pid, "cmd": cmd, "log": str(log), "owner": os.getpid(),
-               "host": socket.gethostname(), "kind": kind,
+               "host": _HOSTNAME, "kind": kind,
                "idle_timeout": idle_timeout,
                "notify_on_exit": notify_on_exit,
                "heartbeat_timeout": heartbeat_timeout,
@@ -4525,7 +4528,7 @@ def _bg_here(rec) -> bool:
     probe / reap). A record with no host predates the host field - treat as local
     (back-compat: old registries only ever held this-box tasks)."""
     h = rec.get("host")
-    return h is None or h == socket.gethostname()
+    return h is None or h == _HOSTNAME
 
 
 def _bg_alive(rec) -> bool:
@@ -5083,7 +5086,7 @@ def _bg_kill_session():
     THIS box), drop them + tidy sidecars. Pegs background jobs to the lean-coder
     that launched them. Host-gated so a pid that collides with a foreign record
     can't make us kill/drop another box's task."""
-    me, host = os.getpid(), socket.gethostname()
+    me, host = os.getpid(), _HOSTNAME
     recs = _bg_load()
     if not recs:
         return
@@ -7331,7 +7334,7 @@ class Agent:
             items = remote.bg_poll()
             alerts = []                       # remote watchdog alerts: follow-up
         else:
-            host = socket.gethostname()
+            host = _HOSTNAME
             items = _bg_finished_here(os.getpid())
             alerts = _bg_alerts_here(os.getpid())
         lines = []
@@ -9395,7 +9398,7 @@ def _status_rows(agent, cfg):
     # Colour by the auto-handover ZONE (what actually drives behaviour) when it's on -
     # so the meter goes yellow/red at the soft/hard thresholds, not at a fixed % of the
     # max window. Falls back to plain %-of-max colour when auto-handover is off.
-    col = _zone_color(zone) if cfg.handover_for().get("auto") else _pct_color(pct)
+    col = _zone_color(zone) if c.get("auto") else _pct_color(pct)
     ctx = col(f"ctx {est}{_fmt_tokens(used)}/{_fmt_tokens(window)} ({pct:.0f}%{zlabel})")
     quota = _provider_usage_str(agent, cfg)     # leading separator already, or "" if none
     # handovers is a live counter (row 3 reprints every turn); shown once any happened.
@@ -9416,7 +9419,7 @@ def _status_key(rows):
         return ()
     stable = list(rows[:-1])
     if stable:                       # drop the volatile 'N turns' token from row 1
-        stable[0] = re.sub(r"\s*" + re.escape(GLYPH["dot"]) + r"\s*\d+ turns", "", stable[0])
+        stable[0] = _STATUS_TURNS_RE.sub("", stable[0])
     return tuple(stable)
 
 
@@ -11748,7 +11751,6 @@ def _input_or_wake(prompt, wake_check=None, tick=0.25):
     if wake_check is None:
         return input(prompt).strip()
     try:
-        import select
         fd = sys.stdin.fileno()
     except (ValueError, OSError, AttributeError):
         return input(prompt).strip()        # no pollable stdin -> plain blocking read
