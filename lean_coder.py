@@ -6962,21 +6962,14 @@ class Agent:
         self.refresh_tools()
         return self.lean_tools.names()
 
-    def _run_tool(self, name, args):
-        """Route a tool call: to the remote executor when connected (with a
-        local confirmation first, since the executor can't prompt), else local.
-        The model is unaware of any of this - identical surface either way."""
-        if name == "request_handover":       # elective soft-zone handover (agent-internal)
-            return self._request_handover()
-        if name == "update_plan":            # pinned-plan upkeep (local agent state, never remote)
-            return self._update_plan(args.get("plan", ""))
-        is_mcp = name.startswith(MCP_NS)
-        plug = self.lean_tools.get(name)
-        safe = bool(plug and plug["safe"])
+    def _gate_tool(self, name, args, plug, safe, is_mcp):
+        """Pre-dispatch gates common to every tool call. Returns a block-message
+        string (and prints the operator-facing block) when the call is refused,
+        else None to let it through. Order: model-capability lock -> hard leash
+        lock -> ask-on-read confirm."""
         # Model-level lock: a chat-only model (provider tool_support=False) has NO tools,
         # and that wins over the leash - raising the ceiling can't grant tools it lacks.
-        if (name != "update_plan"
-                and not self._model_tool_support()):
+        if not self._model_tool_support():
             model = self.cfg.active_model()
             print(red(f"\n{GLYPH['warn']} blocked {name}: model '{model}' has no tool calling "
                       f"(not run; switch models with /model)"))
@@ -6999,43 +6992,66 @@ class Agent:
                 and not auto_approved(self.cfg)):
             if not _confirm_action(self.cfg, "read", name=name, args_fmt=_fmt_args(args)):
                 return "operator declined the read"
-        if self.remote and (name in EXEC_TOOLS or plug) and not (plug and plug.get("driver_only")):
-            host = self.remote.host
+        return None
+
+    def _route_remote(self, name, args, safe):
+        """Run a tool on the connected remote executor (which can't prompt, so the
+        confirm happens locally first). Survives a transient exec-channel drop with a
+        single silent reconnect+retry; a reconnect that also fails drops to LOCAL and
+        tells the model. Tracks written paths for the changed-files set."""
+        host = self.remote.host
+        try:
+            if not confirm_remote_tool(self.cfg, host, name, args,
+                                       safe=safe, fetch=self.remote.read_raw):
+                return "operator declined the remote command"
             try:
-                if not confirm_remote_tool(self.cfg, host, name, args,
-                                           safe=safe, fetch=self.remote.read_raw):
-                    return "operator declined the remote command"
-                try:
-                    result = self.remote.call(name, args,
-                                              should_abort=lambda: self._abort)
-                except (ConnectionError, OSError) as e:
-                    # The exec channel died - almost always a transient master drop
-                    # (idle NAT/keepalive timeout, a brief link blip), NOT a reboot.
-                    # It surfaces on the NEXT request's write to a dead pipe. Try a
-                    # single silent reconnect (re-establish master + re-bootstrap the
-                    # executor over the same host) and retry once; only a reconnect
-                    # that ALSO fails means the box is really gone -> fall to LOCAL.
-                    # Reconnect NON-INTERACTIVELY (batch): this runs mid-tool-call, so
-                    # it must never hang on an invisible password prompt. Keys/a revived
-                    # master -> silent success; a password host or dead box -> fail fast,
-                    # caught below and dropped to LOCAL (operator re-/connect to prompt).
-                    print(dim(f"\n  remote {host} link lost ({e}); reconnecting ..."))
-                    self.remote.connect(batch=True)
-                    result = self.remote.call(name, args,
-                                              should_abort=lambda: self._abort)
+                result = self.remote.call(name, args,
+                                          should_abort=lambda: self._abort)
             except (ConnectionError, OSError) as e:
-                # reconnect failed too: the box rebooted or the link is truly down.
-                # Fall back to local and tell the model, instead of crashing.
-                self.drop_remote(host)
-                print(red(f"\n! remote {host} dropped ({e}); switched to LOCAL."))
-                return (f"error: remote {host} dropped mid-command (rebooted or link "
-                        f"lost); the session is now LOCAL - retry the command.")
-            if name in ("apply_diff", "write_file", "replace_lines") and not any(
-                    result.startswith(p) for p in
-                    ("error", "operator declined", "user declined", "no changes")):
-                if args.get("path"):
-                    self.tools.changed_files.add(args["path"])
-            return result
+                # The exec channel died - almost always a transient master drop
+                # (idle NAT/keepalive timeout, a brief link blip), NOT a reboot.
+                # It surfaces on the NEXT request's write to a dead pipe. Try a
+                # single silent reconnect (re-establish master + re-bootstrap the
+                # executor over the same host) and retry once; only a reconnect
+                # that ALSO fails means the box is really gone -> fall to LOCAL.
+                # Reconnect NON-INTERACTIVELY (batch): this runs mid-tool-call, so
+                # it must never hang on an invisible password prompt. Keys/a revived
+                # master -> silent success; a password host or dead box -> fail fast,
+                # caught below and dropped to LOCAL (operator re-/connect to prompt).
+                print(dim(f"\n  remote {host} link lost ({e}); reconnecting ..."))
+                self.remote.connect(batch=True)
+                result = self.remote.call(name, args,
+                                          should_abort=lambda: self._abort)
+        except (ConnectionError, OSError) as e:
+            # reconnect failed too: the box rebooted or the link is truly down.
+            # Fall back to local and tell the model, instead of crashing.
+            self.drop_remote(host)
+            print(red(f"\n! remote {host} dropped ({e}); switched to LOCAL."))
+            return (f"error: remote {host} dropped mid-command (rebooted or link "
+                    f"lost); the session is now LOCAL - retry the command.")
+        if name in ("apply_diff", "write_file", "replace_lines") and not any(
+                result.startswith(p) for p in
+                ("error", "operator declined", "user declined", "no changes")):
+            if args.get("path"):
+                self.tools.changed_files.add(args["path"])
+        return result
+
+    def _run_tool(self, name, args):
+        """Route a tool call: to the remote executor when connected (with a
+        local confirmation first, since the executor can't prompt), else local.
+        The model is unaware of any of this - identical surface either way."""
+        if name == "request_handover":       # elective soft-zone handover (agent-internal)
+            return self._request_handover()
+        if name == "update_plan":            # pinned-plan upkeep (local agent state, never remote)
+            return self._update_plan(args.get("plan", ""))
+        is_mcp = name.startswith(MCP_NS)
+        plug = self.lean_tools.get(name)
+        safe = bool(plug and plug["safe"])
+        blocked = self._gate_tool(name, args, plug, safe, is_mcp)
+        if blocked is not None:
+            return blocked
+        if self.remote and (name in EXEC_TOOLS or plug) and not (plug and plug.get("driver_only")):
+            return self._route_remote(name, args, safe)
         # local: a non-safe lean-tool still confirms (core tools confirm in Tools)
         if plug and not safe and not auto_approved(self.cfg):
             print(yellow(f"\nlean-tool {name}({_fmt_args(args)})"))
