@@ -2790,6 +2790,15 @@ check("agent.restore: only one system message", sum(
 check("agent.restore: body preserved after system",
       [m["role"] for m in _resag.messages] == ["system", "user", "assistant", "tool"])
 check("agent.restore: clears stale token estimate", _resag.last_prompt_tokens is None)
+# restore must survive a malformed message list (corrupt/hand-edited/partial session):
+# non-dicts, role-less entries, and a non-list input are all filtered, not crashed on.
+_junkag = lc.Agent(lc.Config(cwd=FIX, approval="auto"))
+_jn = _junkag.restore([{"role": "user", "content": "ok"}, "junk", None,
+                       {"content": "no role"}, {"role": "assistant", "content": "a"}])
+check("agent.restore: filters non-dict/role-less junk (keeps 2 valid)",
+      _jn == 2 and all(isinstance(m, dict) and m.get("role") for m in _junkag.messages))
+check("agent.restore: a non-list message payload -> empty body (no crash)",
+      _junkag.restore("not a list") == 0)
 check("/session is a known built-in command", "/session" in lc._BUILTIN_COMMANDS)
 
 # unsaved-changes tracking for /session load guard
