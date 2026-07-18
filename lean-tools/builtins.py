@@ -178,8 +178,9 @@ class Tools:
     def replace_lines(self, path: str, start: int, end: int, new_text: str = "") -> str:
         """Replace an inclusive line range (1-based) with new_text. Sidesteps
         apply_diff's delimiter-matching entirely: read_file gives you line numbers,
-        this takes line numbers. Guard: optional expected_hash (first 8 chars of the
-        file's sha256) to catch stale edits."""
+        this takes line numbers. Staleness guard: the range is validated against the
+        file's CURRENT line count (end > n is refused), so an edit computed from an
+        out-of-date read fails loudly instead of clobbering the wrong lines."""
         p = resolve_in_project(self.cfg, path)
         if not p.is_file():
             return f"error: no such file: {path}"
@@ -552,7 +553,12 @@ def _fuzzy_apply(text: str, search: str, replace: str, idx: int, path: str):
     r_lines = replace.split("\n")
     if r_lines and r_lines[-1] == "":
         r_lines = r_lines[:-1]
-    reindented = [(matched_indent + l.lstrip()) if l.strip() else l for l in r_lines]
+    # Preserve the REPLACE block's OWN internal indentation (nested blocks, continued
+    # statements) - only SHIFT the whole block to the matched region's indent. Strip
+    # the block's common leading whitespace, then prepend matched_indent. Stripping
+    # per-line to bare (the old bug) flattened nesting and wrote broken code.
+    _base = min((len(l) - len(l.lstrip()) for l in r_lines if l.strip()), default=0)
+    reindented = [(matched_indent + l[_base:]) if l.strip() else l for l in r_lines]
     new_lines = file_lines[:at] + reindented + file_lines[at + w:]
     return "\n".join(new_lines), None
 

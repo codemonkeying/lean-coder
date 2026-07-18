@@ -91,7 +91,7 @@ def _prehandover_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.8.10"
+__version__ = "0.8.11"
 
 
 def _prerelease_key(pre):
@@ -3786,6 +3786,44 @@ def host_label(url: str, machines: dict) -> str:
     return url
 
 
+# The scalar Config fields that round-trip through the TOML config file: load reads
+# each (if present) into cfg; save writes each back (default-valued ones are omitted
+# for a clean file, but the value still round-trips). This is the ONE source of truth
+# for "is field X persisted?" - the load loop and the round-trip test both read it, so
+# a new persisted knob is added in exactly one place. (Collections - machines, hosts,
+# provider_settings, mcp_*, etc - have bespoke table serialisers and are handled
+# separately in load/save; they are intentionally NOT here.)
+_PERSISTED_SCALAR_KEYS = (
+    "model", "num_ctx", "max_iterations", "keep_alive", "temperature", "top_p", "top_k",
+    "repeat_penalty", "ask_user_to_run", "autosave", "auto_update", "update_track",
+    "command_timeout", "bg_max_concurrent",
+    "worker_max_concurrent", "worker_idle_timeout", "worker_max_iterations", "editor",
+    "approval", "confirm_reads", "auto_reconnect", "statusline", "statusline_every",
+    "statusline_iter", "auto_evict", "auto_evict_keep",
+    "window_messages", "auto_handover", "handover_soft", "handover_hard",
+    "handover_emergency", "handover_min_interval", "autostart_after_handover",
+    "auto_compact_interval", "auto_compact_hysteresis", "auto_compact_keep",
+    "wake_on_bg_finish",
+    "lean_tools_dir", "providers_dir", "user_name",
+)
+# EPHEMERAL: deliberately NEVER persisted. These are per-launch state - saving them
+# would let one session silently narrow/alter the NEXT launch's default. `composer` is
+# read from the file on load (a user CAN pin composer=false by hand) but is never
+# WRITTEN, since --no-composer / worker mode flip it transiently. `leash` is a
+# runtime-only ceiling; `incognito` a session trace we won't record; `think` a
+# per-session send flag; `cwd`/`model_explicit`/`auto_num_ctx` are derived at launch.
+_EPHEMERAL_KEYS = frozenset((
+    "composer", "leash", "incognito", "think", "cwd", "model_explicit", "auto_num_ctx",
+))
+# DERIVED / bespoke: persisted, but via their own table serialisers (not scalar lines),
+# or reconstructed at load. Listed so the round-trip test can account for every field.
+_BESPOKE_KEYS = frozenset((
+    "host", "hosts", "machines", "connect_hosts", "host_models", "provider",
+    "provider_settings", "providers_enabled", "lean_tools_enabled", "mcp_servers",
+    "mcp_enabled", "always_expand", "show_snapshots", "handover_overrides",
+))
+
+
 def load_config(args) -> Config:
     cfg = Config()
     # config file (lowest, above defaults)
@@ -3796,17 +3834,7 @@ def load_config(args) -> Config:
             file_vals = tomllib.loads(CONFIG_PATH.read_text())
         except Exception as e:
             print(yellow(f"warning: could not parse {CONFIG_PATH}: {e}"))
-    for key in ("model", "num_ctx", "max_iterations", "keep_alive", "temperature", "top_p", "top_k",
-                "repeat_penalty", "ask_user_to_run", "composer", "autosave", "auto_update", "update_track",
-                "command_timeout", "bg_max_concurrent",
-                "worker_max_concurrent", "worker_idle_timeout", "worker_max_iterations", "editor",
-                "leash", "approval", "confirm_reads", "auto_reconnect", "statusline", "statusline_every",
-                "statusline_iter", "auto_evict", "auto_evict_keep",
-                "window_messages", "auto_handover", "handover_soft", "handover_hard",
-                "handover_emergency", "handover_min_interval", "autostart_after_handover",
-                "auto_compact_interval", "auto_compact_hysteresis", "auto_compact_keep",
-                "wake_on_bg_finish",
-                "lean_tools_dir", "providers_dir", "user_name"):
+    for key in _PERSISTED_SCALAR_KEYS + ("composer",):  # composer: read-only (see _EPHEMERAL_KEYS)
         if key in file_vals:
             setattr(cfg, key, file_vals[key])
     # The self-managing mechanism is a HANDOVER (the model pulls the same lever
@@ -4057,6 +4085,10 @@ def save_config(cfg: Config, quiet: bool = False):
         lines.append(f"statusline_every = {cfg.statusline_every}")
     if cfg.statusline_iter != 0:              # default 0 (off); persist if changed
         lines.append(f"statusline_iter = {cfg.statusline_iter}")
+    if cfg.auto_update:                       # default off; persist an opt-IN
+        lines.append("auto_update = true")
+    if cfg.update_track != "stable":          # default stable; persist a non-default track
+        lines.append(f'update_track = "{cfg.update_track}"')
     if cfg.editor:
         lines.append(f'editor = "{cfg.editor}"')
     if cfg.user_name and cfg.user_name != "operator":
@@ -4429,7 +4461,12 @@ def _prune_autosaves(keep: int = AUTOSAVE_KEEP):
 # ----------------------------------------------------------------------------
 
 def resolve_in_project(cfg: Config, path: str) -> Path:
-    p = (cfg.cwd / path).resolve() if not os.path.isabs(path) else Path(path).resolve()
+    # expanduser FIRST so a leading ~ (or ~user) is a real home dir, not a literal
+    # 'cwd/~/...' child - a model that writes "~/notes.txt" means its home, not a
+    # folder called '~'. After expansion an absolute path (incl. an expanded ~) is
+    # taken as-is; anything still relative is anchored to the project cwd.
+    p = Path(path).expanduser()
+    p = p.resolve() if p.is_absolute() else (cfg.cwd / p).resolve()
     return p
 
 
@@ -9486,6 +9523,7 @@ def handle_info_command(agent, cfg, arg=""):
         think, effort = {True: "on", False: "off"}.get(cfg.think, "unset"), "-"
     dot = f"  {GLYPH['dot']}  "
     badge = approval_badge(cfg)
+    print(f"  version:  {__version__}{dot}track: {getattr(cfg, 'update_track', 'stable')}")
     print(f"  model:    {cfg.active_model()}")
     print(f"  provider: {backend}  ({where})")
     hov = f", {agent.handovers} handovers" if agent.handovers else ""
