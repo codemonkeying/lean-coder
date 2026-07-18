@@ -377,7 +377,7 @@ def run(args, cwd):
     where = remote["host"] if remote else "local"
     _H["workers"][launched["pid"]] = {"result": str(result_file), "task": task,
                                       "started": time.time(), "model": model or "(default)",
-                                      "where": where}
+                                      "where": where, "log": launched.get("log")}
     mstr = model or "current model"
     lstr = {"r": "read-only", "rw": "read+write", "rwe": "read+write+exec"}.get(leash, leash)
     _H["workers"][launched["pid"]]["leash"] = leash
@@ -399,6 +399,25 @@ def _read_result(path):
         return _H["_extract_marked"](Path(path).read_text(), _H["RESULT_MARK"])
     except OSError:
         return None
+
+
+def _worker_stderr_tail(result_path, n=15):
+    """Last few lines of a FAILED worker's combined stdout+stderr log (bg_launch runs it
+    with stderr merged into the log), so a crash/early death leaves a visible trace in the
+    failure notice instead of vanishing. "" if we have no log path or it's unreadable."""
+    meta = None
+    for m in _H["workers"].values():
+        if m.get("result") == result_path:
+            meta = m
+            break
+    log = (meta or {}).get("log")
+    tail = _H.get("_bg_log_tail")
+    if not (log and tail):
+        return ""
+    try:
+        return tail(log, n)
+    except Exception:
+        return ""
 
 
 def _read_progress(result_path):
@@ -426,33 +445,58 @@ def _inject_count(result_path):
 
 
 def _finished_notice():
-    """Scan tracked workers for ones that FINISHED since we last looked (result file
-    written), and build the notice to inject into the model's next turn. Reports each
-    newly-finished worker once (dedup via meta['announced']); when that clears the LAST
-    outstanding worker, appends an 'all N finished' line. Fires a desktop ping per
+    """Scan tracked workers for ones that FINISHED since we last looked, and build the
+    notice to inject into the model's next turn. A worker finishes one of two ways:
+      - SUCCESS: its result file got a ===RESULT=== block -> report the (capped) result;
+      - FAILED:  the process is GONE but no result was ever written (crash / early death /
+        lease-kill before writing) -> report the failure + any stderr tail, so the model
+        is never left waiting on a worker that will never report. Without this second
+        branch a dead-without-result worker sits in silent limbo forever (the bug this
+        fixes).
+    Reports each newly-finished worker once (dedup via meta['announced']); when that clears
+    the LAST outstanding worker, appends an 'all N finished' line. Fires a desktop ping per
     finish if the notify lean-tool's _ping is present. "" when nothing new finished."""
     workers = _H["workers"]
     if not workers:
         return ""
     ping = _H.get("ping")
+    rows = _worker_rows()               # {pid: bg_status row}; absent row => proc gone
     lines = []
     just_finished = []
     for pid, meta in workers.items():
         if meta.get("announced"):
             continue
         res = _read_result(meta["result"])
-        if res is None:
-            continue                     # still running / not written yet
+        if res is not None:
+            meta["announced"] = True
+            just_finished.append(pid)
+            tail = res.strip()
+            if len(tail) > 1500:         # keep a long result from flooding the turn
+                tail = tail[:1500] + " ...[truncated; /worker %d for the full result]" % pid
+            lines.append(f"worker {pid} finished ({meta.get('leash','r')}, {meta['model']}) - "
+                         f"task: {meta['task'][:100]}\nresult:\n{tail}")
+            if ping:
+                try:
+                    ping("lean-coder worker", f"worker {pid} finished")
+                except Exception:
+                    pass
+            continue
+        # No result. Only a FAILURE if the process is actually gone (a running worker
+        # just hasn't written yet - leave it). A missing bg_status row => proc gone.
+        if rows.get(pid) is not None:
+            continue                     # still running; wait
         meta["announced"] = True
         just_finished.append(pid)
-        tail = res.strip()
-        if len(tail) > 1500:             # keep a long result from flooding the turn
-            tail = tail[:1500] + " …[truncated; /worker %d for the full result]" % pid
-        lines.append(f"worker {pid} finished ({meta.get('leash','r')}, {meta['model']}) - "
-                     f"task: {meta['task'][:100]}\nresult:\n{tail}")
+        errtail = _worker_stderr_tail(meta.get("result"))
+        msg = (f"worker {pid} FAILED ({meta.get('leash','r')}, {meta['model']}) - "
+               f"it exited without writing a result "
+               f"(crash / early death / lease-kill).\ntask: {meta['task'][:100]}")
+        if errtail:
+            msg += f"\nstderr tail:\n{errtail}"
+        lines.append(msg)
         if ping:
             try:
-                ping("lean-coder worker", f"worker {pid} finished")
+                ping("lean-coder worker", f"worker {pid} FAILED (no result)")
             except Exception:
                 pass
     if not just_finished:
