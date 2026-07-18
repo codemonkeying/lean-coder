@@ -70,6 +70,8 @@ __pycache__/
 !/providers/groq.py
 !/providers/openai.py
 !/providers/openrouter.py
+!/providers/llamacpp.py
+!/providers/mlx.py
 
 # For machine-specific ignores of your own (personal provider plugins, local tools,
 # scratch files) use .git/info/exclude - local, never committed - rather than naming
