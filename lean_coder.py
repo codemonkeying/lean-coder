@@ -91,7 +91,7 @@ def _prehandover_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.8.7"
+__version__ = "0.8.8"
 
 
 def _prerelease_key(pre):
@@ -1041,10 +1041,21 @@ def delete_mcp_client(name):
             pass
 
 
+_CURL_PATH = None   # cached: curl's presence on PATH is stable for the process lifetime
+
+
+def _require_curl(msg):
+    """Cached shutil.which('curl'); raise `msg` if absent. Avoids a PATH scan per call."""
+    global _CURL_PATH
+    if _CURL_PATH is None:
+        _CURL_PATH = shutil.which("curl") or ""
+    if not _CURL_PATH:
+        raise RuntimeError(msg)
+
+
 def _mcp_curl_json(args, timeout=15):
     """Run curl with the given extra args, return parsed JSON or None. stdlib-only."""
-    if not shutil.which("curl"):
-        raise RuntimeError("MCP OAuth needs curl on PATH")
+    _require_curl("MCP OAuth needs curl on PATH")
     r = subprocess.run(["curl", "-s", "--max-time", str(timeout)] + args,
                        capture_output=True, text=True)
     if r.returncode != 0:
@@ -1294,8 +1305,7 @@ class MCPConnection:
         return tok
 
     def _curl(self, extra_args, timeout, capture_headers=None):
-        if not shutil.which("curl"):
-            raise RuntimeError("http MCP transport needs curl on PATH")
+        _require_curl("http MCP transport needs curl on PATH")
         cmd = ["curl", "-s", "--max-time", str(timeout)] + extra_args
         r = subprocess.run(cmd, capture_output=True, text=True)
         if r.returncode != 0:
@@ -4450,6 +4460,8 @@ def _bg_register(pid, cmd, log, kind="task", idle_timeout=None,
                "started_at": time.time()}
         with open(p, "a") as f:
             f.write(json.dumps(rec) + "\n")
+        global _BG_LOAD_CACHE
+        _BG_LOAD_CACHE = (None, [])   # invalidate: next _bg_load re-reads
     except OSError:
         pass
 
@@ -4476,19 +4488,33 @@ def _bg_bump_lease(rec):
         pass
 
 
+_BG_LOAD_CACHE = (None, [])   # (mtime, records); registry read 2-5x/turn otherwise
+
+
 def _bg_load():
+    # Cache on the registry file's mtime: it changes only when a task starts/ends/is
+    # killed, so the cache is hot for the vast majority of the per-turn reads. A stale
+    # mtime just re-reads (always valid), so a cross-process write is never missed.
+    global _BG_LOAD_CACHE
+    p = _bg_registry_path()
     try:
-        return [json.loads(ln) for ln in _bg_registry_path().read_text().splitlines()
-                if ln.strip()]
+        mtime = p.stat().st_mtime
+        if mtime == _BG_LOAD_CACHE[0]:
+            return list(_BG_LOAD_CACHE[1])
+        recs = [json.loads(ln) for ln in p.read_text().splitlines() if ln.strip()]
+        _BG_LOAD_CACHE = (mtime, recs)
+        return list(recs)
     except (OSError, json.JSONDecodeError):
         return []
 
 
 def _bg_save(recs):
+    global _BG_LOAD_CACHE
     try:
         p = _bg_registry_path()
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text("".join(json.dumps(r) + "\n" for r in recs))
+        _BG_LOAD_CACHE = (None, [])   # invalidate: next _bg_load re-reads
     except OSError:
         pass
 
