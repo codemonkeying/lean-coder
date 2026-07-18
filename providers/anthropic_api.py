@@ -247,6 +247,11 @@ def _tool_result_content(r):
     never a stringified list). Any encode failure falls back to the text string,
     so a broken/missing image never breaks the turn."""
     text = r.get("content", "")
+    # The API requires tool_result content to be a string (or a block list). A
+    # loaded/synthesised history could carry a non-string (None, a number) - coerce
+    # it so one odd message can't 400 the whole request.
+    if not isinstance(text, str):
+        text = "" if text is None else str(text)
     ip   = r.get("image_path")
     if not ip:
         return text

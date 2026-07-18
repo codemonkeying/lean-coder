@@ -1838,6 +1838,21 @@ check("gemini vision=False: no inlineData part",
 check("image slices: self.messages history NOT mutated by conversion",
       _ihist == _ihist_copy)
 shutil.rmtree(_png.parent, ignore_errors=True)
+# non-string tool content (a loaded/synthesised history) must not reach the wire as a
+# non-string - each bundled provider coerces it so one odd message can't 400 the call.
+_badhist = [{"role": "system", "content": "s"},
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "", "tool_calls": [{"id": "c1", "function": {"name": "read_file", "arguments": {}}}]},
+            {"role": "tool", "tool_call_id": "c1", "tool_name": "read_file", "content": None}]
+for _pn in ("groq", "openrouter"):
+    _pm = _il.import_module(f"providers.{_pn}")
+    _conv = _pm._cvt_messages(_badhist)
+    _tc = [x for x in _conv if x.get("role") == "tool"][0]
+    check(f"{_pn}: non-string tool content coerced to str (no wire type error)",
+          isinstance(_tc["content"], str))
+_api_m = _il.import_module("providers.anthropic_api")
+check("anthropic_api: _tool_result_content coerces None -> ''",
+      _api_m._tool_result_content({"content": None}) == "")
 
 # 20. remote SSH transport: pure builders
 check("ctl_path sanitizes host + is per-PID + lives in runtime dir",
