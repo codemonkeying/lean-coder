@@ -92,6 +92,28 @@ def _reexec_fresh_updater(dest_root: Path, track: str) -> bool:
     return r.returncode == 0
 
 
+def _smoke_import(dest_root: Path):
+    """Run the freshly-overlaid lean_coder.py in a subprocess to prove it actually
+    IMPORTS (py_compile only proves it parses). `--version` triggers a full module
+    import, then prints the source hash and exits 0. Returns (ok, reason). Guarded
+    by a timeout so a hang can't wedge the update. On its own re-exec pass we skip
+    (the env flag is set) - the outer /update already smoke-checked."""
+    core = dest_root / "lean_coder.py"
+    if os.environ.get(_REEXEC_ENV) or not core.is_file():
+        return True, ""
+    try:
+        r = subprocess.run([sys.executable, str(core), "--version"],
+                           capture_output=True, text=True, timeout=60)
+    except subprocess.TimeoutExpired:
+        return False, "import timed out"
+    except OSError as e:
+        return False, str(e)
+    if r.returncode != 0:
+        tail = (r.stderr.strip() or r.stdout.strip() or f"exit {r.returncode}")
+        return False, tail.splitlines()[-1][:200] if tail else f"exit {r.returncode}"
+    return True, ""
+
+
 def _raw_base(track):
     branch = TRACK_BRANCH.get(track, "main")
     return f"https://raw.githubusercontent.com/{REPO}/{branch}"
@@ -211,8 +233,14 @@ def _apply(cfg, dest_root, dim, green, yellow, red, ask=None):
         core = " (incl. lean_coder.py)" if "lean_coder.py" in changed else ""
         if ask is not None and not ask(f"overlay {n} updated file(s){core} into {dest_root}?"):
             print(dim("cancelled.")); return False
-        # Back up the core file for a hand rollback, then overlay every changed file.
+        # Back up EVERY file we're about to overwrite (not just core) so a failed
+        # import smoke-check below can roll the whole overlay back atomically-ish.
+        # core also keeps the durable lean_coder.py.bak for a later hand rollback.
+        backups = {}   # rel -> saved bytes (None = file didn't exist before)
         try:
+            for rel in changed:
+                dst = dest_root / rel
+                backups[rel] = dst.read_bytes() if dst.exists() else None
             core_dst = dest_root / "lean_coder.py"
             if core_dst.exists():
                 shutil.copy2(core_dst, core_dst.with_suffix(core_dst.suffix + ".bak"))
@@ -224,6 +252,29 @@ def _apply(cfg, dest_root, dim, green, yellow, red, ask=None):
                     dst.chmod(dst.stat().st_mode | 0o111)
         except OSError as e:
             print(red(f"could not write update: {e}")); return False
+        # Import smoke-check: py_compile only proves the file PARSES; a build can
+        # compile and still throw at import (a module-scope NameError, a bad
+        # `from x import y`). Run the freshly-written lean_coder.py in a subprocess
+        # (--version does a full module import, then prints the source hash and
+        # exits). If it fails to import, the overlaid tree would crash on the NEXT
+        # launch - fatal for auto_update, which has no human in the loop - so roll
+        # every changed file back to its pre-overlay bytes and refuse the update.
+        ok_import, why = _smoke_import(dest_root)
+        if not ok_import:
+            for rel, saved in backups.items():
+                try:
+                    dst = dest_root / rel
+                    if saved is None:
+                        dst.unlink(missing_ok=True)
+                    else:
+                        dst.write_bytes(saved)
+                        if rel.endswith(".py"):
+                            dst.chmod(dst.stat().st_mode | 0o111)
+                except OSError:
+                    pass
+            print(red(f"new build failed to import ({why}); rolled back - "
+                      "nothing changed. Your install is untouched."))
+            return False
     print(green(f"updated {n} file(s) to the latest build "
                 f"(lean_coder.py backup at lean_coder.py.bak)."))
     for rel in changed:

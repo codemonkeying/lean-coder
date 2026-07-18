@@ -421,6 +421,17 @@ res_fzd = tools.apply_diff("src/fuzzdup.py", "<<<<<<< SEARCH\nq = 1\n=======\nq 
 check("apply_diff fuzzy rejects ambiguous whitespace match",
       "ambiguous" in res_fzd and "q = 2" not in (FIX / "src/fuzzdup.py").read_text(), res_fzd)
 
+# fuzzy re-indent must PRESERVE the REPLACE block's internal nesting, only shifting
+# the whole block to the matched region's indent (regression: it used to strip every
+# line to bare + prepend one indent, flattening nested blocks into broken code).
+tools.write_file("src/fuzznest.py", "def f():\n  old_a()\n  old_b()\n")   # 2-space region
+_fzn = ("<<<<<<< SEARCH\nold_a()\nold_b()\n=======\n"
+        "if cond:\n    new_a()\n    new_b()\n>>>>>>> REPLACE")            # nested replace
+tools.apply_diff("src/fuzznest.py", _fzn)
+_fznc = (FIX / "src/fuzznest.py").read_text()
+check("apply_diff fuzzy preserves nested REPLACE indentation",
+      _fznc == "def f():\n  if cond:\n      new_a()\n      new_b()\n", repr(_fznc))
+
 # 7b. tool-call line: backgrounded run_command is labelled in TEXT (not just glyph)
 check("tool line: bg run_command shows (background) tag",
       "(background)" in lc._tool_call_line("run_command", {"cmd": "x.py &"}))
@@ -848,7 +859,48 @@ check("save_config: statusline_iter round-trip", _tt_bg.loads(_tcf.read_text()).
 lc.save_config(lc.Config(model="m", statusline_iter=0), quiet=True)
 check("save_config: default statusline_iter (0) omitted",
       "statusline_iter" not in _tt_bg.loads(_tcf.read_text()))
-lc.CONFIG_PATH = _ocp_bg
+# --- config drift guard: every Config field is classified exactly once, and every
+# PERSISTED scalar actually round-trips through save -> load. This is the insurance
+# against the load/save mirror silently dropping a knob (bit us: auto_update /
+# update_track were loadable + /set-able but never saved). If you add a Config field,
+# you MUST add it to _PERSISTED_SCALAR_KEYS, _EPHEMERAL_KEYS, or _BESPOKE_KEYS - this
+# fails until you do, so the classification can't rot.
+import dataclasses as _dc
+_all_fields = set(f.name for f in _dc.fields(lc.Config))
+_classified = set(lc._PERSISTED_SCALAR_KEYS) | lc._EPHEMERAL_KEYS | lc._BESPOKE_KEYS
+check("config: every Config field is classified (persist/ephemeral/bespoke)",
+      _all_fields == _classified,
+      f"unclassified={sorted(_all_fields - _classified)} stale={sorted(_classified - _all_fields)}")
+# Each persisted scalar, set to a non-default, must come back through load_config.
+_nondefault = {
+    "num_ctx": 8192, "max_iterations": 7, "keep_alive": "30m", "temperature": 0.33,
+    "top_p": 0.55, "top_k": 42, "repeat_penalty": 1.11, "ask_user_to_run": False,
+    "autosave": False, "auto_update": True, "update_track": "beta", "command_timeout": 99,
+    "bg_max_concurrent": 2, "worker_max_concurrent": 4, "worker_idle_timeout": 900,
+    "worker_max_iterations": 15, "editor": "vim", "approval": "auto", "confirm_reads": True,
+    "auto_reconnect": True, "statusline": False, "statusline_every": 3, "statusline_iter": 20,
+    "auto_evict": True, "auto_evict_keep": 5, "window_messages": 12, "auto_handover": False,
+    "handover_soft": 0.42, "handover_hard": 0.61, "handover_emergency": 0.99,
+    "handover_min_interval": 33.0, "autostart_after_handover": False,
+    "auto_compact_interval": 8, "auto_compact_hysteresis": 0.4, "auto_compact_keep": 6,
+    "wake_on_bg_finish": True, "lean_tools_dir": "/tmp/lt", "providers_dir": "/tmp/pv",
+    "user_name": "dide", "model": "some-model:1b",
+}
+# every persisted scalar must have a probe value here (so nothing is left untested)
+_missing_probe = [k for k in lc._PERSISTED_SCALAR_KEYS if k not in _nondefault]
+check("config: round-trip probe covers every persisted scalar", not _missing_probe,
+      f"no probe value for {_missing_probe}")
+class _Args:  # minimal args stub for load_config (no CLI overrides)
+    def __getattr__(self, _n): return None
+_cfg_rt = lc.Config(**{k: _nondefault[k] for k in lc._PERSISTED_SCALAR_KEYS})
+lc.save_config(_cfg_rt, quiet=True)
+_ocp_rt = lc.CONFIG_PATH  # load_config reads CONFIG_PATH (already the scratch _tcf here)
+_loaded = lc.load_config(_Args())
+_rt_bad = [k for k in lc._PERSISTED_SCALAR_KEYS
+           if k != "model" and getattr(_loaded, k) != _nondefault[k]]
+check("config: every persisted scalar round-trips save -> load", not _rt_bad,
+      f"dropped/changed: {_rt_bad}")
+
 # 10d. queue-drain 3-way choice (default combine)
 check("_drain_choice: s -> separate", lc._drain_choice("s") == "separate"
       and lc._drain_choice("separate") == "separate")
