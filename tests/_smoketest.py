@@ -727,6 +727,12 @@ _dw._H["workers"] = {
     101: {"result": str(_r1p), "task": "scout A", "model": "m", "leash": "r"},
     102: {"result": str(_r2p), "task": "scout B", "model": "m", "leash": "r"},
 }
+# Both procs stay alive (a present bg_status row) for the whole success run, so finish
+# is signaled purely by the result file appearing - not by the proc-gone FAILED path.
+# (_worker_rows() reads _H["bg_status"]; without this it returns {} and every result-less
+# worker is wrongly declared FAILED on the first scan.)
+_dw_bg_status_real = _dw._H.get("bg_status")
+_dw._H["bg_status"] = lambda owner, kind=None: [{"pid": 101}, {"pid": 102}]
 check("finish-notice: nothing finished -> empty", _dw._finished_notice() == "")
 _r1p.write_text(f"{lc.RESULT_MARK}\nA is here\n{lc.RESULT_MARK}\n")
 _n1 = _dw._finished_notice()
@@ -738,6 +744,14 @@ _r2p.write_text(f"{lc.RESULT_MARK}\nB is here\n{lc.RESULT_MARK}\n")
 _n2 = _dw._finished_notice()
 check("finish-notice: reports the second worker", "worker 102 finished" in _n2)
 check("finish-notice: announces all-done when the last clears", "all 2 dispatched workers" in _n2)
+# FAILED path: a worker with no result whose proc is GONE (no bg_status row) is announced
+# as failed, not left in limbo (regression guard for the silent-limbo bug).
+_r3p = _dwtmp / "w3.result"
+_dw._H["workers"] = {103: {"result": str(_r3p), "task": "scout C", "model": "m", "leash": "r"}}
+_dw._H["bg_status"] = lambda owner, kind=None: []   # proc gone, no result written
+_n3 = _dw._finished_notice()
+check("finish-notice: dead worker with no result -> FAILED", "worker 103 FAILED" in _n3)
+_dw._H["bg_status"] = _dw_bg_status_real
 _dw._H["workers"] = {}
 shutil.rmtree(_dwtmp, ignore_errors=True)
 lc._bg_save([])                                        # tidy the registry for later checks
