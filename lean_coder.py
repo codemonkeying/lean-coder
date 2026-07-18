@@ -771,6 +771,16 @@ def _same_file(a: Path, b: Path) -> bool:
         return False
 
 
+def _dup_name_skip(prev: Path, f: Path, label: str, name: str) -> bool:
+    """First-dir-wins guard shared by the lean-tool and provider loaders: a name
+    already loaded from `prev` is skipped; an identical copy across dirs is silent,
+    a DIFFERENT file under the same name warns. Always returns True (caller continues)."""
+    if not _same_file(prev, f):
+        print(yellow(f"{label} {f.name}: name '{name}' already loaded "
+                     f"(from {prev.name}); skipping"))
+    return True
+
+
 class LeanToolManager:
     """Discovers lean-tool files and exposes their schemas/handlers. `enabled` is a
     set of lean-tool names (None = all, used by the hermetic executor which only
@@ -823,10 +833,7 @@ class LeanToolManager:
                 # identity: the TOOL name for tool lean-tools, else the file stem
                 name = spec["name"] if has_tool else f.stem
                 if name in self.lean_tools:
-                    prev = self.lean_tools[name]["path"]
-                    if not _same_file(prev, f):     # identical copy across dirs -> silent
-                        print(yellow(f"lean-tool {f.name}: name '{name}' already loaded "
-                                     f"(from {prev.name}); skipping"))
+                    _dup_name_skip(self.lean_tools[name]["path"], f, "lean-tool", name)
                     continue
                 entry = {"path": f, "group": group,
                          "setup": setup if callable(setup) else None}
@@ -1590,10 +1597,7 @@ class ProviderManager:
                         continue
                     name = spec["name"]
                     if name in self.providers:   # first dir wins (bundled shadows a user drop-in)
-                        prev = self.providers[name]["path"]
-                        if not _same_file(prev, f):  # identical copy across dirs -> silent
-                            print(yellow(f"provider {f.name}: name '{name}' already loaded "
-                                         f"(from {prev.name}); skipping"))
+                        _dup_name_skip(self.providers[name]["path"], f, "provider", name)
                         continue
                     self.providers[name] = {"path": f, "spec": spec, "module": mod,
                                             "setup": getattr(mod, "setup", None)}
@@ -5421,10 +5425,6 @@ def _confirm_action(cfg, kind: str, **info) -> bool:
     the LOCAL policy.)"""
     if kind == "write":
         path, original, new = info["path"], info["original"], info["new"]
-        # Auto-approved: the operator isn't deciding, so don't dump the full preview -
-        # it's just noise scrolling past. Collapse to a one-line note; /expand shows the
-        # diff on demand. The full preview is only rendered when we actually prompt (you
-        # need to SEE the change to approve it).
         # Auto-approved: no preview here. The uniform result-preview line (printed
         # under the call line for EVERY tool) already shows the outcome + /expand, so a
         # separate pencil note would just double up. Only the interactive prompt below
@@ -11458,16 +11458,11 @@ def handle_handover_command(agent, cfg, arg):
 
 def handle_autosave_command(agent, cfg, arg):
     """/autosave [on|off] - toggle persisting the conversation; no arg flips it."""
-    want = arg.strip().lower()
-    if want in ("on", "true", "yes", "1"):
-        cfg.autosave = True
-    elif want in ("off", "false", "no", "0"):
-        cfg.autosave = False
-    elif want:
+    want = _parse_toggle(arg, cfg.autosave)
+    if want is None:
         print(dim("usage: /autosave [on|off]"))
         return
-    else:
-        cfg.autosave = not cfg.autosave      # no arg toggles
+    cfg.autosave = want
     autosave_config(cfg)
     print(dim(f"autosave -> {'on' if cfg.autosave else 'off (amnesic)'}"))
 
@@ -11981,15 +11976,15 @@ def repl(cfg: Config, resume=None):
                 print(_operator_turn_lines(cfg.user_name, line, agent))
         else:
             try:
+                _wake = (agent.bg_wake_turn
+                         if (cfg.wake_on_bg_finish or agent._has_bg_optins())
+                         else None)
                 if idle_comp is not None:
                     # Idle composer owns the line: correct multi-line paste render
                     # + Tab/history/emacs. Falls back to input() if it can't take
                     # the TTY (RuntimeError). The prompt glyph is drawn by the
                     # composer's own input row, so pass only the remote indicator.
                     try:
-                        _wake = (agent.bg_wake_turn
-                                 if (cfg.wake_on_bg_finish or agent._has_bg_optins())
-                                 else None)
                         line = idle_comp.read_line(
                             prompt_status=(indicator.strip() or None),
                             wake_check=_wake).strip()
@@ -12000,16 +11995,10 @@ def repl(cfg: Config, resume=None):
                             print(_operator_turn_lines(cfg.user_name, line, agent))
                     except RuntimeError:
                         line = _input_or_wake(
-                            _rl_safe(bold(cyan(indicator + _pg + " "))),
-                            (agent.bg_wake_turn
-                             if (cfg.wake_on_bg_finish or agent._has_bg_optins())
-                             else None))
+                            _rl_safe(bold(cyan(indicator + _pg + " "))), _wake)
                 else:
                     line = _input_or_wake(
-                        _rl_safe(bold(cyan(indicator + _pg + " "))),
-                        (agent.bg_wake_turn
-                         if (cfg.wake_on_bg_finish or agent._has_bg_optins())
-                         else None))
+                        _rl_safe(bold(cyan(indicator + _pg + " "))), _wake)
                 pending_exit = False   # any input (even empty) disarms the exit
             except EOFError:           # Ctrl-D
                 agent.close_all_remotes()
