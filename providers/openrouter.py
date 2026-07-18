@@ -329,10 +329,13 @@ def _cvt_messages(messages):
                 tcid = r.get("tool_call_id", "")
                 if not tcid and ci < len(prev_calls):
                     tcid = prev_calls[ci].get("id", "")
+                _c = r.get("content", "")
+                if not isinstance(_c, str):    # a loaded/synthesised history may carry
+                    _c = "" if _c is None else str(_c)   # a non-string; the API wants text
                 out.append({
                     "role":         "tool",
                     "tool_call_id": tcid,
-                    "content":      r.get("content", ""),
+                    "content":      _c,
                 })
                 ci += 1
                 i  += 1

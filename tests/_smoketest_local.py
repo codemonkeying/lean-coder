@@ -49,6 +49,12 @@ for _mod, _nm in ((be, "plan"), (_api, "api")):
           not any("cache_boundary" in mm for mm in _cm))
     _bps = sum(1 for mm in _cm if _has_cc(mm))
     check(f"[{_nm}] exactly 2 message breakpoints (rolling + boundary)", _bps == 2)
+    # non-string tool content (a loaded/synthesised history) must not 400 the request:
+    # _tool_result_content coerces None/number to a string.
+    check(f"[{_nm}] _tool_result_content coerces None to a string",
+          _mod._tool_result_content({"content": None}) == "")
+    check(f"[{_nm}] _tool_result_content coerces a number to a string",
+          _mod._tool_result_content({"content": 42}) == "42")
 lc._lean_tool_commands.clear(); lc._providers.clear()
 
 # usage() provider callback: feeds meters to core renderer
