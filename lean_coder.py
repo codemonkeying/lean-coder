@@ -7573,8 +7573,15 @@ class Agent:
         prompt is dropped and rebuilt for the *current* context (cwd / remote
         state may differ from when it was saved), and the cached token count is
         cleared so the meter re-estimates instead of showing the old session's."""
-        body = [m for m in messages if m.get("role") != "system"]
+        # Defensive: a session file could carry a non-list, or a non-dict entry (hand
+        # edit, partial write, foreign format). Keep only real dict messages with a
+        # role, so one bad entry can't crash the whole resume via .get on a non-dict.
+        if not isinstance(messages, list):
+            messages = []
+        body = [m for m in messages
+                if isinstance(m, dict) and m.get("role") and m.get("role") != "system"]
         self.messages = [{"role": "system", "content": self._system()}] + body
+        self.last_prompt_tokens = None
         self.last_prompt_tokens = None
         self.tools.changed_files.clear()
         self.dirty = False               # now showing a saved session, not unsaved work
