@@ -4137,7 +4137,8 @@ olm._cfg = lc.Config(cwd=FIX)                              # restore for any lat
 # no keys). anthropic_plan is NOT bundled publicly (OAuth/subscription) - its deeper
 # tests live in the local-only _smoketest_local.py.
 for _pname, _ptag in (("anthropic_api", "api"), ("gemini", "gem"),
-                      ("groq", "groq"), ("openrouter", "or")):
+                      ("groq", "groq"), ("openrouter", "or"),
+                      ("llamacpp", "gguf"), ("mlx", "mlx")):
     _pp = lc._load_lean_tool(Path(lc.__file__).parent / "providers" / f"{_pname}.py")
     _pd = _pp.PROVIDER
     check(f"provider {_pname}: name matches file", _pd["name"] == _pname)
