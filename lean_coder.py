@@ -6629,7 +6629,7 @@ class RemoteWorkspace:
     """A bootstrapped remote executor reached over SSH. Same call() surface as
     ExecutorClient, so the agent loop (stage 3) can route tools through it."""
 
-    def __init__(self, host, cwd=".", lean_tool_paths=(), ctl=None):
+    def __init__(self, host, cwd=".", lean_tool_paths=(), ctl=None, ephemeral=False):
         self.host = host
         self.cwd = cwd
         # ctl given = ATTACH mode: reuse a master socket someone else already
@@ -6640,6 +6640,11 @@ class RemoteWorkspace:
         self.owns_master = ctl is None
         self.ctl = ctl or _ctl_path(host)
         self.lean_tool_paths = list(lean_tool_paths)
+        # ephemeral (Windows): FORCE the embeddable-Python fallback even when the host
+        # has a real interpreter, and WIPE the cached %LOCALAPPDATA% runtime on teardown -
+        # a zero-trace, no-install-left-behind mode (also the way to dogfood the embed path
+        # on a box that already has Python).
+        self.ephemeral = ephemeral
         self.remote_dir = None
         self.remote_cwd = None        # executor's resolved working dir (from handshake)
         self.remote_posix = True      # set by the uname probe in connect(); False = Windows
@@ -7008,8 +7013,12 @@ class RemoteWorkspace:
         """Windows target: use a real Python if present ('py -3' or 'python'); otherwise
         provision the official embeddable-amd64 zip (cached under %LOCALAPPDATA%) so a
         stock Win11 box works with zero manual setup. Only if BOTH fail do we error with
-        an actionable message. Caches the working invocation prefix on self.win_python."""
-        prefix = self._win_python() or self._provision_win_embed()
+        an actionable message. Caches the working invocation prefix on self.win_python.
+        ephemeral=True SKIPS the installed-Python probe and forces the embeddable runtime
+        (which is wiped on teardown) - a zero-trace mode + the way to dogfood the embed
+        path on a box that already has Python."""
+        prefix = (self._provision_win_embed() if getattr(self, "ephemeral", False)
+                  else (self._win_python() or self._provision_win_embed()))
         if not prefix:
             raise ConnectionError(
                 f"no Python on the Windows host {self.host} and the embeddable-runtime "
@@ -7027,9 +7036,26 @@ class RemoteWorkspace:
         # master - killing it would drop the parent's live connection.
         if self.owns_master:
             self._wipe_remote()            # zero-trace: remove the pushed code first
+            if self.ephemeral and not self.remote_posix:
+                self._wipe_win_embed()     # ephemeral: also remove the cached embed runtime
             if self.ctl:                   # Windows has no master socket to exit
                 subprocess.run(["ssh", "-o", f"ControlPath={self.ctl}", "-O", "exit", self.host],
                                capture_output=True)
+
+    def _wipe_win_embed(self):
+        """Ephemeral teardown (Windows only): remove the cached embeddable-Python runtime
+        under %LOCALAPPDATA%\\lc-runtime so an --ephemeral session leaves NOTHING behind
+        (the interpreter we provisioned included). Best-effort, guarded to the fixed
+        lc-runtime leaf so it can never remove an unrelated path. Non-ephemeral sessions
+        KEEP the cache (that's the point - download once, reuse)."""
+        cmd = ('$p = Join-Path $env:LOCALAPPDATA "lc-runtime"; '
+               'if (Test-Path $p) { Remove-Item -Recurse -Force $p '
+               '-ErrorAction SilentlyContinue }')
+        try:
+            subprocess.run(_ssh_run_argv(self.host, self.ctl, cmd),
+                           capture_output=True, timeout=30, start_new_session=True)
+        except BaseException:
+            pass
 
     def _wipe_remote(self):
         """Zero-trace teardown: delete the pushed executor dir (agent.py + bundled
@@ -10798,18 +10824,6 @@ def handle_session_command(agent, cfg, arg):
                       f"/set show_snapshots true to show)"))
         return
 
-    if sub == "delete":
-        if not rest:
-            rest = _session_picker("delete session:")
-            if not rest:
-                return
-        print(green(f"deleted session '{rest}'.") if delete_session(rest)
-              else red(f"no such session: {rest}"))
-        return
-
-    print(dim("usage: /session list | delete <name>   (save -> /save, load -> /load)"))
-
-
 def _remote_alive(ws) -> bool:
     """Best-effort: is this pooled connection still usable? A rebooted/dropped box
     makes the executor process exit or its pipe error, which we detect here so a
@@ -10824,16 +10838,17 @@ def _remote_alive(ws) -> bool:
         return False
 
 
-def _do_connect(agent, cfg, rhost, rpath=".", offer_save=False):
+def _do_connect(agent, cfg, rhost, rpath=".", offer_save=False, ephemeral=False):
     """Connect to / switch to `rhost`, routing tools there. Switching to an
     already-open box is instant (no re-push); a pooled box that died (reboot) is
     transparently reconnected. Push is implicit (no prompt); any failure leaves
-    the session where it was. `offer_save` remembers an ad-hoc host."""
+    the session where it was. `offer_save` remembers an ad-hoc host. `ephemeral`
+    (Windows) forces the embeddable-Python runtime and wipes it on teardown."""
     if agent.remote and agent.remote.host == rhost:
         print(dim(f"already active on {rhost}."))
         return
     pooled = agent.remotes.get(rhost)
-    if pooled is not None:
+    if pooled is not None and not ephemeral:
         if _remote_alive(pooled):
             agent.set_remote(pooled)              # instant switch
             print(green(f"switched to {rhost} (tools run there)."))
@@ -10843,7 +10858,8 @@ def _do_connect(agent, cfg, rhost, rpath=".", offer_save=False):
     where = f"on {agent.remote.host}" if agent.remote else "local"
     try:
         ws = RemoteWorkspace(
-            rhost, rpath, lean_tool_paths=agent.lean_tools.enabled_paths()).connect()
+            rhost, rpath, lean_tool_paths=agent.lean_tools.enabled_paths(),
+            ephemeral=ephemeral).connect()
     except (ConnectionError, OSError) as e:
         print(red(f"connect failed (staying {where}): {e}"))
         return
@@ -11819,10 +11835,16 @@ def handle_new_command(agent, cfg, arg):
 
 
 def handle_connect_command(agent, cfg, arg):
-    """/connect <[user@]host> [remote-path] - enter/switch a remote workspace: all
-    file/exec tools then run there, transparently to the model. Bare /connect with saved
-    [connect] hosts (or open ones) opens a menu. /connect remove <name> forgets a saved
-    target. Any failure leaves you where you were."""
+    """/connect <[user@]host> [remote-path] [--ephemeral] - enter/switch a remote
+    workspace: all file/exec tools then run there, transparently to the model. Bare
+    /connect with saved [connect] hosts (or open ones) opens a menu. /connect remove
+    <name> forgets a saved target. --ephemeral (Windows) forces the embeddable-Python
+    runtime and wipes it on teardown (zero-trace; also dogfoods the embed path). Any
+    failure leaves you where you were."""
+    # Pull an --ephemeral / -e flag out of anywhere in the arg (order-agnostic).
+    toks = arg.split()
+    ephemeral = any(t in ("--ephemeral", "-e") for t in toks)
+    arg = " ".join(t for t in toks if t not in ("--ephemeral", "-e"))
     if not arg:
         if cfg.connect_hosts or agent.remotes:
             active = agent.remote.host if agent.remote else None
@@ -11830,9 +11852,9 @@ def handle_connect_command(agent, cfg, arg):
                                        open_hosts=list(agent.remotes),
                                        active=active)
             if target:
-                _do_connect(agent, cfg, target)
+                _do_connect(agent, cfg, target, ephemeral=ephemeral)
         else:
-            print(dim("usage: /connect <[user@]host> [remote-path]  "
+            print(dim("usage: /connect <[user@]host> [remote-path] [--ephemeral]  "
                       "(or add a [connect] section to the config)"))
     elif arg.split(maxsplit=1)[0] == "remove":
         _connect_remove(agent, cfg, arg.split(maxsplit=1)[1].strip() if len(arg.split(maxsplit=1)) > 1 else "")
@@ -11841,7 +11863,7 @@ def handle_connect_command(agent, cfg, arg):
         # a bare token may be a saved [connect] name -> resolve to its target
         rhost = cfg.connect_hosts.get(sp[0], sp[0])
         rpath = sp[1] if len(sp) > 1 else "."
-        _do_connect(agent, cfg, rhost, rpath, offer_save=True)
+        _do_connect(agent, cfg, rhost, rpath, offer_save=True, ephemeral=ephemeral)
 
 
 def _connect_remove(agent, cfg, name):
