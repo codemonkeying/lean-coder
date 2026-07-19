@@ -1272,9 +1272,11 @@ check("window_messages defaults to 0 (off - full context)", lc.Config().window_m
 
 # 12d'. _window_by_tokens: HARD token cap wins over window_messages, keeps whole recent
 # turns under budget, always keeps system + reserves the env/plan tail, non-destructive.
-check("window_tokens defaults to 0 (off)", lc.Config().window_tokens == 0)
+check("window_tokens defaults to 'auto' (overflow backstop on)", lc.Config().window_tokens == "auto")
 wt = lc.Agent.__new__(lc.Agent)
 wt.cfg = lc.Config(model="m")
+wt.cfg.window_tokens = 0                      # tests below drive the numeric path explicitly
+wt.tool_defs = []
 wt.tool_defs = []
 wt.pinned_plan = ""
 wt._skip_plan_reminder_once = False
@@ -1301,6 +1303,25 @@ check("_window_messages: window_tokens takes precedence over window_messages",
 wt.cfg.window_tokens = 0
 check("_window_messages: falls back to window_messages when window_tokens is 0",
       wt._window_messages(_big, 99) is _big)
+# _resolve_window_tokens: 'auto' -> ctx_window minus a reply reserve; int passthrough; off-cases
+wt.cfg.window_messages = 0
+wt.cfg.window_tokens = "auto"
+wt.cfg.num_ctx = 8192                          # ollama path: ctx_window() reads num_ctx
+_auto = wt._resolve_window_tokens()
+check("_resolve_window_tokens: 'auto' = ctx minus reply reserve (< ctx, > 0)",
+      0 < _auto < 8192)
+check("_resolve_window_tokens: 'auto' leaves a sane reply reserve (>= 15% of ctx)",
+      8192 - _auto >= int(8192 * 0.15))
+wt.cfg.window_tokens = 4000
+check("_resolve_window_tokens: an int passes through as the hard cap",
+      wt._resolve_window_tokens() == 4000)
+wt.cfg.window_tokens = 0
+check("_resolve_window_tokens: 0 -> off", wt._resolve_window_tokens() == 0)
+wt.cfg.window_tokens = "off"
+check("_resolve_window_tokens: junk string -> off", wt._resolve_window_tokens() == 0)
+wt.cfg.window_tokens = "auto"                 # backstop no-op on a small history (fits ctx)
+check("window_tokens 'auto': no-op when the history fits the window",
+      wt._window_messages(_big, 0) is _big)
 
 # 12d-bis. _auto_resume_pick: most-recent session wins, NOT cwd-scoped, snapshots skipped
 _ar_rows = [
@@ -3325,12 +3346,20 @@ check("_status_rows hides handovers count when none have happened",
       "handovers" not in _plain)
 check("_status_rows shows the round-cap only in auto mode", "max 25 rounds" in _plain)
 check("_status_rows row1 shows the session name with a colon", "session: sess-x" in _plain)
-# window ON -> the size is shown; handovers count appears once any have happened
+# window ON -> the size is shown; handovers count appears once any have happened.
+# window_tokens (default 'auto') takes precedence in the row, so turn it off to exercise
+# the message-count display.
+_srag.cfg.window_tokens = 0
 _srag.cfg.window_messages = 40
 _srag.handovers = 2
 _plain_w = "\n".join(_re.sub(r"\x1b\[[0-9;]*m", "", r) for r in lc._status_rows(_srag, _srag.cfg))
 check("_status_rows shows 'window N' when window is on", "window 40" in _plain_w)
 check("_status_rows shows handovers count once any happened", "2 handovers" in _plain_w)
+# window_tokens 'auto' renders as 'window auto' and wins over a message-count window
+_srag.cfg.window_tokens = "auto"
+_plain_a = "\n".join(_re.sub(r"\x1b\[[0-9;]*m", "", r) for r in lc._status_rows(_srag, _srag.cfg))
+check("_status_rows shows 'window auto' when window_tokens is auto", "window auto" in _plain_a)
+_srag.cfg.window_tokens = 0
 _srag.cfg.window_messages = 0
 _srag.handovers = 0
 _srag.cfg.statusline = False

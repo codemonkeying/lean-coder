@@ -3596,17 +3596,27 @@ class Config:
                                      # truncated; older turns are simply dropped until
                                      # summarizing compaction backfills them. See
                                      # docs/cost-reduction-roadmap.md.
-    window_tokens: int = 0           # bounded context window by TOKENS (the small-model
-                                     # lever): send at most ~N tokens of a send, measured
-                                     # with the calibrated meter (messages_tokens). System +
-                                     # tool schemas + the env/plan tail are ALWAYS kept and
-                                     # counted first; the conversation tail is then walked
-                                     # back whole-turn-by-whole-turn until adding the next
-                                     # older turn would exceed the budget, cut at a clean
-                                     # user boundary (a tool result is never orphaned). 0 =
-                                     # off. Takes precedence over window_messages when set,
-                                     # so a 4k-context model can pin window_tokens=4000 and
-                                     # never overflow. Non-destructive (shapes the send only).
+    window_tokens: "int | str" = "auto"  # bounded context window by TOKENS (the overflow
+                                     # backstop): cap each send so it can never exceed the
+                                     # model's window, measured with the calibrated meter
+                                     # (messages_tokens). System + tool schemas + the env/plan
+                                     # tail are ALWAYS kept + counted first; the conversation
+                                     # tail is then walked back whole-turn-by-whole-turn until
+                                     # the next older turn wouldn't fit, cut at a clean user
+                                     # boundary (a tool result is never orphaned).
+                                     #   "auto" (DEFAULT): budget = detected ctx_window minus a
+                                     #     reply reserve, recomputed each send. A pure BACKSTOP
+                                     #     - a no-op every turn EXCEPT the one that would
+                                     #     otherwise overflow the server (which ollama silently
+                                     #     top-clips + a hosted API 400s). So it never moves the
+                                     #     cache boundary in normal use; it only trims the turn
+                                     #     that was going over anyway. auto_handover still fires
+                                     #     FIRST at its % (the cache-friendly path); this is the
+                                     #     last line only. Loses old tail, never sys/tools/env/
+                                     #     plan/recent turns - vs the server beheading the top.
+                                     #   an int N: a HARD fixed cap (e.g. 4000 for a 4k model).
+                                     #   0: OFF. Takes precedence over window_messages when on.
+                                     # Non-destructive (shapes the send only).
     auto_handover: bool = True       # self-managing context: when on, the model is shown a
                                      # ctx-budget line and may hand over at a natural break in
                                      # the soft zone; a hard threshold force-hands-over (the
@@ -4036,7 +4046,11 @@ def load_config(args) -> Config:
     if getattr(args, "keep_alive", None) is not None: cfg.keep_alive = args.keep_alive
     if getattr(args, "auto_evict", None): cfg.auto_evict = True
     if getattr(args, "window_messages", None) is not None: cfg.window_messages = args.window_messages
-    if getattr(args, "window_tokens", None) is not None: cfg.window_tokens = args.window_tokens
+    if getattr(args, "window_tokens", None) is not None:
+        try:
+            cfg.window_tokens = _coerce_setting(args.window_tokens, "int_or_auto")
+        except ValueError:
+            pass                              # keep the default on a junk --window-tokens
     if args.temperature is not None:    cfg.temperature = args.temperature
     if args.top_p is not None:          cfg.top_p = args.top_p
     if args.top_k is not None:          cfg.top_k = args.top_k
@@ -4146,8 +4160,8 @@ def save_config(cfg: Config, quiet: bool = False):
         lines.append(f"max_iterations = {cfg.max_iterations}")
     if cfg.window_messages != 0:              # default is off (0) now
         lines.append(f"window_messages = {cfg.window_messages}")
-    if cfg.window_tokens != 0:                # default is off (0)
-        lines.append(f"window_tokens = {cfg.window_tokens}")
+    if cfg.window_tokens != "auto":           # default is 'auto'; persist an int cap or 0 (off)
+        lines.append(f"window_tokens = {_toml_value(cfg.window_tokens)}")
     if not cfg.auto_handover:
         lines.append("auto_handover = false")
     if cfg.handover_soft != 0.70:
@@ -8427,10 +8441,11 @@ class Agent:
         rather than risk an orphaned/!user-leading send). See
         docs/cost-reduction-roadmap.md.
 
-        A TOKEN budget (cfg.window_tokens > 0) takes precedence over the message-count
-        bound: it keeps as many whole recent turns as fit under the token ceiling, so a
-        small-context model can pin a hard send size. See _window_by_tokens."""
-        tok_budget = getattr(getattr(self, "cfg", None), "window_tokens", 0) or 0
+        A TOKEN budget (cfg.window_tokens) takes precedence over the message-count bound:
+        it keeps as many whole recent turns as fit under the token ceiling. 'auto' resolves
+        to the detected context window minus a reply reserve (see _resolve_window_tokens),
+        so it's a pure overflow backstop. See _window_by_tokens."""
+        tok_budget = self._resolve_window_tokens()
         if tok_budget > 0:
             return self._window_by_tokens(msgs, tok_budget)
         start = self._keep_tail_start(msgs, max_msgs)
@@ -8438,6 +8453,35 @@ class Agent:
             return msgs
         head = msgs[:1] if msgs and msgs[0].get("role") == "system" else []
         return head + msgs[start:]
+
+    # Reply reserve for 'auto': room the model needs to GENERATE its answer, kept out of
+    # the prompt budget so an auto-window never fills the whole context and starves output
+    # (on ollama num_ctx is shared prompt+generation; a 100% prompt = no room to reply).
+    # max(fixed floor, fraction of the window) so it scales from a 4k model up to a 200k one.
+    _AUTO_WINDOW_RESERVE = 1024
+    _AUTO_WINDOW_RESERVE_FRAC = 0.15
+
+    def _resolve_window_tokens(self) -> int:
+        """The numeric per-send token budget from cfg.window_tokens: a positive int is used
+        as-is (hard cap); 'auto' -> detected ctx_window minus a reply reserve (the overflow
+        backstop); 0 / off / anything else -> 0 (windowing off). Best-effort: never raises."""
+        cfg = getattr(self, "cfg", None)
+        raw = getattr(cfg, "window_tokens", 0)
+        if isinstance(raw, str):
+            if raw.strip().lower() != "auto":
+                return 0
+            try:
+                ctx = int(cfg.ctx_window())
+            except Exception:
+                return 0
+            if ctx <= 0:
+                return 0
+            reserve = max(self._AUTO_WINDOW_RESERVE, int(ctx * self._AUTO_WINDOW_RESERVE_FRAC))
+            return max(0, ctx - reserve)
+        try:
+            return max(0, int(raw))
+        except (TypeError, ValueError):
+            return 0
 
     def _window_by_tokens(self, msgs, budget):
         """System message + the largest clean-boundary TAIL of `msgs` that keeps the whole
@@ -10067,7 +10111,7 @@ _SETTINGS_FIELDS = [
     ("statusline_iter", "reprint status every N model iterations within a long turn (0 = off)", "int"),
     # --- context management (send-window + auto-handover) ---
     ("window_messages", "send-window size in messages (0 = off, full history)", "int"),
-    ("window_tokens", "send-window HARD cap in tokens (0 = off; wins over window_messages)", "int"),
+    ("window_tokens", "send-window token cap: 'auto' (=ctx-reserve, default), an int (hard cap), or 0 (off)", "int_or_auto"),
     ("auto_handover", "auto-handover (self-managing context)", "bool"),
     ("handover_soft", "handover soft-zone start (fraction of ctx)", "float"),
     ("handover_hard", "handover hard threshold (fraction of ctx)", "float"),
@@ -10095,6 +10139,10 @@ _LIVE_APPLY = {"leash"}
 def _coerce_setting(raw, kind):
     """Parse a raw string to the field's type; raise ValueError on a bad value."""
     if kind == "int":
+        return int(raw)
+    if kind == "int_or_auto":              # 'auto' sentinel OR an int (e.g. window_tokens)
+        if isinstance(raw, str) and raw.strip().lower() == "auto":
+            return "auto"
         return int(raw)
     if kind == "float":
         return float(raw)
@@ -10436,8 +10484,11 @@ def _status_rows(agent, cfg):
         p.append(f"max {mi} rounds" if mi else "no round cap")
     if cfg.confirm_reads:
         p.append("ask-read")
-    if cfg.window_tokens > 0:                  # token cap wins; show it when on
-        p.append(f"window {cfg.window_tokens}tok")
+    _wt = cfg.window_tokens
+    if isinstance(_wt, str) and _wt.strip().lower() == "auto":
+        p.append("window auto")               # backstop: ctx - reply reserve, recomputed
+    elif isinstance(_wt, int) and _wt > 0:    # a hard token cap
+        p.append(f"window {_wt}tok")
     elif cfg.window_messages > 0:             # only show when on - don't nag with 'window off'
         p.append(f"window {cfg.window_messages}")
     c = cfg.handover_for()
@@ -13599,8 +13650,8 @@ def main():
                     help="continuously stub acted-on tool results to cut tokens sent (see docs)")
     ap.add_argument("--window-messages", type=int, dest="window_messages",
                     help="send only the last N messages per request (default 30; 0 = unbounded)")
-    ap.add_argument("--window-tokens", type=int, dest="window_tokens",
-                    help="hard-cap each send to ~N calibrated tokens (0 = off; wins over --window-messages)")
+    ap.add_argument("--window-tokens", dest="window_tokens",
+                    help="cap each send by tokens: 'auto' (=ctx-reserve), an int (hard cap), or 0 (off)")
     ap.add_argument("--cwd", help="project directory (default: current dir)")
     ap.add_argument("-r", "--resume", metavar="NAME",
                     help="resume a saved session by name (see /load)")
