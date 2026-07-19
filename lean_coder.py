@@ -6516,6 +6516,7 @@ class RemoteWorkspace:
         self.lean_tool_paths = list(lean_tool_paths)
         self.remote_dir = None
         self.remote_cwd = None        # executor's resolved working dir (from handshake)
+        self.remote_posix = True      # set by the uname probe in connect(); False = Windows
         self.client = None
 
     def _run(self, remote_cmd, tty=False):
@@ -6540,9 +6541,15 @@ class RemoteWorkspace:
             raise ConnectionError(f"ssh connection to {self.host} timed out")
         if rc != 0:
             raise ConnectionError(f"ssh connection to {self.host} failed")
-        _, out, _ = self._run("command -v python3 || true")
-        if not out.strip():
-            self._install_python()
+        # detect the remote OS/shell family (picks sh vs PowerShell push, python3 vs py)
+        _, _uname, _ = self._run(_OS_PROBE)
+        self.remote_posix = _remote_is_posix(_uname)
+        if self.remote_posix:
+            _, out, _ = self._run("command -v python3 || true")
+            if not out.strip():
+                self._install_python()
+        else:
+            self._check_windows_python()
         self._bootstrap_executor()
         return self
 
@@ -6567,6 +6574,8 @@ class RemoteWorkspace:
         ever runs `--version`, never leaves anything behind beyond the dir."""
         if not want:
             return None, None
+        if not self.remote_posix:
+            return self._reuse_executor_win(want)
         _, d, _ = self._run(_REMOTE_MKDIR)
         rdir = d.strip() or None
         if rdir is None:
@@ -6584,6 +6593,25 @@ class RemoteWorkspace:
             return "python3 " + shlex.quote(agent_py), rdir
         return None, rdir
 
+    def _reuse_executor_win(self, want):
+        """Windows variant of _reuse_executor: make the throwaway dir via the
+        PowerShell mkdir snippet and check for a prior pushed agent.py whose
+        --version matches. No provisioned `lean_coder` on PATH is assumed on
+        Windows, so we only ever reuse a prior push."""
+        _, d, _ = self._run(_WIN_REMOTE_MKDIR)
+        rdir = d.strip() or None
+        if rdir is None:
+            return None, None
+        agent_py = rdir + "\\agent.py"
+        py = getattr(self, "win_python", None) or "python"
+        # PowerShell: run --version only if the file exists; compare driver-side.
+        _, out, _ = self._run(
+            f'if (Test-Path "{agent_py}") {{ {py} "{agent_py}" --version }}')
+        if want in out.split():
+            self.reused = "pushed"
+            return f'{py} "{agent_py}"', rdir
+        return None, rdir
+
     def _bootstrap_executor(self):
         """Launch the executor, pushing this build only if the box doesn't already
         have a matching-hash copy. Used by connect() and reload() - reload reuses
@@ -6593,13 +6621,18 @@ class RemoteWorkspace:
         if exec_cmd is None:                       # no match - push a fresh copy
             with open(__file__, "rb") as f:
                 src = f.read()
-            r = subprocess.run(_ssh_run_argv(self.host, self.ctl, _REMOTE_PUSH),
+            push_snippet = _REMOTE_PUSH if self.remote_posix else _WIN_REMOTE_PUSH
+            r = subprocess.run(_ssh_run_argv(self.host, self.ctl, push_snippet),
                                input=src, capture_output=True, timeout=60)
             self.remote_dir = r.stdout.decode(errors="replace").strip()
             if r.returncode != 0 or not self.remote_dir:
                 raise ConnectionError(
                     f"failed to push agent to {self.host}: {r.stderr.decode(errors='replace')[:200]}")
-            exec_cmd = "python3 " + shlex.quote(self.remote_dir + "/agent.py")
+            if self.remote_posix:
+                exec_cmd = "python3 " + shlex.quote(self.remote_dir + "/agent.py")
+            else:
+                py = getattr(self, "win_python", None) or "python"
+                exec_cmd = f'{py} "{self.remote_dir}\\agent.py"'
         # The single-file agent.py push is NOT self-contained: at import core runs
         # _load_builtins() from <dir>/lean-tools/builtins.py (the builtin tool surface was
         # extracted out of core). Ship that file beside agent.py so the remote import
@@ -6649,6 +6682,39 @@ class RemoteWorkspace:
         self._bootstrap_executor()
         return self
 
+    def _remote_sha256(self, remote_path):
+        """Return the remote file's sha256 hex, or '' if absent/unreadable. POSIX:
+        `sha256sum`. Windows: PowerShell `Get-FileHash -Algorithm SHA256` (its output
+        is UPPERCASE hex, so lowercase to match hashlib.hexdigest())."""
+        if self.remote_posix:
+            _, out, _ = self._run(f"sha256sum {shlex.quote(remote_path)} 2>/dev/null || true")
+            return out.split()[0] if out.split() else ""
+        _, out, _ = self._run(
+            f'if (Test-Path "{remote_path}") {{ (Get-FileHash -Algorithm SHA256 '
+            f'"{remote_path}").Hash }}')
+        return out.strip().lower()
+
+    def _remote_mkdir(self, remote_dir):
+        if self.remote_posix:
+            self._run(f"mkdir -p {shlex.quote(remote_dir)}")
+        else:
+            self._run(f'New-Item -ItemType Directory -Force -Path "{remote_dir}" | Out-Null')
+
+    def _remote_write(self, remote_path, data):
+        """Write bytes to a remote file over ssh. POSIX: `cat > path`. Windows: read
+        the piped stdin stream and write it verbatim via .NET (byte-exact, no encoding
+        mangling of a utf-8 source)."""
+        if self.remote_posix:
+            cmd = f'cat > {shlex.quote(remote_path)}'
+        else:
+            cmd = ('$o=[System.IO.File]::Create("' + remote_path + '"); '
+                   '[Console]::OpenStandardInput().CopyTo($o); $o.Close()')
+        subprocess.run(_ssh_run_argv(self.host, self.ctl, cmd),
+                       input=data, capture_output=True, timeout=60)
+
+    def _remote_sep(self):
+        return "/" if self.remote_posix else "\\"
+
     def _push_builtins(self):
         """Ship the bundled builtins module into <remote_dir>/lean-tools/builtins.py - the
         exact path the remote import's _load_builtins() reads (next to the pushed
@@ -6661,28 +6727,39 @@ class RemoteWorkspace:
             return
         data = local.read_bytes()
         want = hashlib.sha256(data).hexdigest()
-        bdir = self.remote_dir + "/lean-tools"
-        _, out, _ = self._run(f"sha256sum {shlex.quote(bdir + '/builtins.py')} 2>/dev/null || true")
-        if out.split() and out.split()[0] == want:
+        sep = self._remote_sep()
+        bdir = self.remote_dir + sep + "lean-tools"
+        target = bdir + sep + "builtins.py"
+        if self._remote_sha256(target) == want:
             return                                  # already current on the remote
-        self._run(f"mkdir -p {shlex.quote(bdir)}")
-        subprocess.run(_ssh_run_argv(self.host, self.ctl,
-                                     f'cat > {shlex.quote(bdir + "/builtins.py")}'),
-                       input=data, capture_output=True, timeout=60)
+        self._remote_mkdir(bdir)
+        self._remote_write(target, data)
 
     def _push_lean_tools(self):
         """Sync enabled lean-tool files into <remote_dir>/tools and return it.
         Hash-checks what's already there: pushes only changed/new tools and
         removes ones no longer enabled (the stable dir persists between connects,
         so this both saves transfers and prevents stale tools loading remotely)."""
-        pdir = self.remote_dir + "/tools"
-        self._run(f"mkdir -p {shlex.quote(pdir)}")
-        _, out, _ = self._run(f"sha256sum {shlex.quote(pdir)}/*.py 2>/dev/null || true")
+        sep = self._remote_sep()
+        pdir = self.remote_dir + sep + "tools"
+        self._remote_mkdir(pdir)
         remote = {}
-        for line in out.splitlines():
-            parts = line.split()
-            if len(parts) == 2:
-                remote[Path(parts[1]).name] = parts[0]
+        if self.remote_posix:
+            _, out, _ = self._run(f"sha256sum {shlex.quote(pdir)}/*.py 2>/dev/null || true")
+            for line in out.splitlines():
+                parts = line.split()
+                if len(parts) == 2:
+                    remote[Path(parts[1]).name] = parts[0]
+        else:
+            # PowerShell: name + hash per .py file, one per line
+            _, out, _ = self._run(
+                f'Get-ChildItem -Path "{pdir}\\*.py" -ErrorAction SilentlyContinue | '
+                f'ForEach-Object {{ $_.Name + " " + (Get-FileHash -Algorithm SHA256 '
+                f'$_.FullName).Hash }}')
+            for line in out.splitlines():
+                parts = line.split()
+                if len(parts) == 2:
+                    remote[parts[0]] = parts[1].lower()
         local, blobs = {}, {}
         for p in self.lean_tool_paths:
             p = Path(p)
@@ -6691,11 +6768,13 @@ class RemoteWorkspace:
             blobs[p.name] = data
         to_push, to_remove = _tools_to_sync(local, remote)
         for name in to_push:
-            subprocess.run(_ssh_run_argv(self.host, self.ctl,
-                                         f'cat > {shlex.quote(pdir + "/" + name)}'),
-                           input=blobs[name], capture_output=True, timeout=60)
+            self._remote_write(pdir + sep + name, blobs[name])
         if to_remove:
-            self._run("rm -f " + " ".join(shlex.quote(pdir + "/" + n) for n in to_remove))
+            if self.remote_posix:
+                self._run("rm -f " + " ".join(shlex.quote(pdir + "/" + n) for n in to_remove))
+            else:
+                for n in to_remove:
+                    self._run(f'Remove-Item -Force "{pdir}\\{n}" -ErrorAction SilentlyContinue')
         return pdir
 
     def _install_python(self):
@@ -6712,6 +6791,29 @@ class RemoteWorkspace:
         _, out, _ = self._run("command -v python3 || true")
         if not out.strip():
             raise ConnectionError(f"python3 still missing on {self.host} after install")
+
+    def _win_python(self):
+        """Return the Windows Python invocation prefix ('python' or 'py -3'), or None
+        if neither is present. Stock Win11 ships NO Python (only a Store stub that
+        prints usage and exits nonzero), so we probe for a REAL interpreter by running
+        it. `py -3` (the launcher) is preferred when present; else `python`."""
+        for cand in ("py -3", "python"):
+            _, out, _ = self._run(f'{cand} -c "import sys;print(sys.executable)"')
+            if out.strip() and "\\" in out:           # a real path back == a real interpreter
+                return cand
+        return None
+
+    def _check_windows_python(self):
+        """Windows target: require a real Python (we don't auto-install - winget isn't
+        universal and silent installs on someone's box are heavy-handed). Fail with a
+        clear, actionable message if absent. Caches the working prefix on self."""
+        prefix = self._win_python()
+        if not prefix:
+            raise ConnectionError(
+                f"no Python on the Windows host {self.host}. lean-coder's remote executor "
+                f"needs it. Install one (e.g. `winget install Python.Python.3`) or enable "
+                f"the py launcher, then reconnect.")
+        self.win_python = prefix
 
     def call(self, tool, args=None, should_abort=None):
         return self.client.call(tool, args, should_abort=should_abort)
@@ -6751,10 +6853,19 @@ class RemoteWorkspace:
         # ^C^C/EOF quit - which SIGINTs the whole foreground process group - can't kill
         # this wipe's ssh mid-flight. Catch BaseException for the same reason (a pending
         # KeyboardInterrupt must not abort the wipe before rm lands).
-        q = shlex.quote(d)
-        cmd = (f'rm -rf {q}; '
-               f'p=$(cat {shlex.quote(d + "/.watchdog.pid")} 2>/dev/null) && '
-               f'kill "$p" 2>/dev/null; true')
+        if self.remote_posix:
+            q = shlex.quote(d)
+            cmd = (f'rm -rf {q}; '
+                   f'p=$(cat {shlex.quote(d + "/.watchdog.pid")} 2>/dev/null) && '
+                   f'kill "$p" 2>/dev/null; true')
+        else:
+            # PowerShell: kill the watchdog (if its pid file survives), then remove the
+            # dir. taskkill /T reaps the watchdog's tree; Remove-Item -Recurse -Force
+            # drops the whole pushed dir. -ErrorAction keeps it quiet if already gone.
+            cmd = (f'$pf="{d}\\.watchdog.pid"; '
+                   f'if (Test-Path $pf) {{ $p=Get-Content $pf; '
+                   f'taskkill /F /T /PID $p 2>$null }}; '
+                   f'Remove-Item -Recurse -Force "{d}" -ErrorAction SilentlyContinue')
         try:
             subprocess.run(_ssh_run_argv(self.host, self.ctl, cmd),
                            capture_output=True, timeout=30, start_new_session=True)
