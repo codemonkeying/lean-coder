@@ -4134,6 +4134,23 @@ def save_config(cfg: Config, quiet: bool = False):
         lines.append("")
         lines.append("[models]")
         lines += [f'"{h}" = "{m}"' for h, m in cfg.host_models.items()]
+    # Per-model handover overrides: [handover_overrides.<model>] tables. Declared a
+    # BESPOKE (own-serializer) key and READ back in load_config - but historically had
+    # NO writer here, so every autosave_config() (fired by /model, /connect, and the
+    # flows around a handover) rewrote config.toml WITHOUT them: the overrides silently
+    # vanished and the next load fell back to the global handover_soft/hard defaults
+    # (0.70/0.95), which the status line shows as "handover 95%". Write them back.
+    if cfg.handover_overrides:
+        for _m, _ov in cfg.handover_overrides.items():
+            if not (isinstance(_m, str) and _m.strip() and isinstance(_ov, dict) and _ov):
+                continue
+            lines.append("")
+            # Quote the model segment: names carry ':' / '.' (qwen3:32b, claude-opus-4-8)
+            # which are INVALID as a bare TOML key - an unquoted header would make the
+            # whole config.toml unparseable, and the next load would silently fall back to
+            # ALL defaults (wiping global handover_soft/hard too -> the "95%" reset).
+            lines.append(f"[handover_overrides.{_toml_value(_m)}]")
+            lines += [f"{k} = {_toml_value(v)}" for k, v in _ov.items()]
     if cfg.provider and cfg.provider != "ollama":
         lines.insert(2, f'provider = "{cfg.provider}"')   # just after model line
     # ollama is the default provider; omit the line for it (a bare config still
@@ -4648,11 +4665,19 @@ def _detached_popen_kwargs():
     return {"start_new_session": True}
 
 
-def _kill_tree(pid, sig=signal.SIGKILL):
+def _kill_tree(pid, sig=None):
     """Kill a detached child AND its whole group/tree. POSIX: os.killpg on the
     pgid (== pid, since it was start_new_session'd). Windows: os.killpg is absent
     (AttributeError) and groups differ, so use taskkill /T to walk the tree. On
-    any failure, fall back to a direct os.kill. Best-effort; never raises."""
+    any failure, fall back to a direct os.kill. Best-effort; never raises.
+
+    `sig` defaults to None (resolved to SIGTERM) rather than signal.SIGKILL: on
+    Windows signal.SIGKILL DOESN'T EXIST, and a signal.SIGKILL default arg is
+    evaluated at IMPORT time - so importing this module (e.g. the pushed executor
+    agent.py) crashed with AttributeError before the handshake. SIGTERM exists on
+    both; os.kill on Windows treats any non-CTRL_* sig as a hard TerminateProcess."""
+    if sig is None:
+        sig = getattr(signal, "SIGKILL", signal.SIGTERM)
     try:
         os.killpg(int(pid), sig)
         return
@@ -6295,12 +6320,9 @@ _REMOTE_MKDIR = (f'd="{_REMOTE_TMP}"; '
 # utf-8 source, so we read the raw stdin stream and write bytes verbatim. `chmod 700`
 # has no analogue; the per-user %TEMP% is already ACL'd to the user.
 _WIN_REMOTE_TMP = '$d = Join-Path $env:TEMP "leancoder"'
-_WIN_REMOTE_PUSH = (
+_WIN_REMOTE_MKDIR = (
     f'{_WIN_REMOTE_TMP}; '
     'New-Item -ItemType Directory -Force -Path $d | Out-Null; '
-    '$in = [Console]::OpenStandardInput(); '
-    '$out = [System.IO.File]::Create((Join-Path $d "agent.py")); '
-    '$in.CopyTo($out); $out.Close(); '
     '[Console]::Out.Write($d)')
 _WIN_REMOTE_MKDIR = (
     f'{_WIN_REMOTE_TMP}; '
@@ -6465,6 +6487,17 @@ def _ctl_opts(ctl):
     return ["-o", f"ControlPath={ctl}"] if ctl else []
 
 
+def _scp_argv(host, ctl, local_path, remote_path):
+    """scp a local file to `remote_path` on `host`. Reuses the ControlMaster socket
+    when `ctl` is set (POSIX); on Windows (ctl falsy) it's a fresh key-auth transfer.
+    MEASURED on Win11 OpenSSH (192.0.2.16): a full 648KB agent.py lands byte-identical
+    in ~4s - so scp is the Windows push (the old 'scp truncates large files' claim was
+    wrong; it replaces the ~3-4min, deadlock-prone chunked base64 path)."""
+    return (["scp"] + _ctl_opts(ctl) + ["-o", "BatchMode=yes",
+             "-o", "StrictHostKeyChecking=accept-new", "-o", "LogLevel=ERROR",
+             "-p", local_path, f"{host}:{remote_path}"])
+
+
 def _ssh_run_argv(host, ctl, remote_cmd, tty=False):
     # reuses the master socket (BatchMode: auth is already done, so fail fast).
     # LogLevel=ERROR silences the "Shared connection to <host> closed." notice a
@@ -6475,13 +6508,26 @@ def _ssh_run_argv(host, ctl, remote_cmd, tty=False):
             + (["-tt"] if tty else ["-T"]) + [host, remote_cmd])
 
 
-def _ssh_exec_argv(host, ctl, exec_cmd, cwd, lean_tools_dir=None):
+def _win_quote(s):
+    """Quote an argument for a Windows PowerShell command line (the DefaultShell on the
+    Win11 hosts). PowerShell single-quotes are literal (only '' escapes a quote), which
+    is exactly what we want for paths - and unlike shlex.quote (POSIX) an EMPTY string
+    becomes a real '' token PowerShell passes through, instead of being dropped so the
+    next flag swallows the following arg (that dropped-empty-cwd bug exited the executor
+    with an argparse usage error before the handshake)."""
+    return "'" + str(s).replace("'", "''") + "'"
+
+
+def _ssh_exec_argv(host, ctl, exec_cmd, cwd, lean_tools_dir=None, posix=True):
     # long-lived executor channel: -T (no PTY) keeps stdio clean for the protocol.
     # exec_cmd is the executor invocation prefix - "python3 '<dir>/agent.py'" for a
-    # pushed copy, or "lean_coder" for a matching provisioned install.
-    inner = f"{exec_cmd} --tool-exec --cwd {shlex.quote(cwd)}"
+    # pushed copy, or "lean_coder" for a matching provisioned install. Quoting is
+    # per-OS: POSIX shell (shlex) vs Windows PowerShell (_win_quote) - the target runs
+    # PowerShell, where POSIX single-quoting mis-parses (and an empty cwd vanishes).
+    q = shlex.quote if posix else _win_quote
+    inner = f"{exec_cmd} --tool-exec --cwd {q(cwd or '.')}"
     if lean_tools_dir:
-        inner += f" --lean-tools {shlex.quote(lean_tools_dir)}"
+        inner += f" --lean-tools {q(lean_tools_dir)}"
     # ServerAlive on this long-lived channel too: it multiplexes over the master
     # (which also has keepalives) but a multi-minute model turn with no traffic is
     # exactly when a stateful firewall/NAT drops the data channel - belt-and-braces.
@@ -6527,28 +6573,40 @@ class RemoteWorkspace:
         return r.returncode, r.stdout, r.stderr
 
     def connect(self, batch=False):
-        """Open the ssh master + bootstrap the executor. batch=True forces a
+        """Open the ssh master (POSIX) + bootstrap the executor. batch=True forces a
         NON-INTERACTIVE open (BatchMode + a timeout) - for a reconnect that runs
         where we can't prompt (mid-tool-call): it must fail fast rather than hang on
         an invisible 'password:' prompt. A password host then needs an interactive
-        /connect. batch=False (default) is the interactive open (/connect can prompt)."""
+        /connect. batch=False (default) is the interactive open (/connect can prompt).
+
+        Windows: a Linux client's ControlMaster socket technically opens against
+        Windows sshd but a stdin-piped channel over it never receives EOF (the push
+        hangs). So we PROBE the OS first over a plain masterless ssh, and for Windows
+        drop multiplexing entirely (self.ctl=None): every call is a fresh key-auth
+        connection. This needs key auth (a password host would prompt per call)."""
         print(dim(f"connecting to {self.host} ..."))
-        _clear_master(self.host, self.ctl)     # drop any stale socket first (#3)
-        argv = _ssh_master_argv(self.host, self.ctl, batch=batch)
-        try:
-            rc = subprocess.run(argv, timeout=30 if batch else None).returncode
-        except subprocess.TimeoutExpired:
-            raise ConnectionError(f"ssh connection to {self.host} timed out")
-        if rc != 0:
-            raise ConnectionError(f"ssh connection to {self.host} failed")
-        # detect the remote OS/shell family (picks sh vs PowerShell push, python3 vs py)
-        _, _uname, _ = self._run(_OS_PROBE)
-        self.remote_posix = _remote_is_posix(_uname)
+        # Probe the remote OS BEFORE any master, over a plain (masterless) ssh - so a
+        # Windows target never gets a doomed ControlMaster. Uses BatchMode so it can't
+        # hang on a prompt; a POSIX box answers `uname` with a kernel token.
+        _probe = subprocess.run(
+            ["ssh", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new",
+             "-o", "ConnectTimeout=10", "-o", "LogLevel=ERROR", self.host, _OS_PROBE],
+            capture_output=True, text=True, timeout=30)
+        self.remote_posix = _remote_is_posix(_probe.stdout)
         if self.remote_posix:
+            _clear_master(self.host, self.ctl)     # drop any stale socket first (#3)
+            argv = _ssh_master_argv(self.host, self.ctl, batch=batch)
+            try:
+                rc = subprocess.run(argv, timeout=30 if batch else None).returncode
+            except subprocess.TimeoutExpired:
+                raise ConnectionError(f"ssh connection to {self.host} timed out")
+            if rc != 0:
+                raise ConnectionError(f"ssh connection to {self.host} failed")
             _, out, _ = self._run("command -v python3 || true")
             if not out.strip():
                 self._install_python()
         else:
+            self.ctl = None                        # Windows: no multiplexing (see docstring)
             self._check_windows_python()
         self._bootstrap_executor()
         return self
@@ -6621,16 +6679,24 @@ class RemoteWorkspace:
         if exec_cmd is None:                       # no match - push a fresh copy
             with open(__file__, "rb") as f:
                 src = f.read()
-            push_snippet = _REMOTE_PUSH if self.remote_posix else _WIN_REMOTE_PUSH
-            r = subprocess.run(_ssh_run_argv(self.host, self.ctl, push_snippet),
-                               input=src, capture_output=True, timeout=60)
-            self.remote_dir = r.stdout.decode(errors="replace").strip()
-            if r.returncode != 0 or not self.remote_dir:
-                raise ConnectionError(
-                    f"failed to push agent to {self.host}: {r.stderr.decode(errors='replace')[:200]}")
             if self.remote_posix:
+                r = subprocess.run(_ssh_run_argv(self.host, self.ctl, _REMOTE_PUSH),
+                                   input=src, capture_output=True, timeout=60)
+                self.remote_dir = r.stdout.decode(errors="replace").strip()
+                if r.returncode != 0 or not self.remote_dir:
+                    raise ConnectionError(
+                        f"failed to push agent to {self.host}: "
+                        f"{r.stderr.decode(errors='replace')[:200]}")
                 exec_cmd = "python3 " + shlex.quote(self.remote_dir + "/agent.py")
             else:
+                # Windows: make the throwaway dir, then scp the agent in (stdin-piped
+                # push deadlocks vs Windows sshd; scp lands a 648KB file byte-exact in ~4s).
+                if not self.remote_dir:
+                    _, d, _ = self._run(_WIN_REMOTE_MKDIR)
+                    self.remote_dir = d.strip()
+                if not self.remote_dir:
+                    raise ConnectionError(f"failed to make remote dir on {self.host}")
+                self._win_scp_write(self.remote_dir + "\\agent.py", src)
                 py = getattr(self, "win_python", None) or "python"
                 exec_cmd = f'{py} "{self.remote_dir}\\agent.py"'
         # The single-file agent.py push is NOT self-contained: at import core runs
@@ -6642,7 +6708,8 @@ class RemoteWorkspace:
             self._push_builtins()
         lean_tools_remote = self._push_lean_tools() if self.lean_tool_paths else None
         self.client = ExecutorClient(
-            _ssh_exec_argv(self.host, self.ctl, exec_cmd, self.cwd, lean_tools_remote),
+            _ssh_exec_argv(self.host, self.ctl, exec_cmd, self.cwd, lean_tools_remote,
+                           posix=self.remote_posix),
             stderr=subprocess.DEVNULL)
         self.client.host = self.host          # label the wait-spinner with the box
         self.remote_cwd = self.client.ready.get("cwd")
@@ -6701,16 +6768,47 @@ class RemoteWorkspace:
             self._run(f'New-Item -ItemType Directory -Force -Path "{remote_dir}" | Out-Null')
 
     def _remote_write(self, remote_path, data):
-        """Write bytes to a remote file over ssh. POSIX: `cat > path`. Windows: read
-        the piped stdin stream and write it verbatim via .NET (byte-exact, no encoding
-        mangling of a utf-8 source)."""
+        """Write bytes to a remote file over ssh. POSIX: `cat > path` over piped
+        stdin. Windows: scp (Windows sshd deadlocks on a stdin-piped channel, but scp
+        transfers a large file byte-exact in a few seconds - see _win_scp_write)."""
         if self.remote_posix:
-            cmd = f'cat > {shlex.quote(remote_path)}'
+            subprocess.run(_ssh_run_argv(self.host, self.ctl, f'cat > {shlex.quote(remote_path)}'),
+                           input=data, capture_output=True, timeout=60)
         else:
-            cmd = ('$o=[System.IO.File]::Create("' + remote_path + '"); '
-                   '[Console]::OpenStandardInput().CopyTo($o); $o.Close()')
-        subprocess.run(_ssh_run_argv(self.host, self.ctl, cmd),
-                       input=data, capture_output=True, timeout=60)
+            self._win_scp_write(remote_path, data)
+
+    def _win_scp_write(self, remote_path, data):
+        """Byte-exact large-file push to a Windows remote via scp. Windows sshd
+        DEADLOCKS on a stdin-piped exec channel (so `cat > path` can't be used) and the
+        old command-line base64 chunking was slow (~3-4 min, 54 calls) and could hang on
+        a chunk. scp goes through the same sshd over its own channel: MEASURED on Win11
+        OpenSSH (192.0.2.16) a full 648KB agent.py lands byte-identical in ~4s. We write
+        the bytes to a local temp file, scp it across, verify sha256 (raises on
+        mismatch), and always clean the temp file up."""
+        import tempfile
+        want = hashlib.sha256(data).hexdigest()
+        tf = tempfile.NamedTemporaryFile(prefix="lc_push_", delete=False)
+        try:
+            tf.write(data)
+            tf.close()
+            # scp needs a forward-slash / drive-style remote path; the caller passes a
+            # backslash Windows path (\\...\\agent.py) - OpenSSH scp accepts it quoted.
+            r = subprocess.run(
+                _scp_argv(self.host, self.ctl, tf.name, remote_path.replace("\\", "/")),
+                capture_output=True, text=True, timeout=120)
+            if r.returncode != 0:
+                raise ConnectionError(
+                    f"scp push to {self.host} failed: {(r.stderr or '')[:200]}")
+        finally:
+            try:
+                os.unlink(tf.name)
+            except OSError:
+                pass
+        got = self._remote_sha256(remote_path)
+        if got != want:
+            raise ConnectionError(
+                f"scp push to {self.host} corrupted {remote_path}: "
+                f"sha256 {got or 'missing'} != {want}")
 
     def _remote_sep(self):
         return "/" if self.remote_posix else "\\"
@@ -6825,8 +6923,9 @@ class RemoteWorkspace:
         # master - killing it would drop the parent's live connection.
         if self.owns_master:
             self._wipe_remote()            # zero-trace: remove the pushed code first
-            subprocess.run(["ssh", "-o", f"ControlPath={self.ctl}", "-O", "exit", self.host],
-                           capture_output=True)
+            if self.ctl:                   # Windows has no master socket to exit
+                subprocess.run(["ssh", "-o", f"ControlPath={self.ctl}", "-O", "exit", self.host],
+                               capture_output=True)
 
     def _wipe_remote(self):
         """Zero-trace teardown: delete the pushed executor dir (agent.py + bundled
@@ -6838,10 +6937,16 @@ class RemoteWorkspace:
         Guarded to a '.../leancoder' path so a bad remote_dir can never rm elsewhere.
         Best-effort: runs over the master before it's torn down; any failure is
         swallowed (the files are secret-free code, and the dir is throwaway anyway)."""
-        d = (self.remote_dir or "").rstrip("/")
+        d = (self.remote_dir or "").rstrip("/\\")
         if getattr(self, "reused", None) == "installed":
             return
-        if not d or os.path.basename(d) != "leancoder":
+        # Separator-agnostic basename guard: the driver is POSIX but a Windows remote_dir
+        # uses backslashes, and os.path.basename (posixpath here) does NOT split on '\\',
+        # so it returned the whole "C:\...\leancoder" string - the guard then always
+        # failed and the Windows wipe silently returned EARLY (the pushed dir leaked every
+        # session). Split on BOTH separators so the leaf name is checked on either OS.
+        leaf = d.replace("\\", "/").rsplit("/", 1)[-1]
+        if not d or leaf != "leancoder":
             return
         # Remove the dir FIRST, then kill the watchdog. Order matters for robustness:
         # `rm -rf` drops the .lease/.watchdog.pid sidecars, so ANY watchdog (including
@@ -6859,13 +6964,22 @@ class RemoteWorkspace:
                    f'p=$(cat {shlex.quote(d + "/.watchdog.pid")} 2>/dev/null) && '
                    f'kill "$p" 2>/dev/null; true')
         else:
-            # PowerShell: kill the watchdog (if its pid file survives), then remove the
-            # dir. taskkill /T reaps the watchdog's tree; Remove-Item -Recurse -Force
-            # drops the whole pushed dir. -ErrorAction keeps it quiet if already gone.
+            # PowerShell: kill the watchdog by its pid file, then Remove-Item with a
+            # short RETRY loop. client.close() already ended the executor (stdin close),
+            # so the only process still holding agent.py is the detached self-wipe
+            # watchdog (`python agent.py --wipe-watch`, named by .watchdog.pid). Killing
+            # it releases the lock, but Windows holds it for a beat after the process
+            # exits, so a single Remove-Item races and loses - loop until the dir is gone.
+            # (Deliberately NO per-iteration Get-CimInstance process scan: it's ~1-2s each
+            # on Windows, so a 20x loop blew the 30s ssh timeout and got killed mid-wipe,
+            # leaking the dir - the pid-file kill is enough.)
             cmd = (f'$pf="{d}\\.watchdog.pid"; '
                    f'if (Test-Path $pf) {{ $p=Get-Content $pf; '
                    f'taskkill /F /T /PID $p 2>$null }}; '
-                   f'Remove-Item -Recurse -Force "{d}" -ErrorAction SilentlyContinue')
+                   f'foreach ($i in 1..15) {{ '
+                   f'Remove-Item -Recurse -Force "{d}" -ErrorAction SilentlyContinue; '
+                   f'if (-not (Test-Path "{d}")) {{ break }}; '
+                   f'Start-Sleep -Milliseconds 300 }}')
         try:
             subprocess.run(_ssh_run_argv(self.host, self.ctl, cmd),
                            capture_output=True, timeout=30, start_new_session=True)
