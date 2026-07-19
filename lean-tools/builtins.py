@@ -28,6 +28,7 @@ from pathlib import Path
 _INJECT = (
     "IgnoreMatcher", "resolve_in_project", "_parse_search_replace", "_confirm_action",
     "_bg_running", "_bg_register", "_bg_status_items", "_bg_status_msg",
+    "_bg_spawn_detached",
     "READ_MAX_LINES", "READ_HEAD", "READ_TAIL", "TREE_DEFAULT_DEPTH", "TREE_MAX_ENTRIES",
     "SEARCH_MAX_MATCHES", "SEARCH_LINE_MAX", "SEARCH_MAX_FILE_BYTES",
     "OUTPUT_MAX_CHARS", "OUTPUT_HEAD", "OUTPUT_TAIL",
@@ -355,20 +356,16 @@ class Tools:
         heartbeat_timeout = _posint(heartbeat_timeout)
         max_runtime = _posint(max_runtime)
         kill_on_max = True if kill_on_max is None else bool(kill_on_max)
-        notify_on_exit = bool(notify_on_exit)
         try:
             logdir = CONFIG_DIR / "bg"
             logdir.mkdir(parents=True, exist_ok=True)
             log = logdir / f"{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}.log"
             exitf = str(log) + ".exit"
-            wrapped = self._bg_wrap(cmd, exitf, str(log) + ".lease", idle_timeout,
-                                    logf=str(log), max_runtime=max_runtime,
-                                    kill_on_max=kill_on_max,
-                                    heartbeat_timeout=heartbeat_timeout)
-            with open(log, "ab") as f:
-                p = subprocess.Popen(wrapped, shell=True, cwd=str(self.cfg.cwd),
-                                     stdout=f, stderr=subprocess.STDOUT,
-                                     stdin=subprocess.DEVNULL, start_new_session=True)
+            p = _bg_spawn_detached(cmd, log, exitf, str(log) + ".lease",
+                                   logf=str(log), idle_timeout=idle_timeout,
+                                   max_runtime=max_runtime, kill_on_max=kill_on_max,
+                                   heartbeat_timeout=heartbeat_timeout,
+                                   cwd=str(self.cfg.cwd))
         except Exception as e:
             return f"error backgrounding command: {e}"
         _bg_register(p.pid, cmd, log, kind=kind, idle_timeout=idle_timeout,

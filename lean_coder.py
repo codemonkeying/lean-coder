@@ -4632,15 +4632,50 @@ def _proc_alive(pid):
         return False
 
 
-def _bg_kill(pid, sig=signal.SIGTERM):
-    """Kill a backgrounded task's whole group (start_new_session -> pgid == pid)."""
+# --- the ONLY two OS primitives with no cross-platform stdlib call ------------
+# Detaching a child into its own session/group and killing that whole group have
+# no unified API: POSIX uses setsid + os.killpg, Windows uses process-group
+# creation flags + taskkill /T. Every other bg/watchdog behaviour (sidecars,
+# lease/heartbeat/max_runtime logic) is platform-agnostic and sits on top of
+# these two. Kept here as the single source of truth so core (_bg_kill) and the
+# pure-Python bg-runner share one implementation of each (no drift).
+def _detached_popen_kwargs():
+    """Popen kwargs that put the child in its OWN session/process group, so a
+    group kill takes the whole tree. POSIX: start_new_session (setsid), making
+    pgid == the child pid. Windows: CREATE_NEW_PROCESS_GROUP."""
+    if os.name == "nt":
+        return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+    return {"start_new_session": True}
+
+
+def _kill_tree(pid, sig=signal.SIGKILL):
+    """Kill a detached child AND its whole group/tree. POSIX: os.killpg on the
+    pgid (== pid, since it was start_new_session'd). Windows: os.killpg is absent
+    (AttributeError) and groups differ, so use taskkill /T to walk the tree. On
+    any failure, fall back to a direct os.kill. Best-effort; never raises."""
     try:
         os.killpg(int(pid), sig)
-    except (OSError, ValueError, TypeError):
+        return
+    except (OSError, ValueError, TypeError, AttributeError):
+        pass
+    if os.name == "nt":
         try:
-            os.kill(int(pid), sig)
-        except OSError:
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(int(pid))],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return
+        except (OSError, ValueError, TypeError):
             pass
+    try:
+        os.kill(int(pid), sig)
+    except (OSError, ValueError, TypeError):
+        pass
+
+
+def _bg_kill(pid, sig=signal.SIGTERM):
+    """Kill a backgrounded task's whole group (start_new_session -> pgid == pid).
+    Delegates to the shared _kill_tree primitive so Linux and Windows share one
+    implementation."""
+    _kill_tree(pid, sig)
 
 
 def _bg_here(rec) -> bool:
@@ -4902,6 +4937,133 @@ def _bg_status_msg(rows, pid=None) -> str:
     return "\n\n".join(out)
 
 
+def _bg_poll_interval(lease, maxrt, hb):
+    """Watchdog poll cadence: a few checks per shortest active window, clamped
+    5..30s. Identical to _bg_wrap's `chk` so shell and Python paths trip alike."""
+    wins = [w for w in (lease or None, maxrt or None, hb or None) if w]
+    return max(5, min(30, min(wins) // 4)) if wins else 30
+
+
+def run_bg_child(cfg):
+    """Pure-Python backgrounded-command runner (the cross-platform twin of the
+    POSIX shell wrapper built by builtins Tools._bg_wrap). Spawned detached as
+    `python lean_coder.py --bg-run <json>` so it survives the executor/ssh drop,
+    exactly like the old subshell. Reproduces the sidecar contract byte-for-byte:
+      <log>.exit   : child exit code on completion; 137 on lease-expiry / max-kill
+      <log>.lease  : touched at launch; parent bumps mtime; stale>idle -> 137 + kill
+      <log>.maxrun : elapsed secs, written ONCE on max trip when kill_on_max=False
+      <log>.silent : silence secs, written ONCE when log mtime stale>hb (bark, re-arms)
+    All watchdog channels are file-based so they read identically local/remote and
+    survive a reconnect. Used on Windows (no POSIX shell); POSIX keeps the shell path.
+    `cfg` keys: cmd, exitf, leasef, logf, idle_timeout, max_runtime, heartbeat_timeout,
+    kill_on_max."""
+    cmd = cfg["cmd"]
+    exitf, leasef, logf = cfg["exitf"], cfg["leasef"], cfg.get("logf") or cfg["exitf"]
+    lease = int(cfg.get("idle_timeout") or 0)
+    maxrt = int(cfg.get("max_runtime") or 0)
+    hb = int(cfg.get("heartbeat_timeout") or 0)
+    kill_on_max = bool(cfg.get("kill_on_max", True))
+    silentf, maxrunf = logf + ".silent", logf + ".maxrun"
+
+    def _write(path, text):
+        try:
+            with open(path, "w") as f:
+                f.write(str(text))
+        except OSError:
+            pass
+
+    def _mtime(path, default):
+        try:
+            return os.path.getmtime(path)
+        except OSError:
+            return default
+
+    # lease sidecar exists from t0 (shell path: touch '{leasef}')
+    try:
+        open(leasef, "a").close()
+        os.utime(leasef, None)
+    except OSError:
+        pass
+    logdir = cfg.get("cwd")
+    proc = subprocess.Popen(cmd, shell=True, cwd=logdir,
+                            stdin=subprocess.DEVNULL, **_detached_popen_kwargs())
+
+    if not (lease or maxrt or hb):
+        rc = proc.wait()
+        if not os.path.exists(exitf):
+            _write(exitf, rc)
+        return rc
+
+    chk = _bg_poll_interval(lease, maxrt, hb)
+    t0 = time.time()
+    state = {"mr": 0, "hb": 0, "done": False}
+
+    def _watch():
+        while not state["done"]:
+            now = time.time()
+            if lease and now - _mtime(leasef, now) >= lease:
+                _write(exitf, 137)
+                _kill_tree(proc.pid)
+                return
+            if maxrt and state["mr"] == 0 and now - t0 >= maxrt:
+                state["mr"] = 1
+                if kill_on_max:
+                    _write(exitf, 137)
+                    _kill_tree(proc.pid)
+                    return
+                _write(maxrunf, maxrt)
+            if hb:
+                if now - _mtime(logf, now) >= hb:
+                    if state["hb"] == 0:
+                        state["hb"] = 1
+                        _write(silentf, int(now - _mtime(logf, now)))
+                else:
+                    state["hb"] = 0
+            time.sleep(chk)
+
+    threading.Thread(target=_watch, daemon=True).start()
+    rc = proc.wait()
+    state["done"] = True
+    if not os.path.exists(exitf):
+        _write(exitf, rc)
+    return rc
+
+
+def _bg_spawn_detached(cmd, log, exitf, leasef, logf=None, idle_timeout=None,
+                       max_runtime=None, kill_on_max=True, heartbeat_timeout=None,
+                       cwd=None):
+    """The single detached-bg spawn chokepoint shared by core (_bg_launch) and the
+    run_command ' &' path. POSIX: build the proven shell wrapper (Tools._bg_wrap)
+    and Popen it via /bin/sh - unchanged, battle-tested. Windows (no POSIX shell):
+    spawn `python lean_coder.py --bg-run <json>` running run_bg_child, which
+    reproduces the identical sidecar contract. Returns the detached Popen handle.
+    Its .pid is the group leader (start_new_session / CREATE_NEW_PROCESS_GROUP), so
+    _kill_tree(pid) reaps the whole tree on either OS. Caller opens `log` for stdout."""
+    f = open(log, "ab")
+    try:
+        if os.name == "nt":
+            cfg = {"cmd": cmd, "exitf": exitf, "leasef": leasef,
+                   "logf": logf or str(log), "idle_timeout": idle_timeout,
+                   "max_runtime": max_runtime, "kill_on_max": kill_on_max,
+                   "heartbeat_timeout": heartbeat_timeout,
+                   "cwd": str(cwd) if cwd else None}
+            argv = [sys.executable, os.path.abspath(__file__), "--bg-run",
+                    json.dumps(cfg)]
+            return subprocess.Popen(argv, stdout=f, stderr=subprocess.STDOUT,
+                                    stdin=subprocess.DEVNULL,
+                                    **_detached_popen_kwargs())
+        wrapped = _BUILTINS.Tools._bg_wrap(cmd, exitf, leasef, idle_timeout,
+                                           logf=logf, max_runtime=max_runtime,
+                                           kill_on_max=kill_on_max,
+                                           heartbeat_timeout=heartbeat_timeout)
+        return subprocess.Popen(wrapped, shell=True,
+                                cwd=str(cwd) if cwd else None,
+                                stdout=f, stderr=subprocess.STDOUT,
+                                stdin=subprocess.DEVNULL,
+                                **_detached_popen_kwargs())
+    finally:
+        f.close()
+
 def _bg_launch(cmd, cwd=None, kind="task", idle_timeout=None,
                heartbeat_timeout=None, heartbeat_file=None):
     """Launch a detached background process on THIS box and register it, returning
@@ -4925,15 +5087,11 @@ def _bg_launch(cmd, cwd=None, kind="task", idle_timeout=None,
         # heartbeat_file lets a worker point the (bark-not-bite) staleness watchdog at
         # its OWN progress file (bumped each iteration) instead of the bg log, so a worker
         # that's genuinely stuck (model looping, hung tool) - not merely quiet - trips the
-        # alert. logf carries that path into _bg_wrap's HEARTBEAT channel.
+        # alert. logf carries that path into the HEARTBEAT channel (shell or Python path).
         hb_watch = heartbeat_file or log
-        wrapped = _BUILTINS.Tools._bg_wrap(cmd, exitf, leasef, idle_timeout,
-                                           logf=hb_watch,
-                                           heartbeat_timeout=heartbeat_timeout)
-        with open(log, "ab") as f:
-            p = subprocess.Popen(wrapped, shell=True, cwd=str(cwd) if cwd else None,
-                                 stdout=f, stderr=subprocess.STDOUT,
-                                 stdin=subprocess.DEVNULL, start_new_session=True)
+        p = _bg_spawn_detached(cmd, log, exitf, leasef, logf=str(hb_watch),
+                               idle_timeout=idle_timeout,
+                               heartbeat_timeout=heartbeat_timeout, cwd=cwd)
     except Exception as e:
         return {"error": f"launch failed: {e}"}
     _bg_register(p.pid, cmd, log, kind=kind, idle_timeout=idle_timeout,
@@ -12693,6 +12851,9 @@ def main():
     ap.add_argument("--top-p", type=float, dest="top_p")
     ap.add_argument("--top-k", type=int, dest="top_k")
     ap.add_argument("--repeat-penalty", type=float, dest="repeat_penalty")
+    ap.add_argument("--bg-run", dest="bg_run",
+                    help="(internal) detached backgrounded-command runner: JSON cfg; "
+                         "the cross-platform twin of the POSIX shell bg wrapper")
     ap.add_argument("--tool-exec", action="store_true", dest="tool_exec",
                     help="run as a hermetic tool executor (JSON over stdio); internal")
     ap.add_argument("--lean-tools", dest="lean_tools_exec",
@@ -12719,6 +12880,11 @@ def main():
     if args.version:                   # version probe: print self-hash, do nothing else
         print(source_hash())           # /connect parses this exact line (hash only)
         return
+    if args.bg_run:                    # detached bg-runner role: run one command, write sidecars, exit
+        try:
+            sys.exit(run_bg_child(json.loads(args.bg_run)) or 0)
+        except Exception:
+            sys.exit(1)
     if args.tool_exec:                 # hermetic executor role: no config, no model
         run_tool_executor(args.cwd or ".", args.lean_tools_exec)
         return
