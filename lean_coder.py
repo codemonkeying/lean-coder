@@ -6378,10 +6378,36 @@ _WIN_REMOTE_MKDIR = (
     f'{_WIN_REMOTE_TMP}; '
     'New-Item -ItemType Directory -Force -Path $d | Out-Null; '
     '[Console]::Out.Write($d)')
-_WIN_REMOTE_MKDIR = (
-    f'{_WIN_REMOTE_TMP}; '
-    'New-Item -ItemType Directory -Force -Path $d | Out-Null; '
-    '[Console]::Out.Write($d)')
+
+# Embeddable-Python fallback for a Windows host with NO real interpreter. Stock Win11
+# ships none (only a Store stub), and we won't silently winget-install. Instead we
+# provision the official python-<ver>-embed-amd64.zip - a self-contained ~10MB CPython
+# with a FULL stdlib (the import spike confirmed our executor imports cleanly under it:
+# all stdlib, all lazy imports guarded). It is CACHED under %LOCALAPPDATA% in a neutral
+# dir (survives our %TEMP% wipe, so we download once), and its python<ver>._pth is
+# rewritten to un-comment `import site` so the interpreter behaves normally. Prints the
+# path to python.exe on success, or 'ERR:<reason>'. Idempotent: reuses a cached unzip.
+_WIN_EMBED_VER = "3.12.7"
+_WIN_EMBED_URL = (f"https://www.python.org/ftp/python/{_WIN_EMBED_VER}/"
+                  f"python-{_WIN_EMBED_VER}-embed-amd64.zip")
+_WIN_PROVISION_EMBED = (
+    "$ErrorActionPreference='Stop'; try {"
+    "  $root = Join-Path $env:LOCALAPPDATA 'lc-runtime';"
+    "  $dir  = Join-Path $root 'py-embed-amd64';"
+    "  $exe  = Join-Path $dir 'python.exe';"
+    "  if (-not (Test-Path $exe)) {"
+    "    New-Item -ItemType Directory -Force -Path $root | Out-Null;"
+    "    $zip = Join-Path $root 'embed.zip';"
+    f"    Invoke-WebRequest -UseBasicParsing -Uri '{_WIN_EMBED_URL}' -OutFile $zip;"
+    "    if (Test-Path $dir) { Remove-Item -Recurse -Force $dir }"
+    "    Expand-Archive -Path $zip -DestinationPath $dir -Force;"
+    "    Remove-Item -Force $zip;"
+    "    Get-ChildItem -Path $dir -Filter 'python*._pth' | ForEach-Object {"
+    "      (Get-Content $_.FullName) -replace '^#\\s*import\\s+site','import site'"
+    "        | Set-Content $_.FullName };"
+    "  }"
+    "  [Console]::Out.Write($exe);"
+    "} catch { [Console]::Out.Write('ERR:' + $_.Exception.Message) }")
 
 # Probe run over ssh at connect to detect the remote OS/shell family. A bare `uname`
 # is the most portable discriminator: a POSIX shell prints a known kernel token
@@ -6955,16 +6981,40 @@ class RemoteWorkspace:
                 return cand
         return None
 
+    def _provision_win_embed(self):
+        """Fallback for a Windows host with no real Python: provision the official
+        embeddable-amd64 zip (cached under %LOCALAPPDATA%\\lc-runtime, downloaded once)
+        and return a quoted 'python.exe' path to invoke it, or None on failure. The
+        import spike confirmed our --tool-exec executor runs cleanly under the embed
+        distro (all-stdlib, guarded lazy imports)."""
+        print(dim(f"no Python on {self.host}; provisioning the embeddable runtime "
+                  f"(one-time ~10MB download)…"))
+        rc, out, err = self._run(_WIN_PROVISION_EMBED)
+        out = (out or "").strip()
+        if rc != 0 or not out or out.startswith("ERR:"):
+            reason = out[4:] if out.startswith("ERR:") else (err or "").strip()[:200]
+            print(yellow(f"  embeddable provision failed: {reason or 'unknown error'}"))
+            return None
+        # Verify the provisioned interpreter actually runs before we commit to it.
+        quoted = f'"{out}"'
+        _, ver, _ = self._run(f'{quoted} -c "import sys;print(sys.executable)"')
+        if not (ver.strip() and "\\" in ver):
+            print(yellow("  provisioned python.exe did not run; falling back to error."))
+            return None
+        print(dim(f"  provisioned embeddable Python at {out}"))
+        return quoted
+
     def _check_windows_python(self):
-        """Windows target: require a real Python (we don't auto-install - winget isn't
-        universal and silent installs on someone's box are heavy-handed). Fail with a
-        clear, actionable message if absent. Caches the working prefix on self."""
-        prefix = self._win_python()
+        """Windows target: use a real Python if present ('py -3' or 'python'); otherwise
+        provision the official embeddable-amd64 zip (cached under %LOCALAPPDATA%) so a
+        stock Win11 box works with zero manual setup. Only if BOTH fail do we error with
+        an actionable message. Caches the working invocation prefix on self.win_python."""
+        prefix = self._win_python() or self._provision_win_embed()
         if not prefix:
             raise ConnectionError(
-                f"no Python on the Windows host {self.host}. lean-coder's remote executor "
-                f"needs it. Install one (e.g. `winget install Python.Python.3`) or enable "
-                f"the py launcher, then reconnect.")
+                f"no Python on the Windows host {self.host} and the embeddable-runtime "
+                f"fallback failed. Install one (e.g. `winget install Python.Python.3`) or "
+                f"enable the py launcher, then reconnect.")
         self.win_python = prefix
 
     def call(self, tool, args=None, should_abort=None):
