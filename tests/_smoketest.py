@@ -4729,6 +4729,57 @@ check("_set_setting_field: leash applies live (cfg + reduced tool surface)",
 check("_set_setting_field: leash with agent=None just sets cfg (headless-safe)",
       lc._set_setting_field(None, lc.Config(leash="rwe"), "leash", "r") is True)
 
+# --- GOAL C: uniform DEFAULTS / SESSION-OVERRIDE layer -----------------------
+# (a) /set (session scope) records a session override, NOT a config default.
+_ovc = lc.Config(model="m", temperature=0.7)
+_ovc._defaults = {k: getattr(_ovc, k) for k in lc._PERSISTED_SCALAR_KEYS}
+lc._set_setting_field(None, _ovc, "temperature", "0.2", scope="session")
+check("goal C: /set session override sets live cfg", _ovc.temperature == 0.2)
+check("goal C: /set session override recorded in session_overrides",
+      _ovc.session_overrides.get("temperature") == 0.2)
+check("goal C: /set session override does NOT touch _defaults",
+      _ovc._defaults.get("temperature") == 0.7)
+# (b) save_config writes scalar lines FROM _defaults, so the override never leaks.
+import tomllib as _ttc
+_ocp = lc.CONFIG_PATH
+_ocf = pathlib.Path(tempfile.mktemp(suffix=".toml")); lc.CONFIG_PATH = _ocf
+lc.save_config(_ovc, quiet=True)
+check("goal C: save_config writes the DEFAULT, not the session override",
+      _ttc.loads(_ocf.read_text()).get("temperature") == 0.7)
+# (c) /set --config writes ONE key to the default AND clears the session override.
+lc._set_setting_field(None, _ovc, "temperature", "0.9", scope="config")
+check("goal C: /set --config updates _defaults", _ovc._defaults.get("temperature") == 0.9)
+check("goal C: /set --config clears the session override",
+      "temperature" not in _ovc.session_overrides)
+lc.save_config(_ovc, quiet=True)
+check("goal C: /set --config persisted the new default",
+      _ttc.loads(_ocf.read_text()).get("temperature") == 0.9)
+# (d) session load applies overrides at RUNTIME only, never writing config.toml.
+_load_cfg = lc.Config(model="m", approval="ask")
+_load_cfg._defaults = {k: getattr(_load_cfg, k) for k in lc._PERSISTED_SCALAR_KEYS}
+class _StubAg:
+    def __init__(self): self.messages = [{"role": "system", "content": ""}]; self.pinned_plan = ""
+    def refresh_tools(self): pass
+    def _system(self): return ""
+_meta = {"session_overrides": {"approval": "auto"}, "leash": "rwe"}
+_before = _ocf.read_text()
+lc._restore_backend_for = (lambda *a, **k: "")  # neutralize backend switch for this stub
+lc._restore_session_state(_StubAg(), _load_cfg, _meta)
+check("goal C: session load applies the override to live cfg", _load_cfg.approval == "auto")
+check("goal C: session load leaves _defaults (config) unchanged",
+      _load_cfg._defaults.get("approval") == "ask")
+check("goal C: session load did NOT rewrite config.toml", _ocf.read_text() == _before)
+# (e) handover_for: session override > per-model handover_overrides > global.
+_hc = lc.Config(model="m", handover_soft=0.70,
+                handover_overrides={"m": {"soft": 0.50}})
+_hc.set_active_model("m")
+check("goal C: handover_for uses per-model override when no session override",
+      _hc.handover_for("m")["soft"] == 0.50)
+_hc.session_overrides["handover_soft"] = 0.33; _hc.handover_soft = 0.33
+check("goal C: handover_for session override beats per-model",
+      _hc.handover_for("m")["soft"] == 0.33)
+lc.CONFIG_PATH = _ocp; _ocf.unlink(missing_ok=True)
+
 # --- leash HARD dispatch lock (defense in depth behind the surface filter) ---
 check("_leash_allows_tool: read rides at r", lc._leash_allows_tool("r", "read_file") is True)
 check("_leash_allows_tool: write blocked at r", lc._leash_allows_tool("r", "write_file") is False)

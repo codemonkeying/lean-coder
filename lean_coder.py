@@ -3662,6 +3662,18 @@ class Config:
     providers_enabled: list = field(default_factory=list)  # enabled provider plugin names
     provider: str = "ollama"         # active backend - ALWAYS a registered provider now
     provider_settings: dict = field(default_factory=dict)  # name -> {model, num_ctx, thinking, effort, <custom>}
+    # --- the DEFAULTS / SESSION-OVERRIDE layer (uniform working-state model) --------
+    # config.toml holds DEFAULTS; a session holds per-key OVERRIDES. The live cfg
+    # attribute is always the EFFECTIVE value (override if present, else default), so
+    # every read site stays `cfg.<key>` unchanged. `_defaults` snapshots the persisted
+    # scalars as loaded from config.toml (populated in load_config); save_config writes
+    # the scalar lines FROM `_defaults`, never the live/effective value - so a session
+    # override (e.g. approval flipped by a loaded worker session) can NEVER leak into
+    # config.toml. `session_overrides` is the per-key override map, persisted in the
+    # SESSION meta (not config.toml) and re-applied onto the live cfg at load time,
+    # RUNTIME-only. Neither is a config.toml scalar - both are classified EPHEMERAL.
+    _defaults: dict = field(default_factory=dict)          # config.toml default snapshot
+    session_overrides: dict = field(default_factory=dict)  # per-key session overrides
 
     # --- provider-aware accessors ---------------------------------------------
     # There is no "native" backend any more: the active model is ALWAYS a provider's
@@ -3697,16 +3709,23 @@ class Config:
         return stored
 
     def handover_for(self, model: "str | None" = None):
-        """Resolve compaction settings for `model` (default: the active model),
-        applying any per-model override in handover_overrides over the global defaults.
-        Models fill context at different rates, so these are per-model. Returns a dict:
-        {auto, soft, hard, autostart}."""
+        """Resolve compaction settings for `model` (default: the active model).
+        Precedence (uniform working-state layer): SESSION override > per-model
+        handover_overrides > global default. A /set of a handover_* key is a session
+        override and must win over a per-model override; a /set --config writes the
+        global default. Models fill context at different rates, so the per-model layer
+        sits between. Returns {auto, soft, hard, autostart}."""
         ov = self.handover_overrides.get(model or self.active_model(), {})
+        so = self.session_overrides
+        def pick(mkey, gkey, gval):
+            if gkey in so:                       # session override wins outright
+                return getattr(self, gkey)
+            return ov.get(mkey, gval)
         return {
-            "auto":      ov.get("auto",      self.auto_handover),
-            "soft":      ov.get("soft",      self.handover_soft),
-            "hard":      ov.get("hard",      self.handover_hard),
-            "autostart": ov.get("autostart", self.autostart_after_handover),
+            "auto":      pick("auto",      "auto_handover",            self.auto_handover),
+            "soft":      pick("soft",      "handover_soft",            self.handover_soft),
+            "hard":      pick("hard",      "handover_hard",            self.handover_hard),
+            "autostart": pick("autostart", "autostart_after_handover", self.autostart_after_handover),
         }
 
     def set_active_model(self, name):
@@ -3828,6 +3847,11 @@ _PERSISTED_SCALAR_KEYS = (
 # per-session send flag; `cwd`/`model_explicit`/`auto_num_ctx` are derived at launch.
 _EPHEMERAL_KEYS = frozenset((
     "composer", "leash", "incognito", "think", "cwd", "model_explicit", "auto_num_ctx",
+    # Not config.toml scalars: `_defaults` is the DEFAULTS snapshot save_config writes
+    # FROM; `session_overrides` is the per-key override map persisted in the SESSION
+    # meta (not config.toml) and re-applied at load runtime-only. Classified here so
+    # the config-drift guard accounts for them without treating them as saved scalars.
+    "_defaults", "session_overrides",
 ))
 # DERIVED / bespoke: persisted, but via their own table serialisers (not scalar lines),
 # or reconstructed at load. Listed so the round-trip test can account for every field.
@@ -3851,6 +3875,14 @@ def load_config(args) -> Config:
     for key in _PERSISTED_SCALAR_KEYS + ("composer",):  # composer: read-only (see _EPHEMERAL_KEYS)
         if key in file_vals:
             setattr(cfg, key, file_vals[key])
+    # Snapshot the config.toml DEFAULTS layer: for each persisted scalar, the value as
+    # configured (file value if present, else the dataclass default). save_config writes
+    # scalar lines FROM this, so a per-session OVERRIDE later applied onto the live cfg
+    # never leaks back into config.toml. A /set --config <k> <v> mutates _defaults[k]
+    # AND the live attribute together (new default shows through once the override is
+    # cleared). CLI-flag overrides below are session-ish but pre-date this layer; they
+    # DO update the live value only (not _defaults), matching prior behaviour.
+    cfg._defaults = {k: getattr(cfg, k) for k in _PERSISTED_SCALAR_KEYS}
     # The self-managing mechanism is a HANDOVER (the model pulls the same lever
     # /handover does); "compact" now means only the programmatic /compact strip.
     # The knobs are handover_* accordingly - no compact_* back-compat aliases (they'd
@@ -3996,7 +4028,28 @@ def _toml_value(v) -> str:
     return '"' + str(v).replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
+class _DefaultsView:
+    """Read-only view over a Config that returns the config.toml DEFAULT for any
+    persisted scalar (cfg._defaults[key]) instead of the live/effective value, and
+    falls through to the live attribute for everything else (bespoke tables, and any
+    scalar not yet in _defaults - e.g. a Config built directly in a test). save_config
+    reads through this so a per-session OVERRIDE held on the live cfg can never leak
+    into config.toml."""
+    __slots__ = ("_cfg",)
+
+    def __init__(self, cfg):
+        object.__setattr__(self, "_cfg", cfg)
+
+    def __getattr__(self, name):
+        cfg = object.__getattribute__(self, "_cfg")
+        d = cfg._defaults
+        if name in _PERSISTED_SCALAR_KEYS and name in d:
+            return d[name]
+        return getattr(cfg, name)
+
+
 def save_config(cfg: Config, quiet: bool = False):
+    cfg = _DefaultsView(cfg)          # persisted scalars read from _defaults, not live
     CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
     # One-time safety net: before the first write that introduces the new
     # provider-based format, snapshot the legacy config so the ollama-as-provider
@@ -4277,6 +4330,7 @@ def save_session(messages, cfg, name: str, remote=None, pinned_plan=""):
         "title": _session_title(messages),
         "turns": len(body),
         "pinned_plan": pinned_plan or "",
+        "session_overrides": dict(getattr(cfg, "session_overrides", {}) or {}),
         "tok_factor": _tok_factor(),         # learned estimate->actual factor (calibrated meter)
     }
     path = _session_path(safe)
@@ -9719,11 +9773,18 @@ def _coerce_setting(raw, kind):
     return raw
 
 
-def _set_setting_field(agent, cfg, key, raw):
+def _set_setting_field(agent, cfg, key, raw, scope="session"):
     """Set one /set config field from a raw string, APPLYING it to the live agent when
     the field affects its tool surface or system prompt (leash, ask_user_to_run) -
     not just the cfg value. Returns True on success. `agent` may be None for headless
-    callers (then live-apply is skipped)."""
+    callers (then live-apply is skipped).
+
+    scope controls where the value lands (the uniform DEFAULTS/OVERRIDE model):
+      "session" (default): a per-session OVERRIDE - live cfg + cfg.session_overrides[key]
+                 (carried in the session meta by autosave). config.toml is NOT touched.
+      "config":  the config.toml DEFAULT - live cfg + cfg._defaults[key], AND the session
+                 override for that key is CLEARED so the new default shows through. The
+                 caller persists via save_config."""
     if key not in _SETTINGS_BY_KEY:
         print(yellow(f"unknown setting '{key}' (try: {', '.join(_SETTINGS_BY_KEY)})"))
         return False
@@ -9739,12 +9800,18 @@ def _set_setting_field(agent, cfg, key, raw):
     if key == "approval":
         set_approval(cfg, val)
     elif key == "leash" and agent is not None:
-        _apply_leash(agent, cfg, val)        # live: rebuild tools + system prompt + AI note
+        _apply_leash(agent, cfg, val, persist=(scope == "config"))  # live rebuild
     else:
         setattr(cfg, key, val)
         # ask_user_to_run adds/removes a tool, so the live surface must rebuild too.
         if key == "ask_user_to_run" and agent is not None:
             agent.refresh_tools()
+    # Record where the value belongs in the DEFAULTS/OVERRIDE layer.
+    if scope == "config":
+        cfg._defaults[key] = getattr(cfg, key)   # the new config.toml default
+        cfg.session_overrides.pop(key, None)      # let the new default show through
+    else:
+        cfg.session_overrides[key] = getattr(cfg, key)  # per-session override
     return True
 
 
@@ -9798,15 +9865,43 @@ def _settings_sessions_view(agent, cfg):
 
 
 def handle_settings_command(agent, cfg, arg):
-    """/set - granular editor over the app config (config.toml). No arg: interactive
-    menu. `key value`: set one field directly. Persists with save_config().
+    """/set - granular editor over the working state. No arg: interactive menu.
+    `key value`: a per-SESSION override (live + carried in the session, config.toml
+    untouched). `--config key value`: write that ONE key as the config.toml DEFAULT and
+    clear its session override (so the new default shows through). `--config key` with
+    no value: clear the session override for that key (revert to the config default).
     (Provider-specific backend knobs live in /provider set.)"""
     if arg:
+        to_config = False
+        if arg.split(maxsplit=1)[0] in ("--config", "--default"):
+            to_config = True
+            arg = arg.split(maxsplit=1)[1] if len(arg.split(maxsplit=1)) > 1 else ""
         parts = arg.split(maxsplit=1)
-        if len(parts) == 2 and _set_setting_field(agent, cfg, parts[0], parts[1]):
-            save_config(cfg, quiet=True)
+        if to_config and len(parts) == 1 and parts[0] in _SETTINGS_BY_KEY:
+            # `/set --config key` (no value): drop the session override so the live cfg
+            # reverts to the config.toml default for that key.
+            key = parts[0]
+            cfg.session_overrides.pop(key, None)
+            if key in cfg._defaults:
+                if key == "leash" and agent is not None:
+                    _apply_leash(agent, cfg, cfg._defaults[key], persist=False)
+                elif key == "approval":
+                    set_approval(cfg, cfg._defaults[key])
+                else:
+                    setattr(cfg, key, cfg._defaults[key])
+                    if key == "ask_user_to_run" and agent is not None:
+                        agent.refresh_tools()
+            print(dim(f"{key} -> {getattr(cfg, key)}  (session override cleared)"))
+            return
+        scope = "config" if to_config else "session"
+        if len(parts) == 2 and _set_setting_field(agent, cfg, parts[0], parts[1], scope=scope):
+            if to_config:
+                save_config(cfg, quiet=True)
+            else:
+                autosave_session(agent, cfg)      # carry the override in the session
             if parts[0] not in _LIVE_APPLY:       # live-apply keys announce themselves
-                print(dim(f"{parts[0]} -> {getattr(cfg, parts[0])}"))
+                tag = "" if to_config else "  (session override)"
+                print(dim(f"{parts[0]} -> {getattr(cfg, parts[0])}{tag}"))
         elif len(parts) == 1:                     # bare key -> edit that one field
             if parts[0] in _SETTINGS_BY_KEY:
                 label, kind = _SETTINGS_BY_KEY[parts[0]]
@@ -10259,9 +10354,10 @@ def _setup_readline(agent, cfg):
 
 
 def handle_save_command(agent, cfg, arg):
-    """/save [name] - snapshot the current conversation under a name. No arg
-    prompts for one. Config persists automatically and is NOT what /save means
-    any more (autosave handles it)."""
+    """/save [name] - DEPRECATED alias: autosave already persists the conversation
+    (and now its per-session overrides) each turn, so a manual save is rarely needed.
+    Still works: it snapshots + names the session (autosave then continues into it).
+    No arg prompts for a name. Config persists automatically - /save never writes it."""
     name = arg.strip()
     if not any(m.get("role") != "system" for m in agent.messages):
         # Empty conversation: a bare `/save` has nothing to snapshot, but an
@@ -10419,12 +10515,32 @@ def _restore_session_state(agent, cfg, meta):
         if val is not None and val != cfg.setting(key):
             cfg.set_setting(key, val)
 
+    # Per-key SESSION OVERRIDES (the uniform working-state layer): re-apply the loaded
+    # session's overrides onto the LIVE cfg at RUNTIME only - never save_config here, so
+    # a worker/auto session can't clobber the config.toml defaults (the old approval->
+    # auto root bug). The legacy top-level meta "approval"/"leash" (below) still restore
+    # for sessions saved before this layer; going forward they ride session_overrides.
+    overrides = meta.get("session_overrides")
+    if isinstance(overrides, dict):
+        cfg.session_overrides = dict(overrides)
+        for k, v in overrides.items():
+            if k not in _SETTINGS_BY_KEY or k == "leash":  # leash handled below (escalation notice)
+                continue
+            if k == "approval":
+                if v in APPROVAL_MODES:
+                    set_approval(cfg, v)
+            else:
+                setattr(cfg, k, v)
+        if "ask_user_to_run" in overrides:
+            agent.refresh_tools()
+
     approval = meta.get("approval")
     if approval in APPROVAL_MODES and approval != cfg.approval:
-        set_approval(cfg, approval)
+        set_approval(cfg, approval)                        # runtime only (not autosaved)
 
     escalated_from = None
-    want = meta.get("leash")
+    # A leash session-override takes precedence over the legacy top-level meta field.
+    want = (meta.get("session_overrides") or {}).get("leash") or meta.get("leash")
     if want in LEASH_LEVELS and want != cfg.leash:
         if LEASH_LEVELS.index(want) > LEASH_LEVELS.index(cfg.leash):
             escalated_from = cfg.leash                     # this load RAISES the ceiling
@@ -11527,14 +11643,18 @@ def handle_incognito_command(agent, cfg, arg):
                   "autosave setting again."))
 
 
-def _apply_leash(agent, cfg, want):
+def _apply_leash(agent, cfg, want, persist=True):
     """Set the capability ceiling, rebuild the system prompt + tool surface live, and
-    announce the grant. Used by /leash."""
+    announce the grant. Used by /leash. `persist=True` autosaves the leash as a
+    config.toml DEFAULT (the /leash command's behaviour); `persist=False` applies it
+    live only (a /set session override records it in session_overrides itself)."""
     cfg.leash = want
     agent.messages[0] = {"role": "system", "content": agent._system()}
     agent.refresh_tools()
     agent._pending_ai_note = _leash_note(want)   # tell the model on its next turn (not via the cached prompt)
-    autosave_config(cfg)
+    if persist:
+        cfg._defaults["leash"] = want
+        autosave_config(cfg)
     print(bold(f"leash: {want}") + dim(f"  - {_LEASH_GRANTS[want]}  "
                                        f"({len(agent.tool_defs)} tools)"))
     if want == "rwe":
