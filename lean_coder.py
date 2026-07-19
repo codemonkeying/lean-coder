@@ -6407,7 +6407,7 @@ _WIN_REMOTE_MKDIR = (
 
 # Embeddable-Python fallback for a Windows host with NO real interpreter. Stock Win11
 # ships none (only a Store stub), and we won't silently winget-install. Instead we
-# provision the official python-<ver>-embed-amd64.zip - a self-contained ~10MB CPython
+# provision the official python-<ver>-embed-amd64.zip - a self-contained embeddable CPython
 # with a FULL stdlib (the import spike confirmed our executor imports cleanly under it:
 # all stdlib, all lazy imports guarded). It is CACHED under %LOCALAPPDATA% in a neutral
 # dir (survives our %TEMP% wipe, so we download once), and its python<ver>._pth is
@@ -7060,7 +7060,7 @@ class RemoteWorkspace:
         import spike confirmed our --tool-exec executor runs cleanly under the embed
         distro (all-stdlib, guarded lazy imports)."""
         print(dim(f"no Python on {self.host}; provisioning the embeddable runtime "
-                  f"(one-time ~10MB download)…"))
+                  f"(one-time: CPython {_WIN_EMBED_VER} embeddable, cached)…"))
         rc, out, err = self._run(_WIN_PROVISION_EMBED)
         out = (out or "").strip()
         if rc != 0 or not out or out.startswith("ERR:"):
@@ -7075,7 +7075,19 @@ class RemoteWorkspace:
         if not (ver.strip() and "\\" in ver):
             print(yellow("  provisioned python.exe did not run; falling back to error."))
             return None
-        print(dim(f"  provisioned embeddable Python at {out}"))
+        # Report the ACTUAL on-disk footprint (no hardcoded transfer size): measure the
+        # provisioned dir. Best-effort - a failure just drops the size, never blocks.
+        size = ""
+        try:
+            _, mb, _ = self._run(
+                "$d = Split-Path -Parent '" + out + "'; "
+                "$b = (Get-ChildItem -Recurse -File $d | Measure-Object -Sum Length).Sum; "
+                "[Console]::Out.Write([math]::Round($b/1MB,1))")
+            if mb.strip():
+                size = f" ({mb.strip()} MB on disk)"
+        except Exception:
+            pass
+        print(dim(f"  provisioned embeddable Python at {out}{size}"))
         return quoted
 
     def _check_windows_python(self):
