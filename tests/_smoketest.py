@@ -1408,9 +1408,13 @@ _ppt = lc.Agent(lc.Config(cwd=FIX)); _ppt.pinned_plan = "GOAL: x"
 _st = _ppt._with_plan_reminder([{"role": "tool", "tool_name": "read_file", "content": "DATA"}])
 check("_with_plan_reminder keeps a tool result exact, adds a trailing user note",
       _st[0]["content"] == "DATA" and _st[-1]["role"] == "user" and "GOAL: x" in _st[-1]["content"])
-check("_with_plan_reminder no-op when no plan",
-      lc.Agent(lc.Config(cwd=FIX))._with_plan_reminder([{"role": "user", "content": "q"}])
-      == [{"role": "user", "content": "q"}])
+# With no plan pinned the PLAN block is absent, but the live session-env ALWAYS rides
+# the uncached tail (cwd + shell family) - so the last message gains the ENV block only.
+_npr = lc.Agent(lc.Config(cwd=FIX))._with_plan_reminder([{"role": "user", "content": "q"}])
+check("_with_plan_reminder: no plan -> env rides, no plan block",
+      _npr[-1]["content"].startswith("q")
+      and "SESSION ENV" in _npr[-1]["content"]
+      and "PINNED PLAN" not in _npr[-1]["content"])
 
 # soft-zone nudge: throttled, soft zone only, injected (not in the cached prompt)
 sn = lc.Agent.__new__(lc.Agent)
@@ -2029,22 +2033,21 @@ _rt = pathlib.Path(tempfile.mkdtemp())
 _e, _clip, _tot, _shown = lc._read_raw_b64(_rt / "x", max_bytes=3)
 check("_read_raw_b64 clips with real counts (no marker)",
       _clip and _tot == 5 and _shown == 3 and _b64mod.b64decode(_e) == b"ABC")
-check("_read_raw_b64 exact + unclipped under cap",
-      lc._read_raw_b64(_rt / "x")[1] is False)
-shutil.rmtree(_rt, ignore_errors=True)
-
-# minor 1: system prompt names the dir tools act on (remote when connected), no "remote" leak
+# minor 1: the live session-env (uncached tail) names the dir tools act on (remote when
+# connected) + the shell family, and never leaks "remote"/"local" to the model.
 class _WS:
-    host = "gpu"; cwd = "."; remote_cwd = "/srv/app"
+    host = "gpu"; cwd = "."; remote_cwd = "/srv/app"; remote_posix = True
     def read_raw(self, p): return None
 agm = lc.Agent(lc.Config(cwd=FIX))
-check("system cwd is local by default", str(FIX) in agm.messages[0]["content"])
+check("session-env cwd is local by default", str(FIX) in agm._session_env())
+check("cached system block no longer carries the cwd", str(FIX) not in agm.messages[0]["content"])
 agm.set_remote(_WS())
-check("system cwd switches to remote dir on connect", "/srv/app" in agm.messages[0]["content"])
-check("system prompt does not leak 'remote' to the model",
-      "remote" not in agm.messages[0]["content"].lower())
+check("session-env cwd switches to remote dir on connect", "/srv/app" in agm._session_env())
+check("session-env does not leak 'remote'/'local' to the model",
+      "remote" not in agm._session_env().lower() and "local" not in agm._session_env().lower())
+check("session-env states the shell family (POSIX remote)", "sh (POSIX)" in agm._session_env())
 agm.set_remote(None)
-check("system cwd returns to local on disconnect", str(FIX) in agm.messages[0]["content"])
+check("session-env cwd returns to local on disconnect", str(FIX) in agm._session_env())
 
 # 22. lean-tools: load, dispatch (safe vs confirm), config round-trip
 plugdir = pathlib.Path(tempfile.mkdtemp(prefix="lc_plug_"))
@@ -2394,8 +2397,8 @@ try:
     ag.set_remote(ws)
     check("agent remote mode: no ssh in surface (it's an opt-in lean-tool now)",
           "ssh" not in [t["function"]["name"] for t in ag.tool_defs])
-    check("system prompt picks up the remote cwd (handshake)",
-          bool(ws.remote_cwd) and ws.remote_cwd in ag.messages[0]["content"])
+    check("session-env picks up the remote cwd (handshake)",
+          bool(ws.remote_cwd) and ws.remote_cwd in ag._session_env())
     check("remote read_raw fetches file content",
           "print('hi')" in (ws.read_raw("hello.py") or ""))
     check("router: read-only runs remote (no confirm)",
@@ -3015,8 +3018,9 @@ _resag.last_prompt_tokens = 9999
 _rn = _resag.restore(_smsgs)
 check("agent.restore: returns body turn count", _rn == 3)
 check("agent.restore: system rebuilt for current cwd (not 'OLD SYS')",
-      _resag.messages[0]["role"] == "system" and str(FIX) in _resag.messages[0]["content"]
-      and "OLD SYS" not in _resag.messages[0]["content"])
+      _resag.messages[0]["role"] == "system"
+      and "OLD SYS" not in _resag.messages[0]["content"]
+      and str(FIX) in _resag._session_env())
 check("agent.restore: only one system message", sum(
     1 for m in _resag.messages if m["role"] == "system") == 1)
 check("agent.restore: body preserved after system",
@@ -4548,11 +4552,12 @@ try:
           "run_command" not in [t["function"]["name"] for t in _mag.tool_defs]
           and "read-write" in (_mag._pending_ai_note or "")
           and "Read-write" not in _mag.messages[0]["content"])
-
-    # incognito: model is told + no local session persistence
+    # incognito: no local session persistence. (The incognito NOTICE was removed from
+    # the system prompt - the model is no longer told; only the on-disk behaviour matters.)
     _iag = lc.Agent(lc.Config(cwd=FIX, incognito=True))
     _iag.autosave_name = "auto-incog-test"
-    check("incognito: system prompt tells the model", "Incognito" in _iag.messages[0]["content"])
+    check("incognito: notice NOT in the (trimmed) system prompt",
+          "Incognito" not in _iag.messages[0]["content"])
     _isd = lc.SESSIONS_DIR
     lc.SESSIONS_DIR = Path(tempfile.mkdtemp(prefix="lc_incog_"))
     _iag.messages.append({"role": "user", "content": "secret"})

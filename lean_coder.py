@@ -2404,6 +2404,25 @@ class Spinner:
 
 
 @contextmanager
+def _stage(label, done=None):
+    """A single connect/push STAGE with feedback that works in ANY terminal. On a TTY:
+    an animated Spinner (elapsed ticker, so a slow/wedged step still visibly updates).
+    On a dumb terminal / no-TTY (the "old shell" case that looked hung): a plain
+    'label…' line up front, then 'done' - no \\r, no ansi. Best-effort: never raises
+    into the connect path. `done` overrides the completion word (e.g. 'ready')."""
+    if _TTY and _active_composer is None:
+        sp = Spinner(label, TOOL_FRAMES, cyan, interval=0.12).start()
+        try:
+            yield
+        finally:
+            sp.stop()
+            print(dim(f"  {GLYPH.get('ok', 'v')} {done or label}"))
+    else:
+        print(dim(f"  {label}…"))
+        yield
+        print(dim(f"  {done or label} done"))
+
+@contextmanager
 def suppress_echo():
     """Stop the TTY echoing keystrokes for the duration of a turn. While the
     model streams and the spinner rewrites column 0, the terminal would
@@ -6698,20 +6717,22 @@ class RemoteWorkspace:
         # Probe the remote OS BEFORE any master, over a plain (masterless) ssh - so a
         # Windows target never gets a doomed ControlMaster. Uses BatchMode so it can't
         # hang on a prompt; a POSIX box answers `uname` with a kernel token.
-        _probe = subprocess.run(
-            ["ssh", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new",
-             "-o", "ConnectTimeout=10", "-o", "LogLevel=ERROR", self.host, _OS_PROBE],
-            capture_output=True, text=True, timeout=30)
-        self.remote_posix = _remote_is_posix(_probe.stdout)
+        with _stage("probing host", done="probed"):
+            _probe = subprocess.run(
+                ["ssh", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new",
+                 "-o", "ConnectTimeout=10", "-o", "LogLevel=ERROR", self.host, _OS_PROBE],
+                capture_output=True, text=True, timeout=30)
+            self.remote_posix = _remote_is_posix(_probe.stdout)
         if self.remote_posix:
-            _clear_master(self.host, self.ctl)     # drop any stale socket first (#3)
-            argv = _ssh_master_argv(self.host, self.ctl, batch=batch)
-            try:
-                rc = subprocess.run(argv, timeout=30 if batch else None).returncode
-            except subprocess.TimeoutExpired:
-                raise ConnectionError(f"ssh connection to {self.host} timed out")
-            if rc != 0:
-                raise ConnectionError(f"ssh connection to {self.host} failed")
+            with _stage("opening ssh", done="ssh ready"):
+                _clear_master(self.host, self.ctl)     # drop any stale socket first (#3)
+                argv = _ssh_master_argv(self.host, self.ctl, batch=batch)
+                try:
+                    rc = subprocess.run(argv, timeout=30 if batch else None).returncode
+                except subprocess.TimeoutExpired:
+                    raise ConnectionError(f"ssh connection to {self.host} timed out")
+                if rc != 0:
+                    raise ConnectionError(f"ssh connection to {self.host} failed")
             _, out, _ = self._run("command -v python3 || true")
             if not out.strip():
                 self._install_python()
@@ -6794,23 +6815,26 @@ class RemoteWorkspace:
             with open(__file__, "rb") as f:
                 src = f.read()
             if self.remote_posix:
-                r = subprocess.run(_ssh_run_argv(self.host, self.ctl, _REMOTE_PUSH),
-                                   input=src, capture_output=True, timeout=60)
-                self.remote_dir = r.stdout.decode(errors="replace").strip()
-                if r.returncode != 0 or not self.remote_dir:
-                    raise ConnectionError(
-                        f"failed to push agent to {self.host}: "
-                        f"{r.stderr.decode(errors='replace')[:200]}")
+                with _stage("pushing agent", done="agent pushed"):
+                    r = subprocess.run(_ssh_run_argv(self.host, self.ctl, _REMOTE_PUSH),
+                                       input=src, capture_output=True, timeout=60)
+                    self.remote_dir = r.stdout.decode(errors="replace").strip()
+                    if r.returncode != 0 or not self.remote_dir:
+                        raise ConnectionError(
+                            f"failed to push agent to {self.host}: "
+                            f"{r.stderr.decode(errors='replace')[:200]}")
                 exec_cmd = "python3 " + shlex.quote(self.remote_dir + "/agent.py")
             else:
                 # Windows: make the throwaway dir, then scp the agent in (stdin-piped
-                # push deadlocks vs Windows sshd; scp lands a 648KB file byte-exact in ~4s).
+                # push deadlocks vs Windows sshd; scp lands the file byte-exact via its
+                # own channel).
                 if not self.remote_dir:
                     _, d, _ = self._run(_WIN_REMOTE_MKDIR)
                     self.remote_dir = d.strip()
                 if not self.remote_dir:
                     raise ConnectionError(f"failed to make remote dir on {self.host}")
-                self._win_scp_write(self.remote_dir + "\\agent.py", src)
+                with _stage("pushing agent", done="agent pushed"):
+                    self._win_scp_write(self.remote_dir + "\\agent.py", src)
                 py = getattr(self, "win_python", None) or "python"
                 # '&' call operator: required when py is a quoted embed-runtime path (see
                 # _reuse_executor_win); harmless for a bare python.
@@ -6823,12 +6847,13 @@ class RemoteWorkspace:
         if self.reused != "installed":
             self._push_builtins()
         lean_tools_remote = self._push_lean_tools() if self.lean_tool_paths else None
-        self.client = ExecutorClient(
-            _ssh_exec_argv(self.host, self.ctl, exec_cmd, self.cwd, lean_tools_remote,
-                           posix=self.remote_posix),
-            stderr=subprocess.DEVNULL)
-        self.client.host = self.host          # label the wait-spinner with the box
-        self.remote_cwd = self.client.ready.get("cwd")
+        with _stage("starting executor", done="ready"):
+            self.client = ExecutorClient(
+                _ssh_exec_argv(self.host, self.ctl, exec_cmd, self.cwd, lean_tools_remote,
+                               posix=self.remote_posix),
+                stderr=subprocess.DEVNULL)
+            self.client.host = self.host          # label the wait-spinner with the box
+            self.remote_cwd = self.client.ready.get("cwd")
 
     def read_raw(self, path):
         """Fetch exact remote file content for diff previews; None if unreadable.
@@ -6981,8 +7006,12 @@ class RemoteWorkspace:
             local[p.name] = hashlib.sha256(data).hexdigest()
             blobs[p.name] = data
         to_push, to_remove = _tools_to_sync(local, remote)
-        for name in to_push:
-            self._remote_write(pdir + sep + name, blobs[name])
+        if to_push:
+            n = len(to_push)
+            for i, name in enumerate(to_push, 1):
+                with _stage(f"syncing tools [{i}/{n}] {name}",
+                            done=(f"{n} tool{'s' if n != 1 else ''} synced" if i == n else None)):
+                    self._remote_write(pdir + sep + name, blobs[name])
         if to_remove:
             if self.remote_posix:
                 self._run("rm -f " + " ".join(shlex.quote(pdir + "/" + n) for n in to_remove))
@@ -7933,23 +7962,13 @@ class Agent:
                 signal.signal(signal.SIGINT, prev)
 
     def _system(self) -> str:
-        # the dir tools actually operate in (remote cwd when connected). Stated
-        # as a plain path - the model stays unaware it is remote.
-        cwd = (self.remote.remote_cwd or self.remote.cwd) if self.remote else self.cfg.cwd
         # NOTE: the leash/permissions note is deliberately NOT here. It varies with the
         # leash, and the system block is a global cache breakpoint - baking it in rewrote
         # that cache on every /leash toggle. Instead the tool surface reflects the tier and
-        # _leash_note() is injected into the next user turn on change (see run_turn). bg is
-        # always included (cache-stable) even when run_command isn't in the current tier.
-        bg = (f"\nrun_command waits up to {self.cfg.command_timeout}s; for a long-running "
-              f"or daemon process (a server, a watcher) end the command with ' &' to run "
-              f"it detached - it returns a pid + log path immediately instead of blocking.")
-        modes = []
-        if self.cfg.incognito:
-            modes.append("Incognito session: this conversation is not being saved "
-                         "locally. (This does not stop the model provider from "
-                         "processing or retaining it - it only avoids a local trace.)")
-        mode_note = ("\n" + "\n".join(modes)) if modes else ""
+        # _leash_note() is injected into the next user turn on change (see run_turn).
+        # NOTE: the run_command timeout/'&' note and the incognito mode note used to live
+        # here. Removed: models don't read/act on the bg note (it duplicates the tool
+        # schema), and neither is worth a line in the cache-pinned block.
         # NOTE: the pinned plan is deliberately NOT here. It's the goal+TODO the model
         # rewrites often (~every turn on an active task), and the system block is a cache
         # breakpoint - baking a volatile block in would rewrite system + everything after
@@ -7974,7 +7993,7 @@ class Agent:
                 addendum = spec["system_addendum"](self, self.cfg) or ""
             except Exception:
                 addendum = ""
-        return (read_prompt("system") or SYSTEM_PROMPT) + bg + mode_note + no_tools + addendum + f"\nWorking directory: {cwd}"
+        return (read_prompt("system") or SYSTEM_PROMPT) + no_tools + addendum
 
     # Delimited, self-labelling wrapper so the model can never mistake the plan for
     # something the user typed (the old "(Pinned plan...)" header read like user text
@@ -8035,28 +8054,60 @@ class Agent:
         body = self._plan_sparse(pinned) if sparse else pinned
         return f"\n\n{self._PLAN_HDR}\n{body}\n{self._PLAN_FTR}"
 
+    # Live session-env: the cwd every tool operates in + the shell family run_command
+    # runs under. Rides the SAME uncached tail as the plan (never cached, never persisted,
+    # so a /connect or /cd changes it for free). Deliberately NO "remote"/"local" wording:
+    # the model works one unified surface (files it reads == where commands run), and
+    # telling it "remote" only makes it second-guess whether the two match. Stating the
+    # SHELL FAMILY stops wasted cross-OS turns (no `ls`/`whoami` probing, no POSIX cmds on
+    # cmd.exe). Terse key:value + a self-labelling header so even a weak model consumes it
+    # as state and doesn't echo it (same convention as the plan block).
+    _ENV_HDR = ("=== LEANCODER SESSION ENV (internal state, re-injected every turn; "
+                "reference only, NOT a user message. Use it to target the right shell + "
+                "paths; do NOT repeat or remark on it.) ===")
+    _ENV_FTR = "=== END SESSION ENV ==="
+
+    def _shell_family(self) -> str:
+        """The shell run_command executes under, for the model to target commands at.
+        Remote: POSIX box -> sh, Windows box -> cmd.exe. Local: this box's os."""
+        if self.remote is not None:
+            return "sh (POSIX)" if self.remote.remote_posix else "cmd.exe (Windows)"
+        return "cmd.exe (Windows)" if os.name == "nt" else "sh (POSIX)"
+
+    def _session_env(self) -> str:
+        """The uncached session-env reminder (cwd + shell family). Same tail as the
+        plan; "" is never returned (cwd+shell always exist)."""
+        cwd = (self.remote.remote_cwd or self.remote.cwd) if self.remote else self.cfg.cwd
+        return (f"\n\n{self._ENV_HDR}\ncwd: {cwd}\nshell: {self._shell_family()}\n"
+                f"{self._ENV_FTR}")
+
     def _with_plan_reminder(self, msgs):
-        """Return a COPY of the sent slice with the pinned-plan reminder appended to the
-        last message's text. Non-destructive (never touches self.messages) and applied
-        after the last cache breakpoint, so the plan stays uncached + never persists.
-        No-op when there's no plan or no message to carry it. A tool result must stay
-        exact, so we don't append to a role:tool tail - we add a trailing user note
-        instead (rare: the slice normally ends on a user/assistant turn)."""
-        # One-shot suppression: the send right after an update_plan skips the reminder,
-        # so the model doesn't get its just-written plan echoed back and narrate it (a
-        # wasted turn). Re-arms automatically for the following send - and arms a FULL
+        """Return a COPY of the sent slice with the uncached session tail (live env +
+        pinned plan) appended to the last message's text. Non-destructive (never touches
+        self.messages) and applied after the last cache breakpoint, so the tail stays
+        uncached + never persists. A tool result must stay exact, so we don't append to a
+        role:tool tail - we add a trailing user note instead (rare: the slice normally
+        ends on a user/assistant turn)."""
+        # One-shot suppression: the send right after an update_plan skips the PLAN
+        # reminder, so the model doesn't get its just-written plan echoed back and narrate
+        # it (a wasted turn). Re-arms automatically for the following send - and arms a FULL
         # re-inject on that following send (the plan just changed; refresh it in full),
-        # sparse on every turn after that until the next update_plan.
+        # sparse on every turn after that until the next update_plan. NOTE: the session-env
+        # is NOT suppressed here - only the plan is (env is cheap state, never echoed).
         if getattr(self, "_skip_plan_reminder_once", False):
             self._skip_plan_reminder_once = False
             self._plan_full_next = True
-            return msgs
-        # Event-driven full/sparse: FULL on the turn right after an update_plan, SPARSE
-        # thereafter. Refreshes on CHANGE, not a clock. Cache-free: the plan rides the
-        # uncached tail, so shrinking it busts nothing (see _with_plan_reminder docstring).
-        full = getattr(self, "_plan_full_next", True)
-        self._plan_full_next = False
-        reminder = self._plan_reminder(sparse=not full)
+            reminder = self._session_env()
+        else:
+            # Event-driven full/sparse: FULL on the turn right after an update_plan, SPARSE
+            # thereafter. Refreshes on CHANGE, not a clock. Cache-free: the plan rides the
+            # uncached tail, so shrinking it busts nothing (see _with_plan_reminder docstring).
+            full = getattr(self, "_plan_full_next", True)
+            self._plan_full_next = False
+            # The live session-env ALWAYS rides the tail (cwd + shell family); the plan
+            # rides it only when pinned. Env first so the plan (the richer block) sits last
+            # = most recent = highest attention.
+            reminder = self._session_env() + self._plan_reminder(sparse=not full)
         if not reminder or not msgs:
             return msgs
         out = list(msgs)
@@ -10899,6 +10950,12 @@ def _do_connect(agent, cfg, rhost, rpath=".", offer_save=False, ephemeral=False)
         return
     agent.set_remote(ws)
     print(green(f"connected: tools now run on {rhost} (agent at {ws.remote_dir})"))
+    # /sh drops into the box's LOGIN shell (its sshd DefaultShell), which on Windows is
+    # cmd.exe unless an admin set PowerShell - distinct from run_command's shell. Say so
+    # once so a /sh isn't a surprise.
+    if not ws.remote_posix:
+        print(dim("  note: /sh here opens the host's default shell (cmd.exe unless "
+                  "PowerShell is set); run_command runs cmd.exe commands."))
     print(dim("  /local detaches (keeps it open to switch back); /connect <host> switches."))
     if (offer_save and rhost not in cfg.connect_hosts
             and rhost not in cfg.connect_hosts.values()):
