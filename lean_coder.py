@@ -3596,6 +3596,17 @@ class Config:
                                      # truncated; older turns are simply dropped until
                                      # summarizing compaction backfills them. See
                                      # docs/cost-reduction-roadmap.md.
+    window_tokens: int = 0           # bounded context window by TOKENS (the small-model
+                                     # lever): send at most ~N tokens of a send, measured
+                                     # with the calibrated meter (messages_tokens). System +
+                                     # tool schemas + the env/plan tail are ALWAYS kept and
+                                     # counted first; the conversation tail is then walked
+                                     # back whole-turn-by-whole-turn until adding the next
+                                     # older turn would exceed the budget, cut at a clean
+                                     # user boundary (a tool result is never orphaned). 0 =
+                                     # off. Takes precedence over window_messages when set,
+                                     # so a 4k-context model can pin window_tokens=4000 and
+                                     # never overflow. Non-destructive (shapes the send only).
     auto_handover: bool = True       # self-managing context: when on, the model is shown a
                                      # ctx-budget line and may hand over at a natural break in
                                      # the soft zone; a hard threshold force-hands-over (the
@@ -3870,7 +3881,7 @@ _PERSISTED_SCALAR_KEYS = (
     "worker_max_concurrent", "worker_idle_timeout", "worker_max_iterations", "editor",
     "approval", "confirm_reads", "auto_reconnect", "statusline", "statusline_every",
     "statusline_iter", "auto_evict", "auto_evict_keep",
-    "window_messages", "auto_handover", "handover_soft", "handover_hard",
+    "window_messages", "window_tokens", "auto_handover", "handover_soft", "handover_hard",
     "handover_emergency", "handover_min_interval", "autostart_after_handover",
     "auto_compact_interval", "auto_compact_hysteresis", "auto_compact_keep",
     "wake_on_bg_finish",
@@ -4025,6 +4036,7 @@ def load_config(args) -> Config:
     if getattr(args, "keep_alive", None) is not None: cfg.keep_alive = args.keep_alive
     if getattr(args, "auto_evict", None): cfg.auto_evict = True
     if getattr(args, "window_messages", None) is not None: cfg.window_messages = args.window_messages
+    if getattr(args, "window_tokens", None) is not None: cfg.window_tokens = args.window_tokens
     if args.temperature is not None:    cfg.temperature = args.temperature
     if args.top_p is not None:          cfg.top_p = args.top_p
     if args.top_k is not None:          cfg.top_k = args.top_k
@@ -4134,6 +4146,8 @@ def save_config(cfg: Config, quiet: bool = False):
         lines.append(f"max_iterations = {cfg.max_iterations}")
     if cfg.window_messages != 0:              # default is off (0) now
         lines.append(f"window_messages = {cfg.window_messages}")
+    if cfg.window_tokens != 0:                # default is off (0)
+        lines.append(f"window_tokens = {cfg.window_tokens}")
     if not cfg.auto_handover:
         lines.append("auto_handover = false")
     if cfg.handover_soft != 0.70:
@@ -8411,12 +8425,84 @@ class Agent:
         already within the bound, returns `msgs` unchanged. If no clean boundary
         falls within range, returns `msgs` unchanged (skip windowing this round
         rather than risk an orphaned/!user-leading send). See
-        docs/cost-reduction-roadmap.md."""
+        docs/cost-reduction-roadmap.md.
+
+        A TOKEN budget (cfg.window_tokens > 0) takes precedence over the message-count
+        bound: it keeps as many whole recent turns as fit under the token ceiling, so a
+        small-context model can pin a hard send size. See _window_by_tokens."""
+        tok_budget = getattr(getattr(self, "cfg", None), "window_tokens", 0) or 0
+        if tok_budget > 0:
+            return self._window_by_tokens(msgs, tok_budget)
         start = self._keep_tail_start(msgs, max_msgs)
         if start is None:
             return msgs
         head = msgs[:1] if msgs and msgs[0].get("role") == "system" else []
         return head + msgs[start:]
+
+    def _window_by_tokens(self, msgs, budget):
+        """System message + the largest clean-boundary TAIL of `msgs` that keeps the whole
+        send at/under `budget` CALIBRATED tokens (messages_tokens - the same fixed meter the
+        ctx line/handover use, so the bound matches reality). ALWAYS kept + counted first:
+        the system message, the tool schemas, and a reserve for the env/plan tail that
+        _with_plan_reminder appends AFTER this (so the real send never blows past budget).
+        The conversation tail is then grown one WHOLE turn at a time (each user boundary)
+        from newest back until the next older turn wouldn't fit, cut at that user boundary
+        so a tool result is never orphaned. Non-destructive. Returns `msgs` unchanged when
+        it already fits, or when even the last turn alone can't fit (we never send an empty
+        or orphaned slice - overflow is then the model/provider's own truncation to handle,
+        exactly as with no window)."""
+        head = msgs[:1] if msgs and msgs[0].get("role") == "system" else []
+        body = msgs[len(head):]
+        if not body:
+            return msgs
+        # Fixed overhead that is ALWAYS on the wire: system + tools + the env/plan tail
+        # reserve. Count them against the budget up front so the conversation only gets
+        # what's left. messages_tokens is the calibrated meter (never the raw char count).
+        reserve = head + [{"role": "user", "content": self._reminder_probe()}]
+        overhead = messages_tokens(reserve, self.tool_defs)
+        remaining = budget - overhead
+        if remaining <= 0:
+            # Budget can't even hold the fixed surface; keep the last turn so we still send
+            # something coherent (provider truncates if it must) rather than an empty body.
+            start = self._first_user_from(body, len(body) - 1)
+            return (head + body[start:]) if start is not None else msgs
+        # Grow the tail newest-first, snapping each candidate start to a user boundary, and
+        # keep the largest slice that fits. Walk user boundaries from the end backwards.
+        best = None
+        for i in range(len(body) - 1, -1, -1):
+            if body[i].get("role") != "user":
+                continue
+            cand = body[i:]
+            if messages_tokens(cand, None) <= remaining:
+                best = i
+            else:
+                break                          # older turns only get bigger; stop
+        if best is None:
+            # Not even the last turn fits the remaining budget: send the last turn anyway
+            # (coherent over empty); the provider handles the overflow like the no-window case.
+            start = self._first_user_from(body, len(body) - 1)
+            return (head + body[start:]) if start is not None else msgs
+        if best == 0:
+            return msgs                         # whole history fits -> unchanged
+        return head + body[best:]
+
+    def _first_user_from(self, body, from_idx):
+        """Index of the nearest user message at or before `from_idx` in `body` (so a slice
+        starts on a clean turn), or None if there is none."""
+        for i in range(min(from_idx, len(body) - 1), -1, -1):
+            if body[i].get("role") == "user":
+                return i
+        return None
+
+    def _reminder_probe(self):
+        """A worst-case-ish stand-in for the env/plan tail _with_plan_reminder appends after
+        windowing, so _window_by_tokens can RESERVE room for it. Uses the live env + a FULL
+        (non-sparse) plan reminder - the largest form - so the reserve never under-counts.
+        Best-effort: any failure returns '' (reserve just 0, still safe-ish)."""
+        try:
+            return self._session_env() + self._plan_reminder(sparse=False)
+        except Exception:
+            return ""
 
     def _keep_tail_start(self, msgs, max_msgs):
         """Index into `msgs` where the kept tail begins: the first user-message
@@ -9980,7 +10066,8 @@ _SETTINGS_FIELDS = [
     ("statusline_every", "reprint status every N prompts (1 = every turn, 0 = only on change)", "int"),
     ("statusline_iter", "reprint status every N model iterations within a long turn (0 = off)", "int"),
     # --- context management (send-window + auto-handover) ---
-    ("window_messages", "send-window size (0 = off, full history)", "int"),
+    ("window_messages", "send-window size in messages (0 = off, full history)", "int"),
+    ("window_tokens", "send-window HARD cap in tokens (0 = off; wins over window_messages)", "int"),
     ("auto_handover", "auto-handover (self-managing context)", "bool"),
     ("handover_soft", "handover soft-zone start (fraction of ctx)", "float"),
     ("handover_hard", "handover hard threshold (fraction of ctx)", "float"),
@@ -10349,7 +10436,9 @@ def _status_rows(agent, cfg):
         p.append(f"max {mi} rounds" if mi else "no round cap")
     if cfg.confirm_reads:
         p.append("ask-read")
-    if cfg.window_messages > 0:               # only show when on - don't nag with 'window off'
+    if cfg.window_tokens > 0:                  # token cap wins; show it when on
+        p.append(f"window {cfg.window_tokens}tok")
+    elif cfg.window_messages > 0:             # only show when on - don't nag with 'window off'
         p.append(f"window {cfg.window_messages}")
     c = cfg.handover_for()
     p.append(f"handover {c['hard'] * 100:.0f}%" if c.get("auto") else "handover off")
@@ -13510,6 +13599,8 @@ def main():
                     help="continuously stub acted-on tool results to cut tokens sent (see docs)")
     ap.add_argument("--window-messages", type=int, dest="window_messages",
                     help="send only the last N messages per request (default 30; 0 = unbounded)")
+    ap.add_argument("--window-tokens", type=int, dest="window_tokens",
+                    help="hard-cap each send to ~N calibrated tokens (0 = off; wins over --window-messages)")
     ap.add_argument("--cwd", help="project directory (default: current dir)")
     ap.add_argument("-r", "--resume", metavar="NAME",
                     help="resume a saved session by name (see /load)")
