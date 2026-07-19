@@ -8243,6 +8243,39 @@ class Agent:
                 break
         return parsed, missing, attempt, turn_text
 
+    def _finish_handover(self, parsed, *, summary_prefix, tail=None,
+                         autostart=False, stamp_clock=False):
+        """Shared epilogue for handover() + auto_handover(): once the marked blocks
+        are parsed, install the pinned plan, rebuild history as [system, summary(+tail)],
+        set the stable cache boundary, and reset the per-turn counters. The two callers
+        differ only in the four knobs:
+          - summary_prefix: how the compacted summary is introduced;
+          - tail: recent verbatim messages kept AFTER the summary (auto only; None = a
+            clean [system, summary] cut for an operator-driven /handover);
+          - autostart: queue the model's next-step self-prompt (auto only - nobody's
+            watching to type it);
+          - stamp_clock: bump the anti-thrash loop guard (auto only).
+        Returns the handover text block."""
+        block = parsed["handover"]
+        if parsed["plan"]:
+            self.pinned_plan = parsed["plan"]   # survives handover (uncached send-time reminder)
+        self.messages = [
+            {"role": "system", "content": self._system()},
+            {"role": "user", "content": summary_prefix + block, "cache_boundary": True},
+        ] + (tail or [])
+        # Cache-boundary signal: after a handover the prefix [system][summary] is STABLE,
+        # so a client with a spare breakpoint can pin it and re-read the prefix at ~0.1x.
+        # 2 = system + the one compacted-summary user message.
+        self._handover_boundary = 2
+        self.last_prompt_tokens = None
+        self.tools.changed_files.clear()
+        if stamp_clock:
+            self._last_compact_ts = time.time()
+        if autostart and parsed["next"] and self.cfg.handover_for()["autostart"]:
+            self._autostart_pending = parsed["next"]
+        self.handovers += 1
+        return block
+
     def handover(self):
         """Agentic /handover: the model gets a real (tool-capable) turn to update +
         commit any durable docs, then write its future-self handover as marked text
@@ -8254,27 +8287,14 @@ class Agent:
             return None
         instr = read_prompt("handover") or HANDOVER_INSTR
         parsed, missing, attempt, _turn_text = self._solicit_handover(instr)
-        block = parsed["handover"]
-        if not block:        # no usable handover (truly empty) -> leave history untouched
+        if not parsed["handover"]:   # no usable handover (truly empty) -> leave history untouched
             return None
         if parsed["tier"] >= 3 or missing:
             self._log_activity("handover",
                                f"degraded parse (tier {parsed['tier']}, missing {missing})",
                                "model dropped marker discipline; salvaged via tolerant parser")
-        plan = parsed["plan"]
-        if plan:
-            self.pinned_plan = plan          # survives the handover (uncached send-time reminder)
-        self.messages = [
-            {"role": "system", "content": self._system()},
-            {"role": "user",
-             "content": "Session handover (prior context summarized):\n" + block,
-             "cache_boundary": True},
-        ]
-        self._handover_boundary = 2      # stable prefix (system + summary) - see auto_handover()
-        self.last_prompt_tokens = None
-        self.tools.changed_files.clear()
-        self.handovers += 1
-        return block
+        return self._finish_handover(
+            parsed, summary_prefix="Session handover (prior context summarized):\n")
 
     def _update_plan(self, plan: str):
         """The update_plan tool body: replace the pinned GOAL + TODO and refresh the
@@ -8368,32 +8388,11 @@ class Agent:
         # accepted that tier - so a strict _extract_* here would silently throw away the
         # salvage for exactly the models the tolerant parser exists to rescue, dropping
         # both the pinned plan and the autostart self-prompt. Same source as handover().
-        selfprompt = parsed["next"]
-        plan = parsed["plan"]
-        if plan:
-            self.pinned_plan = plan          # survives the handover (uncached send-time reminder)
-        summary_msg = {"role": "user",
-                       "content": "Earlier context (compacted summary):\n" + block,
-                       "cache_boundary": True}
-        self.messages = [
-            {"role": "system", "content": self._system()},
-            summary_msg,
-        ] + tail
-        # Cache-boundary signal for the provider client: after a handover the prefix
-        # [system][summary] is STABLE (it won't change turn to turn), so a client with a
-        # spare cache breakpoint can pin it there and re-read the whole prefix at ~0.1x.
-        # The signal rides the message itself ("cache_boundary": True) so it survives
-        # windowing/repair as long as the message is sent; the client decides whether/how
-        # to use it (this stays gitignored-provider territory). We also publish the index
-        # for /info. 2 = system + the one compacted-summary user message.
-        self._handover_boundary = 2
-        self.last_prompt_tokens = None
-        self.tools.changed_files.clear()
-        self._last_compact_ts = time.time()
-        if selfprompt and self.cfg.handover_for()["autostart"]:
-            self._autostart_pending = selfprompt
-        self.handovers += 1
-        return block
+        # Auto differs from /handover only in the four knobs below: keep the recent
+        # verbatim tail, queue the next-step self-prompt, and stamp the loop guard.
+        return self._finish_handover(
+            parsed, summary_prefix="Earlier context (compacted summary):\n",
+            tail=tail, autostart=True, stamp_clock=True)
 
     def _dispatch(self, name: str, args: dict) -> str:
         if name.startswith(MCP_NS):
