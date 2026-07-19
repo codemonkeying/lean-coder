@@ -631,6 +631,41 @@ check("lease: _bg_clean_sidecars removes the .lease too",
       not Path(_llog + ".lease").exists() and not Path(_llog + ".exit").exists())
 lc._bg_save([])
 
+# AFK lease-bump regression (the "worker died with no output" bug, commit 93d489b):
+# a parent idle at the prompt must keep a leased WORKER alive via bg_wake_turn's idle
+# tick, not just per-turn run_turn. Guards the exact seam that once had no test.
+lc._bg_save([])
+_afklog = str(lc.CONFIG_DIR / "bg" / "afk-worker.log")
+Path(_afklog).parent.mkdir(parents=True, exist_ok=True)
+Path(_afklog).write_text("")
+_afk_lease = Path(_afklog + ".lease"); _afk_lease.write_text("")
+_afk_old = _t_bg.time() - 100                                # 100s-stale lease (unattended)
+_os_bg.utime(_afk_lease, (_afk_old, _afk_old))
+lc._bg_register(424242, "fake worker", _afklog, kind="worker", idle_timeout=1800)
+_afk_ag = lc.Agent.__new__(lc.Agent)
+_afk_ag.cfg = lc.Config(model="m"); _afk_ag.remote = None; _afk_ag._bg_announced = set()
+# 1. a worker-only session arms the idle-wake path (the root-cause miss)
+check("afk lease: _has_bg_optins arms for a worker-only session",
+      lc.Agent._has_bg_optins(_afk_ag) is True)
+# 2. bg_wake_turn bumps the stale lease -> the AFK worker survives (no exit 137)
+_afk_before = _afk_lease.stat().st_mtime
+lc.Agent.bg_wake_turn(_afk_ag)
+_afk_after = _afk_lease.stat().st_mtime
+check("afk lease: bg_wake_turn bumps a stale worker lease (survives AFK)",
+      _afk_after > _afk_before)
+# 3. throttle: a second immediate call does NOT re-bump (~free per idle tick)
+_afk_m2 = _afk_lease.stat().st_mtime
+lc.Agent.bg_wake_turn(_afk_ag)
+check("afk lease: bump throttled within 30s", _afk_lease.stat().st_mtime == _afk_m2)
+# 4. past the throttle window it bumps again (steady-state keep-alive)
+_afk_ag._last_idle_lease_bump = _t_bg.monotonic() - 31
+_t_bg.sleep(0.02)
+lc.Agent.bg_wake_turn(_afk_ag)
+check("afk lease: bump resumes after the 30s throttle window",
+      _afk_lease.stat().st_mtime > _afk_m2)
+lc._bg_clean_sidecars({"log": _afklog})
+lc._bg_save([])
+
 # 10d. cross-platform bg-runner (run_bg_child / --bg-run). This is the pure-Python
 # twin of the POSIX shell wrapper used on Windows (no /bin/sh). Assert it reproduces
 # the sidecar contract: plain exit code, and the 137 kill on max_runtime.
