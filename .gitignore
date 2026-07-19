@@ -9,6 +9,7 @@ __pycache__/
 
 # Internal dev notes, handovers, design docs, backlog - never public.
 /docs/
+NOTES.md
 
 # Model-evaluation harness + results - local research, not shipped.
 /model-eval/
