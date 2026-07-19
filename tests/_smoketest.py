@@ -655,6 +655,20 @@ check("bg-runner: --bg-run entrypoint enforces max_runtime (exit 137 sidecar)",
       Path(_mlog + ".exit").read_text().strip() == "137")
 shutil.rmtree(_bgc_dir, ignore_errors=True)
 
+# 10e. self-wipe watchdog (run_wipe_watchdog / --wipe-watch): the cross-platform twin
+# of the old POSIX sh loop. A stale lease -> the pushed dir is rmtree'd; a bumped lease
+# self-heals (no wipe). Uses the real detached --wipe-watch subprocess.
+_ww_dir = Path(tempfile.mkdtemp(prefix="lc_wipe_")) / "leancoder"
+_ww_dir.mkdir(parents=True); (_ww_dir / ".lease").touch(); (_ww_dir / "agent.py").touch()
+_wwargv = [sys.executable, str(Path(lc.__file__).resolve()), "--wipe-watch",
+           _json_bgr.dumps({"dir": str(_ww_dir), "ttl": 2, "chk": 1})]
+_wwp = _sp_bgr.Popen(_wwargv, stdin=_sp_bgr.DEVNULL, stdout=_sp_bgr.DEVNULL,
+                     stderr=_sp_bgr.DEVNULL, **lc._detached_popen_kwargs())
+for _ in range(80):                                     # stale lease -> wipe within TTL+poll
+    if not _ww_dir.is_dir(): break
+    _t_bg.sleep(0.1)
+check("wipe-watch: stale lease -> pushed dir is wiped", not _ww_dir.is_dir())
+
 # --- worker engine (--agent-run): brief/grant parsing + result harvest --------
 # The full headless run is hand-tested (needs a live provider); here we cover the
 # pure logic that shapes a worker run so a regression is caught offline.

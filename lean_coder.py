@@ -6074,22 +6074,19 @@ def _arm_self_wipe():
     try:
         old = int(Path(pidf).read_text().strip())
         if old != os.getpid():
-            os.kill(old, signal.SIGTERM)
+            _kill_tree(old, signal.SIGTERM)
     except (OSError, ValueError):
         pass
-    q = shlex.quote(mydir)
-    script = (
-        f'd={q}; l="$d/.lease"; '
-        f'while :; do '
-        f'[ -d "$d" ] || exit 0; '
-        f'now=$(date +%s); m=$(stat -c %Y "$l" 2>/dev/null || echo "$now"); '
-        f'if [ $((now - m)) -ge {ttl} ]; then rm -rf "$d"; exit 0; fi; '
-        f'sleep {chk}; done'
-    )
+    # Detached watchdog: a Python child (own session/process group, so it outlives
+    # this executor and the ssh channel) that rm -rf's the dir once the lease goes
+    # unbumped for TTL. Pure-Python + shutil.rmtree so it runs identically on POSIX
+    # and native Windows (no sh/stat/date/rm dependency).
     try:
-        wp = subprocess.Popen(["sh", "-c", script], stdin=subprocess.DEVNULL,
+        argv = [sys.executable, os.path.abspath(__file__), "--wipe-watch",
+                json.dumps({"dir": mydir, "ttl": ttl, "chk": chk})]
+        wp = subprocess.Popen(argv, stdin=subprocess.DEVNULL,
                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                              start_new_session=True)
+                              **_detached_popen_kwargs())
         Path(pidf).write_text(str(wp.pid))
     except (OSError, ValueError):
         return
@@ -6101,6 +6098,30 @@ def _arm_self_wipe():
                 pass
             time.sleep(chk)
     threading.Thread(target=_bump, daemon=True).start()
+
+
+def run_wipe_watchdog(cfg):
+    """Detached self-wipe watchdog (cross-platform twin of the old POSIX sh loop).
+    Spawned as `python lean_coder.py --wipe-watch <json>`, own session/group, so it
+    outlives the executor + ssh channel. Polls the pushed dir's '.lease' mtime; once
+    unbumped for `ttl` it shutil.rmtree's the dir and exits, or exits early if the dir
+    is already gone (a clean disconnect wiped it). `cfg`: dir, ttl, chk."""
+    d = cfg["dir"]
+    ttl = int(cfg["ttl"])
+    chk = int(cfg["chk"])
+    lease = os.path.join(d, ".lease")
+    while True:
+        if not os.path.isdir(d):
+            return
+        now = time.time()
+        try:
+            m = os.path.getmtime(lease)
+        except OSError:
+            m = now
+        if now - m >= ttl:
+            shutil.rmtree(d, ignore_errors=True)
+            return
+        time.sleep(chk)
 
 
 def run_tool_executor(cwd, lean_tools_dir=None):
@@ -12854,6 +12875,9 @@ def main():
     ap.add_argument("--bg-run", dest="bg_run",
                     help="(internal) detached backgrounded-command runner: JSON cfg; "
                          "the cross-platform twin of the POSIX shell bg wrapper")
+    ap.add_argument("--wipe-watch", dest="wipe_watch",
+                    help="(internal) detached self-wipe watchdog for a pushed remote "
+                         "executor: JSON cfg (dir/ttl/chk); cross-platform")
     ap.add_argument("--tool-exec", action="store_true", dest="tool_exec",
                     help="run as a hermetic tool executor (JSON over stdio); internal")
     ap.add_argument("--lean-tools", dest="lean_tools_exec",
@@ -12885,6 +12909,12 @@ def main():
             sys.exit(run_bg_child(json.loads(args.bg_run)) or 0)
         except Exception:
             sys.exit(1)
+    if args.wipe_watch:                # detached self-wipe watchdog for a pushed executor
+        try:
+            run_wipe_watchdog(json.loads(args.wipe_watch))
+        except Exception:
+            pass
+        return
     if args.tool_exec:                 # hermetic executor role: no config, no model
         run_tool_executor(args.cwd or ".", args.lean_tools_exec)
         return
