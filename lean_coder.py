@@ -12224,14 +12224,26 @@ def handle_handover_command(agent, cfg, arg):
     history is then replaced with the handover."""
     print(dim("handover: update + commit durable docs, then write the "
               f"handover between {HANDOVER_MARK} markers and finalize…"))
-    # snapshot the full pre-handover conversation so it stays loadable
-    autosave_session(agent, cfg)
+    # Snapshot the full pre-handover conversation as a <name>-prehandover-N sidecar
+    # (NOT under the live name) so it stays loadable AND the live session keeps its
+    # name. Mirrors auto_handover: an explicit /handover must not fork a named session
+    # into a fresh auto- one (the "it's auto again" bug) - you continue IN the session
+    # you handed over, now carrying the compacted summary.
+    try:
+        rhost = agent.remote.host if agent.remote else None
+        origin = getattr(agent, "autosave_name", "") or "session"
+        existing = [nm for nm, _ in list_sessions()]
+        save_session(list(agent.messages), cfg, _prehandover_name(origin, existing),
+                     remote=rhost, pinned_plan=getattr(agent, "pinned_plan", ""))
+    except Exception:
+        pass
     summary = agent.handover()
     if summary is None:
         print(yellow("\nno handover captured - history left intact. (Write it "
                      f"between {HANDOVER_MARK} markers as visible text.)"))
     else:
-        agent.autosave_name = _new_autosave_name()
+        # Keep the live autosave_name: the next autosave writes the compacted history
+        # back into the SAME session, so a named session stays named.
         print(dim("\nhistory replaced with the handover above; "
                   "new cache boundary set on the summary."))
         agent._print_ctx()
