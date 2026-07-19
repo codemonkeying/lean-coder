@@ -8185,15 +8185,24 @@ class Agent:
         return "\n\n".join(l for l in lines if l)
 
     def _has_bg_optins(self) -> bool:
-        """True if any live bg task THIS session owns opted into a per-job push
-        (notify_on_exit / heartbeat_timeout / max_runtime). Lets the wake path stay
-        armed for those jobs even when global wake_on_bg_finish is off - cheap
+        """True if any live bg job THIS session owns needs the idle wake path armed:
+          - a plain TASK that opted into a per-job push (notify_on_exit /
+            heartbeat_timeout / max_runtime), OR
+          - ANY live WORKER. A worker ALWAYS needs the idle path: its finish wakes the
+            agent via the wake-hook registry, AND - critically - the idle path is where
+            its LEASE gets bumped while the parent sits idle (see bg_wake_turn). Without
+            counting workers here, a parent with only workers live never arms the wake
+            path, never bumps the lease, and the worker self-terminates (exit 137) ~30min
+            into an AFK stretch - the 'worker died with no output' bug.
+        Lets the wake path stay armed even when global wake_on_bg_finish is off - cheap
         registry read, best-effort."""
         try:
             me = os.getpid()
             for r in _bg_load():
-                if r.get("owner") != me or r.get("kind", "task") != "task":
+                if r.get("owner") != me:
                     continue
+                if r.get("kind", "task") == "worker":
+                    return True
                 if (r.get("notify_on_exit") or r.get("heartbeat_timeout")
                         or r.get("max_runtime")):
                     return True
@@ -8218,6 +8227,16 @@ class Agent:
         heartbeat_timeout / max_runtime) - only_notify restricts the finished notices to
         those. Wrapped in autonomous-wake framing + an explicit react instruction, since
         no operator prompt accompanies it."""
+        # Attend our leased bg tasks/workers HERE too, not just in run_turn: a parent
+        # sitting IDLE at the prompt (operator AFK) is still alive, but run_turn - the
+        # only other lease-bump site - doesn't fire without a turn. Without this, a
+        # dispatched worker (idle_timeout=1800) self-terminates ~30min into an AFK stretch
+        # with exit 137 = the "worker died with no output" bug. This wake_check runs every
+        # idle tick (~0.25s); throttle the bump to once per ~30s so it's ~free.
+        now = time.monotonic()
+        if now - getattr(self, "_last_idle_lease_bump", 0.0) >= 30:
+            self._last_idle_lease_bump = now
+            self._bg_bump_session()
         global_wake = bool(getattr(self.cfg, "wake_on_bg_finish", False))
         parts = []
         note = self._bg_finished_note(only_notify=not global_wake)
