@@ -1077,6 +1077,32 @@ try:
 finally:
     lc.CONFIG_PATH = _orig_cpB
 
+# handover_overrides + non-default global thresholds SURVIVE a save_config round-trip.
+# Regression: save_config had no serializer for handover_overrides (a BESPOKE key), so
+# every autosave_config() rewrote config.toml WITHOUT them - they vanished and the next
+# load fell back to the global defaults (0.70/0.95 -> the "handover 95%" reset). Model
+# names carry ':'/'.' so the table header MUST be quoted or the whole file won't parse.
+_hop2 = _plA.Path(_tfA.mkdtemp()) / "ho2.toml"
+_orig_cpC = lc.CONFIG_PATH
+lc.CONFIG_PATH = _hop2
+try:
+    _cfg = lc.Config()
+    _cfg.handover_soft = 0.2
+    _cfg.handover_hard = 0.25
+    _cfg.handover_overrides = {"qwen3:32b": {"soft": 0.6, "hard": 0.85},
+                               "claude-opus-4-8": {"auto": False}}
+    lc.save_config(_cfg, quiet=True)
+    _rl = lc.load_config(A())
+    check("save_config preserves non-default global thresholds",
+          (_rl.handover_soft, _rl.handover_hard) == (0.2, 0.25),
+          (_rl.handover_soft, _rl.handover_hard))
+    check("save_config preserves handover_overrides (colon/dot model names)",
+          _rl.handover_overrides == {"qwen3:32b": {"soft": 0.6, "hard": 0.85},
+                                     "claude-opus-4-8": {"auto": False}},
+          _rl.handover_overrides)
+finally:
+    lc.CONFIG_PATH = _orig_cpC
+
 # 12. /compact - stub old tool results, keep last N in full
 ag = lc.Agent(lc.Config(cwd=FIX, approval="auto"))
 for i in range(4):
@@ -2431,21 +2457,38 @@ _wsw = lc.RemoteWorkspace.__new__(lc.RemoteWorkspace)
 _wsw.host = "winbox"; _wsw.ctl = "/tmp/x.sock"; _wsw.remote_posix = False
 _wsw.remote_dir = r"C:\Users\me\AppData\Local\Temp\leancoder"
 _wcaps = []
+# Simulate the Windows box for the scp push: capture the scp argv, "receive" the file
+# by reading the local temp file scp would have sent, and answer Get-FileHash with the
+# sha256 of those bytes so the end-to-end verify passes.
+_wstate = {"files": {}}
 def _wsw_run(cmd, tty=False, _caps=_wcaps):
+    import re as _re
     _caps.append(cmd)
-    # the MKDIR snippet must echo a dir back; everything else returns empty ("absent")
     if "New-Item" in cmd and "Directory" in cmd and "agent.py" not in cmd:
         return 0, _wsw.remote_dir, ""
+    if "Get-FileHash" in cmd:
+        m = _re.search(r'Test-Path "([^"]*)"', cmd)
+        data = _wstate["files"].get(m.group(1)) if m else None
+        return (0, lc.hashlib.sha256(data).hexdigest().upper(), "") if data is not None else (0, "", "")
     return 0, "", ""
 _wsw._run = _wsw_run
 _wwrites = []
 _orig_ssh_run = lc.subprocess.run
 def _cap_ssh_run(argv, *a, **k):
+    # scp argv is ["scp", ..., <localtmp>, "winbox:C:/.../big"]: emulate the transfer by
+    # reading the local temp file and recording it under the (backslash) remote path.
     _wwrites.append((argv, k.get("input")))
+    if argv and argv[0] == "scp":
+        localtmp = argv[-2]
+        remote = argv[-1].split(":", 1)[1].replace("/", "\\")
+        try:
+            _wstate["files"][remote] = open(localtmp, "rb").read()
+        except OSError:
+            pass
     class _R:  # noqa
         returncode = 0; stdout = b""; stderr = b""
     return _R()
-# _remote_write / push go through subprocess.run(_ssh_run_argv(...)); capture those
+# _remote_write / push go through subprocess.run(_scp_argv(...)); capture those
 lc.subprocess.run = _cap_ssh_run
 try:
     _wsw._remote_mkdir(r"C:\tmp\d")
@@ -2455,13 +2498,16 @@ try:
     check("win: _remote_sha256 emits Get-FileHash SHA256",
           "Get-FileHash -Algorithm SHA256" in _wcaps[-1] and "sha256sum" not in _wcaps[-1])
     check("win: _remote_sep is backslash", _wsw._remote_sep() == "\\")
-    _wsw._remote_write(r"C:\tmp\f", b"data")
-    _argv, _inp = _wwrites[-1]
-    _joined = " ".join(_argv)
-    check("win: _remote_write uses .NET File.Create over ssh (no cat >)",
-          "System.IO.File]::Create" in _joined and "cat >" not in _joined and _inp == b"data")
-    check("win: _remote_write rides the same ssh argv builder (ctl honored)",
-          "winbox" in _joined)
+    _wsw._remote_write(r"C:\tmp\big", b"data" * 20000)
+    check("win: _remote_write pushes via scp (no stdin, no cat >, no Add-Content)",
+          any(a[0] and a[0][0] == "scp" for a in _wwrites)
+          and all("cat >" not in c for c in _wcaps)
+          and all("Add-Content" not in c for c in _wcaps))
+    check("win: scp push reconstructs bytes end-to-end (sha256 verified)",
+          _wstate["files"].get(r"C:\tmp\big") == b"data" * 20000)
+    check("win: scp argv reuses the ControlPath + BatchMode",
+          any("BatchMode=yes" in a[0] and any("ControlPath" in x for x in a[0])
+              for a in _wwrites if a[0] and a[0][0] == "scp"))
     _wsw.win_python = "py -3"
     _ex, _rd = _wsw._reuse_executor_win("deadbeef")
     check("win: _reuse_executor_win probes agent.py via Test-Path + py",
@@ -2483,6 +2529,51 @@ try:
 except ConnectionError as _e:
     check("win: _check_windows_python errors when Python absent", "no Python" in str(_e))
 
+# 22c. Regression cover for the Windows live-connect fixes (all found on 192.0.2.16):
+# (i) _kill_tree default sig must NOT be signal.SIGKILL (absent on Windows -> import
+#     crash). Resolves to SIGTERM when SIGKILL is missing; here (POSIX) SIGKILL exists.
+import inspect as _inspect
+check("win: _kill_tree default sig is a None sentinel (no import-time SIGKILL)",
+      _inspect.signature(lc._kill_tree).parameters["sig"].default is None)
+# (ii) _win_quote makes an EMPTY arg a real '' token (shlex.quote drops it, so PowerShell
+#      swallowed the next flag -> the empty-cwd argparse crash that killed the executor).
+check("win: _win_quote('') -> real empty quoted token", lc._win_quote("") == "''")
+check("win: _win_quote escapes a literal quote by doubling", lc._win_quote("a'b") == "'a''b'")
+# (iii) _ssh_exec_argv quotes per-OS: POSIX shlex vs Windows PowerShell (_win_quote), and
+#       a None/empty cwd becomes '.' not a dropped token.
+_ewin = lc._ssh_exec_argv("h", None, 'python "a.py"', None, posix=False)[-1]
+check("win: _ssh_exec_argv (posix=False) uses '.' for a None cwd, PowerShell-quoted",
+      "--cwd '.'" in _ewin and "--cwd ''" not in _ewin)
+_eposix = lc._ssh_exec_argv("h", "/c", "python3 agent.py", "/p", posix=True)[-1]
+check("win: _ssh_exec_argv (posix=True) keeps POSIX shlex quoting", "--cwd /p" in _eposix)
+# (iv) _wipe_remote basename guard is separator-agnostic: a backslash Windows remote_dir
+#      whose leaf is 'leancoder' must ACTUALLY wipe (posixpath.basename returned the whole
+#      string -> early return -> the pushed dir leaked every session). Capture the emitted
+#      command; a non-leancoder leaf must still be refused.
+_wr = lc.RemoteWorkspace.__new__(lc.RemoteWorkspace)
+_wr.host = "winbox"; _wr.ctl = None; _wr.remote_posix = False; _wr.reused = None
+_wr.remote_dir = r"C:\Users\me\AppData\Local\Temp\leancoder"
+_wcmd = {}
+def _cap_wipe(argv, *a, **k):
+    _wcmd["cmd"] = argv[-1]
+    class _R:  # noqa
+        returncode = 0; stdout = b""; stderr = b""
+    return _R()
+_orig_wipe_run = lc.subprocess.run
+lc.subprocess.run = _cap_wipe
+try:
+    _wr._wipe_remote()
+    check("win: _wipe_remote runs on a backslash 'leancoder' path (guard not early-return)",
+          bool(_wcmd) and "Remove-Item" in _wcmd.get("cmd", "")
+          and ".watchdog.pid" in _wcmd["cmd"])
+    _wcmd.clear()
+    _wr.remote_dir = r"C:\Users\me\AppData\Local\Temp\notours"
+    _wr._wipe_remote()
+    check("win: _wipe_remote REFUSES a non-leancoder leaf (safety guard holds)", not _wcmd)
+finally:
+    lc.subprocess.run = _orig_wipe_run
+
+# 23. install.sh --remote: stage + run the installer on another box over SSH
 # 23. install.sh --remote: stage + run the installer on another box over SSH
 import subprocess as _subp
 INSTALL = str(Path(lc.__file__).parent / "install.sh")
