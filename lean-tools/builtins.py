@@ -648,7 +648,7 @@ BUILTIN_TOOLS = [
                        "content": {"type": "string", "description": "Full new contents of the file."}},
         "required": ["path", "content"]}},
     {"name": "run_command", "tier": "exec",
-     "description": "Run a non-interactive shell command (builds, tests, git, file ops); returns stdout/stderr (truncated - if clipped, pipe to a file or use grep/head/tail to read specific parts). Fresh shell each call - cd/env don't persist, chain with '&&'. Times out after a fixed limit - for a long-running or daemon process end the command with ' &' to background it (returns a pid immediately; poll with bg_status). For sudo/password/interactive use ask_user_to_run; for a shell that stays open use shell_session.",
+     "description": "Run a non-interactive shell command (builds, tests, git, file ops); returns stdout/stderr (truncated - if clipped, pipe to a file or use grep/head/tail to read specific parts). Fresh shell each call - cd/env don't persist, chain with '&&'. Times out after a fixed limit - for a long-running or daemon process end the command with ' &' to background it (returns a pid immediately; poll with bg_status). Backgrounded jobs (and dispatched workers) live ONLY while this lean-coder session runs and die on session exit; for something that must outlive the session, launch it OS-level (nohup/systemd) directly, NOT via ' &'. For sudo/password/interactive use ask_user_to_run; for a shell that stays open use shell_session.",
      "parameters": {"type": "object",
         "properties": {"cmd": {"type": "string", "description": "The shell command to run."},
                        "notify_on_exit": {"type": "boolean", "description": "Bg jobs (' &') only: push exit code + tail back to you on completion."},
