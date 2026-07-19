@@ -2423,6 +2423,66 @@ shutil.rmtree(shimdir, ignore_errors=True)
 shutil.rmtree(proj, ignore_errors=True)
 shutil.rmtree(plugdir, ignore_errors=True)
 
+# 22b. Windows transport branches (remote_posix=False): the remote file helpers must
+# emit PowerShell, not POSIX sh. We drive a RemoteWorkspace whose _run captures the
+# command string (and returns canned output) instead of touching ssh - so the branch
+# selection is asserted offline, before a real Win11 box exists.
+_wsw = lc.RemoteWorkspace.__new__(lc.RemoteWorkspace)
+_wsw.host = "winbox"; _wsw.ctl = "/tmp/x.sock"; _wsw.remote_posix = False
+_wsw.remote_dir = r"C:\Users\me\AppData\Local\Temp\leancoder"
+_wcaps = []
+def _wsw_run(cmd, tty=False, _caps=_wcaps):
+    _caps.append(cmd)
+    # the MKDIR snippet must echo a dir back; everything else returns empty ("absent")
+    if "New-Item" in cmd and "Directory" in cmd and "agent.py" not in cmd:
+        return 0, _wsw.remote_dir, ""
+    return 0, "", ""
+_wsw._run = _wsw_run
+_wwrites = []
+_orig_ssh_run = lc.subprocess.run
+def _cap_ssh_run(argv, *a, **k):
+    _wwrites.append((argv, k.get("input")))
+    class _R:  # noqa
+        returncode = 0; stdout = b""; stderr = b""
+    return _R()
+# _remote_write / push go through subprocess.run(_ssh_run_argv(...)); capture those
+lc.subprocess.run = _cap_ssh_run
+try:
+    _wsw._remote_mkdir(r"C:\tmp\d")
+    check("win: _remote_mkdir emits PowerShell New-Item",
+          "New-Item -ItemType Directory" in _wcaps[-1] and "mkdir" not in _wcaps[-1])
+    _wsw._remote_sha256(r"C:\tmp\f")
+    check("win: _remote_sha256 emits Get-FileHash SHA256",
+          "Get-FileHash -Algorithm SHA256" in _wcaps[-1] and "sha256sum" not in _wcaps[-1])
+    check("win: _remote_sep is backslash", _wsw._remote_sep() == "\\")
+    _wsw._remote_write(r"C:\tmp\f", b"data")
+    _argv, _inp = _wwrites[-1]
+    _joined = " ".join(_argv)
+    check("win: _remote_write uses .NET File.Create over ssh (no cat >)",
+          "System.IO.File]::Create" in _joined and "cat >" not in _joined and _inp == b"data")
+    check("win: _remote_write rides the same ssh argv builder (ctl honored)",
+          "winbox" in _joined)
+    _wsw.win_python = "py -3"
+    _ex, _rd = _wsw._reuse_executor_win("deadbeef")
+    check("win: _reuse_executor_win probes agent.py via Test-Path + py",
+          any("Test-Path" in c and "--version" in c for c in _wcaps))
+finally:
+    lc.subprocess.run = _orig_ssh_run
+# _check_windows_python: a real interpreter path passes; a bare stub fails
+_wsp = lc.RemoteWorkspace.__new__(lc.RemoteWorkspace)
+_wsp.host = "winbox"
+_wsp._run = lambda cmd, tty=False: (0, r"C:\Python312\python.exe", "")   # real path back
+_wsp._check_windows_python()
+check("win: _check_windows_python accepts a real interpreter", getattr(_wsp, "win_python", None) in ("py -3", "python"))
+_wsp2 = lc.RemoteWorkspace.__new__(lc.RemoteWorkspace)
+_wsp2.host = "winbox"
+_wsp2._run = lambda cmd, tty=False: (0, "", "")                          # no interpreter
+try:
+    _wsp2._check_windows_python()
+    check("win: _check_windows_python errors when Python absent", False)
+except ConnectionError as _e:
+    check("win: _check_windows_python errors when Python absent", "no Python" in str(_e))
+
 # 23. install.sh --remote: stage + run the installer on another box over SSH
 import subprocess as _subp
 INSTALL = str(Path(lc.__file__).parent / "install.sh")
