@@ -2410,24 +2410,35 @@ class Spinner:
         self.stop()
 
 
+class _StageHandle:
+    """Yielded by _stage so the body can refine the completion word once it knows more
+    (e.g. the probe learns the remote OS -> 'probed · Windows'). Set .done inside the
+    block; whatever it holds at exit is what prints."""
+    __slots__ = ("done",)
+    def __init__(self, done):
+        self.done = done
+
+
 @contextmanager
 def _stage(label, done=None):
     """A single connect/push STAGE with feedback that works in ANY terminal. On a TTY:
     an animated Spinner (elapsed ticker, so a slow/wedged step still visibly updates).
     On a dumb terminal / no-TTY (the "old shell" case that looked hung): a plain
     'label…' line up front, then 'done' - no \\r, no ansi. Best-effort: never raises
-    into the connect path. `done` overrides the completion word (e.g. 'ready')."""
+    into the connect path. `done` overrides the completion word (e.g. 'ready'). Yields a
+    handle whose .done can be reassigned inside the block to append late-known detail."""
+    h = _StageHandle(done or label)
     if _TTY and _active_composer is None:
         sp = Spinner(label, TOOL_FRAMES, cyan, interval=0.12).start()
         try:
-            yield
+            yield h
         finally:
             sp.stop()
-            print(dim(f"  {GLYPH.get('ok', 'v')} {done or label}"))
+            print(dim(f"  {GLYPH.get('ok', 'v')} {h.done}"))
     else:
         print(dim(f"  {label}…"))
-        yield
-        print(dim(f"  {done or label} done"))
+        yield h
+        print(dim(f"  {h.done} done"))
 
 @contextmanager
 def suppress_echo():
@@ -6470,6 +6481,23 @@ def _remote_is_posix(uname_out) -> bool:
     s = (uname_out or "").strip().lower()
     return any(tok in s for tok in _POSIX_UNAMES)
 
+
+def _remote_os_label(uname_out) -> str:
+    """A short human name for the probed remote OS, from the _OS_PROBE (`uname`) output -
+    surfaced on the connect 'probed' line so a misdetect is visible immediately (before
+    the push path forks on it). POSIX kernels map to a friendly name; anything else (uname
+    absent/error) is 'Windows', matching _remote_is_posix's Windows branch."""
+    s = (uname_out or "").strip().lower()
+    if "linux" in s:
+        return "Linux"
+    if "darwin" in s:
+        return "macOS"
+    if "bsd" in s:
+        return "BSD"
+    if any(tok in s for tok in ("sunos", "aix", "cygwin", "msys", "gnu")):
+        return s.split()[0].strip() or "POSIX"
+    return "Windows"
+
 # package managers tried, in order, when python3 is missing on the remote.
 _PKG_INSTALL = [
     ("apt-get", "sudo apt-get update && sudo apt-get install -y python3"),
@@ -6740,12 +6768,13 @@ class RemoteWorkspace:
         # Probe the remote OS BEFORE any master, over a plain (masterless) ssh - so a
         # Windows target never gets a doomed ControlMaster. Uses BatchMode so it can't
         # hang on a prompt; a POSIX box answers `uname` with a kernel token.
-        with _stage("probing host", done="probed"):
+        with _stage("probing host", done="probed") as _st:
             _probe = subprocess.run(
                 ["ssh", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new",
                  "-o", "ConnectTimeout=10", "-o", "LogLevel=ERROR", self.host, _OS_PROBE],
                 capture_output=True, text=True, timeout=30)
             self.remote_posix = _remote_is_posix(_probe.stdout)
+            _st.done = f"probed · {_remote_os_label(_probe.stdout)}"
         if self.remote_posix:
             with _stage("opening ssh", done="ssh ready"):
                 _clear_master(self.host, self.ctl)     # drop any stale socket first (#3)
