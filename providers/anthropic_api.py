@@ -584,7 +584,12 @@ class _ApiKeyClient:
         minfo      = _ensure_models().get(cur_model, {})
         max_out    = minfo.get("max_tokens", _MAX_TOKENS)
         max_in     = minfo.get("max_input_tokens", _CTX_DEFAULT)
-        _est_toks  = len(json.dumps(messages)) // 4
+        # Use core's CALIBRATED estimator (chars/4 * learned factor + per-message framing,
+        # self-tuned from real input_tokens) instead of a raw json.dumps//4 - the latter
+        # both over-counts (JSON punctuation/escaping) and under-counts (no per-msg
+        # overhead), unpredictably. Falls back to the crude form if core isn't wired yet.
+        _mt = _lc.get("messages_tokens")
+        _est_toks  = _mt(messages, api_tools) if _mt else len(json.dumps(messages)) // 4
         if _est_toks > max_in:
             raise RuntimeError(
                 f"context too large for {cur_model} "
