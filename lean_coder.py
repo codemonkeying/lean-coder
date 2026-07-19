@@ -11772,6 +11772,8 @@ def _maybe_autostart_provider(agent, cfg):
             want = "ollama"               # the bundled, out-of-the-box default
     if not want:
         cfg.provider = ""
+        agent._provider_fail_reason = ("no backend could be started - every provider "
+                                       "is disabled/unconfigured on this box")
         return None                       # no provider at all -> no backend
     try:
         prep = get_provider(want).get("prepare")
@@ -11787,8 +11789,11 @@ def _maybe_autostart_provider(agent, cfg):
             try:
                 agent.activate_provider("ollama")
                 return agent.active_provider()
-            except Exception:
-                pass
+            except Exception as e2:
+                agent._provider_fail_reason = (f"provider '{want}' failed to start ({e}); "
+                                               f"ollama fallback also failed ({e2})")
+        else:
+            agent._provider_fail_reason = f"provider '{want}' failed to start: {e}"
         cfg.provider = ""
         return None
 
@@ -13183,12 +13188,16 @@ def run_agent_brief(args) -> int:
     if not cfg.cwd.is_dir():
         return _fail(f"cwd is not a directory: {cfg.cwd}")
 
-    _register_dir_providers(cfg)
-    agent = Agent(cfg)
+    try:
+        _register_dir_providers(cfg)
+        agent = Agent(cfg)
+    except Exception as e:
+        return _fail(f"worker failed to initialise (Agent build): {e}")
     prov = _maybe_autostart_provider(agent, cfg)
     if prov is None or agent.client is None:
-        return _fail("no provider/model available on this box (worker needs the "
-                     "driver's activated provider + auth)")
+        why = getattr(agent, "_provider_fail_reason", "") or (
+            "worker needs the driver's activated provider + auth")
+        return _fail(f"no provider/model available on this box: {why}")
 
     # Attach to the parent's remote (its brain runs here on the driver, but its TOOLS
     # run where the PARENT's do - same box, same codebase). Reuse the parent's live ssh
@@ -13226,14 +13235,18 @@ def run_agent_brief(args) -> int:
     # the activated default and note it - a worker must never die on a bad model name.
     want_model = grant.get("model")
     if want_model and want_model != cfg.active_model():
-        spec = agent.active_provider()
-        avail = list(spec["list_models"]() or []) if spec else []
-        if want_model in avail:
-            cfg.set_active_model(want_model)
-            agent.use_client(spec["make_client"](cfg))
-            agent.messages[0] = {"role": "system", "content": agent._system()}
-        else:
-            print(yellow(f"agent-run: model '{want_model}' not available here; "
+        try:
+            spec = agent.active_provider()
+            avail = list(spec["list_models"]() or []) if spec else []
+            if want_model in avail:
+                cfg.set_active_model(want_model)
+                agent.use_client(spec["make_client"](cfg))
+                agent.messages[0] = {"role": "system", "content": agent._system()}
+            else:
+                print(yellow(f"agent-run: model '{want_model}' not available here; "
+                             f"using '{cfg.active_model()}'"))
+        except Exception as e:
+            print(yellow(f"agent-run: could not switch to model '{want_model}' ({e}); "
                          f"using '{cfg.active_model()}'"))
 
     # Preamble: tell the worker it's headless + how to return its answer.
