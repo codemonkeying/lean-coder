@@ -2539,9 +2539,21 @@ check("win: _kill_tree default sig is a None sentinel (no import-time SIGKILL)",
 #      swallowed the next flag -> the empty-cwd argparse crash that killed the executor).
 check("win: _win_quote('') -> real empty quoted token", lc._win_quote("") == "''")
 check("win: _win_quote escapes a literal quote by doubling", lc._win_quote("a'b") == "'a''b'")
+# Windows commands are now wrapped as `powershell -NoProfile -NonInteractive
+# -EncodedCommand <base64-UTF16LE>` (shell-agnostic: runs under cmd.exe OR PowerShell,
+# so a stock box whose sshd DefaultShell is cmd.exe no longer fails every command).
+# Decode the payload back to the PowerShell text so the branch asserts still inspect it.
+import base64 as _b64
+def _decode_ps(s):
+    """Return the decoded PowerShell text if s is an -EncodedCommand wrapper, else s."""
+    m = _re.search(r'-EncodedCommand\s+([A-Za-z0-9+/=]+)', s)
+    return _b64.b64decode(m.group(1)).decode("utf-16-le") if m else s
+check("win: _win_ps wraps as base64 -EncodedCommand (shell-agnostic)",
+      "-EncodedCommand" in lc._win_ps("Write-Output hi")
+      and _decode_ps(lc._win_ps("Write-Output hi")) == "Write-Output hi")
 # (iii) _ssh_exec_argv quotes per-OS: POSIX shlex vs Windows PowerShell (_win_quote), and
-#       a None/empty cwd becomes '.' not a dropped token.
-_ewin = lc._ssh_exec_argv("h", None, 'python "a.py"', None, posix=False)[-1]
+#       a None/empty cwd becomes '.' not a dropped token. (Windows: inside the wrapper.)
+_ewin = _decode_ps(lc._ssh_exec_argv("h", None, 'python "a.py"', None, posix=False)[-1])
 check("win: _ssh_exec_argv (posix=False) uses '.' for a None cwd, PowerShell-quoted",
       "--cwd '.'" in _ewin and "--cwd ''" not in _ewin)
 _eposix = lc._ssh_exec_argv("h", "/c", "python3 agent.py", "/p", posix=True)[-1]
@@ -2563,9 +2575,9 @@ _orig_wipe_run = lc.subprocess.run
 lc.subprocess.run = _cap_wipe
 try:
     _wr._wipe_remote()
+    _wcmd_ps = _decode_ps(_wcmd.get("cmd", ""))
     check("win: _wipe_remote runs on a backslash 'leancoder' path (guard not early-return)",
-          bool(_wcmd) and "Remove-Item" in _wcmd.get("cmd", "")
-          and ".watchdog.pid" in _wcmd["cmd"])
+          bool(_wcmd) and "Remove-Item" in _wcmd_ps and ".watchdog.pid" in _wcmd_ps)
     _wcmd.clear()
     _wr.remote_dir = r"C:\Users\me\AppData\Local\Temp\notours"
     _wr._wipe_remote()

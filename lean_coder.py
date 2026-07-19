@@ -6598,6 +6598,20 @@ def _win_quote(s):
     return "'" + str(s).replace("'", "''") + "'"
 
 
+def _win_ps(cmd):
+    """Wrap a PowerShell command so it runs regardless of the remote sshd DefaultShell.
+    Windows OpenSSH runs an exec channel under whatever DefaultShell is configured -
+    cmd.exe by DEFAULT, PowerShell only if an admin set the registry key. Our Windows
+    commands are all PowerShell syntax, which cmd.exe can't parse (`'$d' is not
+    recognized`), so a stock box silently failed every remote command. base64-UTF16LE
+    -EncodedCommand is pure [A-Za-z0-9+/=] - it needs NO quoting and passes through ssh,
+    cmd.exe AND PowerShell byte-identically, so we no longer depend on the DefaultShell
+    being PowerShell. (-NonInteractive so it can never block on a prompt; the JSON stdio
+    protocol stays transparent - verified live on a cmd.exe-default Win11 box.)"""
+    b64 = base64.b64encode(cmd.encode("utf-16-le")).decode()
+    return f"powershell -NoProfile -NonInteractive -EncodedCommand {b64}"
+
+
 def _ssh_exec_argv(host, ctl, exec_cmd, cwd, lean_tools_dir=None, posix=True):
     # long-lived executor channel: -T (no PTY) keeps stdio clean for the protocol.
     # exec_cmd is the executor invocation prefix - "python3 '<dir>/agent.py'" for a
@@ -6608,6 +6622,11 @@ def _ssh_exec_argv(host, ctl, exec_cmd, cwd, lean_tools_dir=None, posix=True):
     inner = f"{exec_cmd} --tool-exec --cwd {q(cwd or '.')}"
     if lean_tools_dir:
         inner += f" --lean-tools {q(lean_tools_dir)}"
+    if not posix:
+        # Windows: wrap the whole launch in a base64 -EncodedCommand so the long-lived
+        # executor channel runs regardless of the sshd DefaultShell (cmd.exe by default).
+        # The JSON stdio protocol stays transparent through it (verified live).
+        inner = _win_ps(inner)
     # ServerAlive on this long-lived channel too: it multiplexes over the master
     # (which also has keepalives) but a multi-minute model turn with no traffic is
     # exactly when a stateful firewall/NAT drops the data channel - belt-and-braces.
@@ -6651,6 +6670,12 @@ class RemoteWorkspace:
         self.client = None
 
     def _run(self, remote_cmd, tty=False):
+        # Windows: every remote command we emit is PowerShell, but sshd runs the exec
+        # channel under its DefaultShell (cmd.exe by default). Wrap in a base64
+        # -EncodedCommand so it runs no matter the DefaultShell (see _win_ps). tty is a
+        # POSIX-only path (the sudo prompt), so it's never wrapped.
+        if not getattr(self, "remote_posix", True) and not tty:
+            remote_cmd = _win_ps(remote_cmd)
         if tty:                                    # interactive (sudo prompt is the user's)
             return subprocess.run(_ssh_run_argv(self.host, self.ctl, remote_cmd, tty=True)).returncode, "", ""
         r = subprocess.run(_ssh_run_argv(self.host, self.ctl, remote_cmd),
@@ -6747,12 +6772,16 @@ class RemoteWorkspace:
             return None, None
         agent_py = rdir + "\\agent.py"
         py = getattr(self, "win_python", None) or "python"
-        # PowerShell: run --version only if the file exists; compare driver-side.
+        # PowerShell: run --version only if the file exists; compare driver-side. The
+        # leading '&' (call operator) is REQUIRED when win_python is a quoted absolute
+        # path (the embeddable-runtime case) - PowerShell parses a statement that starts
+        # with a "quoted string" as a string LITERAL, not a command, without it. Harmless
+        # for a bare 'python'/'py -3'.
         _, out, _ = self._run(
-            f'if (Test-Path "{agent_py}") {{ {py} "{agent_py}" --version }}')
+            f'if (Test-Path "{agent_py}") {{ & {py} "{agent_py}" --version }}')
         if want in out.split():
             self.reused = "pushed"
-            return f'{py} "{agent_py}"', rdir
+            return f'& {py} "{agent_py}"', rdir
         return None, rdir
 
     def _bootstrap_executor(self):
@@ -6783,7 +6812,9 @@ class RemoteWorkspace:
                     raise ConnectionError(f"failed to make remote dir on {self.host}")
                 self._win_scp_write(self.remote_dir + "\\agent.py", src)
                 py = getattr(self, "win_python", None) or "python"
-                exec_cmd = f'{py} "{self.remote_dir}\\agent.py"'
+                # '&' call operator: required when py is a quoted embed-runtime path (see
+                # _reuse_executor_win); harmless for a bare python.
+                exec_cmd = f'& {py} "{self.remote_dir}\\agent.py"'
         # The single-file agent.py push is NOT self-contained: at import core runs
         # _load_builtins() from <dir>/lean-tools/builtins.py (the builtin tool surface was
         # extracted out of core). Ship that file beside agent.py so the remote import
@@ -7000,9 +7031,11 @@ class RemoteWorkspace:
             reason = out[4:] if out.startswith("ERR:") else (err or "").strip()[:200]
             print(yellow(f"  embeddable provision failed: {reason or 'unknown error'}"))
             return None
-        # Verify the provisioned interpreter actually runs before we commit to it.
+        # Verify the provisioned interpreter actually runs before we commit to it. The
+        # '&' call operator is needed because `quoted` is a "quoted path" (see
+        # _reuse_executor_win) - PowerShell would treat it as a string literal without it.
         quoted = f'"{out}"'
-        _, ver, _ = self._run(f'{quoted} -c "import sys;print(sys.executable)"')
+        _, ver, _ = self._run(f'& {quoted} -c "import sys;print(sys.executable)"')
         if not (ver.strip() and "\\" in ver):
             print(yellow("  provisioned python.exe did not run; falling back to error."))
             return None
@@ -7052,7 +7085,7 @@ class RemoteWorkspace:
                'if (Test-Path $p) { Remove-Item -Recurse -Force $p '
                '-ErrorAction SilentlyContinue }')
         try:
-            subprocess.run(_ssh_run_argv(self.host, self.ctl, cmd),
+            subprocess.run(_ssh_run_argv(self.host, self.ctl, _win_ps(cmd)),
                            capture_output=True, timeout=30, start_new_session=True)
         except BaseException:
             pass
@@ -7110,6 +7143,7 @@ class RemoteWorkspace:
                    f'Remove-Item -Recurse -Force "{d}" -ErrorAction SilentlyContinue; '
                    f'if (-not (Test-Path "{d}")) {{ break }}; '
                    f'Start-Sleep -Milliseconds 300 }}')
+            cmd = _win_ps(cmd)   # run PowerShell regardless of the sshd DefaultShell
         try:
             subprocess.run(_ssh_run_argv(self.host, self.ctl, cmd),
                            capture_output=True, timeout=30, start_new_session=True)
