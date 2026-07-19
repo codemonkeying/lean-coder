@@ -6234,6 +6234,16 @@ def run_tool_executor(cwd, lean_tools_dir=None):
     `cwd`, write JSON results on stdout. Tool prints (diffs, notices) are sent to
     stderr so they never pollute the protocol channel. Runs until stdin closes.
     Any lean-tools under `lean_tools_dir` (pushed by the driver) are also dispatchable."""
+    # Pin the protocol stdio to UTF-8 (the driver's ExecutorClient reads UTF-8). On a
+    # Windows executor - esp. embeddable Python under cmd.exe - stdout/stdin default to
+    # cp1252, so a non-ASCII char in a tool result (the '·' separators) would mojibake to
+    # 'Â·' on the driver. reconfigure() is a no-op if already UTF-8; guarded for any
+    # stream that doesn't support it (test doubles).
+    for _s in (sys.stdout, sys.stdin, sys.stderr):
+        try:
+            _s.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
     proto = sys.stdout
     sys.stdout = sys.stderr            # keep real stdout clean for the protocol
     _arm_self_wipe()   # pushed executor: self-delete if the driver never cleanly disconnects
@@ -6291,9 +6301,15 @@ class ExecutorClient:
     over SSH). Sends a tool request and returns its result string."""
 
     def __init__(self, argv, stderr=None):
+        # Pin the protocol channel to UTF-8 on BOTH ends (the executor reconfigures its
+        # own stdio to match - see run_tool_executor). Without this, text=True decodes
+        # with the driver's locale while a Windows executor emits cp1252, so any non-ASCII
+        # char in a tool result (e.g. the '·' separators) mojibakes to 'Â·'. errors=replace
+        # keeps a stray undecodable byte from tearing the whole channel down.
         self.proc = subprocess.Popen(
             argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=stderr, text=True, bufsize=1)
+            stderr=stderr, text=True, bufsize=1,
+            encoding="utf-8", errors="replace")
         self._id = 0
         self.host = None                # set by RemoteWorkspace for wait-spinner labels
         self.ready = self._read_obj()   # consume the {"ready": ...} handshake
