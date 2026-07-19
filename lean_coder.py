@@ -670,6 +670,13 @@ def active_tools(cfg, remote=False, lean_tool_schemas=(), model_tools=True,
             continue
         if nm in _EXEC_TIER and not allow_exec:
             continue
+        # run_command's description carries a {command_timeout} placeholder so the model
+        # sees the LIVE foreground timeout (respects /settings changes). Fill it on a
+        # shallow copy - never mutate the shared schema dict.
+        if nm == "run_command" and "{command_timeout}" in t["function"].get("description", ""):
+            t = {**t, "function": {**t["function"],
+                 "description": t["function"]["description"].format(
+                     command_timeout=getattr(cfg, "command_timeout", 300))}}
         tools.append(t)
     if cfg.ask_user_to_run and allow_exec:   # a handoff to RUN a command -> exec tier
         tools.append(ASK_USER_TOOL)
