@@ -669,6 +669,27 @@ for _ in range(80):                                     # stale lease -> wipe wi
     _t_bg.sleep(0.1)
 check("wipe-watch: stale lease -> pushed dir is wiped", not _ww_dir.is_dir())
 
+# 10f. cross-platform ssh transport groundwork: OS-detect + multiplex-aware argv.
+# Windows OpenSSH has NO ControlMaster, so with no ctl the argv builders must drop
+# the ControlPath option; POSIX (ctl set) stays byte-identical. _remote_is_posix
+# classifies the `uname` probe output.
+check("_remote_is_posix: Linux -> True", lc._remote_is_posix("Linux"))
+check("_remote_is_posix: Darwin -> True", lc._remote_is_posix("Darwin"))
+check("_remote_is_posix: empty -> False (Windows)", not lc._remote_is_posix(""))
+check("_remote_is_posix: cmd error -> False",
+      not lc._remote_is_posix("'uname' is not recognized as an internal or external command"))
+check("_remote_is_posix: None -> False", not lc._remote_is_posix(None))
+check("_ctl_opts: with ctl -> ControlPath", lc._ctl_opts("/x") == ["-o", "ControlPath=/x"])
+check("_ctl_opts: no ctl -> empty (no multiplexing)", lc._ctl_opts(None) == [])
+check("_ssh_run_argv: posix carries ControlPath",
+      "ControlPath=/x" in " ".join(lc._ssh_run_argv("h", "/x", "cmd")))
+check("_ssh_run_argv: windows (no ctl) drops ControlPath",
+      "ControlPath" not in " ".join(lc._ssh_run_argv("h", None, "cmd")))
+check("_ssh_exec_argv: windows (no ctl) drops ControlPath, keeps --tool-exec",
+      "ControlPath" not in " ".join(lc._ssh_exec_argv("h", None, "python agent.py", "."))
+      and "--tool-exec" in " ".join(lc._ssh_exec_argv("h", None, "python agent.py", ".")))
+check("_ssh_master_alive: no ctl -> False (no master to check)",
+      lc._ssh_master_alive("h", None) is False)
 # --- worker engine (--agent-run): brief/grant parsing + result harvest --------
 # The full headless run is hand-tested (needs a live provider); here we cover the
 # pure logic that shapes a worker run so a regression is caught offline.

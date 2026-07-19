@@ -6288,6 +6288,44 @@ _REMOTE_PUSH = (f'd="{_REMOTE_TMP}"; '
 _REMOTE_MKDIR = (f'd="{_REMOTE_TMP}"; '
                  'mkdir -p "$d" && chmod 700 "$d" 2>/dev/null; printf %s "$d"')
 
+# Windows/PowerShell equivalents (used when the target's DefaultShell is PowerShell,
+# which has no sh/mkdir -p/chmod/cat/printf). Throwaway dir: %TEMP%\leancoder. PUSH
+# reads the piped agent.py bytes from stdin and writes them, then echoes the dir with
+# NO trailing newline (the driver .strip()s it anyway). -Encoding Byte would corrupt a
+# utf-8 source, so we read the raw stdin stream and write bytes verbatim. `chmod 700`
+# has no analogue; the per-user %TEMP% is already ACL'd to the user.
+_WIN_REMOTE_TMP = '$d = Join-Path $env:TEMP "leancoder"'
+_WIN_REMOTE_PUSH = (
+    f'{_WIN_REMOTE_TMP}; '
+    'New-Item -ItemType Directory -Force -Path $d | Out-Null; '
+    '$in = [Console]::OpenStandardInput(); '
+    '$out = [System.IO.File]::Create((Join-Path $d "agent.py")); '
+    '$in.CopyTo($out); $out.Close(); '
+    '[Console]::Out.Write($d)')
+_WIN_REMOTE_MKDIR = (
+    f'{_WIN_REMOTE_TMP}; '
+    'New-Item -ItemType Directory -Force -Path $d | Out-Null; '
+    '[Console]::Out.Write($d)')
+
+# Probe run over ssh at connect to detect the remote OS/shell family. A bare `uname`
+# is the most portable discriminator: a POSIX shell prints a known kernel token
+# ("Linux"/"Darwin"/"FreeBSD"/etc); Windows cmd/PowerShell have no `uname`, so the
+# channel prints an error / nothing recognisable. Detection is done driver-side by
+# _remote_is_posix() on the captured output (NOT on shell operators, which differ
+# between sh and PowerShell < 7). Kept trivial so it behaves in ANY remote shell.
+_OS_PROBE = "uname"
+_POSIX_UNAMES = ("linux", "darwin", "bsd", "sunos", "aix", "cygwin", "msys", "gnu")
+
+
+def _remote_is_posix(uname_out) -> bool:
+    """Classify a remote from the _OS_PROBE (`uname`) output. True = POSIX shell
+    (Linux/macOS/BSD/Termux): use the ControlMaster + sh push path unchanged. False =
+    Windows (uname absent -> error/empty/'not recognized'): use the non-multiplexed
+    ssh + PowerShell push path. Errs toward POSIX only on a clear kernel token, so an
+    ambiguous/empty answer is treated as Windows (the safer branch to probe further)."""
+    s = (uname_out or "").strip().lower()
+    return any(tok in s for tok in _POSIX_UNAMES)
+
 # package managers tried, in order, when python3 is missing on the remote.
 _PKG_INSTALL = [
     ("apt-get", "sudo apt-get update && sudo apt-get install -y python3"),
@@ -6407,7 +6445,11 @@ def _ssh_master_alive(host, ctl) -> bool:
     """True if a LIVE ControlMaster socket exists at ctl for host (`ssh -O check`).
     Used by dispatch_worker to verify the parent's shared master is up BEFORE it
     launches a detached worker that will reuse it (a bg worker can't answer an auth
-    prompt, so a dead master must be caught in the foreground dispatch call)."""
+    prompt, so a dead master must be caught in the foreground dispatch call).
+    False when there's no ctl (Windows / non-multiplexed transport): there is no
+    master to check, so a worker can't ride one - callers must handle that."""
+    if not ctl:
+        return False
     try:
         return subprocess.run(["ssh", "-o", f"ControlPath={ctl}", "-O", "check", host],
                               capture_output=True, timeout=10).returncode == 0
@@ -6415,11 +6457,19 @@ def _ssh_master_alive(host, ctl) -> bool:
         return False
 
 
+def _ctl_opts(ctl):
+    """SSH options binding a call to a shared ControlMaster socket. Empty when ctl is
+    falsy: Windows OpenSSH has NO ControlMaster support (client or server), so the
+    Windows transport runs each ssh WITHOUT multiplexing (a fresh auth per channel, or
+    key-auth). On POSIX ctl is always set, so behaviour is byte-identical to before."""
+    return ["-o", f"ControlPath={ctl}"] if ctl else []
+
+
 def _ssh_run_argv(host, ctl, remote_cmd, tty=False):
     # reuses the master socket (BatchMode: auth is already done, so fail fast).
     # LogLevel=ERROR silences the "Shared connection to <host> closed." notice a
     # -tt channel prints when it ends (the master stays up; nothing real closes).
-    return (["ssh", "-o", f"ControlPath={ctl}", "-o", "BatchMode=yes",
+    return (["ssh"] + _ctl_opts(ctl) + ["-o", "BatchMode=yes",
              "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=8",
              "-o", "LogLevel=ERROR"]
             + (["-tt"] if tty else ["-T"]) + [host, remote_cmd])
@@ -6435,9 +6485,9 @@ def _ssh_exec_argv(host, ctl, exec_cmd, cwd, lean_tools_dir=None):
     # ServerAlive on this long-lived channel too: it multiplexes over the master
     # (which also has keepalives) but a multi-minute model turn with no traffic is
     # exactly when a stateful firewall/NAT drops the data channel - belt-and-braces.
-    return ["ssh", "-T", "-o", f"ControlPath={ctl}", "-o", "BatchMode=yes",
+    return (["ssh", "-T"] + _ctl_opts(ctl) + ["-o", "BatchMode=yes",
             "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=8",
-            "-o", "LogLevel=ERROR", host, inner]
+            "-o", "LogLevel=ERROR", host, inner])
 
 
 def _tools_to_sync(local, remote):
