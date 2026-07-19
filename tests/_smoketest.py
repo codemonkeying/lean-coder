@@ -994,7 +994,8 @@ _nondefault = {
     "bg_max_concurrent": 2, "worker_max_concurrent": 4, "worker_idle_timeout": 900,
     "worker_max_iterations": 15, "editor": "vim", "approval": "auto", "confirm_reads": True,
     "auto_reconnect": True, "statusline": False, "statusline_every": 3, "statusline_iter": 20,
-    "auto_evict": True, "auto_evict_keep": 5, "window_messages": 12, "auto_handover": False,
+    "auto_evict": True, "auto_evict_keep": 5, "window_messages": 12, "window_tokens": 4000,
+    "auto_handover": False,
     "handover_soft": 0.42, "handover_hard": 0.61, "handover_emergency": 0.99,
     "handover_min_interval": 33.0, "autostart_after_handover": False,
     "auto_compact_interval": 8, "auto_compact_hysteresis": 0.4, "auto_compact_keep": 6,
@@ -1268,6 +1269,38 @@ _noturn = [{"role": "system", "content": "S"},
 check("_window with no user boundary in range returns unchanged",
       wm._window_messages(_noturn, 2) is _noturn)
 check("window_messages defaults to 0 (off - full context)", lc.Config().window_messages == 0)
+
+# 12d'. _window_by_tokens: HARD token cap wins over window_messages, keeps whole recent
+# turns under budget, always keeps system + reserves the env/plan tail, non-destructive.
+check("window_tokens defaults to 0 (off)", lc.Config().window_tokens == 0)
+wt = lc.Agent.__new__(lc.Agent)
+wt.cfg = lc.Config(model="m")
+wt.tool_defs = []
+wt.pinned_plan = ""
+wt._skip_plan_reminder_once = False
+wt._plan_full_next = True
+wt.remote = None
+_big = [{"role": "system", "content": "S"}]
+for _i in range(1, 21):
+    _big.append({"role": "user", "content": f"user turn number {_i} " * 4})
+    _big.append({"role": "assistant", "content": f"assistant reply number {_i} " * 4})
+check("window_tokens: ample budget returns history unchanged",
+      wt._window_by_tokens(_big, 100000) is _big)
+_wt = wt._window_by_tokens(_big, 400)
+check("window_tokens: keeps the system message first", _wt[0]["role"] == "system")
+check("window_tokens: body starts on a clean user boundary (no orphan)",
+      _wt[1]["role"] == "user")
+check("window_tokens: actually trimmed the history", len(_wt) < len(_big))
+check("window_tokens: kept slice is the most RECENT turns",
+      _wt[-1]["content"] == _big[-1]["content"])
+check("window_tokens: non-destructive (history intact)", len(_big) == 41)
+wt.cfg.window_tokens = 400
+wt.cfg.window_messages = 99
+check("_window_messages: window_tokens takes precedence over window_messages",
+      len(wt._window_messages(_big, 99)) < len(_big))
+wt.cfg.window_tokens = 0
+check("_window_messages: falls back to window_messages when window_tokens is 0",
+      wt._window_messages(_big, 99) is _big)
 
 # 12d-bis. _auto_resume_pick: most-recent session wins, NOT cwd-scoped, snapshots skipped
 _ar_rows = [
