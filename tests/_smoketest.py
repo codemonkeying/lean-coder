@@ -631,6 +631,30 @@ check("lease: _bg_clean_sidecars removes the .lease too",
       not Path(_llog + ".lease").exists() and not Path(_llog + ".exit").exists())
 lc._bg_save([])
 
+# 10d. cross-platform bg-runner (run_bg_child / --bg-run). This is the pure-Python
+# twin of the POSIX shell wrapper used on Windows (no /bin/sh). Assert it reproduces
+# the sidecar contract: plain exit code, and the 137 kill on max_runtime.
+import json as _json_bgr, subprocess as _sp_bgr
+check("bg: _detached_popen_kwargs posix uses start_new_session",
+      lc.os.name == "nt" or lc._detached_popen_kwargs() == {"start_new_session": True})
+check("bg: _kill_tree never raises on a dead/absent pid", lc._kill_tree(2 ** 31 - 1) is None)
+_bgc_dir = Path(tempfile.mkdtemp(prefix="lc_bgchild_"))
+_clog = str(_bgc_dir / "c.log"); Path(_clog).touch()
+_ccfg = {"cmd": "exit 5", "exitf": _clog + ".exit", "leasef": _clog + ".lease", "logf": _clog}
+_crc = lc.run_bg_child(_ccfg)
+check("bg-runner: plain exit code returned + written to sidecar",
+      _crc == 5 and Path(_clog + ".exit").read_text().strip() == "5")
+_mlog = str(_bgc_dir / "m.log"); Path(_mlog).touch()
+_mcfg = {"cmd": "sleep 30", "exitf": _mlog + ".exit", "leasef": _mlog + ".lease",
+         "logf": _mlog, "max_runtime": 2, "kill_on_max": True}
+_argv = [sys.executable, str(Path(lc.__file__).resolve()), "--bg-run", _json_bgr.dumps(_mcfg)]
+_p = _sp_bgr.Popen(_argv, stdout=_sp_bgr.DEVNULL, stderr=_sp_bgr.DEVNULL,
+                   stdin=_sp_bgr.DEVNULL, **lc._detached_popen_kwargs())
+_p.wait()
+check("bg-runner: --bg-run entrypoint enforces max_runtime (exit 137 sidecar)",
+      Path(_mlog + ".exit").read_text().strip() == "137")
+shutil.rmtree(_bgc_dir, ignore_errors=True)
+
 # --- worker engine (--agent-run): brief/grant parsing + result harvest --------
 # The full headless run is hand-tested (needs a live provider); here we cover the
 # pure logic that shapes a worker run so a regression is caught offline.
