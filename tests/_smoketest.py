@@ -801,6 +801,81 @@ check("dispatch_worker: setup captured bg_launch hook", "bg_launch" in _dw._H)
 check("dispatch_worker: setup captured core file for the worker argv",
       _dw._H.get("__file__", "").endswith("lean_coder.py"))
 
+# --- shell_session _drain: the echo-race fix. A pty echoes the typed line back
+# within ms; the command's real output can lag (ssh RTT / slow remote). _drain must
+# NOT let that instant echo trip the quiet-gap early-exit and return only the echo
+# (the bug: output landed a call late / "no output"). _beyond_echo is the pure core.
+_ss = lc._load_lean_tool(Path(__file__).resolve().parent.parent / "lean-tools" / "shell_session.py")
+check("shell_session: is driver_only (pty fd lives on the driver)",
+      _ss.TOOL.get("driver_only") is True)
+check("_beyond_echo: bare echo alone is NOT real output",
+      _ss._beyond_echo(b"qm list\n", b"qm list\n") is False)
+check("_beyond_echo: echo + CR variations still counted as echo-only",
+      _ss._beyond_echo(b"qm list\r\n", b"qm list\n") is False)
+check("_beyond_echo: output past the echo IS real",
+      _ss._beyond_echo(b"qm list\nVMID NAME\n", b"qm list\n") is True)
+check("_beyond_echo: no echo passed -> any non-space is real (bare read)",
+      _ss._beyond_echo(b"data\n", b"") is True and _ss._beyond_echo(b"  \n", b"") is False)
+# --- shell_session sentinel-marker draining (deterministic completion) ----------
+# _mode_for: shells/ssh get marker mode; REPLs/listeners/unknown get raw.
+check("_mode_for: bare shell -> shell", _ss._mode_for("") == "shell")
+check("_mode_for: ssh -> shell (far end is a login shell)", _ss._mode_for("ssh user@host") == "shell")
+check("_mode_for: sudo/su -> shell", _ss._mode_for("sudo -s") == "shell")
+check("_mode_for: python -i -> raw", _ss._mode_for("python3 -i") == "raw")
+check("_mode_for: nc listener -> raw", _ss._mode_for("nc -lvnp 4444") == "raw")
+check("_mode_for: unknown command -> raw (never inject a marker blindly)",
+      _ss._mode_for("some-weird-repl") == "raw")
+# _strip_marker: output is exactly the lines BETWEEN the echoed injected line and the
+# <mark><rc> terminator - so echo AND trailing prompt both drop.
+_MK = "__LC_DONE_1_2_"
+_cap = ("echo hi; printf '\\n%s' \"$?\"\n"   # echo of our injected line (has mark)
+        "hi\n"                                # the real output
+        f"{_MK}0\n"                           # the terminator
+        "user@box:~$ ")                       # next prompt (must be dropped)
+_cap = _cap.replace("%s", _MK)
+check("_strip_marker: keeps only output between echo and terminator",
+      _ss._strip_marker(_cap, _MK).strip() == "hi")
+check("_strip_marker: fallback filters mark lines when anchors missing",
+      _ss._strip_marker(f"just output\n{_MK}0", _MK).strip() == "just output")
+# End-to-end through a real pty (POSIX only): the cases that broke before -
+# lagged/bursty output, exit code surfaced, clean-exit stays quiet, prompt/echo
+# never leak. Guarded so a no-pty platform just skips.
+try:
+    import pty as _pty_probe  # noqa: F401
+    _has_pty = True
+except ImportError:
+    _has_pty = False
+if _has_pty:
+    _ss._H["_clean_captured"] = getattr(lc, "_clean_captured", lambda t: t)
+    def _sss(inp, timeout=6):
+        return _ss.run({"action": "send", "id": _sid, "input": inp, "timeout": timeout}, "/tmp")
+    _startres = _ss._start({}, "/tmp")
+    _sid = _startres.split()[1]              # "session sN started ..."
+    # bursty: output split by a mid-command sleep longer than the quiet-gap
+    _r = _sss("echo A; sleep 1; echo B_LATE")
+    check("shell_session e2e: bursty output fully captured (marker drain)",
+          "A" in _r and "B_LATE" in _r and "__LC_DONE" not in _r, repr(_r))
+    # exit code surfaced on failure, quiet on clean success
+    check("shell_session e2e: non-zero exit surfaced", "[exit 1]" in _sss("false"), )
+    check("shell_session e2e: clean exit stays quiet (no [exit 0])",
+          "[exit" not in _sss("true"))
+    # no prompt / echo / marker leakage
+    _r = _sss("echo HELLO")
+    check("shell_session e2e: output is clean (no prompt/echo/marker leak)",
+          _r.strip() == "HELLO", repr(_r))
+    # state persists across sends
+    _sss("cd /etc && export _LCT=zzz")
+    check("shell_session e2e: cwd + env persist across sends",
+          _ss.run({"action": "send", "id": _sid, "input": 'echo "$PWD/$_LCT"'}, "/tmp").strip()
+          == "/etc/zzz")
+    # timeout < command -> 'still running', rest retrievable via read
+    _r = _sss("sleep 3; echo TARDY", timeout=1)
+    check("shell_session e2e: timeout reports still-running (not a false empty)",
+          "still running" in _r)
+    check("shell_session e2e: the late output is retrievable via read",
+          "TARDY" in _ss.run({"action": "read", "id": _sid, "timeout": 4}, "/tmp"))
+    _ss.run({"action": "close", "id": _sid}, "/tmp")
+
 # --- web_screenshot lean-tool: MUST be driver_only ----------------------------
 # The browser + playwright live on the driver; if this tool is pushed to a remote
 # executor it tries to apt-install pip+playwright+a browser onto the user's box.
@@ -1001,6 +1076,7 @@ _nondefault = {
     "auto_compact_interval": 8, "auto_compact_hysteresis": 0.4, "auto_compact_keep": 6,
     "wake_on_bg_finish": True, "lean_tools_dir": "/tmp/lt", "providers_dir": "/tmp/pv",
     "user_name": "dide", "model": "some-model:1b", "ephemeral": True,
+    "gen_connect_timeout": 7.0, "gen_ttft_timeout": 120.0, "gen_idle_timeout": 30.0,
 }
 # every persisted scalar must have a probe value here (so nothing is left untested)
 _missing_probe = [k for k in lc._PERSISTED_SCALAR_KEYS if k not in _nondefault]
@@ -1553,6 +1629,26 @@ sp = lc.Spinner("x").start()
 sp.stop()
 check("spinner no-op offline: no thread, no active spinner",
       sp._thread is None and lc._active_spinner is None)
+# 12c'. Nested spinners stack: only the TOP is active; stopping it resumes the one
+# underneath; stopping the last clears. (Guards the flip-flop bug: two painters on
+# one status line.) Force the TTY path so start()/stop() manage the stack.
+_otty = lc._TTY
+lc._TTY = False   # keep it painter-free but still stack-managed (the no-TTY branch pushes too)
+try:
+    _s1 = lc.Spinner("outer").start()
+    check("spinner stack: first push is active + on stack",
+          lc._active_spinner is _s1 and lc._spinner_stack == [_s1])
+    _s2 = lc.Spinner("inner").start()
+    check("spinner stack: nested push becomes top",
+          lc._active_spinner is _s2 and lc._spinner_stack == [_s1, _s2])
+    _s2.stop()
+    check("spinner stack: pop resumes the one underneath",
+          lc._active_spinner is _s1 and lc._spinner_stack == [_s1])
+    _s1.stop()
+    check("spinner stack: last pop clears",
+          lc._active_spinner is None and lc._spinner_stack == [])
+finally:
+    lc._TTY = _otty
 
 # --- the bundled ollama provider lives in providers/ollama.py now (extracted
 # from core). Load it the way the manager does (compile+exec) and run its
