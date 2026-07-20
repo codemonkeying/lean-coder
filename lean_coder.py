@@ -91,7 +91,7 @@ def _prehandover_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.9.0"
+__version__ = "0.9.1"
 
 
 def _prerelease_key(pre):
@@ -2275,6 +2275,65 @@ def style_md_line(line: str) -> str:
     return line
 
 
+class StreamStall(ConnectionError):
+    """A streaming model request stalled at the socket level. Subclasses
+    ConnectionError so the agent loop's cross-provider next-model fallback (which
+    catches ConnectionError) still fires - no per-provider `on_error` hook needed.
+    `kind` distinguishes the two tiers for callers that care (the eval harness reads
+    it off the exception): "prefill" = the server accepted the request but never
+    emitted a first token (TTFT deadline tripped); "decode" = the stream went idle
+    mid-flight (inter-token deadline tripped)."""
+    def __init__(self, kind, where=""):
+        self.kind = kind
+        what = "first token" if kind == "prefill" else "next token"
+        loc = f" from {where}" if where else ""
+        super().__init__(
+            f"stream stalled ({kind}) waiting for the {what}{loc}: the server "
+            f"accepted the request but went idle "
+            f"(tune gen_ttft_timeout / gen_idle_timeout).")
+
+
+def _set_stream_read_timeout(resp, secs):
+    """Best-effort: retarget a live urllib response socket's read timeout. urllib's
+    single urlopen `timeout` scalar can't express connect-vs-read tiers, so we open
+    with the connect deadline then re-arm the socket here for the TTFT / idle read
+    phases. Silent no-op if the internals aren't reachable (never breaks a stream)."""
+    if not secs:
+        return
+    try:
+        resp.fp.raw._sock.settimeout(secs)
+    except Exception:
+        pass
+
+
+def stream_tiered(resp, cfg, where=""):
+    """Wrap a streaming urllib response in the 3-tier timeout model and yield its
+    raw lines. The provider opens the connection with `cfg.gen_connect_timeout`,
+    then iterates THIS instead of `resp` directly; its own should_abort poll and
+    line parsing are unchanged. We re-arm the socket to `gen_ttft_timeout` until the
+    first line arrives (a socket.timeout before then = "prefill" stall), then to
+    `gen_idle_timeout` for the decode phase (a timeout after = "decode" stall).
+    Prod defaults (ttft=600, idle=None) reproduce the old single 600s read timeout
+    exactly - idle=None leaves the ttft deadline in place, so a live-but-slow stream
+    is never tripped. Raises StreamStall (a ConnectionError) on a stall."""
+    ttft = getattr(cfg, "gen_ttft_timeout", None) or 600
+    idle = getattr(cfg, "gen_idle_timeout", None)
+    _set_stream_read_timeout(resp, ttft)
+    it = iter(resp)
+    got_first = False
+    while True:
+        try:
+            raw = next(it)
+        except StopIteration:
+            return
+        except socket.timeout:
+            raise StreamStall("prefill" if not got_first else "decode", where)
+        if not got_first:
+            got_first = True
+            _set_stream_read_timeout(resp, idle)   # None = keep ttft (prod)
+        yield raw
+
+
 class MarkdownStream:
     """Line-buffered styler for streamed output: feed() chunks, it writes styled
     complete lines and holds the partial tail until flush(). The ``` fence
@@ -2310,7 +2369,8 @@ class MarkdownStream:
             self._emit(self._buf, False)
             self._buf = ""
 
-_active_spinner = None             # so _ask() can pause it before prompting
+_active_spinner = None             # the TOP spinner (so _ask() can pause it before prompting)
+_spinner_stack = []                # nesting stack: only the top spinner paints the status line
 
 
 WATCHDOG_ELAPSED_AT = 6      # s before the status starts showing an elapsed counter
@@ -2347,14 +2407,24 @@ class Spinner:
         self.color, self.interval = color, interval
         self._stop = None
         self._thread = None
-
     def start(self):
         global _active_spinner
         # A live elapsed/escape ticker runs in BOTH modes so a long or wedged step
         # keeps updating (the worker thread is separate from the stuck main thread).
+        # Spinners NEST (a mid-tool-call reconnect starts connect()'s stage spinners
+        # while the outer tool spinner is still alive). Only the TOP of the stack may
+        # paint the shared status line - otherwise two ticker threads fight over it
+        # every ~0.1s and the display flip-flops. On start we suspend the current top
+        # (stop its thread, leave it on the stack) and become the new top; on stop we
+        # pop and RESUME whoever was underneath.
         self._stop = threading.Event()
-        t0 = time.monotonic()
+        self._t0 = time.monotonic()
         pid = os.getpid()
+
+        if _spinner_stack:                       # pause the current top's painter
+            _spinner_stack[-1]._pause()
+        _spinner_stack.append(self)
+        _active_spinner = self
 
         if _active_composer is not None:     # composer owns the status line
             comp = _active_composer
@@ -2362,7 +2432,7 @@ class Spinner:
             def tick_composer():
                 comp.status = self.label
                 while not self._stop.wait(0.5):
-                    base = _activity_label(self.label, time.monotonic() - t0, pid)
+                    base = _activity_label(self.label, time.monotonic() - self._t0, pid)
                     q = len(getattr(comp, "queued", []))
                     comp.status = base + (f"  ·  {q} queued (^C to send)" if q else "")
 
@@ -2376,15 +2446,57 @@ class Spinner:
             for fr in itertools.cycle(self.frames):
                 if self._stop.is_set():
                     break
-                lbl = _activity_label(self.label, time.monotonic() - t0, pid)
+                lbl = _activity_label(self.label, time.monotonic() - self._t0, pid)
                 sys.stdout.write("\r\033[K" + self.color(f"{fr} {lbl}"))
                 sys.stdout.flush()
                 self._stop.wait(self.interval)
 
         self._thread = threading.Thread(target=run, daemon=True)
-        _active_spinner = self
         self._thread.start()
         return self
+
+    def _pause(self):
+        """Stop this spinner's painter thread WITHOUT popping it from the stack -
+        it stays suspended while a nested spinner is on top, and _resume() restarts
+        it when the nested one pops."""
+        if self._stop is not None:
+            self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=0.5)
+        self._thread = None
+
+    def _resume(self):
+        """Restart this spinner's painter after a nested spinner popped off above
+        it. Keeps its original t0 so the elapsed counter is continuous."""
+        pid = os.getpid()
+        self._stop = threading.Event()
+        if _active_composer is not None:
+            comp = _active_composer
+
+            def tick_composer():
+                comp.status = self.label
+                while not self._stop.wait(0.5):
+                    base = _activity_label(self.label, time.monotonic() - self._t0, pid)
+                    q = len(getattr(comp, "queued", []))
+                    comp.status = base + (f"  ·  {q} queued (^C to send)" if q else "")
+
+            self._thread = threading.Thread(target=tick_composer, daemon=True)
+            self._thread.start()
+            return
+        if not _TTY:
+            return
+
+        def run():
+            for fr in itertools.cycle(self.frames):
+                if self._stop.is_set():
+                    break
+                lbl = _activity_label(self.label, time.monotonic() - self._t0, pid)
+                sys.stdout.write("\r\033[K" + self.color(f"{fr} {lbl}"))
+                sys.stdout.flush()
+                self._stop.wait(self.interval)
+
+        self._thread = threading.Thread(target=run, daemon=True)
+        self._thread.start()
 
     def stop(self):
         global _active_spinner
@@ -2393,14 +2505,27 @@ class Spinner:
         if self._thread:
             self._thread.join(timeout=0.5)
         self._stop = self._thread = None
+        # Pop from the stack (we may not be the top if stops interleave oddly).
+        if self in _spinner_stack:
+            _spinner_stack.remove(self)
         if _active_composer is not None:
-            _active_composer.status = ""
+            if _spinner_stack:                   # resume whoever's underneath
+                _active_spinner = _spinner_stack[-1]
+                _active_spinner._resume()
+            else:
+                _active_spinner = None
+                _active_composer.status = ""
             return
         if not _TTY:
+            _active_spinner = _spinner_stack[-1] if _spinner_stack else None
             return
         sys.stdout.write("\r\033[K")          # clear the spinner line
         sys.stdout.flush()
-        if _active_spinner is self:
+        if _spinner_stack:                       # resume the one underneath
+            _active_spinner = _spinner_stack[-1]
+            _active_spinner._resume()
+        else:
+            _active_spinner = None
             _active_spinner = None
 
     def __enter__(self):
@@ -3581,6 +3706,16 @@ class Config:
                                      # request (keeps the prefill KV cache warm between
                                      # turns). Modest default since the box may be shared;
                                      # set "-1" to pin indefinitely, "0" to unload at once.
+    # --- ollama streaming timeouts (3-tier). Prod defaults preserve the old
+    # single 600s socket timeout byte-for-byte; raise/lower per box or in eval. ---
+    gen_connect_timeout: float = 10.0  # ollama: TCP connect-phase deadline (s)
+    gen_ttft_timeout: float = 600.0    # ollama: read deadline until the FIRST token
+                                       # arrives (catches a prefill stall - server
+                                       # accepts then emits nothing). 600 = old default.
+    gen_idle_timeout: "float | None" = None  # ollama: max gap BETWEEN tokens once
+                                       # streaming (catches a decode stall). None =
+                                       # disabled (old behaviour); a slow-but-live
+                                       # stream must not trip it, so set generously.
     auto_evict: bool = False         # continuous tool-output eviction: each round, stub
                                      # acted-on tool results (keep last auto_evict_keep in
                                      # full). A raw-token quota lever - BUT it rewrites
@@ -3907,6 +4042,7 @@ _PERSISTED_SCALAR_KEYS = (
     "handover_emergency", "handover_min_interval", "autostart_after_handover",
     "auto_compact_interval", "auto_compact_hysteresis", "auto_compact_keep",
     "wake_on_bg_finish",
+    "gen_connect_timeout", "gen_ttft_timeout", "gen_idle_timeout",
     "lean_tools_dir", "providers_dir", "user_name", "ephemeral",
 )
 # EPHEMERAL: deliberately NEVER persisted. These are per-launch state - saving them
@@ -4164,6 +4300,13 @@ def save_config(cfg: Config, quiet: bool = False):
         lines.append(f"num_ctx = {cfg.num_ctx}")
     if cfg.keep_alive and cfg.keep_alive != "10m":
         lines.append(f'keep_alive = "{cfg.keep_alive}"')
+    # ollama streaming timeouts: persist only a non-default (prod defaults stay implicit).
+    if cfg.gen_connect_timeout != 10.0:
+        lines.append(f"gen_connect_timeout = {cfg.gen_connect_timeout}")
+    if cfg.gen_ttft_timeout != 600.0:
+        lines.append(f"gen_ttft_timeout = {cfg.gen_ttft_timeout}")
+    if cfg.gen_idle_timeout is not None:
+        lines.append(f"gen_idle_timeout = {cfg.gen_idle_timeout}")
     if cfg.auto_evict:
         lines.append("auto_evict = true")
     if cfg.auto_evict_keep != 3:
@@ -6117,6 +6260,7 @@ def _emit_json(stream, obj):
 # cap/rstrip and is binary-safe.
 RAW_READ = "__read_raw__"
 BG_POLL  = "__bg_poll__"        # driver-only: finished bg tasks the executor owns
+BG_LIST  = "__bg_list__"        # driver-only: all bg tasks (running+finished) it owns, for /bg
 
 
 def _read_raw_b64(path: Path, max_bytes=RAW_READ_MAX):
@@ -6362,6 +6506,10 @@ def run_tool_executor(cwd, lean_tools_dir=None):
             _emit_json(proto, {"id": rid, "ok": True,
                                "result": _bg_finished_here(_me)})
             continue
+        if tool == BG_LIST:                # driver-only: all bg tasks (running+finished) WE own here
+            _emit_json(proto, {"id": rid, "ok": True,
+                               "result": _bg_status_items(os.getpid())})
+            continue
         plug = lean_tools.get(tool) if lean_tools else None
         if tool not in EXEC_TOOLS and not plug:
             _emit_json(proto, {"id": rid, "ok": False, "error": f"tool not allowed: {tool}"})
@@ -6386,10 +6534,17 @@ class ExecutorClient:
         # with the driver's locale while a Windows executor emits cp1252, so any non-ASCII
         # char in a tool result (e.g. the '·' separators) mojibakes to 'Â·'. errors=replace
         # keeps a stray undecodable byte from tearing the whole channel down.
+        # start_new_session: run the ssh channel in its OWN process group so a
+        # terminal ^C (SIGINT to the whole foreground group) does NOT reach the ssh
+        # child. Without this, ^C to abort a turn killed the exec channel -> the next
+        # request hit a dead pipe -> _route_remote misread it as a link drop and
+        # reconnected. Now ^C only trips the cooperative self._abort path (clean
+        # abort, master + channel intact). Windows: its own group, same effect.
         self.proc = subprocess.Popen(
             argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=stderr, text=True, bufsize=1,
-            encoding="utf-8", errors="replace")
+            encoding="utf-8", errors="replace",
+            **_detached_popen_kwargs())
         self._id = 0
         self.host = None                # set by RemoteWorkspace for wait-spinner labels
         self.ready = self._read_obj()   # consume the {"ready": ...} handshake
@@ -6427,7 +6582,7 @@ class ExecutorClient:
                 if not ready:
                     if spin is None and time.monotonic() - t0 >= REMOTE_WAIT_GRACE:
                         where = f" on {self.host}" if self.host else ""
-                        spin = Spinner(f"waiting for remote{where} (link slow? ^C to abort)",
+                        spin = Spinner(f"waiting for remote{where}",
                                        TOOL_FRAMES, yellow, interval=0.12).start()
                     continue
                 line = self.proc.stdout.readline()
@@ -6656,9 +6811,11 @@ def _remote_is_posix(uname_out) -> bool:
 
 def _remote_os_label(uname_out) -> str:
     """A short human name for the probed remote OS, from the _OS_PROBE (`uname`) output -
-    surfaced on the connect 'probed' line so a misdetect is visible immediately (before
-    the push path forks on it). POSIX kernels map to a friendly name; anything else (uname
-    absent/error) is 'Windows', matching _remote_is_posix's Windows branch."""
+    surfaced on the connect 'probed' line so a misdetect is visible immediately. POSIX
+    kernels map to a friendly name. Anything without a recognisable kernel token is
+    'unknown' - we do NOT assume Windows here (that call belongs to the caller, which
+    knows the box connected fine and simply lacks `uname`); an empty/garbled answer
+    that could be anything must not masquerade as a confident 'Windows'."""
     s = (uname_out or "").strip().lower()
     if "linux" in s:
         return "Linux"
@@ -6668,7 +6825,49 @@ def _remote_os_label(uname_out) -> str:
         return "BSD"
     if any(tok in s for tok in ("sunos", "aix", "cygwin", "msys", "gnu")):
         return s.split()[0].strip() or "POSIX"
-    return "Windows"
+    return "unknown"
+
+
+# ssh exits 255 for its OWN failures (can't connect, auth refused, timeout) as
+# opposed to relaying the remote command's exit code. That's how we tell "the box
+# is genuinely Windows (connected fine, no `uname`)" from "we never reached a
+# shell at all" - the latter must NOT be misread as Windows (it was, and the real
+# ssh error got buried under a doomed embeddable-Python push).
+_SSH_UNREACHABLE = (
+    "network is unreachable", "no route to host", "connection refused",
+    "connection timed out", "connection closed", "operation timed out",
+    "could not resolve", "name or service not known", "timed out",
+    "host is down", "no address associated",
+)
+_SSH_AUTH_DENIED = (
+    "permission denied", "authentication failed", "too many authentication",
+    "password", "publickey", "host key verification failed",
+)
+
+
+def _classify_ssh_probe(rc, stdout, stderr):
+    """Classify the connect-time OS probe. Returns (kind, detail):
+      "posix"       - reached a POSIX shell (uname kernel token in stdout)
+      "windows"     - CONNECTED (rc 0) but no uname -> a real Windows box
+      "auth"        - reachable but ssh couldn't authenticate (needs a password/key;
+                      BatchMode refused it). Caller retries WITHOUT BatchMode.
+      "unreachable" - never reached the host (network/route/DNS/refused/timeout).
+    rc 255 is ssh's own-failure code; anything else means the remote shell ran."""
+    if _remote_is_posix(stdout):
+        return "posix", ""
+    err = (stderr or "").strip()
+    low = err.lower()
+    if rc == 255 or rc is None:
+        if any(tok in low for tok in _SSH_AUTH_DENIED) and not any(
+                tok in low for tok in _SSH_UNREACHABLE):
+            return "auth", err
+        if any(tok in low for tok in _SSH_UNREACHABLE) or not err:
+            return "unreachable", err or "ssh could not connect"
+        # An unrecognised 255 is a connection-level failure too - surface it.
+        return "unreachable", err
+    # rc != 255: ssh connected and ran the command; no uname => genuine Windows.
+    return "windows", ""
+
 
 def _runtime_dir() -> Path:
     """Local ephemeral dir for control sockets. Prefers XDG_RUNTIME_DIR, then TMPDIR
@@ -6907,88 +7106,81 @@ class RemoteWorkspace:
         return r.returncode, r.stdout, r.stderr
 
     def connect(self, batch=False):
-        """Open the ssh master (POSIX) + bootstrap the executor. batch=True forces a
+        """Open the ssh master + bootstrap the executor. batch=True forces a
         NON-INTERACTIVE open (BatchMode + a timeout) - for a reconnect that runs
-        where we can't prompt (mid-tool-call): it must fail fast rather than hang on
-        an invisible 'password:' prompt. A password host then needs an interactive
-        /connect. batch=False (default) is the interactive open (/connect can prompt).
+        where we can't prompt (mid-tool-call, or a detached worker): it must fail
+        fast rather than hang on an invisible 'password:' prompt. A password host
+        then needs an interactive /connect. batch=False (default) is the interactive
+        open where ssh may prompt ONCE for a password/passphrase.
 
-        Windows: we PROBE the OS first over a plain masterless ssh (so a doomed master
-        is never opened blind), then TRY to multiplex - a Linux client CAN drive a
-        shared ControlMaster to Windows sshd, and we keep it only if `ssh -O check`
-        confirms it's live+reusable (_try_open_win_master), else fall back to per-call
-        connections (self.ctl=None, the old behaviour). All Windows commands are
-        stdin-free (powershell -EncodedCommand / scp), so the historic stdin-piped
-        deadlock can't recur. Multiplexing needs key auth (a password host prompts)."""
+        Order: open the ControlMaster FIRST (the single auth - key OR one interactive
+        password prompt), THEN detect the OS by running `uname` OVER that master
+        (BatchMode reuse, no second auth). A Linux client can drive a shared master
+        to both POSIX and Windows sshd, so we don't need to know the OS to open it -
+        and this is the one place auth happens, so a password host is asked exactly
+        once (the old probe-then-master order asked twice). If ssh never reaches the
+        host, or auth fails, we surface the REAL ssh error here instead of misreading
+        empty output as 'Windows' and marching into a doomed embeddable-Python push.
+
+        Windows/unknown boxes: not every Windows sshd honours session-reuse, so we
+        keep the master only if `ssh -O check` confirms it live+reusable; otherwise
+        we drop to per-call connections (self.ctl=None, the old always-correct
+        behaviour). All Windows commands are stdin-free (powershell -EncodedCommand /
+        scp over its own channel), so the historic stdin-piped deadlock can't recur."""
         print(dim(f"connecting to {self.host} ..."))
-        # Probe the remote OS BEFORE any master, over a plain (masterless) ssh - so a
-        # Windows target never gets a doomed ControlMaster. Uses BatchMode so it can't
-        # hang on a prompt; a POSIX box answers `uname` with a kernel token.
-        with _stage("probing host", done="probed") as _st:
-            _probe = subprocess.run(
-                ["ssh", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new",
-                 "-o", "ConnectTimeout=10", "-o", "LogLevel=ERROR", self.host, _OS_PROBE],
-                capture_output=True, text=True, timeout=30)
-            self.remote_posix = _remote_is_posix(_probe.stdout)
-            _st.done = f"probed · {_remote_os_label(_probe.stdout)}"
-        if self.remote_posix:
-            with _stage("opening ssh", done="ssh ready"):
-                _clear_master(self.host, self.ctl)     # drop any stale socket first (#3)
-                argv = _ssh_master_argv(self.host, self.ctl, batch=batch)
-                try:
-                    rc = subprocess.run(argv, timeout=30 if batch else None).returncode
-                except subprocess.TimeoutExpired:
-                    raise ConnectionError(f"ssh connection to {self.host} timed out")
-                if rc != 0:
-                    raise ConnectionError(f"ssh connection to {self.host} failed")
-            self._check_posix_python()
-        else:
-            # Windows: TRY to multiplex (a Linux client CAN drive a shared master to a
-            # Windows sshd - multiplexing is a client feature). But only KEEP it if the
-            # master actually comes up and `ssh -O check` confirms it: some Windows sshd
-            # builds don't honour session-reuse, and we must degrade cleanly. On any
-            # doubt we fall back to ctl=None (a fresh key-auth connection per call - the
-            # old, always-correct behaviour). All Windows commands are stdin-free
-            # (powershell -EncodedCommand / scp over its own channel), so the historic
-            # stdin-piped-channel deadlock against Windows sshd can't recur here.
-            if not self._try_open_win_master(batch=batch):
-                self.ctl = None                    # no reliable mux -> per-call connections
-            self._check_windows_python()
-        self._bootstrap_executor()
-        return self
-
-    def _try_open_win_master(self, batch=False):
-        """Windows only: attempt to open a shared ControlMaster and verify it's usable,
-        returning True if we should multiplex, False to fall back to per-call connections.
-
-        A Linux ssh client CAN multiplex to a Windows sshd (ControlMaster is a client
-        feature), which collapses the ~4-handshakes-per-file provisioning cost onto one
-        reused connection. But not every Windows sshd honours session-reuse, so we PROVE
-        it before trusting it: clear any stale socket, open a backgrounded master
-        (_ssh_master_argv, same as the POSIX path), then require `ssh -O check` to
-        confirm the master is genuinely live and reusable. Any failure (open
-        error, timeout, check fails) -> tear down and return False so the caller uses
-        ctl=None. self.ctl must already be set (the per-PID socket path)."""
-        if not self.ctl:
-            return False
-        try:
+        with _stage("opening ssh", done="ssh ready") as _st:
             _clear_master(self.host, self.ctl)     # drop any stale socket first
             argv = _ssh_master_argv(self.host, self.ctl, batch=batch)
             try:
-                rc = subprocess.run(argv, timeout=30).returncode
+                # capture_output so we can classify a failure from ssh's own stderr;
+                # an interactive password prompt still reaches the tty regardless.
+                r = subprocess.run(argv, capture_output=True, text=True,
+                                   timeout=30 if batch else None)
             except subprocess.TimeoutExpired:
                 _clear_master(self.host, self.ctl)
-                return False
-            if rc != 0:
-                return False
-            # The master opened - but only KEEP it if it's genuinely reusable.
-            if _ssh_master_alive(self.host, self.ctl):
-                return True
-            _clear_master(self.host, self.ctl)     # opened but not shareable - drop it
-            return False
-        except (OSError, subprocess.SubprocessError):
-            _clear_master(self.host, self.ctl)
-            return False
+                raise ConnectionError(f"ssh connection to {self.host} timed out")
+            if r.returncode != 0:
+                kind, detail = _classify_ssh_probe(r.returncode, "", r.stderr)
+                _clear_master(self.host, self.ctl)
+                if kind in ("unreachable", "auth"):
+                    _st.done = "unreachable" if kind == "unreachable" else "auth failed"
+                    raise ConnectionError(f"can't reach {self.host}: {detail}")
+                # Connected + authed but the shared master didn't hold (a Windows
+                # sshd that won't multiplex): fall back to per-call connections.
+                self.ctl = None
+                _st.done = "ssh ready (per-call)"
+        # Master (or per-call fallback) is up. Detect the OS by running `uname` over
+        # it - reuses the master when we have one (BatchMode, no re-auth).
+        with _stage("probing host", done="probed") as _st:
+            uname_out = uname_err = ""
+            try:
+                _p = subprocess.run(_ssh_run_argv(self.host, self.ctl, _OS_PROBE),
+                                    capture_output=True, text=True, timeout=30)
+                uname_out, uname_err = _p.stdout, _p.stderr
+            except (subprocess.SubprocessError, OSError):
+                pass
+            self.remote_posix = _remote_is_posix(uname_out)
+            if self.remote_posix:
+                label = _remote_os_label(uname_out)
+            elif any(t in (uname_err or "").lower() for t in
+                     ("not recognized", "commandnotfound", "cmdlet")):
+                label = "Windows"          # ran the channel, no uname -> genuine Windows
+            else:
+                label = "unknown"          # connected but couldn't tell (never assume)
+            _st.done = f"probed · {label}"
+            if self.remote_posix:
+                self._check_posix_python()
+            else:
+                # Windows/unknown: keep the master only if it's genuinely reusable; some
+                # Windows sshd builds don't honour session-reuse. Else drop to per-call.
+                if self.ctl and not _ssh_master_alive(self.host, self.ctl):
+                    _clear_master(self.host, self.ctl)
+                    self.ctl = None
+                self._check_windows_python()
+            if getattr(self, "remote_py_desc", ""):
+                _st.done = f"probed · {label} · {self.remote_py_desc}"
+        self._bootstrap_executor()
+        return self
 
     def attach(self):
         """ATTACH to a master a PARENT already opened (worker reuse): DON'T open or
@@ -7131,6 +7323,17 @@ class RemoteWorkspace:
             return []
         return obj.get("result") or [] if obj.get("ok") else []
 
+    def bg_list(self):
+        """All bg tasks (running + finished) the REMOTE executor owns, as
+        _bg_status_items rows [{pid, cmd, state, runtime, started, tail}] - the
+        data behind /bg for a connected session (the registry lives on that box).
+        [] on any error (never break the command over a poll)."""
+        try:
+            obj = self.client.request(BG_LIST, deadline=time.monotonic() + 3)
+        except (ConnectionError, OSError, TimeoutError):
+            return []
+        return obj.get("result") or [] if obj.get("ok") else []
+
     def reload(self, lean_tool_paths=()):
         """Re-push current code + lean-tools and relaunch the executor over the
         SAME ssh master (no re-auth, connection preserved)."""
@@ -7258,10 +7461,12 @@ class RemoteWorkspace:
         to_push, to_remove = _tools_to_sync(local, remote)
         if to_push:
             n = len(to_push)
-            for i, name in enumerate(to_push, 1):
-                with _stage(f"syncing tools [{i}/{n}] {name}",
-                            done=(f"{n} tool{'s' if n != 1 else ''} synced" if i == n else None)):
+            with _stage("syncing tools",
+                        done=f"{n} tool{'s' if n != 1 else ''} synced") as _st:
+                for i, name in enumerate(to_push, 1):
+                    _st.done = f"{i}/{n} synced"
                     self._remote_write(pdir + sep + name, blobs[name])
+                _st.done = f"{n} tool{'s' if n != 1 else ''} synced"
         if to_remove:
             if self.remote_posix:
                 self._run("rm -f " + " ".join(shlex.quote(pdir + "/" + n) for n in to_remove))
@@ -7272,9 +7477,16 @@ class RemoteWorkspace:
 
     def _posix_python(self):
         """Return 'python3' if the POSIX remote already has a usable interpreter on
-        PATH, else None. A bare probe - no install, nothing left behind."""
-        _, out, _ = self._run("command -v python3 || true")
-        return "python3" if out.strip() else None
+        PATH, else None. A bare probe - no install, nothing left behind. Records the
+        version string on self.remote_py_ver for the connect readout."""
+        _, out, _ = self._run(
+            'command -v python3 >/dev/null 2>&1 && '
+            'python3 -c "import sys;print(\\"%d.%d.%d\\"%sys.version_info[:3])" || true')
+        out = (out or "").strip()
+        if out:
+            self.remote_py_ver = out
+            return "python3"
+        return None
 
     def _posix_embed_libc(self):
         """Detect the remote's C library so we fetch a runnable install_only build:
@@ -7372,22 +7584,37 @@ class RemoteWorkspace:
         way to dogfood the embed path on a box that already has Python. Caches the
         working `python3` invocation on self.posix_python. An uncovered-arch host with
         no python3 is a hard error (raised by _provision_posix_embed)."""
-        prefix = (self._provision_posix_embed(forced=True) if getattr(self, "ephemeral", False)
-                  else (self._posix_python() or self._provision_posix_embed()))
+        self.remote_py_ver = ""
+        if getattr(self, "ephemeral", False):
+            prefix = self._provision_posix_embed(forced=True)
+            src = "provisioned"
+        elif (prefix := self._posix_python()):
+            src = "system"
+        else:
+            prefix = self._provision_posix_embed()
+            src = "provisioned"
         if not prefix:
             raise ConnectionError(
                 f"no python3 on {self.host} and the embeddable-runtime fallback failed. "
                 f"Install python3 there (any 3.x) and reconnect.")
         self.posix_python = prefix
+        ver = f"python {self.remote_py_ver}" if self.remote_py_ver else "python3"
+        self.remote_py_desc = f"{ver} ({src})"
 
     def _win_python(self):
         """Return the Windows Python invocation prefix ('python' or 'py -3'), or None
         if neither is present. Stock Win11 ships NO Python (only a Store stub that
         prints usage and exits nonzero), so we probe for a REAL interpreter by running
-        it. `py -3` (the launcher) is preferred when present; else `python`."""
+        it. `py -3` (the launcher) is preferred when present; else `python`. Records the
+        version on self.remote_py_ver for the connect readout."""
         for cand in ("py -3", "python"):
-            _, out, _ = self._run(f'{cand} -c "import sys;print(sys.executable)"')
-            if out.strip() and "\\" in out:           # a real path back == a real interpreter
+            _, out, _ = self._run(
+                f'{cand} -c "import sys;print(sys.executable);'
+                f'print(\'%d.%d.%d\'%sys.version_info[:3])"')
+            lines = [l for l in (out or "").splitlines() if l.strip()]
+            if lines and "\\" in lines[0]:            # a real path back == a real interpreter
+                if len(lines) > 1:
+                    self.remote_py_ver = lines[1].strip()
                 return cand
         return None
 
@@ -7443,14 +7670,23 @@ class RemoteWorkspace:
         ephemeral=True SKIPS the installed-Python probe and forces the embeddable runtime
         (which is wiped on teardown) - a zero-trace mode + the way to dogfood the embed
         path on a box that already has Python."""
-        prefix = (self._provision_win_embed(forced=True) if getattr(self, "ephemeral", False)
-                  else (self._win_python() or self._provision_win_embed()))
+        self.remote_py_ver = ""
+        if getattr(self, "ephemeral", False):
+            prefix = self._provision_win_embed(forced=True)
+            src = "provisioned"
+        elif (prefix := self._win_python()):
+            src = "system"
+        else:
+            prefix = self._provision_win_embed()
+            src = "provisioned"
         if not prefix:
             raise ConnectionError(
                 f"no Python on the Windows host {self.host} and the embeddable-runtime "
                 f"fallback failed. Install one (e.g. `winget install Python.Python.3`) or "
                 f"enable the py launcher, then reconnect.")
         self.win_python = prefix
+        ver = f"python {self.remote_py_ver}" if self.remote_py_ver else "python"
+        self.remote_py_desc = f"{ver} ({src})"
 
     def call(self, tool, args=None, should_abort=None):
         return self.client.call(tool, args, should_abort=should_abort)
@@ -10407,7 +10643,10 @@ _SETTINGS_FIELDS = [
     ("auto_handover", "auto-handover (self-managing context)", "bool"),
     ("handover_soft", "handover soft-zone start (fraction of ctx)", "float"),
     ("handover_hard", "handover hard threshold (fraction of ctx)", "float"),
-    ("handover_emergency", "handover emergency threshold (fraction of ctx)", "float"),
+    ("auto_num_ctx", "ollama: detect num_ctx at startup", "bool"),
+    ("gen_connect_timeout", "ollama: TCP connect deadline (s)", "float"),
+    ("gen_ttft_timeout", "ollama: read deadline until first token (s)", "float"),
+    ("gen_idle_timeout", "ollama: max gap between tokens (s; blank = off)", "float"),
     ("handover_min_interval", "min seconds between handovers", "float"),
     ("autostart_after_handover", "auto-continue the turn after a handover (on by default; 5s ^C to cancel)", "bool"),
     ("wake_on_bg_finish", "wake + react autonomously when a background task finishes (off by default)", "bool"),
@@ -10668,10 +10907,28 @@ def handle_providers_command(agent, cfg, arg):
 
 
 def handle_bg_command(agent, cfg, arg):
-    """/bg - list running background tasks; /bg kill <pid|all> - stop them."""
+    """/bg - list background tasks; /bg kill <pid|all> - stop them. When the session
+    is /connect'ed the tasks run in the REMOTE executor and its registry lives on that
+    box, so both list + kill are routed there (via BG_LIST / a remote kill); a LOCAL
+    session reads its own registry directly."""
+    remote = getattr(agent, "remote", None)
     parts = arg.split()
     if parts and parts[0].lower() == "kill":
         tgt = parts[1] if len(parts) > 1 else ""
+        if remote is not None:
+            rows = [r for r in remote.bg_list() if r.get("state") == "running"]
+            if tgt == "all":
+                pids = [r.get("pid") for r in rows]
+            elif tgt.isdigit() and any(r.get("pid") == int(tgt) for r in rows):
+                pids = [int(tgt)]
+            else:
+                print(dim("usage: /bg kill <pid|all>"
+                          + ("" if rows else "  (no background tasks running)")))
+                return
+            for pid in pids:
+                remote.call("run_command", {"cmd": f"kill {int(pid)} 2>/dev/null || true"})
+            print(dim(f"killed {len(pids)} background task(s) on {remote.host}."))
+            return
         running = _bg_running()
         if tgt == "all":
             killed = [r.get("pid") for r in running]
@@ -10685,6 +10942,22 @@ def handle_bg_command(agent, cfg, arg):
             _bg_kill(pid)
         _bg_save([r for r in _bg_load() if r.get("pid") not in set(killed)])
         print(dim(f"killed {len(killed)} background task(s)."))
+        return
+    if remote is not None:
+        rows = remote.bg_list()
+        if not rows:
+            print(dim(f"no background tasks on {remote.host}.  "
+                      f"(end a command with ' &' to start one)"))
+            return
+        print(bold(f"background tasks (remote {remote.host}):"))
+        for r in rows:
+            st = r.get("state", "?")
+            label = green("running") if st == "running" else (
+                green(st) if st == "exit 0" else red(st))
+            print(f"  {bold(cyan(str(r.get('pid'))))}  {label}  "
+                  f"(ran {r.get('runtime', '?')})  {r.get('cmd', '?')}")
+            if st == "running":
+                print(dim(f"      /bg kill {r.get('pid')}"))
         return
     me = os.getpid()
     recs = _bg_load()

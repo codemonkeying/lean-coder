@@ -35,6 +35,7 @@ child is chatty. This is a run-commands capability, so it is NOT safe (confirms
 unless approval is auto/armed), and needs the 'rwe' leash like run_command.
 """
 import os
+import re
 import select
 import shlex
 import signal
@@ -65,6 +66,12 @@ TOOL = {
             "timeout": {"type": "number",
                         "description": "send/read only: seconds to wait for output "
                                        "(default 4). Raise it for a slow command."},
+            "raw": {"type": "boolean",
+                    "description": "start only: force drain mode. Omit to auto-detect "
+                                   "(a shell/ssh gets deterministic marker draining; a "
+                                   "REPL/listener like python -i or nc uses timing). Set "
+                                   "true for a REPL the auto-detect missed, false to force "
+                                   "marker mode."},
         },
         "required": ["action"],
     },
@@ -84,6 +91,40 @@ _SEQ = 0
 _READ_QUIET = 0.3      # once output has arrived, stop after this long with none more
 _READ_DEFAULT = 4.0    # default overall wait for a send/read
 _MAX_SESSIONS = 8      # guard against runaway session count
+
+# Sentinel-marker draining (the pexpect / Ansible-shell technique). For a POSIX
+# shell/ssh session we append a command that prints a UNIQUE end-marker plus the
+# exit code AFTER the real command finishes; _drain then reads until it sees that
+# marker instead of guessing with a quiet-gap timer. Completion becomes
+# DETERMINISTIC: a command that pauses mid-flight (sleep, a slow remote, bursty
+# output) no longer returns early or lands a call late, and we get the exit code
+# for free. The nonce is per-session so a marker can't collide with real output.
+# A raw/interactive session (python -i, nc, a REPL, a password prompt) has no
+# shell to run the marker, so it keeps the quiet-gap/timeout path (mode="raw").
+_MARK_PREFIX = "__LC_DONE_"
+
+# Interactive/raw children we must NOT inject a shell marker into - they have no
+# POSIX printf/$?. Matched against the basename of the start command's first word.
+_RAW_HINTS = ("python", "python3", "python2", "node", "irb", "ruby", "psql",
+              "mysql", "sqlite3", "mongo", "redis-cli", "nc", "ncat", "netcat",
+              "telnet", "gdb", "lldb", "julia", "ghci", "iex", "php")
+
+
+def _mode_for(command):
+    """Decide a new session's drain mode from its start command. A plain shell or
+    an ssh/sh -c lands on a POSIX prompt -> "shell" (marker draining). A REPL / raw
+    listener has no shell to run the marker -> "raw" (quiet-gap draining). An
+    unknown command errs to "raw" (never inject a marker where it'd echo as literal
+    text). ssh is "shell": the far end is a login shell."""
+    if not command:
+        return "shell"                     # bare interactive shell
+    try:
+        first = os.path.basename(shlex.split(command)[0])
+    except (ValueError, IndexError):
+        return "raw"
+    if first in ("ssh", "sh", "bash", "zsh", "dash", "ksh", "sudo", "su", "fish"):
+        return "shell"
+    return "raw"                           # REPL / listener / unknown -> no marker
 
 
 def _collapse_cr(text):
@@ -115,14 +156,36 @@ def _clean(raw_bytes):
     return text
 
 
-def _drain(fd, timeout):
+def _beyond_echo(acc, echo):
+    """True once `acc` (bytes read so far) contains anything BEYOND the pty's echo
+    of the just-sent input. The pty echoes a typed line back within milliseconds;
+    that echo must NOT be mistaken for the command's actual output (which, over ssh
+    / a slow remote, lands hundreds of ms later). We strip one leading copy of the
+    echoed bytes (CR-insensitive) and report whether non-whitespace remains."""
+    a = acc.replace(b"\r", b"")
+    e = (echo or b"").replace(b"\r", b"")
+    if e:
+        idx = a.find(e)
+        if idx != -1:
+            a = a[:idx] + a[idx + len(e):]
+    return bool(a.strip())
+
+
+def _drain(fd, timeout, echo=b""):
     """Read whatever the child has produced, up to `timeout` seconds. Returns bytes.
-    Waits up to `timeout` for the FIRST output, then stops after a short quiet gap
-    (_READ_QUIET) so an idle prompt doesn't burn the whole timeout."""
+
+    Waits up to `timeout` for REAL output (anything past the pty echo of `echo`),
+    then stops after a short quiet gap (_READ_QUIET) once that output has settled -
+    so an idle prompt doesn't burn the whole timeout. Passing `echo` (the bytes just
+    written by _send) is what fixes the latency race: the instant command echo no
+    longer trips the quiet-gap early-exit before the command's output arrives, which
+    made a slow/remote command return only its own echo (output landing a call late).
+    With echo=b"" (a bare `read`) the first byte of anything counts, as before."""
     chunks = []
     deadline = time.time() + max(0.0, timeout)
+    seen_real = False
     while time.time() < deadline:
-        wait = _READ_QUIET if chunks else (deadline - time.time())
+        wait = _READ_QUIET if seen_real else (deadline - time.time())
         try:
             r, _, _ = select.select([fd], [], [], max(0.0, wait))
         except (OSError, ValueError):
@@ -135,10 +198,84 @@ def _drain(fd, timeout):
             if not data:                 # EOF - child's pty closed
                 break
             chunks.append(data)
-        elif chunks:                     # had output, now quiet -> done
+            if not seen_real and _beyond_echo(b"".join(chunks), echo):
+                seen_real = True
+        elif seen_real:                  # had real output, now quiet -> done
             break
     return b"".join(chunks)
 
+
+def _drain_until(fd, mark, timeout, echo=b""):
+    """Marker-aware drain: read until the end-marker `mark` appears (deterministic
+    completion) OR `timeout` elapses (a hard safety ceiling, NOT the primary signal).
+    Returns (raw_bytes, exit_code_or_None, done). `done` is True when the marker was
+    seen; on a marker hit exit_code is parsed from the `<mark><rc>` line. On timeout
+    we return what we have with done=False so the caller can say 'still running'.
+    The echoed marker command (the line WE injected) is only ever printed once by the
+    shell after the real command; the LAST occurrence is the true terminator, so we
+    match on that and ignore the pty echo of our own injected text earlier in the
+    stream."""
+    buf = b""
+    deadline = time.time() + max(0.0, timeout)
+    mark_b = mark.encode()
+    # <mark><rc> on its own line; rc is the shell's $? (digits, possibly 130 etc).
+    pat = re.compile(re.escape(mark_b) + rb"(\d{1,3})")
+    while time.time() < deadline:
+        try:
+            r, _, _ = select.select([fd], [], [], max(0.0, deadline - time.time()))
+        except (OSError, ValueError):
+            break
+        if not r:
+            continue
+        try:
+            data = os.read(fd, 65536)
+        except OSError:
+            break
+        if not data:                        # EOF - child's pty closed
+            break
+        buf += data
+        # The marker text appears TWICE in the raw stream: once as the pty echo of
+        # our injected command, once when the shell actually runs it. Only the run
+        # emits <mark><DIGITS>; the echo is <mark>$? (literal). Match the numeric one.
+        m = None
+        for m in pat.finditer(buf):
+            pass                            # keep the last match (the real terminator)
+        if m is not None:
+            # Marker seen. Briefly consume the tail (rest of the marker line + the
+            # next shell prompt the pty is about to echo) so it doesn't leak into the
+            # NEXT command's output. Best-effort, short and bounded.
+            tail_deadline = time.time() + 0.3
+            while time.time() < tail_deadline:
+                try:
+                    r2, _, _ = select.select([fd], [], [], 0.1)
+                except (OSError, ValueError):
+                    break
+                if not r2:
+                    break
+                try:
+                    more = os.read(fd, 65536)
+                except OSError:
+                    break
+                if not more:
+                    break
+                buf += more
+            return buf, int(m.group(1)), True
+    return buf, None, False
+
+
+def _strip_marker(text, mark):
+    """Return just the command's own output from a marker-drained capture. The
+    cleaned stream is:  <echo of our injected line (contains mark)> / OUTPUT /
+    <mark><rc> terminator / <next shell prompt>. The output is exactly the lines
+    BETWEEN the first mark-bearing line (the echo) and the last one (the
+    terminator) - so slicing there drops both the echoed command AND the trailing
+    prompt in one move. Falls back to a plain mark-line filter if we can't find the
+    two anchors (e.g. a partial capture)."""
+    lines = text.split("\n")
+    marked = [i for i, ln in enumerate(lines) if mark in ln]
+    if len(marked) >= 2:
+        return "\n".join(lines[marked[0] + 1:marked[-1]])
+    return "\n".join(ln for ln in lines if mark not in ln)
 
 def _alive(sess):
     return sess["proc"].poll() is None
@@ -195,8 +332,18 @@ def _start(args, cwd):
     os.close(slave)                      # parent keeps only the master end
     _SEQ += 1
     sid = f"s{_SEQ}"
+    # Drain mode: "shell" -> deterministic marker draining; "raw" -> quiet-gap.
+    # An explicit `raw` arg overrides the command-based guess (force one or the other).
+    raw = args.get("raw")
+    if raw is True:
+        mode = "raw"
+    elif raw is False:
+        mode = "shell"
+    else:
+        mode = _mode_for(command)
     _SESSIONS[sid] = {"proc": proc, "fd": master, "cmd": where,
-                      "started": time.time(), "where": where}
+                      "started": time.time(), "where": where,
+                      "mode": mode, "nonce": f"{os.getpid()}_{_SEQ}"}
     banner = _clean(_drain(master, 1.5)) # let a prompt/banner appear
     head = f"session {sid} started ({where}, pid {proc.pid})."
     return head + (f"\n{banner}" if banner.strip() else "")
@@ -222,17 +369,55 @@ def _send(args, cwd):
         return (f"session {sid} has exited (rc {sess['proc'].returncode}); closed it."
                 + (f"\n{tail}" if tail.strip() else ""))
     text = args.get("input", "")
-    if not text.endswith("\n") and text != "":
-        text += "\n"
-    try:
-        os.write(sess["fd"], text.encode("utf-8", "replace"))
-    except OSError as e:
-        return f"error: write to session {sid} failed: {e}"
     try:
         timeout = float(args.get("timeout") or _READ_DEFAULT)
     except (TypeError, ValueError):
         timeout = _READ_DEFAULT
-    out = _clean(_drain(sess["fd"], timeout))
+
+    # SHELL mode: append a marker command so completion is deterministic. `printf`
+    # runs AFTER the real command (on the same line via ';'), emitting <mark><$?>
+    # once the command - however slow or bursty - has actually finished. We drain
+    # until that marker instead of guessing with a quiet-gap timer, then strip our
+    # injected line + the marker line, leaving just the command's own output plus a
+    # real exit code. A bare keystroke (input ends without newline, e.g. sending a
+    # ctrl-char or answering a prompt) skips the marker - there's no command to
+    # terminate. RAW mode always uses the quiet-gap path (no shell to run printf).
+    # Marker only for a normal command line: shell mode, non-empty, single line, and
+    # WE own the newline (caller didn't pre-terminate or send a bare keystroke).
+    marker_ok = (sess.get("mode") == "shell" and text.strip() != ""
+                 and "\n" not in text.rstrip("\n"))
+    if marker_ok:
+        mark = _MARK_PREFIX + sess["nonce"] + "_"
+        line = text.rstrip("\n")
+        mark = _MARK_PREFIX + sess["nonce"] + "_"
+        line = text.rstrip("\n")
+        full = f"{line}; printf '\\n{mark}%s\\n' \"$?\"\n"
+        echo = full.encode("utf-8", "replace")
+        try:
+            os.write(sess["fd"], echo)
+        except OSError as e:
+            return f"error: write to session {sid} failed: {e}"
+        raw, rc, done = _drain_until(sess["fd"], mark, timeout, echo=echo)
+        out = _strip_marker(_clean(raw), mark).strip("\n")
+        if not _alive(sess):
+            _reap(sid, sess)
+            return (out + f"\n[session {sid} exited (rc {sess['proc'].returncode})]").strip()
+        if not done:
+            tail = f"[session {sid}: still running after {timeout:g}s - use read to get the rest]"
+            return (out + "\n" + tail).strip() if out.strip() else tail
+        if rc == 0:
+            return out.strip() if out.strip() else f"[session {sid}: ok, no output]"
+        return (out + f"\n[exit {rc}]").strip()
+
+    # RAW mode (or a bare keystroke): quiet-gap drain, echo-aware.
+    if not text.endswith("\n") and text != "":
+        text += "\n"
+    echo = text.encode("utf-8", "replace")
+    try:
+        os.write(sess["fd"], echo)
+    except OSError as e:
+        return f"error: write to session {sid} failed: {e}"
+    out = _clean(_drain(sess["fd"], timeout, echo=echo))
     if not _alive(sess):
         _reap(sid, sess)
         return (out + f"\n[session {sid} exited (rc {sess['proc'].returncode})]").strip()
