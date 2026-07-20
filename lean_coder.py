@@ -766,7 +766,7 @@ def _load_lean_tool(path: Path):
     # importlib's .pyc cache can serve stale bytecode after a same-second edit.
     mod = types.ModuleType(f"lcleantool_{path.stem}")
     mod.__file__ = str(path)
-    exec(compile(path.read_text(), str(path), "exec"), mod.__dict__)
+    exec(compile(path.read_text(encoding="utf-8"), str(path), "exec"), mod.__dict__)
     return mod
 
 
