@@ -6577,7 +6577,7 @@ class ExecutorClient:
                 if not ready:
                     if spin is None and time.monotonic() - t0 >= REMOTE_WAIT_GRACE:
                         where = f" on {self.host}" if self.host else ""
-                        spin = Spinner(f"waiting for remote{where} (link slow? ^C to abort)",
+                        spin = Spinner(f"waiting for remote{where}",
                                        TOOL_FRAMES, yellow, interval=0.12).start()
                     continue
                 line = self.proc.stdout.readline()
@@ -7163,15 +7163,17 @@ class RemoteWorkspace:
             else:
                 label = "unknown"          # connected but couldn't tell (never assume)
             _st.done = f"probed · {label}"
-        if self.remote_posix:
-            self._check_posix_python()
-        else:
-            # Windows/unknown: keep the master only if it's genuinely reusable; some
-            # Windows sshd builds don't honour session-reuse. Else drop to per-call.
-            if self.ctl and not _ssh_master_alive(self.host, self.ctl):
-                _clear_master(self.host, self.ctl)
-                self.ctl = None
-            self._check_windows_python()
+            if self.remote_posix:
+                self._check_posix_python()
+            else:
+                # Windows/unknown: keep the master only if it's genuinely reusable; some
+                # Windows sshd builds don't honour session-reuse. Else drop to per-call.
+                if self.ctl and not _ssh_master_alive(self.host, self.ctl):
+                    _clear_master(self.host, self.ctl)
+                    self.ctl = None
+                self._check_windows_python()
+            if getattr(self, "remote_py_desc", ""):
+                _st.done = f"probed · {label} · {self.remote_py_desc}"
         self._bootstrap_executor()
         return self
 
@@ -7443,10 +7445,12 @@ class RemoteWorkspace:
         to_push, to_remove = _tools_to_sync(local, remote)
         if to_push:
             n = len(to_push)
-            for i, name in enumerate(to_push, 1):
-                with _stage(f"syncing tools [{i}/{n}] {name}",
-                            done=(f"{n} tool{'s' if n != 1 else ''} synced" if i == n else None)):
+            with _stage("syncing tools",
+                        done=f"{n} tool{'s' if n != 1 else ''} synced") as _st:
+                for i, name in enumerate(to_push, 1):
+                    _st.done = f"{i}/{n} synced"
                     self._remote_write(pdir + sep + name, blobs[name])
+                _st.done = f"{n} tool{'s' if n != 1 else ''} synced"
         if to_remove:
             if self.remote_posix:
                 self._run("rm -f " + " ".join(shlex.quote(pdir + "/" + n) for n in to_remove))
@@ -7457,9 +7461,16 @@ class RemoteWorkspace:
 
     def _posix_python(self):
         """Return 'python3' if the POSIX remote already has a usable interpreter on
-        PATH, else None. A bare probe - no install, nothing left behind."""
-        _, out, _ = self._run("command -v python3 || true")
-        return "python3" if out.strip() else None
+        PATH, else None. A bare probe - no install, nothing left behind. Records the
+        version string on self.remote_py_ver for the connect readout."""
+        _, out, _ = self._run(
+            'command -v python3 >/dev/null 2>&1 && '
+            'python3 -c "import sys;print(\\"%d.%d.%d\\"%sys.version_info[:3])" || true')
+        out = (out or "").strip()
+        if out:
+            self.remote_py_ver = out
+            return "python3"
+        return None
 
     def _posix_embed_libc(self):
         """Detect the remote's C library so we fetch a runnable install_only build:
@@ -7557,22 +7568,37 @@ class RemoteWorkspace:
         way to dogfood the embed path on a box that already has Python. Caches the
         working `python3` invocation on self.posix_python. An uncovered-arch host with
         no python3 is a hard error (raised by _provision_posix_embed)."""
-        prefix = (self._provision_posix_embed(forced=True) if getattr(self, "ephemeral", False)
-                  else (self._posix_python() or self._provision_posix_embed()))
+        self.remote_py_ver = ""
+        if getattr(self, "ephemeral", False):
+            prefix = self._provision_posix_embed(forced=True)
+            src = "provisioned"
+        elif (prefix := self._posix_python()):
+            src = "system"
+        else:
+            prefix = self._provision_posix_embed()
+            src = "provisioned"
         if not prefix:
             raise ConnectionError(
                 f"no python3 on {self.host} and the embeddable-runtime fallback failed. "
                 f"Install python3 there (any 3.x) and reconnect.")
         self.posix_python = prefix
+        ver = f"python {self.remote_py_ver}" if self.remote_py_ver else "python3"
+        self.remote_py_desc = f"{ver} ({src})"
 
     def _win_python(self):
         """Return the Windows Python invocation prefix ('python' or 'py -3'), or None
         if neither is present. Stock Win11 ships NO Python (only a Store stub that
         prints usage and exits nonzero), so we probe for a REAL interpreter by running
-        it. `py -3` (the launcher) is preferred when present; else `python`."""
+        it. `py -3` (the launcher) is preferred when present; else `python`. Records the
+        version on self.remote_py_ver for the connect readout."""
         for cand in ("py -3", "python"):
-            _, out, _ = self._run(f'{cand} -c "import sys;print(sys.executable)"')
-            if out.strip() and "\\" in out:           # a real path back == a real interpreter
+            _, out, _ = self._run(
+                f'{cand} -c "import sys;print(sys.executable);'
+                f'print(\'%d.%d.%d\'%sys.version_info[:3])"')
+            lines = [l for l in (out or "").splitlines() if l.strip()]
+            if lines and "\\" in lines[0]:            # a real path back == a real interpreter
+                if len(lines) > 1:
+                    self.remote_py_ver = lines[1].strip()
                 return cand
         return None
 
@@ -7628,14 +7654,23 @@ class RemoteWorkspace:
         ephemeral=True SKIPS the installed-Python probe and forces the embeddable runtime
         (which is wiped on teardown) - a zero-trace mode + the way to dogfood the embed
         path on a box that already has Python."""
-        prefix = (self._provision_win_embed(forced=True) if getattr(self, "ephemeral", False)
-                  else (self._win_python() or self._provision_win_embed()))
+        self.remote_py_ver = ""
+        if getattr(self, "ephemeral", False):
+            prefix = self._provision_win_embed(forced=True)
+            src = "provisioned"
+        elif (prefix := self._win_python()):
+            src = "system"
+        else:
+            prefix = self._provision_win_embed()
+            src = "provisioned"
         if not prefix:
             raise ConnectionError(
                 f"no Python on the Windows host {self.host} and the embeddable-runtime "
                 f"fallback failed. Install one (e.g. `winget install Python.Python.3`) or "
                 f"enable the py launcher, then reconnect.")
         self.win_python = prefix
+        ver = f"python {self.remote_py_ver}" if self.remote_py_ver else "python"
+        self.remote_py_desc = f"{ver} ({src})"
 
     def call(self, tool, args=None, should_abort=None):
         return self.client.call(tool, args, should_abort=should_abort)
