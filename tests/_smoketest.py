@@ -801,6 +801,22 @@ check("dispatch_worker: setup captured bg_launch hook", "bg_launch" in _dw._H)
 check("dispatch_worker: setup captured core file for the worker argv",
       _dw._H.get("__file__", "").endswith("lean_coder.py"))
 
+# --- shell_session _drain: the echo-race fix. A pty echoes the typed line back
+# within ms; the command's real output can lag (ssh RTT / slow remote). _drain must
+# NOT let that instant echo trip the quiet-gap early-exit and return only the echo
+# (the bug: output landed a call late / "no output"). _beyond_echo is the pure core.
+_ss = lc._load_lean_tool(Path(__file__).resolve().parent.parent / "lean-tools" / "shell_session.py")
+check("shell_session: is driver_only (pty fd lives on the driver)",
+      _ss.TOOL.get("driver_only") is True)
+check("_beyond_echo: bare echo alone is NOT real output",
+      _ss._beyond_echo(b"qm list\n", b"qm list\n") is False)
+check("_beyond_echo: echo + CR variations still counted as echo-only",
+      _ss._beyond_echo(b"qm list\r\n", b"qm list\n") is False)
+check("_beyond_echo: output past the echo IS real",
+      _ss._beyond_echo(b"qm list\nVMID NAME\n", b"qm list\n") is True)
+check("_beyond_echo: no echo passed -> any non-space is real (bare read)",
+      _ss._beyond_echo(b"data\n", b"") is True and _ss._beyond_echo(b"  \n", b"") is False)
+
 # --- web_screenshot lean-tool: MUST be driver_only ----------------------------
 # The browser + playwright live on the driver; if this tool is pushed to a remote
 # executor it tries to apt-install pip+playwright+a browser onto the user's box.
@@ -1554,6 +1570,26 @@ sp = lc.Spinner("x").start()
 sp.stop()
 check("spinner no-op offline: no thread, no active spinner",
       sp._thread is None and lc._active_spinner is None)
+# 12c'. Nested spinners stack: only the TOP is active; stopping it resumes the one
+# underneath; stopping the last clears. (Guards the flip-flop bug: two painters on
+# one status line.) Force the TTY path so start()/stop() manage the stack.
+_otty = lc._TTY
+lc._TTY = False   # keep it painter-free but still stack-managed (the no-TTY branch pushes too)
+try:
+    _s1 = lc.Spinner("outer").start()
+    check("spinner stack: first push is active + on stack",
+          lc._active_spinner is _s1 and lc._spinner_stack == [_s1])
+    _s2 = lc.Spinner("inner").start()
+    check("spinner stack: nested push becomes top",
+          lc._active_spinner is _s2 and lc._spinner_stack == [_s1, _s2])
+    _s2.stop()
+    check("spinner stack: pop resumes the one underneath",
+          lc._active_spinner is _s1 and lc._spinner_stack == [_s1])
+    _s1.stop()
+    check("spinner stack: last pop clears",
+          lc._active_spinner is None and lc._spinner_stack == [])
+finally:
+    lc._TTY = _otty
 
 # --- the bundled ollama provider lives in providers/ollama.py now (extracted
 # from core). Load it the way the manager does (compile+exec) and run its
