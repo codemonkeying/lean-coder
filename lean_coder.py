@@ -7628,6 +7628,8 @@ class RemoteWorkspace:
         else:
             prefix = self._provision_posix_embed()
             src = "provisioned"
+        if src == "provisioned" and prefix and not self.remote_py_ver:
+            self.remote_py_ver = _POSIX_EMBED_PYVER   # embed distro version is known
         if not prefix:
             raise ConnectionError(
                 f"no python3 on {self.host} and the embeddable-runtime fallback failed. "
@@ -7662,12 +7664,11 @@ class RemoteWorkspace:
         the embed runtime (--ephemeral), not that the box lacks Python - so the notice
         must not falsely claim 'no Python'."""
         if forced:
-            print(dim(f"  --ephemeral: pushing a private Python to remote {self.host} "
-                      f"(CPython {_WIN_EMBED_VER} embeddable, one-time, cached)."))
+            print(dim(f"  windows - ephemeral - pushing python {_WIN_EMBED_VER} "
+                      f"(one-time, cached)"))
         else:
-            print(dim(f"no Python on remote {self.host}; pushing a private one "
-                      f"(CPython {_WIN_EMBED_VER} embeddable, one-time, cached). "
-                      f"Install Python ON THE REMOTE to skip this next time."))
+            print(dim(f"  windows - no python - pushing python {_WIN_EMBED_VER} "
+                      f"(one-time, cached); install python to skip this next time"))
         rc, out, err = self._run(_WIN_PROVISION_EMBED)
         out = (out or "").strip()
         if rc != 0 or not out or out.startswith("ERR:"):
@@ -7714,6 +7715,8 @@ class RemoteWorkspace:
         else:
             prefix = self._provision_win_embed()
             src = "provisioned"
+        if src == "provisioned" and prefix and not self.remote_py_ver:
+            self.remote_py_ver = _WIN_EMBED_VER   # embed distro version is known
         if not prefix:
             raise ConnectionError(
                 f"no Python on the Windows host {self.host} and the embeddable-runtime "
