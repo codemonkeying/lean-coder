@@ -11137,12 +11137,14 @@ def handle_note_command(agent, cfg, arg):
                            "from": parts[1] if len(parts) > 1 else "",
                            "to": parts[2] if len(parts) > 2 else ""})
     elif sub == "add":
-        out = agent._note({"action": "add", "text": arg[len("add"):].strip()})
+        out = agent._note({"action": "add", "text": "operator: " + arg[len("add"):].strip()})
     elif sub == "recent" or not arg.strip():
         out = agent._note({"action": "recent",
                            "n": parts[1] if sub == "recent" and len(parts) > 1 else None})
-    else:                                     # bare text -> add it
-        out = agent._note({"action": "add", "text": arg.strip()})
+    else:                                     # bare text -> add it. Prefix 'operator: ' in
+        # plain language (not a coded tag) so even a small model reads it as "the operator
+        # said this" - and can weight it - while the model's OWN notes stay bare.
+        out = agent._note({"action": "add", "text": "operator: " + arg.strip()})
     print(out)
 
 
