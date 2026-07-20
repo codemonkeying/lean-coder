@@ -379,6 +379,7 @@ class _ApiKeyClient:
         self.last_cache_read  = 0    # cache_read_input_tokens from last turn
         self.last_cache_write = 0    # cache_creation_input_tokens from last turn
         self.last_cache_write_1h = 0 # ephemeral_1h_input_tokens from last turn
+        self.last_input_tokens = 0   # raw input_tokens (uncached fresh) from last turn
         self._sess_cache_read  = 0   # session totals
         self._sess_cache_write = 0
         self._sess_cache_write_1h = 0
@@ -465,6 +466,7 @@ class _ApiKeyClient:
                 elif etype == "message_start":
                     _u = obj.get("message", {}).get("usage", {})
                     prompt_eval = _u.get("input_tokens")
+                    self.last_input_tokens = prompt_eval or 0
                     self.last_cache_read  = _u.get("cache_read_input_tokens",  0) or 0
                     self.last_cache_write = _u.get("cache_creation_input_tokens", 0) or 0
                     self.last_cache_write_1h = (_u.get("cache_creation") or {}).get(
@@ -759,6 +761,23 @@ def _detail(agent, cfg):
     w1h_s = f" (1h {_sn(cw1h)})" if cw1h else ""
     cache_s = f"   cache r {_sn(cr)} w {_sn(cw)}{w1h_s}" if (cr or cw) else ""
     lines.append(dim(f"\n  session   in {si:,}   out {so:,}   total {si + so:,}{cache_s}"))
+
+    # Last-turn cache breakdown + hit ratio: the fast read of whether the prompt cache
+    # is working. read = prefix served at ~0.1x; write = prefix (re)cached at 1.25x
+    # (a MISS - new session, a prefix change, or a >1h TTL expiry); fresh = uncached
+    # input_tokens (the tail: env/plan + this turn). A healthy repeat turn is nearly all
+    # read with tiny fresh and zero write; a big write with no read is a full cache miss.
+    lr  = getattr(agent.client, "last_cache_read",   0) or 0
+    lw  = getattr(agent.client, "last_cache_write",  0) or 0
+    lf  = getattr(agent.client, "last_input_tokens", 0) or 0
+    if lr or lw or lf:
+        cached = lr + lw
+        total  = cached + lf
+        hit    = (lr / cached * 100) if cached else 0
+        miss_flag = red("  MISS (full re-cache)") if (lw and not lr) else ""
+        lines.append(dim(
+            f"  last turn read {_sn(lr)}  write {_sn(lw)}  fresh {_sn(lf)}"
+            f"  ({hit:.0f}% cache hit of {_sn(total)} in){miss_flag}"))
 
     rl = getattr(agent.client, "_last_rl", {})
     if rl:
