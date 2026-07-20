@@ -173,9 +173,9 @@ class Tools:
                         if rx.search(line):
                             fp = f.resolve()
                             try:
-                                rel = fp.relative_to(self.cfg.cwd.resolve()).as_posix()
+                                rel = str(fp.relative_to(self.cfg.cwd.resolve()))
                             except ValueError:
-                                rel = fp.as_posix()
+                                rel = str(fp)
                             if ctx_lines and all_lines:
                                 # Emit context window around this hit.
                                 start_c = max(1, i - ctx_lines)
