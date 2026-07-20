@@ -6529,6 +6529,99 @@ _WIN_PROVISION_EMBED = (
     "  [Console]::Out.Write($exe);"
     "} catch { [Console]::Out.Write('ERR:' + $_.Exception.Message) }")
 
+# ---------------------------------------------------------------------------
+# POSIX embeddable Python (no-interpreter Linux/BSD boxes + zero-trace mode)
+# ---------------------------------------------------------------------------
+# Mirror of the Windows embed path for a POSIX host with no python3 (and for the
+# --ephemeral dogfood/zero-trace mode). We ship a self-contained CPython from
+# astral-sh/python-build-standalone: the `install_only` tarball is a normal
+# ./python/bin/python3 tree with a FULL stdlib (our executor is all-stdlib +
+# guarded lazy imports, so it runs cleanly under it). We ALWAYS pick the musl
+# build - it is statically linked against musl libc with NO shared-library
+# dependencies, so one binary runs on glibc AND musl distros alike (the gnu
+# builds would fault on Alpine). The release + CPython version + per-arch sha256
+# are PINNED here (reproducible, verifiable) - never "latest". The driver
+# DOWNLOADS the tarball once (local cache, sha256-verified), then PUSHES it to
+# the remote over the existing ssh master (scp) - the remote never reaches the
+# internet, so an air-gapped box works and the transfer is auditable. Uncovered
+# arch -> a hard, actionable error (never a silent wrong-arch binary).
+_POSIX_EMBED_RELEASE = "20260718"        # python-build-standalone release tag (pinned)
+_POSIX_EMBED_PYVER = "3.10.20"           # CPython version in that release (pinned)
+# uname -m token -> (asset arch slug, sha256 of the musl install_only tarball).
+# Only arches we have a verified hash for are covered; anything else hard-errors.
+_POSIX_EMBED_ARCH = {
+    "x86_64":  ("x86_64",  "013ff8ab30357820d99df80745ea58b49fb693165a27b599b9fec09c4780dd20"),
+    "amd64":   ("x86_64",  "013ff8ab30357820d99df80745ea58b49fb693165a27b599b9fec09c4780dd20"),
+    "aarch64": ("aarch64", "1e3a67cd2a207b281815bfe7c9e7bc41b2881dd7460e7efb3c3705f651bdf731"),
+    "arm64":   ("aarch64", "1e3a67cd2a207b281815bfe7c9e7bc41b2881dd7460e7efb3c3705f651bdf731"),
+}
+
+
+def _posix_embed_asset(uname_m: str):
+    """Map a remote `uname -m` token to (asset_filename, url, sha256) for the pinned
+    musl install_only tarball, or None if the arch isn't covered (caller hard-errors).
+    Normalises case/whitespace so 'X86_64\\n' etc. still resolve."""
+    key = (uname_m or "").strip().lower()
+    hit = _POSIX_EMBED_ARCH.get(key)
+    if not hit:
+        return None
+    slug, sha = hit
+    fn = (f"cpython-{_POSIX_EMBED_PYVER}+{_POSIX_EMBED_RELEASE}-"
+          f"{slug}-unknown-linux-musl-install_only.tar.gz")
+    url = (f"https://github.com/astral-sh/python-build-standalone/releases/download/"
+           f"{_POSIX_EMBED_RELEASE}/{fn}")
+    return fn, url, sha
+
+
+def _posix_embed_cache_download(fn: str, url: str, sha: str) -> Path:
+    """Fetch the pinned tarball to the LOCAL driver cache (~/.cache/leancoder/
+    lc-runtime), verifying sha256; reuse a cached copy that already matches. Returns
+    the local Path. Raises ConnectionError on download/verify failure. Download-once:
+    a second POSIX embed connect reuses the file (no re-fetch)."""
+    cache = Path(os.path.expanduser("~/.cache/leancoder/lc-runtime"))
+    cache.mkdir(parents=True, exist_ok=True)
+    dest = cache / fn
+
+    def _sha(p: Path) -> str:
+        h = hashlib.sha256()
+        with open(p, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+        return h.hexdigest()
+
+    if dest.is_file() and _sha(dest) == sha:
+        return dest                                # cached + verified: reuse
+    tmp = dest.with_suffix(dest.suffix + ".part")
+    try:
+        with urllib.request.urlopen(url, timeout=120) as r, open(tmp, "wb") as out:
+            while True:
+                chunk = r.read(1 << 20)
+                if not chunk:
+                    break
+                out.write(chunk)
+    except (urllib.error.URLError, OSError) as e:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise ConnectionError(f"failed to download embeddable Python ({url}): {e}")
+    got = _sha(tmp)
+    if got != sha:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise ConnectionError(
+            f"embeddable Python tarball sha256 mismatch: got {got}, expected {sha}")
+    tmp.replace(dest)
+    return dest
+
+
+# Remote cache layout for the pushed embed runtime. Kept UNDER a fixed lc-runtime
+# leaf (like Windows' %LOCALAPPDATA%\\lc-runtime) so ephemeral teardown can wipe
+# exactly it and never an unrelated path. XDG_CACHE_HOME honoured, else ~/.cache.
+_POSIX_EMBED_ROOT = '${XDG_CACHE_HOME:-$HOME/.cache}/leancoder/lc-runtime'
+
 # Probe run over ssh at connect to detect the remote OS/shell family. A bare `uname`
 # is the most portable discriminator: a POSIX shell prints a known kernel token
 # ("Linux"/"Darwin"/"FreeBSD"/etc); Windows cmd/PowerShell have no `uname`, so the
@@ -6564,24 +6657,6 @@ def _remote_os_label(uname_out) -> str:
     if any(tok in s for tok in ("sunos", "aix", "cygwin", "msys", "gnu")):
         return s.split()[0].strip() or "POSIX"
     return "Windows"
-
-# package managers tried, in order, when python3 is missing on the remote.
-_PKG_INSTALL = [
-    ("apt-get", "sudo apt-get update && sudo apt-get install -y python3"),
-    ("dnf", "sudo dnf install -y python3"),
-    ("apk", "sudo apk add python3"),
-    ("pacman", "sudo pacman -S --noconfirm python3"),
-    ("zypper", "sudo zypper install -y python3"),
-]
-
-
-def _install_cmd(pm: str):
-    """Map a detected package manager to its python3 install command (or None)."""
-    for name, cmd in _PKG_INSTALL:
-        if name == pm:
-            return cmd
-    return None
-
 
 def _runtime_dir() -> Path:
     """Local ephemeral dir for control sockets. Prefers XDG_RUNTIME_DIR, then TMPDIR
@@ -6854,9 +6929,7 @@ class RemoteWorkspace:
                     raise ConnectionError(f"ssh connection to {self.host} timed out")
                 if rc != 0:
                     raise ConnectionError(f"ssh connection to {self.host} failed")
-            _, out, _ = self._run("command -v python3 || true")
-            if not out.strip():
-                self._install_python()
+            self._check_posix_python()
         else:
             # Windows: TRY to multiplex (a Linux client CAN drive a shared master to a
             # Windows sshd - multiplexing is a client feature). But only KEEP it if the
@@ -6938,11 +7011,12 @@ class RemoteWorkspace:
             self.reused = "installed"
             return "lean_coder", rdir
         agent_py = rdir + "/agent.py"
+        py = getattr(self, "posix_python", None) or "python3"
         _, out, _ = self._run(f"[ -f {shlex.quote(agent_py)} ] && "
-                              f"python3 {shlex.quote(agent_py)} --version 2>/dev/null || true")
+                              f"{py} {shlex.quote(agent_py)} --version 2>/dev/null || true")
         if want in out.split():
             self.reused = "pushed"
-            return "python3 " + shlex.quote(agent_py), rdir
+            return f"{py} " + shlex.quote(agent_py), rdir
         return None, rdir
 
     def _reuse_executor_win(self, want):
@@ -6986,7 +7060,8 @@ class RemoteWorkspace:
                         raise ConnectionError(
                             f"failed to push agent to {self.host}: "
                             f"{r.stderr.decode(errors='replace')[:200]}")
-                exec_cmd = "python3 " + shlex.quote(self.remote_dir + "/agent.py")
+                py = getattr(self, "posix_python", None) or "python3"
+                exec_cmd = f"{py} " + shlex.quote(self.remote_dir + "/agent.py")
             else:
                 # Windows: make the throwaway dir, then scp the agent in (stdin-piped
                 # push deadlocks vs Windows sshd; scp lands the file byte-exact via its
@@ -7183,20 +7258,95 @@ class RemoteWorkspace:
                     self._run(f'Remove-Item -Force "{pdir}\\{n}" -ErrorAction SilentlyContinue')
         return pdir
 
-    def _install_python(self):
-        print(yellow(f"python3 not found on {self.host}; trying to install it ..."))
-        _, pm, _ = self._run(
-            "for p in apt-get dnf apk pacman zypper; do "
-            "command -v $p >/dev/null 2>&1 && { echo $p; break; }; done")
-        cmd = _install_cmd(pm.strip())
-        if not cmd:
-            raise ConnectionError(
-                f"no known package manager on {self.host}; install python3 yourself")
-        print(dim(f"  $ {cmd}   (any sudo prompt is yours to answer)"))
-        self._run(cmd, tty=True)                   # interactive: operator does sudo
+    def _posix_python(self):
+        """Return 'python3' if the POSIX remote already has a usable interpreter on
+        PATH, else None. A bare probe - no install, nothing left behind."""
         _, out, _ = self._run("command -v python3 || true")
-        if not out.strip():
-            raise ConnectionError(f"python3 still missing on {self.host} after install")
+        return "python3" if out.strip() else None
+
+    def _provision_posix_embed(self):
+        """Fallback for a POSIX host with no python3 (and the mechanism behind
+        --ephemeral): provision a self-contained CPython from python-build-standalone.
+        The driver DOWNLOADS the pinned musl `install_only` tarball once (local cache,
+        sha256-verified), PUSHES it to the remote over the live ssh master (scp), then
+        extracts it under a fixed lc-runtime cache dir and returns the absolute path to
+        its python3, or None on a soft failure. An UNCOVERED arch is a HARD error (never
+        a silent wrong-arch binary). Idempotent: a matching extracted runtime is reused."""
+        _, machine, _ = self._run("uname -m || true")
+        asset = _posix_embed_asset(machine)
+        if asset is None:
+            raise ConnectionError(
+                f"no python3 on {self.host} and no pinned embeddable build for its "
+                f"architecture ({(machine or '').strip() or 'unknown'}). Install python3 "
+                f"there (any 3.x), or connect from/to a covered arch "
+                f"({', '.join(sorted(_POSIX_EMBED_ARCH))}).")
+        fn, url, sha = asset
+        # Resolve the remote cache dir + expected python3 path; reuse if already extracted.
+        _, root, _ = self._run(f'printf %s "{_POSIX_EMBED_ROOT}"')
+        root = root.strip()
+        if not root:
+            return None
+        # Extracted tree is ./python/bin/python3 (the install_only layout). Tag the dir
+        # with the pinned version so a version bump lands beside the old one, not over it.
+        rdir = f"{root}/py-{_POSIX_EMBED_PYVER}-{_POSIX_EMBED_RELEASE}"
+        py = f"{rdir}/python/bin/python3"
+        _, have, _ = self._run(
+            f'[ -x {shlex.quote(py)} ] && {shlex.quote(py)} -c '
+            f'"import sys;print(sys.executable)" 2>/dev/null || true')
+        if have.strip():
+            print(dim(f"  reusing embeddable Python at {py}"))
+            return py
+        print(dim(f"no python3 on {self.host}; provisioning the embeddable runtime "
+                  f"(one-time: CPython {_POSIX_EMBED_PYVER} musl, cached)…"))
+        try:
+            tarball = _posix_embed_cache_download(fn, url, sha)
+        except ConnectionError as e:
+            print(yellow(f"  embeddable provision failed: {e}"))
+            return None
+        # Push the tarball to a temp path on the remote, extract, then remove it.
+        remote_tar = f"{root}/{fn}"
+        self._run(f"mkdir -p {shlex.quote(rdir)}")
+        try:
+            self._remote_write(remote_tar, tarball.read_bytes())
+        except (OSError, ConnectionError) as e:
+            print(yellow(f"  embeddable push failed: {e}"))
+            return None
+        rc, _, err = self._run(
+            f"tar -xzf {shlex.quote(remote_tar)} -C {shlex.quote(rdir)} && "
+            f"rm -f {shlex.quote(remote_tar)}")
+        if rc != 0:
+            self._run(f"rm -f {shlex.quote(remote_tar)}")
+            print(yellow(f"  embeddable extract failed: {(err or '').strip()[:200]}"))
+            return None
+        _, ver, _ = self._run(
+            f'{shlex.quote(py)} -c "import sys;print(sys.executable)" 2>/dev/null || true')
+        if not ver.strip():
+            print(yellow("  provisioned python3 did not run; falling back to error."))
+            return None
+        size = ""
+        _, mb, _ = self._run(
+            f"du -sm {shlex.quote(rdir)} 2>/dev/null | cut -f1 || true")
+        if mb.strip():
+            size = f" ({mb.strip()} MB on disk)"
+        print(dim(f"  provisioned embeddable Python at {py}{size}"))
+        return py
+
+    def _check_posix_python(self):
+        """POSIX target: use the system python3 if present; otherwise provision the
+        pinned embeddable musl CPython (downloaded by the driver, pushed + extracted
+        under a fixed lc-runtime cache) so a box with NO interpreter works with zero
+        manual setup and NO sudo/package install. ephemeral=True SKIPS the system probe
+        and forces the embeddable runtime (wiped on teardown) - a zero-trace mode + the
+        way to dogfood the embed path on a box that already has Python. Caches the
+        working `python3` invocation on self.posix_python. An uncovered-arch host with
+        no python3 is a hard error (raised by _provision_posix_embed)."""
+        prefix = (self._provision_posix_embed() if getattr(self, "ephemeral", False)
+                  else (self._posix_python() or self._provision_posix_embed()))
+        if not prefix:
+            raise ConnectionError(
+                f"no python3 on {self.host} and the embeddable-runtime fallback failed. "
+                f"Install python3 there (any 3.x) and reconnect.")
+        self.posix_python = prefix
 
     def _win_python(self):
         """Return the Windows Python invocation prefix ('python' or 'py -3'), or None
@@ -7273,8 +7423,11 @@ class RemoteWorkspace:
         # master - killing it would drop the parent's live connection.
         if self.owns_master:
             self._wipe_remote()            # zero-trace: remove the pushed code first
-            if self.ephemeral and not self.remote_posix:
-                self._wipe_win_embed()     # ephemeral: also remove the cached embed runtime
+            if self.ephemeral:             # ephemeral: also remove the cached embed runtime
+                if self.remote_posix:
+                    self._wipe_posix_embed()
+                else:
+                    self._wipe_win_embed()
             if self.ctl:                   # Windows has no master socket to exit
                 subprocess.run(["ssh", "-o", f"ControlPath={self.ctl}", "-O", "exit", self.host],
                                capture_output=True)
@@ -7290,6 +7443,22 @@ class RemoteWorkspace:
                '-ErrorAction SilentlyContinue }')
         try:
             subprocess.run(_ssh_run_argv(self.host, self.ctl, _win_ps(cmd)),
+                           capture_output=True, timeout=30, start_new_session=True)
+        except BaseException:
+            pass
+
+    def _wipe_posix_embed(self):
+        """Ephemeral teardown (POSIX only): remove the pushed embeddable-Python runtime
+        under the fixed lc-runtime cache leaf so an --ephemeral session leaves NOTHING
+        behind (the provisioned interpreter included). Best-effort, guarded to the fixed
+        '.../leancoder/lc-runtime' path so it can never remove an unrelated dir. A
+        non-ephemeral session KEEPS the cache (download once, reuse). The LOCAL driver
+        cache (~/.cache/leancoder/lc-runtime tarballs) is never touched - it's the reuse
+        source, not a remote trace."""
+        cmd = (f'p="{_POSIX_EMBED_ROOT}"; '
+               'case "$p" in */leancoder/lc-runtime) rm -rf "$p" ;; esac')
+        try:
+            subprocess.run(_ssh_run_argv(self.host, self.ctl, cmd),
                            capture_output=True, timeout=30, start_new_session=True)
         except BaseException:
             pass
