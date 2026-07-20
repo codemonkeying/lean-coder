@@ -6850,10 +6850,52 @@ class RemoteWorkspace:
             if not out.strip():
                 self._install_python()
         else:
-            self.ctl = None                        # Windows: no multiplexing (see docstring)
+            # Windows: TRY to multiplex (a Linux client CAN drive a shared master to a
+            # Windows sshd - multiplexing is a client feature). But only KEEP it if the
+            # master actually comes up and `ssh -O check` confirms it: some Windows sshd
+            # builds don't honour session-reuse, and we must degrade cleanly. On any
+            # doubt we fall back to ctl=None (a fresh key-auth connection per call - the
+            # old, always-correct behaviour). All Windows commands are stdin-free
+            # (powershell -EncodedCommand / scp over its own channel), so the historic
+            # stdin-piped-channel deadlock against Windows sshd can't recur here.
+            if not self._try_open_win_master(batch=batch):
+                self.ctl = None                    # no reliable mux -> per-call connections
             self._check_windows_python()
         self._bootstrap_executor()
         return self
+
+    def _try_open_win_master(self, batch=False):
+        """Windows only: attempt to open a shared ControlMaster and verify it's usable,
+        returning True if we should multiplex, False to fall back to per-call connections.
+
+        A Linux ssh client CAN multiplex to a Windows sshd (ControlMaster is a client
+        feature), which collapses the ~4-handshakes-per-file provisioning cost onto one
+        reused connection. But not every Windows sshd honours session-reuse, so we PROVE
+        it before trusting it: clear any stale socket, open a backgrounded master
+        (_ssh_master_argv, same as the POSIX path), then require `ssh -O check` to
+        confirm the master is genuinely live and reusable. Any failure (open
+        error, timeout, check fails) -> tear down and return False so the caller uses
+        ctl=None. self.ctl must already be set (the per-PID socket path)."""
+        if not self.ctl:
+            return False
+        try:
+            _clear_master(self.host, self.ctl)     # drop any stale socket first
+            argv = _ssh_master_argv(self.host, self.ctl, batch=batch)
+            try:
+                rc = subprocess.run(argv, timeout=30).returncode
+            except subprocess.TimeoutExpired:
+                _clear_master(self.host, self.ctl)
+                return False
+            if rc != 0:
+                return False
+            # The master opened - but only KEEP it if it's genuinely reusable.
+            if _ssh_master_alive(self.host, self.ctl):
+                return True
+            _clear_master(self.host, self.ctl)     # opened but not shareable - drop it
+            return False
+        except (OSError, subprocess.SubprocessError):
+            _clear_master(self.host, self.ctl)
+            return False
 
     def attach(self):
         """ATTACH to a master a PARENT already opened (worker reuse): DON'T open or
