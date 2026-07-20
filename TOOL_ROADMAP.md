@@ -41,16 +41,17 @@ staged/unstaged diffstat, and the last few commits.
   string; truncate long diffstats.
 - **Teaches:** the lean-tool contract and the read-only/context-cost tradeoff.
 
-## 3. Semantic navigation / LSP - *deferred* (lean-tool, `safe:True`)
+## 3. Semantic navigation - *partly done* (`symbols.py`, `safe:True`); full LSP deferred
 
-Go-to-definition, find-references, rename via an installed language server,
-sibling to `diagnostics.py`.
+Go-to-definition and file outline, sibling to `diagnostics.py`.
 
-- **Why:** the one real *capability* gap. grep covers ~80% of navigation; this is
-  the precise 20% that matters on large or polyglot codebases.
-- **Cost:** the highest build cost here - speaking LSP (JSON-RPC over a server
-  subprocess) is real work, and the value only shows up on big repos. Defer
-  unless that's the target.
+- **Shipped (`symbols.py`):** a dependency-free, Python-only navigator - `outline`
+  (structure of a file) and `def` (locate a definition by name), built on the stdlib
+  `ast`, so it fits the zero-dep ethos and ships bundled (toggle with `/tools`).
+- **Still deferred (multi-language LSP):** find-references/rename and non-Python
+  languages need a real language server (JSON-RPC over a subprocess) or tree-sitter -
+  the highest build cost here, and the value only shows up on big/polyglot repos.
+  Add unless zero-dep Python outline+def already covers the target.
 
 ## 4. `notify` - *done* (setup-hook lean-tool, not a model tool)
 
@@ -61,15 +62,18 @@ Ping the operator when a long task finishes or needs input.
   not the remote executor - so it's a `setup()` hook / slash command, *not* a
   pushed `TOOL`. This is the executor-vs-driver distinction in miniature.
 
-## 5. Sub-agent / delegate - *deferred*
+## 5. Sub-agent / delegate - *done* (`dispatch_worker`, never `safe:True`)
 
-Spawn a scoped child that does a fan-out search and returns only the conclusion,
-saving the driver's context.
+Spawn a scoped background child that does a fan-out sub-task and returns only the
+conclusion, keeping the driver's context clean.
 
-- **Why:** real context-economy win on huge repos.
-- **Cost:** a second loop and result marshalling - meaningful complexity, and it
-  fights the 32k-lean philosophy (it exists *because* context is precious, but it
-  also adds machinery). Lowest priority for now.
+- **Shipped (`dispatch_worker`):** hands a self-contained task to a background worker
+  agent with its own session + context; the parent is notified on completion and pulls
+  the (optionally full) result, so a long errand's intermediate output never bloats the
+  driver. Own capability leash (`r`/`rw`/`rwe`, capped at the parent's), optional
+  separate model/host, and mid-task `inject`/`cancel`. This is the context-economy win
+  the entry called for - the machinery earns its keep by *removing* tokens from the
+  driver, in line with the lean philosophy rather than against it.
 
 ## 6. `web_fetch` - *done* (lean-tool, never `safe:True`); `http_request` deferred
 
@@ -86,5 +90,8 @@ Fetch a URL (read docs, hit a local dev server / API).
 
 ## Recommended cut
 
-If picking a tight set: **#1 (done) + #2**, optionally **#4**. #3 only if large
-codebases are the target; #5 and #6 on demand.
+Most of this list has shipped: #1 (parallel calls), #2 (`git_summary`), #4 (`notify`),
+#5 (`dispatch_worker`), and #6 (`web_fetch`) are all done, plus a zero-dep Python slice
+of #3 (`symbols`). What remains genuinely deferred: **multi-language LSP** (#3, the
+build-cost item, worth it only on big/polyglot repos) and **`http_request`** (#6's
+riskier method/body sibling - on explicit demand).
