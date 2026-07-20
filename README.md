@@ -170,7 +170,7 @@ actual code. lean-coder treats context as the scarce resource it is:
   | write (`rw`) | ~1.5k | + apply_diff, replace_lines, write_file |
   | exec (`rwe`) | **~2k** | + run_command, ask_user_to_run - the fresh-session floor |
 
-  That **~2k** is the whole shipped agent: system prompt plus all ten always-on
+  That **~2k** is the whole shipped agent: system prompt plus all eleven always-on
   builtin tools. On top, the **optional bundled lean-tools** are off by default and
   cost nothing until you `/tools` them on. Roughly:
 
@@ -181,7 +181,6 @@ actual code. lean-coder treats context as the scarce resource it is:
   | symbols | 327 | | ssh | 134 |
   | shell_session | 291 | | diagnostics | 65 |
   | git_summary | 63 | | word_count | 56 |
-  | note | 54 | | | |
 
   Turn on **every** one and the total is still **under ~5k tokens**. The meter always
   shows the real current figure.
@@ -390,7 +389,6 @@ on with `/tools` and it costs context only from that point. These ship bundled i
 | `symbols`         | Navigate Python code without grepping: outline a file/dir's classes+defs, or locate a definition by name (zero-dep, stdlib `ast`). |
 | `shell_session`   | A persistent interactive shell the model holds open across calls (REPL, ssh, etc.). |
 | `ssh`             | One-shot `ssh host cmd` (network egress, kept out of core). |
-| `note`            | Append a line to `NOTES.md`. |
 | `notify`          | Desktop notification when a long task finishes. |
 | `provision`       | `/provision` wizard: install lean-coder onto another box over SSH. |
 | `update`          | `/update` - self-update `lean_coder.py` to the latest published build. |
