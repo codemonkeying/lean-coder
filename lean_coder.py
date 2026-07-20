@@ -12185,6 +12185,21 @@ def handle_connect_command(agent, cfg, arg):
         _connect_remove(agent, cfg, arg.split(maxsplit=1)[1].strip() if len(arg.split(maxsplit=1)) > 1 else "")
     else:
         sp = arg.split(maxsplit=1)
+        # a bare integer selects from the SAME ordered list the menu shows (saved
+        # [connect] targets, then open-but-unsaved sessions) - so `/connect 8` means
+        # "the 8th menu item", NOT a host literally named "8" (which ssh would dial as
+        # 0.0.0.8). Only when there's no matching item does it fall through as a literal.
+        if sp[0].isdigit():
+            ordered = list(cfg.connect_hosts.values())
+            for h in agent.remotes:
+                if h not in cfg.connect_hosts.values():
+                    ordered.append(h)
+            idx = int(sp[0])
+            if 1 <= idx <= len(ordered):
+                rpath = sp[1] if len(sp) > 1 else "."
+                _do_connect(agent, cfg, ordered[idx - 1], rpath,
+                            offer_save=True, ephemeral=ephemeral)
+                return
         # a bare token may be a saved [connect] name -> resolve to its target
         rhost = cfg.connect_hosts.get(sp[0], sp[0])
         rpath = sp[1] if len(sp) > 1 else "."
