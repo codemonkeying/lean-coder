@@ -37,6 +37,7 @@ _INJECT = (
     "_menu_index", "pick_model_menu", "model_available",
     "_norm_host", "resolve_host", "host_label", "valid_host",
     "_ask", "save_config", "_TTY",
+    "stream_tiered", "StreamStall",
 )
 
 
@@ -441,9 +442,16 @@ class OllamaClient:
         done_reason = None                # 'load' = cold-load ack, not a real turn
         self.last_out_tokens = None       # set on `done`; cleared so a failed call can't restack
         spin = Spinner("thinking", THINK_FRAMES).start()  # until first token
+        # 3-tier timeout (shared core helper): open with the connect deadline, then
+        # stream_tiered re-arms the socket to the TTFT deadline until the first line
+        # and to the inter-token idle deadline after, raising StreamStall (a
+        # ConnectionError, so core's next-model fallback still fires) on a stall.
+        # should_abort semantics are untouched. Prod defaults (ttft=600, idle=None)
+        # reproduce the old single 600s socket timeout.
+        connect_to = getattr(self.cfg, "gen_connect_timeout", None) or 600
         try:
-            with urllib.request.urlopen(req, timeout=600) as resp:
-                for raw in resp:
+            with urllib.request.urlopen(req, timeout=connect_to) as resp:
+                for raw in stream_tiered(resp, self.cfg, self.cfg.host):
                     if should_abort and should_abort():
                         aborted = True
                         break

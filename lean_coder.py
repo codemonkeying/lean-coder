@@ -2275,6 +2275,65 @@ def style_md_line(line: str) -> str:
     return line
 
 
+class StreamStall(ConnectionError):
+    """A streaming model request stalled at the socket level. Subclasses
+    ConnectionError so the agent loop's cross-provider next-model fallback (which
+    catches ConnectionError) still fires - no per-provider `on_error` hook needed.
+    `kind` distinguishes the two tiers for callers that care (the eval harness reads
+    it off the exception): "prefill" = the server accepted the request but never
+    emitted a first token (TTFT deadline tripped); "decode" = the stream went idle
+    mid-flight (inter-token deadline tripped)."""
+    def __init__(self, kind, where=""):
+        self.kind = kind
+        what = "first token" if kind == "prefill" else "next token"
+        loc = f" from {where}" if where else ""
+        super().__init__(
+            f"stream stalled ({kind}) waiting for the {what}{loc}: the server "
+            f"accepted the request but went idle "
+            f"(tune gen_ttft_timeout / gen_idle_timeout).")
+
+
+def _set_stream_read_timeout(resp, secs):
+    """Best-effort: retarget a live urllib response socket's read timeout. urllib's
+    single urlopen `timeout` scalar can't express connect-vs-read tiers, so we open
+    with the connect deadline then re-arm the socket here for the TTFT / idle read
+    phases. Silent no-op if the internals aren't reachable (never breaks a stream)."""
+    if not secs:
+        return
+    try:
+        resp.fp.raw._sock.settimeout(secs)
+    except Exception:
+        pass
+
+
+def stream_tiered(resp, cfg, where=""):
+    """Wrap a streaming urllib response in the 3-tier timeout model and yield its
+    raw lines. The provider opens the connection with `cfg.gen_connect_timeout`,
+    then iterates THIS instead of `resp` directly; its own should_abort poll and
+    line parsing are unchanged. We re-arm the socket to `gen_ttft_timeout` until the
+    first line arrives (a socket.timeout before then = "prefill" stall), then to
+    `gen_idle_timeout` for the decode phase (a timeout after = "decode" stall).
+    Prod defaults (ttft=600, idle=None) reproduce the old single 600s read timeout
+    exactly - idle=None leaves the ttft deadline in place, so a live-but-slow stream
+    is never tripped. Raises StreamStall (a ConnectionError) on a stall."""
+    ttft = getattr(cfg, "gen_ttft_timeout", None) or 600
+    idle = getattr(cfg, "gen_idle_timeout", None)
+    _set_stream_read_timeout(resp, ttft)
+    it = iter(resp)
+    got_first = False
+    while True:
+        try:
+            raw = next(it)
+        except StopIteration:
+            return
+        except socket.timeout:
+            raise StreamStall("prefill" if not got_first else "decode", where)
+        if not got_first:
+            got_first = True
+            _set_stream_read_timeout(resp, idle)   # None = keep ttft (prod)
+        yield raw
+
+
 class MarkdownStream:
     """Line-buffered styler for streamed output: feed() chunks, it writes styled
     complete lines and holds the partial tail until flush(). The ``` fence
@@ -3581,6 +3640,16 @@ class Config:
                                      # request (keeps the prefill KV cache warm between
                                      # turns). Modest default since the box may be shared;
                                      # set "-1" to pin indefinitely, "0" to unload at once.
+    # --- ollama streaming timeouts (3-tier). Prod defaults preserve the old
+    # single 600s socket timeout byte-for-byte; raise/lower per box or in eval. ---
+    gen_connect_timeout: float = 10.0  # ollama: TCP connect-phase deadline (s)
+    gen_ttft_timeout: float = 600.0    # ollama: read deadline until the FIRST token
+                                       # arrives (catches a prefill stall - server
+                                       # accepts then emits nothing). 600 = old default.
+    gen_idle_timeout: "float | None" = None  # ollama: max gap BETWEEN tokens once
+                                       # streaming (catches a decode stall). None =
+                                       # disabled (old behaviour); a slow-but-live
+                                       # stream must not trip it, so set generously.
     auto_evict: bool = False         # continuous tool-output eviction: each round, stub
                                      # acted-on tool results (keep last auto_evict_keep in
                                      # full). A raw-token quota lever - BUT it rewrites
@@ -10407,7 +10476,10 @@ _SETTINGS_FIELDS = [
     ("auto_handover", "auto-handover (self-managing context)", "bool"),
     ("handover_soft", "handover soft-zone start (fraction of ctx)", "float"),
     ("handover_hard", "handover hard threshold (fraction of ctx)", "float"),
-    ("handover_emergency", "handover emergency threshold (fraction of ctx)", "float"),
+    ("auto_num_ctx", "ollama: detect num_ctx at startup", "bool"),
+    ("gen_connect_timeout", "ollama: TCP connect deadline (s)", "float"),
+    ("gen_ttft_timeout", "ollama: read deadline until first token (s)", "float"),
+    ("gen_idle_timeout", "ollama: max gap between tokens (s; blank = off)", "float"),
     ("handover_min_interval", "min seconds between handovers", "float"),
     ("autostart_after_handover", "auto-continue the turn after a handover (on by default; 5s ^C to cancel)", "bool"),
     ("wake_on_bg_finish", "wake + react autonomously when a background task finishes (off by default)", "bool"),

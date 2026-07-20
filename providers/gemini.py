@@ -463,7 +463,7 @@ class _GeminiClient:
 
         spin = _lc["Spinner"]("thinking", _lc["THINK_FRAMES"]).start()
         try:
-            for raw in resp:
+            for raw in _lc["stream_tiered"](resp, self.cfg):
                 if should_abort and should_abort():
                     aborted = True
                     break
@@ -551,7 +551,9 @@ class _GeminiClient:
                 headers={"Content-Type": "application/json", "x-goog-api-key": key},  # sweep-ok
             )
             try:
-                with urllib.request.urlopen(req, timeout=600) as resp:
+                with urllib.request.urlopen(
+                        req,
+                        timeout=(getattr(self.cfg, "gen_connect_timeout", None) or 600)) as resp:
                     return self._consume(resp, should_abort)
             except urllib.error.HTTPError as e:
                 body = e.read().decode(errors="replace")
