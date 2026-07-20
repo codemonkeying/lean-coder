@@ -28,6 +28,7 @@ from pathlib import Path
 _INJECT = (
     "IgnoreMatcher", "resolve_in_project", "_parse_search_replace", "_confirm_action",
     "_bg_running", "_bg_register", "_bg_status_items", "_bg_status_msg",
+    "_bg_spawn_detached",
     "READ_MAX_LINES", "READ_HEAD", "READ_TAIL", "TREE_DEFAULT_DEPTH", "TREE_MAX_ENTRIES",
     "SEARCH_MAX_MATCHES", "SEARCH_LINE_MAX", "SEARCH_MAX_FILE_BYTES",
     "OUTPUT_MAX_CHARS", "OUTPUT_HEAD", "OUTPUT_TAIL",
@@ -101,8 +102,17 @@ class Tools:
             if depth > TREE_DEFAULT_DEPTH or count >= TREE_MAX_ENTRIES:
                 return
             try:
-                entries = sorted(d.iterdir(), key=lambda x: (x.is_file(), x.name))
-            except PermissionError:
+                # is_file() in the sort key can itself raise on a junction/reparse
+                # point (Windows WinError 448), so guard it per-entry too.
+                def _isfile(x):
+                    try:
+                        return x.is_file()
+                    except OSError:
+                        return True
+                entries = sorted(d.iterdir(), key=lambda x: (_isfile(x), x.name))
+            except OSError:
+                # PermissionError, or a Windows untrusted-mount-point junction
+                # (WinError 448) - skip this dir rather than abort the whole listing.
                 return
             for e in entries:
                 if count >= TREE_MAX_ENTRIES:
@@ -110,10 +120,14 @@ class Tools:
                     return
                 if self.ignore.ignored(e):
                     continue
+                try:
+                    is_dir = e.is_dir()
+                except OSError:
+                    continue
                 rel = _rel(e)
-                out.append(rel + ("/" if e.is_dir() else ""))
+                out.append(rel + ("/" if is_dir else ""))
                 count += 1
-                if e.is_dir():
+                if is_dir:
                     walk(e, depth + 1)
 
         walk(base, 1)
@@ -355,20 +369,16 @@ class Tools:
         heartbeat_timeout = _posint(heartbeat_timeout)
         max_runtime = _posint(max_runtime)
         kill_on_max = True if kill_on_max is None else bool(kill_on_max)
-        notify_on_exit = bool(notify_on_exit)
         try:
             logdir = CONFIG_DIR / "bg"
             logdir.mkdir(parents=True, exist_ok=True)
             log = logdir / f"{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}.log"
             exitf = str(log) + ".exit"
-            wrapped = self._bg_wrap(cmd, exitf, str(log) + ".lease", idle_timeout,
-                                    logf=str(log), max_runtime=max_runtime,
-                                    kill_on_max=kill_on_max,
-                                    heartbeat_timeout=heartbeat_timeout)
-            with open(log, "ab") as f:
-                p = subprocess.Popen(wrapped, shell=True, cwd=str(self.cfg.cwd),
-                                     stdout=f, stderr=subprocess.STDOUT,
-                                     stdin=subprocess.DEVNULL, start_new_session=True)
+            p = _bg_spawn_detached(cmd, log, exitf, str(log) + ".lease",
+                                   logf=str(log), idle_timeout=idle_timeout,
+                                   max_runtime=max_runtime, kill_on_max=kill_on_max,
+                                   heartbeat_timeout=heartbeat_timeout,
+                                   cwd=str(self.cfg.cwd))
         except Exception as e:
             return f"error backgrounding command: {e}"
         _bg_register(p.pid, cmd, log, kind=kind, idle_timeout=idle_timeout,
@@ -651,18 +661,18 @@ BUILTIN_TOOLS = [
                        "content": {"type": "string", "description": "Full new contents of the file."}},
         "required": ["path", "content"]}},
     {"name": "run_command", "tier": "exec",
-     "description": "Run a non-interactive shell command (builds, tests, git, file ops); returns stdout/stderr (truncated - if clipped, pipe to a file or use grep/head/tail to read specific parts). Fresh shell each call - cd/env don't persist, chain with '&&'. Times out after a fixed limit - for a long-running or daemon process end the command with ' &' to background it (returns a pid immediately; poll with bg_status). For sudo/password/interactive use ask_user_to_run; for a shell that stays open use shell_session.",
+     "description": "Run a non-interactive shell command (builds, tests, git, file ops); returns exit code + stdout/stderr (truncated - if clipped, pipe to a file or grep/head/tail it). Fresh shell each call - cd/env don't persist, chain with '&&'. Foreground runs are killed at {command_timeout}s (set via /settings) returning only a timeout error, so anything slower, or any server/daemon/watcher, MUST be backgrounded: end with ' &' to get a pid immediately (poll with bg_status). Backgrounded jobs and workers die on session exit; to outlive it use nohup/systemd, NOT ' &'. For sudo/interactive use ask_user_to_run; for a persistent shell (REPL, ssh) use shell_session.",
      "parameters": {"type": "object",
-        "properties": {"cmd": {"type": "string", "description": "The shell command to run."},
-                       "notify_on_exit": {"type": "boolean", "description": "Bg jobs (' &') only: push exit code + tail back to you on completion."},
+        "properties": {"cmd": {"type": "string", "description": "The shell command to run. End with ' &' to background it."},
+                       "notify_on_exit": {"type": "boolean", "description": "Bg jobs (' &') only: push exit code + output tail back when it finishes."},
                        "heartbeat_timeout": {"type": "integer", "description": "Bg jobs only: alert once if no output for N secs. Never kills (silence != dead)."},
                        "max_runtime": {"type": "integer", "description": "Bg jobs only: wall-clock ceiling (secs); notify + auto-kill on trip."},
                        "kill_on_max": {"type": "boolean", "description": "With max_runtime: false = notify only, keep running (default true = kill)."}},
         "required": ["cmd"]}},
     {"name": "bg_status", "tier": "read",
-     "description": "Poll background tasks (started with a trailing ' &' on run_command): state, runtime, last output. No pid = all; a pid = just that one.",
+     "description": "Poll the background jobs THIS session started with ' &' on run_command: returns state (running/exited/killed), runtime, recent output. No pid = all; a pid = just that one. (Does NOT show dispatched workers - use dispatch_worker action='status'.)",
      "parameters": {"type": "object",
-        "properties": {"pid": {"type": "integer", "description": "A specific task's pid (optional; omit to list all)."}},
+        "properties": {"pid": {"type": "integer", "description": "A specific job's pid (optional; omit to list all)."}},
         "required": []}},
 ]
 

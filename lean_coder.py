@@ -91,7 +91,7 @@ def _prehandover_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.8.13"
+__version__ = "0.9.0"
 
 
 def _prerelease_key(pre):
@@ -670,6 +670,13 @@ def active_tools(cfg, remote=False, lean_tool_schemas=(), model_tools=True,
             continue
         if nm in _EXEC_TIER and not allow_exec:
             continue
+        # run_command's description carries a {command_timeout} placeholder so the model
+        # sees the LIVE foreground timeout (respects /settings changes). Fill it on a
+        # shallow copy - never mutate the shared schema dict.
+        if nm == "run_command" and "{command_timeout}" in t["function"].get("description", ""):
+            t = {**t, "function": {**t["function"],
+                 "description": t["function"]["description"].format(
+                     command_timeout=getattr(cfg, "command_timeout", 300))}}
         tools.append(t)
     if cfg.ask_user_to_run and allow_exec:   # a handoff to RUN a command -> exec tier
         tools.append(ASK_USER_TOOL)
@@ -759,7 +766,7 @@ def _load_lean_tool(path: Path):
     # importlib's .pyc cache can serve stale bytecode after a same-second edit.
     mod = types.ModuleType(f"lcleantool_{path.stem}")
     mod.__file__ = str(path)
-    exec(compile(path.read_text(), str(path), "exec"), mod.__dict__)
+    exec(compile(path.read_text(encoding="utf-8"), str(path), "exec"), mod.__dict__)
     return mod
 
 
@@ -2403,6 +2410,36 @@ class Spinner:
         self.stop()
 
 
+class _StageHandle:
+    """Yielded by _stage so the body can refine the completion word once it knows more
+    (e.g. the probe learns the remote OS -> 'probed · Windows'). Set .done inside the
+    block; whatever it holds at exit is what prints."""
+    __slots__ = ("done",)
+    def __init__(self, done):
+        self.done = done
+
+
+@contextmanager
+def _stage(label, done=None):
+    """A single connect/push STAGE with feedback that works in ANY terminal. On a TTY:
+    an animated Spinner (elapsed ticker, so a slow/wedged step still visibly updates).
+    On a dumb terminal / no-TTY (the "old shell" case that looked hung): a plain
+    'label…' line up front, then 'done' - no \\r, no ansi. Best-effort: never raises
+    into the connect path. `done` overrides the completion word (e.g. 'ready'). Yields a
+    handle whose .done can be reassigned inside the block to append late-known detail."""
+    h = _StageHandle(done or label)
+    if _TTY and _active_composer is None:
+        sp = Spinner(label, TOOL_FRAMES, cyan, interval=0.12).start()
+        try:
+            yield h
+        finally:
+            sp.stop()
+            print(dim(f"  {GLYPH.get('ok', 'v')} {h.done}"))
+    else:
+        print(dim(f"  {label}…"))
+        yield h
+        print(dim(f"  {h.done} done"))
+
 @contextmanager
 def suppress_echo():
     """Stop the TTY echoing keystrokes for the duration of a turn. While the
@@ -3479,9 +3516,15 @@ class IgnoreMatcher:
             rel = path.resolve().relative_to(self._root_resolved).as_posix()
         except ValueError:
             return False
+        except OSError:
+            # e.g. a Windows junction / untrusted mount point (WinError 448)
+            return True
         if not rel or rel == ".":
             return False
-        is_dir = path.is_dir()
+        try:
+            is_dir = path.is_dir()
+        except OSError:
+            is_dir = False
         parts = rel.split("/")
         for pat in self.patterns:
             anchored = pat.startswith("/")
@@ -3559,6 +3602,27 @@ class Config:
                                      # truncated; older turns are simply dropped until
                                      # summarizing compaction backfills them. See
                                      # docs/cost-reduction-roadmap.md.
+    window_tokens: "int | str" = "auto"  # bounded context window by TOKENS (the overflow
+                                     # backstop): cap each send so it can never exceed the
+                                     # model's window, measured with the calibrated meter
+                                     # (messages_tokens). System + tool schemas + the env/plan
+                                     # tail are ALWAYS kept + counted first; the conversation
+                                     # tail is then walked back whole-turn-by-whole-turn until
+                                     # the next older turn wouldn't fit, cut at a clean user
+                                     # boundary (a tool result is never orphaned).
+                                     #   "auto" (DEFAULT): budget = detected ctx_window minus a
+                                     #     reply reserve, recomputed each send. A pure BACKSTOP
+                                     #     - a no-op every turn EXCEPT the one that would
+                                     #     otherwise overflow the server (which ollama silently
+                                     #     top-clips + a hosted API 400s). So it never moves the
+                                     #     cache boundary in normal use; it only trims the turn
+                                     #     that was going over anyway. auto_handover still fires
+                                     #     FIRST at its % (the cache-friendly path); this is the
+                                     #     last line only. Loses old tail, never sys/tools/env/
+                                     #     plan/recent turns - vs the server beheading the top.
+                                     #   an int N: a HARD fixed cap (e.g. 4000 for a 4k model).
+                                     #   0: OFF. Takes precedence over window_messages when on.
+                                     # Non-destructive (shapes the send only).
     auto_handover: bool = True       # self-managing context: when on, the model is shown a
                                      # ctx-budget line and may hand over at a natural break in
                                      # the soft zone; a hard threshold force-hands-over (the
@@ -3634,6 +3698,12 @@ class Config:
     confirm_reads: bool = False      # ask-on-read: read tools confirm too, not just writes
     incognito: bool = False          # no session persistence this run; the model is told
                                      # (ephemeral - never written to config; --incognito to start)
+    ephemeral: bool = False          # default for /connect: FORCE the embeddable-Python
+                                     # runtime on a remote (even if it has a real one) and
+                                     # WIPE the cached runtime on teardown - a zero-trace,
+                                     # no-install-left-behind mode. Persisted so a user can
+                                     # opt into always-wipe; a per-/connect --ephemeral flag
+                                     # overrides it for one connection.
     hosts: list = field(default_factory=list)  # tiered failover list (priority order)
     host_models: dict = field(default_factory=dict)  # per-host default model (url -> model)
     model_explicit: bool = False     # model came from --model / env (skip per-host override)
@@ -3662,6 +3732,18 @@ class Config:
     providers_enabled: list = field(default_factory=list)  # enabled provider plugin names
     provider: str = "ollama"         # active backend - ALWAYS a registered provider now
     provider_settings: dict = field(default_factory=dict)  # name -> {model, num_ctx, thinking, effort, <custom>}
+    # --- the DEFAULTS / SESSION-OVERRIDE layer (uniform working-state model) --------
+    # config.toml holds DEFAULTS; a session holds per-key OVERRIDES. The live cfg
+    # attribute is always the EFFECTIVE value (override if present, else default), so
+    # every read site stays `cfg.<key>` unchanged. `_defaults` snapshots the persisted
+    # scalars as loaded from config.toml (populated in load_config); save_config writes
+    # the scalar lines FROM `_defaults`, never the live/effective value - so a session
+    # override (e.g. approval flipped by a loaded worker session) can NEVER leak into
+    # config.toml. `session_overrides` is the per-key override map, persisted in the
+    # SESSION meta (not config.toml) and re-applied onto the live cfg at load time,
+    # RUNTIME-only. Neither is a config.toml scalar - both are classified EPHEMERAL.
+    _defaults: dict = field(default_factory=dict)          # config.toml default snapshot
+    session_overrides: dict = field(default_factory=dict)  # per-key session overrides
 
     # --- provider-aware accessors ---------------------------------------------
     # There is no "native" backend any more: the active model is ALWAYS a provider's
@@ -3697,16 +3779,23 @@ class Config:
         return stored
 
     def handover_for(self, model: "str | None" = None):
-        """Resolve compaction settings for `model` (default: the active model),
-        applying any per-model override in handover_overrides over the global defaults.
-        Models fill context at different rates, so these are per-model. Returns a dict:
-        {auto, soft, hard, autostart}."""
+        """Resolve compaction settings for `model` (default: the active model).
+        Precedence (uniform working-state layer): SESSION override > per-model
+        handover_overrides > global default. A /set of a handover_* key is a session
+        override and must win over a per-model override; a /set --config writes the
+        global default. Models fill context at different rates, so the per-model layer
+        sits between. Returns {auto, soft, hard, autostart}."""
         ov = self.handover_overrides.get(model or self.active_model(), {})
+        so = self.session_overrides
+        def pick(mkey, gkey, gval):
+            if gkey in so:                       # session override wins outright
+                return getattr(self, gkey)
+            return ov.get(mkey, gval)
         return {
-            "auto":      ov.get("auto",      self.auto_handover),
-            "soft":      ov.get("soft",      self.handover_soft),
-            "hard":      ov.get("hard",      self.handover_hard),
-            "autostart": ov.get("autostart", self.autostart_after_handover),
+            "auto":      pick("auto",      "auto_handover",            self.auto_handover),
+            "soft":      pick("soft",      "handover_soft",            self.handover_soft),
+            "hard":      pick("hard",      "handover_hard",            self.handover_hard),
+            "autostart": pick("autostart", "autostart_after_handover", self.autostart_after_handover),
         }
 
     def set_active_model(self, name):
@@ -3814,11 +3903,11 @@ _PERSISTED_SCALAR_KEYS = (
     "worker_max_concurrent", "worker_idle_timeout", "worker_max_iterations", "editor",
     "approval", "confirm_reads", "auto_reconnect", "statusline", "statusline_every",
     "statusline_iter", "auto_evict", "auto_evict_keep",
-    "window_messages", "auto_handover", "handover_soft", "handover_hard",
+    "window_messages", "window_tokens", "auto_handover", "handover_soft", "handover_hard",
     "handover_emergency", "handover_min_interval", "autostart_after_handover",
     "auto_compact_interval", "auto_compact_hysteresis", "auto_compact_keep",
     "wake_on_bg_finish",
-    "lean_tools_dir", "providers_dir", "user_name",
+    "lean_tools_dir", "providers_dir", "user_name", "ephemeral",
 )
 # EPHEMERAL: deliberately NEVER persisted. These are per-launch state - saving them
 # would let one session silently narrow/alter the NEXT launch's default. `composer` is
@@ -3828,6 +3917,11 @@ _PERSISTED_SCALAR_KEYS = (
 # per-session send flag; `cwd`/`model_explicit`/`auto_num_ctx` are derived at launch.
 _EPHEMERAL_KEYS = frozenset((
     "composer", "leash", "incognito", "think", "cwd", "model_explicit", "auto_num_ctx",
+    # Not config.toml scalars: `_defaults` is the DEFAULTS snapshot save_config writes
+    # FROM; `session_overrides` is the per-key override map persisted in the SESSION
+    # meta (not config.toml) and re-applied at load runtime-only. Classified here so
+    # the config-drift guard accounts for them without treating them as saved scalars.
+    "_defaults", "session_overrides",
 ))
 # DERIVED / bespoke: persisted, but via their own table serialisers (not scalar lines),
 # or reconstructed at load. Listed so the round-trip test can account for every field.
@@ -3851,6 +3945,14 @@ def load_config(args) -> Config:
     for key in _PERSISTED_SCALAR_KEYS + ("composer",):  # composer: read-only (see _EPHEMERAL_KEYS)
         if key in file_vals:
             setattr(cfg, key, file_vals[key])
+    # Snapshot the config.toml DEFAULTS layer: for each persisted scalar, the value as
+    # configured (file value if present, else the dataclass default). save_config writes
+    # scalar lines FROM this, so a per-session OVERRIDE later applied onto the live cfg
+    # never leaks back into config.toml. A /set --config <k> <v> mutates _defaults[k]
+    # AND the live attribute together (new default shows through once the override is
+    # cleared). CLI-flag overrides below are session-ish but pre-date this layer; they
+    # DO update the live value only (not _defaults), matching prior behaviour.
+    cfg._defaults = {k: getattr(cfg, k) for k in _PERSISTED_SCALAR_KEYS}
     # The self-managing mechanism is a HANDOVER (the model pulls the same lever
     # /handover does); "compact" now means only the programmatic /compact strip.
     # The knobs are handover_* accordingly - no compact_* back-compat aliases (they'd
@@ -3956,6 +4058,11 @@ def load_config(args) -> Config:
     if getattr(args, "keep_alive", None) is not None: cfg.keep_alive = args.keep_alive
     if getattr(args, "auto_evict", None): cfg.auto_evict = True
     if getattr(args, "window_messages", None) is not None: cfg.window_messages = args.window_messages
+    if getattr(args, "window_tokens", None) is not None:
+        try:
+            cfg.window_tokens = _coerce_setting(args.window_tokens, "int_or_auto")
+        except ValueError:
+            pass                              # keep the default on a junk --window-tokens
     if args.temperature is not None:    cfg.temperature = args.temperature
     if args.top_p is not None:          cfg.top_p = args.top_p
     if args.top_k is not None:          cfg.top_k = args.top_k
@@ -3996,7 +4103,28 @@ def _toml_value(v) -> str:
     return '"' + str(v).replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
+class _DefaultsView:
+    """Read-only view over a Config that returns the config.toml DEFAULT for any
+    persisted scalar (cfg._defaults[key]) instead of the live/effective value, and
+    falls through to the live attribute for everything else (bespoke tables, and any
+    scalar not yet in _defaults - e.g. a Config built directly in a test). save_config
+    reads through this so a per-session OVERRIDE held on the live cfg can never leak
+    into config.toml."""
+    __slots__ = ("_cfg",)
+
+    def __init__(self, cfg):
+        object.__setattr__(self, "_cfg", cfg)
+
+    def __getattr__(self, name):
+        cfg = object.__getattribute__(self, "_cfg")
+        d = cfg._defaults
+        if name in _PERSISTED_SCALAR_KEYS and name in d:
+            return d[name]
+        return getattr(cfg, name)
+
+
 def save_config(cfg: Config, quiet: bool = False):
+    cfg = _DefaultsView(cfg)          # persisted scalars read from _defaults, not live
     CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
     # One-time safety net: before the first write that introduces the new
     # provider-based format, snapshot the legacy config so the ollama-as-provider
@@ -4044,6 +4172,8 @@ def save_config(cfg: Config, quiet: bool = False):
         lines.append(f"max_iterations = {cfg.max_iterations}")
     if cfg.window_messages != 0:              # default is off (0) now
         lines.append(f"window_messages = {cfg.window_messages}")
+    if cfg.window_tokens != "auto":           # default is 'auto'; persist an int cap or 0 (off)
+        lines.append(f"window_tokens = {_toml_value(cfg.window_tokens)}")
     if not cfg.auto_handover:
         lines.append("auto_handover = false")
     if cfg.handover_soft != 0.70:
@@ -4093,6 +4223,8 @@ def save_config(cfg: Config, quiet: bool = False):
         lines.append("confirm_reads = true")
     if cfg.auto_reconnect:
         lines.append("auto_reconnect = true")
+    if cfg.ephemeral:                         # default off; persist an opt-IN (always-wipe)
+        lines.append("ephemeral = true")
     if not cfg.statusline:                    # default on; persist only when turned off
         lines.append("statusline = false")
     if cfg.statusline_every != 1:             # default 1 (every prompt); persist if changed
@@ -4134,6 +4266,23 @@ def save_config(cfg: Config, quiet: bool = False):
         lines.append("")
         lines.append("[models]")
         lines += [f'"{h}" = "{m}"' for h, m in cfg.host_models.items()]
+    # Per-model handover overrides: [handover_overrides.<model>] tables. Declared a
+    # BESPOKE (own-serializer) key and READ back in load_config - but historically had
+    # NO writer here, so every autosave_config() (fired by /model, /connect, and the
+    # flows around a handover) rewrote config.toml WITHOUT them: the overrides silently
+    # vanished and the next load fell back to the global handover_soft/hard defaults
+    # (0.70/0.95), which the status line shows as "handover 95%". Write them back.
+    if cfg.handover_overrides:
+        for _m, _ov in cfg.handover_overrides.items():
+            if not (isinstance(_m, str) and _m.strip() and isinstance(_ov, dict) and _ov):
+                continue
+            lines.append("")
+            # Quote the model segment: names carry ':' / '.' (qwen3:32b, claude-opus-4-8)
+            # which are INVALID as a bare TOML key - an unquoted header would make the
+            # whole config.toml unparseable, and the next load would silently fall back to
+            # ALL defaults (wiping global handover_soft/hard too -> the "95%" reset).
+            lines.append(f"[handover_overrides.{_toml_value(_m)}]")
+            lines += [f"{k} = {_toml_value(v)}" for k, v in _ov.items()]
     if cfg.provider and cfg.provider != "ollama":
         lines.insert(2, f'provider = "{cfg.provider}"')   # just after model line
     # ollama is the default provider; omit the line for it (a bare config still
@@ -4260,6 +4409,7 @@ def save_session(messages, cfg, name: str, remote=None, pinned_plan=""):
         "title": _session_title(messages),
         "turns": len(body),
         "pinned_plan": pinned_plan or "",
+        "session_overrides": dict(getattr(cfg, "session_overrides", {}) or {}),
         "tok_factor": _tok_factor(),         # learned estimate->actual factor (calibrated meter)
     }
     path = _session_path(safe)
@@ -4632,15 +4782,58 @@ def _proc_alive(pid):
         return False
 
 
-def _bg_kill(pid, sig=signal.SIGTERM):
-    """Kill a backgrounded task's whole group (start_new_session -> pgid == pid)."""
+# --- the ONLY two OS primitives with no cross-platform stdlib call ------------
+# Detaching a child into its own session/group and killing that whole group have
+# no unified API: POSIX uses setsid + os.killpg, Windows uses process-group
+# creation flags + taskkill /T. Every other bg/watchdog behaviour (sidecars,
+# lease/heartbeat/max_runtime logic) is platform-agnostic and sits on top of
+# these two. Kept here as the single source of truth so core (_bg_kill) and the
+# pure-Python bg-runner share one implementation of each (no drift).
+def _detached_popen_kwargs():
+    """Popen kwargs that put the child in its OWN session/process group, so a
+    group kill takes the whole tree. POSIX: start_new_session (setsid), making
+    pgid == the child pid. Windows: CREATE_NEW_PROCESS_GROUP."""
+    if os.name == "nt":
+        return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+    return {"start_new_session": True}
+
+
+def _kill_tree(pid, sig=None):
+    """Kill a detached child AND its whole group/tree. POSIX: os.killpg on the
+    pgid (== pid, since it was start_new_session'd). Windows: os.killpg is absent
+    (AttributeError) and groups differ, so use taskkill /T to walk the tree. On
+    any failure, fall back to a direct os.kill. Best-effort; never raises.
+
+    `sig` defaults to None (resolved to SIGTERM) rather than signal.SIGKILL: on
+    Windows signal.SIGKILL DOESN'T EXIST, and a signal.SIGKILL default arg is
+    evaluated at IMPORT time - so importing this module (e.g. the pushed executor
+    agent.py) crashed with AttributeError before the handshake. SIGTERM exists on
+    both; os.kill on Windows treats any non-CTRL_* sig as a hard TerminateProcess."""
+    if sig is None:
+        sig = getattr(signal, "SIGKILL", signal.SIGTERM)
     try:
         os.killpg(int(pid), sig)
-    except (OSError, ValueError, TypeError):
+        return
+    except (OSError, ValueError, TypeError, AttributeError):
+        pass
+    if os.name == "nt":
         try:
-            os.kill(int(pid), sig)
-        except OSError:
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(int(pid))],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return
+        except (OSError, ValueError, TypeError):
             pass
+    try:
+        os.kill(int(pid), sig)
+    except (OSError, ValueError, TypeError):
+        pass
+
+
+def _bg_kill(pid, sig=signal.SIGTERM):
+    """Kill a backgrounded task's whole group (start_new_session -> pgid == pid).
+    Delegates to the shared _kill_tree primitive so Linux and Windows share one
+    implementation."""
+    _kill_tree(pid, sig)
 
 
 def _bg_here(rec) -> bool:
@@ -4902,6 +5095,133 @@ def _bg_status_msg(rows, pid=None) -> str:
     return "\n\n".join(out)
 
 
+def _bg_poll_interval(lease, maxrt, hb):
+    """Watchdog poll cadence: a few checks per shortest active window, clamped
+    5..30s. Identical to _bg_wrap's `chk` so shell and Python paths trip alike."""
+    wins = [w for w in (lease or None, maxrt or None, hb or None) if w]
+    return max(5, min(30, min(wins) // 4)) if wins else 30
+
+
+def run_bg_child(cfg):
+    """Pure-Python backgrounded-command runner (the cross-platform twin of the
+    POSIX shell wrapper built by builtins Tools._bg_wrap). Spawned detached as
+    `python lean_coder.py --bg-run <json>` so it survives the executor/ssh drop,
+    exactly like the old subshell. Reproduces the sidecar contract byte-for-byte:
+      <log>.exit   : child exit code on completion; 137 on lease-expiry / max-kill
+      <log>.lease  : touched at launch; parent bumps mtime; stale>idle -> 137 + kill
+      <log>.maxrun : elapsed secs, written ONCE on max trip when kill_on_max=False
+      <log>.silent : silence secs, written ONCE when log mtime stale>hb (bark, re-arms)
+    All watchdog channels are file-based so they read identically local/remote and
+    survive a reconnect. Used on Windows (no POSIX shell); POSIX keeps the shell path.
+    `cfg` keys: cmd, exitf, leasef, logf, idle_timeout, max_runtime, heartbeat_timeout,
+    kill_on_max."""
+    cmd = cfg["cmd"]
+    exitf, leasef, logf = cfg["exitf"], cfg["leasef"], cfg.get("logf") or cfg["exitf"]
+    lease = int(cfg.get("idle_timeout") or 0)
+    maxrt = int(cfg.get("max_runtime") or 0)
+    hb = int(cfg.get("heartbeat_timeout") or 0)
+    kill_on_max = bool(cfg.get("kill_on_max", True))
+    silentf, maxrunf = logf + ".silent", logf + ".maxrun"
+
+    def _write(path, text):
+        try:
+            with open(path, "w") as f:
+                f.write(str(text))
+        except OSError:
+            pass
+
+    def _mtime(path, default):
+        try:
+            return os.path.getmtime(path)
+        except OSError:
+            return default
+
+    # lease sidecar exists from t0 (shell path: touch '{leasef}')
+    try:
+        open(leasef, "a").close()
+        os.utime(leasef, None)
+    except OSError:
+        pass
+    logdir = cfg.get("cwd")
+    proc = subprocess.Popen(cmd, shell=True, cwd=logdir,
+                            stdin=subprocess.DEVNULL, **_detached_popen_kwargs())
+
+    if not (lease or maxrt or hb):
+        rc = proc.wait()
+        if not os.path.exists(exitf):
+            _write(exitf, rc)
+        return rc
+
+    chk = _bg_poll_interval(lease, maxrt, hb)
+    t0 = time.time()
+    state = {"mr": 0, "hb": 0, "done": False}
+
+    def _watch():
+        while not state["done"]:
+            now = time.time()
+            if lease and now - _mtime(leasef, now) >= lease:
+                _write(exitf, 137)
+                _kill_tree(proc.pid)
+                return
+            if maxrt and state["mr"] == 0 and now - t0 >= maxrt:
+                state["mr"] = 1
+                if kill_on_max:
+                    _write(exitf, 137)
+                    _kill_tree(proc.pid)
+                    return
+                _write(maxrunf, maxrt)
+            if hb:
+                if now - _mtime(logf, now) >= hb:
+                    if state["hb"] == 0:
+                        state["hb"] = 1
+                        _write(silentf, int(now - _mtime(logf, now)))
+                else:
+                    state["hb"] = 0
+            time.sleep(chk)
+
+    threading.Thread(target=_watch, daemon=True).start()
+    rc = proc.wait()
+    state["done"] = True
+    if not os.path.exists(exitf):
+        _write(exitf, rc)
+    return rc
+
+
+def _bg_spawn_detached(cmd, log, exitf, leasef, logf=None, idle_timeout=None,
+                       max_runtime=None, kill_on_max=True, heartbeat_timeout=None,
+                       cwd=None):
+    """The single detached-bg spawn chokepoint shared by core (_bg_launch) and the
+    run_command ' &' path. POSIX: build the proven shell wrapper (Tools._bg_wrap)
+    and Popen it via /bin/sh - unchanged, battle-tested. Windows (no POSIX shell):
+    spawn `python lean_coder.py --bg-run <json>` running run_bg_child, which
+    reproduces the identical sidecar contract. Returns the detached Popen handle.
+    Its .pid is the group leader (start_new_session / CREATE_NEW_PROCESS_GROUP), so
+    _kill_tree(pid) reaps the whole tree on either OS. Caller opens `log` for stdout."""
+    f = open(log, "ab")
+    try:
+        if os.name == "nt":
+            cfg = {"cmd": cmd, "exitf": exitf, "leasef": leasef,
+                   "logf": logf or str(log), "idle_timeout": idle_timeout,
+                   "max_runtime": max_runtime, "kill_on_max": kill_on_max,
+                   "heartbeat_timeout": heartbeat_timeout,
+                   "cwd": str(cwd) if cwd else None}
+            argv = [sys.executable, os.path.abspath(__file__), "--bg-run",
+                    json.dumps(cfg)]
+            return subprocess.Popen(argv, stdout=f, stderr=subprocess.STDOUT,
+                                    stdin=subprocess.DEVNULL,
+                                    **_detached_popen_kwargs())
+        wrapped = _BUILTINS.Tools._bg_wrap(cmd, exitf, leasef, idle_timeout,
+                                           logf=logf, max_runtime=max_runtime,
+                                           kill_on_max=kill_on_max,
+                                           heartbeat_timeout=heartbeat_timeout)
+        return subprocess.Popen(wrapped, shell=True,
+                                cwd=str(cwd) if cwd else None,
+                                stdout=f, stderr=subprocess.STDOUT,
+                                stdin=subprocess.DEVNULL,
+                                **_detached_popen_kwargs())
+    finally:
+        f.close()
+
 def _bg_launch(cmd, cwd=None, kind="task", idle_timeout=None,
                heartbeat_timeout=None, heartbeat_file=None):
     """Launch a detached background process on THIS box and register it, returning
@@ -4925,15 +5245,11 @@ def _bg_launch(cmd, cwd=None, kind="task", idle_timeout=None,
         # heartbeat_file lets a worker point the (bark-not-bite) staleness watchdog at
         # its OWN progress file (bumped each iteration) instead of the bg log, so a worker
         # that's genuinely stuck (model looping, hung tool) - not merely quiet - trips the
-        # alert. logf carries that path into _bg_wrap's HEARTBEAT channel.
+        # alert. logf carries that path into the HEARTBEAT channel (shell or Python path).
         hb_watch = heartbeat_file or log
-        wrapped = _BUILTINS.Tools._bg_wrap(cmd, exitf, leasef, idle_timeout,
-                                           logf=hb_watch,
-                                           heartbeat_timeout=heartbeat_timeout)
-        with open(log, "ab") as f:
-            p = subprocess.Popen(wrapped, shell=True, cwd=str(cwd) if cwd else None,
-                                 stdout=f, stderr=subprocess.STDOUT,
-                                 stdin=subprocess.DEVNULL, start_new_session=True)
+        p = _bg_spawn_detached(cmd, log, exitf, leasef, logf=str(hb_watch),
+                               idle_timeout=idle_timeout,
+                               heartbeat_timeout=heartbeat_timeout, cwd=cwd)
     except Exception as e:
         return {"error": f"launch failed: {e}"}
     _bg_register(p.pid, cmd, log, kind=kind, idle_timeout=idle_timeout,
@@ -5662,16 +5978,43 @@ def _menu_index(sel: str, count: int):
     return None
 
 
-def pick_connect_menu(connect_hosts, open_hosts=(), active=None, prompt=input):
-    """Numbered picker over saved [connect] targets plus any currently-open
-    sessions (marked). Returns the chosen ssh target, or None on cancel/empty.
-    No liveness probe - SSH handles auth (passwordless straight in, else prompts)."""
-    items, seen = [], set()                       # (label, target)
+def menu_resolve(arg, ordered):
+    """MENU CONTRACT (single source of truth). A command that opens a numbered menu on
+    bare invocation MUST accept a bare 1-based integer arg as "pick that item from the
+    SAME ordered list the menu shows" - so `/connect 8` == the 8th menu row, never a
+    host literally named 8. Returns the chosen item, or None when `arg` isn't a valid
+    in-range index (caller then falls through to its name/literal handling). Pure; the
+    ordering passed in must match what the command's picker renders. Built on
+    _menu_index so the CLI-arg path and the interactive picker share one index rule."""
+    idx = _menu_index(str(arg).strip(), len(ordered))
+    return ordered[idx] if idx is not None else None
+
+
+def _connect_menu_items(connect_hosts, open_hosts=()):
+    """MENU CONTRACT: the ordered (name, target) list backing BOTH the bare-/connect
+    picker AND the `/connect <N>` numeric arg path - saved [connect] targets first (in
+    config order), then open-but-unsaved sessions. One source so the two can never
+    drift (a numeric arg must select exactly the row the menu renders). Pure."""
+    items, seen = [], set()                       # (name, target)
     for name, target in connect_hosts.items():
         items.append((name, target)); seen.add(target)
     for host in open_hosts:                        # open-but-unsaved targets too
         if host not in seen:
             items.append((host, host)); seen.add(host)
+    return items
+
+
+def _connect_menu_order(cfg, agent):
+    """The list of ssh TARGETS in menu order (see _connect_menu_items) - what a bare
+    integer /connect arg indexes into. Kept beside the picker so both share it."""
+    return [t for _n, t in _connect_menu_items(cfg.connect_hosts, list(agent.remotes))]
+
+
+def pick_connect_menu(connect_hosts, open_hosts=(), active=None, prompt=input):
+    """Numbered picker over saved [connect] targets plus any currently-open
+    sessions (marked). Returns the chosen ssh target, or None on cancel/empty.
+    No liveness probe - SSH handles auth (passwordless straight in, else prompts)."""
+    items = _connect_menu_items(connect_hosts, open_hosts)
     if not items:
         print(dim("no saved connect targets; use /connect <[user@]host>, or add a "
                   "[connect] section to the config."))
@@ -5916,22 +6259,19 @@ def _arm_self_wipe():
     try:
         old = int(Path(pidf).read_text().strip())
         if old != os.getpid():
-            os.kill(old, signal.SIGTERM)
+            _kill_tree(old, signal.SIGTERM)
     except (OSError, ValueError):
         pass
-    q = shlex.quote(mydir)
-    script = (
-        f'd={q}; l="$d/.lease"; '
-        f'while :; do '
-        f'[ -d "$d" ] || exit 0; '
-        f'now=$(date +%s); m=$(stat -c %Y "$l" 2>/dev/null || echo "$now"); '
-        f'if [ $((now - m)) -ge {ttl} ]; then rm -rf "$d"; exit 0; fi; '
-        f'sleep {chk}; done'
-    )
+    # Detached watchdog: a Python child (own session/process group, so it outlives
+    # this executor and the ssh channel) that rm -rf's the dir once the lease goes
+    # unbumped for TTL. Pure-Python + shutil.rmtree so it runs identically on POSIX
+    # and native Windows (no sh/stat/date/rm dependency).
     try:
-        wp = subprocess.Popen(["sh", "-c", script], stdin=subprocess.DEVNULL,
+        argv = [sys.executable, os.path.abspath(__file__), "--wipe-watch",
+                json.dumps({"dir": mydir, "ttl": ttl, "chk": chk})]
+        wp = subprocess.Popen(argv, stdin=subprocess.DEVNULL,
                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                              start_new_session=True)
+                              **_detached_popen_kwargs())
         Path(pidf).write_text(str(wp.pid))
     except (OSError, ValueError):
         return
@@ -5945,11 +6285,45 @@ def _arm_self_wipe():
     threading.Thread(target=_bump, daemon=True).start()
 
 
+def run_wipe_watchdog(cfg):
+    """Detached self-wipe watchdog (cross-platform twin of the old POSIX sh loop).
+    Spawned as `python lean_coder.py --wipe-watch <json>`, own session/group, so it
+    outlives the executor + ssh channel. Polls the pushed dir's '.lease' mtime; once
+    unbumped for `ttl` it shutil.rmtree's the dir and exits, or exits early if the dir
+    is already gone (a clean disconnect wiped it). `cfg`: dir, ttl, chk."""
+    d = cfg["dir"]
+    ttl = int(cfg["ttl"])
+    chk = int(cfg["chk"])
+    lease = os.path.join(d, ".lease")
+    while True:
+        if not os.path.isdir(d):
+            return
+        now = time.time()
+        try:
+            m = os.path.getmtime(lease)
+        except OSError:
+            m = now
+        if now - m >= ttl:
+            shutil.rmtree(d, ignore_errors=True)
+            return
+        time.sleep(chk)
+
+
 def run_tool_executor(cwd, lean_tools_dir=None):
     """Hermetic executor loop: read JSON tool requests on stdin, run them against
     `cwd`, write JSON results on stdout. Tool prints (diffs, notices) are sent to
     stderr so they never pollute the protocol channel. Runs until stdin closes.
     Any lean-tools under `lean_tools_dir` (pushed by the driver) are also dispatchable."""
+    # Pin the protocol stdio to UTF-8 (the driver's ExecutorClient reads UTF-8). On a
+    # Windows executor - esp. embeddable Python under cmd.exe - stdout/stdin default to
+    # cp1252, so a non-ASCII char in a tool result (the '·' separators) would mojibake to
+    # 'Â·' on the driver. reconfigure() is a no-op if already UTF-8; guarded for any
+    # stream that doesn't support it (test doubles).
+    for _s in (sys.stdout, sys.stdin, sys.stderr):
+        try:
+            _s.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
     proto = sys.stdout
     sys.stdout = sys.stderr            # keep real stdout clean for the protocol
     _arm_self_wipe()   # pushed executor: self-delete if the driver never cleanly disconnects
@@ -6007,9 +6381,15 @@ class ExecutorClient:
     over SSH). Sends a tool request and returns its result string."""
 
     def __init__(self, argv, stderr=None):
+        # Pin the protocol channel to UTF-8 on BOTH ends (the executor reconfigures its
+        # own stdio to match - see run_tool_executor). Without this, text=True decodes
+        # with the driver's locale while a Windows executor emits cp1252, so any non-ASCII
+        # char in a tool result (e.g. the '·' separators) mojibakes to 'Â·'. errors=replace
+        # keeps a stray undecodable byte from tearing the whole channel down.
         self.proc = subprocess.Popen(
             argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=stderr, text=True, bufsize=1)
+            stderr=stderr, text=True, bufsize=1,
+            encoding="utf-8", errors="replace")
         self._id = 0
         self.host = None                # set by RemoteWorkspace for wait-spinner labels
         self.ready = self._read_obj()   # consume the {"ready": ...} handshake
@@ -6109,23 +6489,186 @@ _REMOTE_PUSH = (f'd="{_REMOTE_TMP}"; '
 _REMOTE_MKDIR = (f'd="{_REMOTE_TMP}"; '
                  'mkdir -p "$d" && chmod 700 "$d" 2>/dev/null; printf %s "$d"')
 
-# package managers tried, in order, when python3 is missing on the remote.
-_PKG_INSTALL = [
-    ("apt-get", "sudo apt-get update && sudo apt-get install -y python3"),
-    ("dnf", "sudo dnf install -y python3"),
-    ("apk", "sudo apk add python3"),
-    ("pacman", "sudo pacman -S --noconfirm python3"),
-    ("zypper", "sudo zypper install -y python3"),
-]
+# Windows/PowerShell equivalents (used when the target's DefaultShell is PowerShell,
+# which has no sh/mkdir -p/chmod/cat/printf). Throwaway dir: %TEMP%\leancoder. PUSH
+# reads the piped agent.py bytes from stdin and writes them, then echoes the dir with
+# NO trailing newline (the driver .strip()s it anyway). -Encoding Byte would corrupt a
+# utf-8 source, so we read the raw stdin stream and write bytes verbatim. `chmod 700`
+# has no analogue; the per-user %TEMP% is already ACL'd to the user.
+_WIN_REMOTE_TMP = '$d = Join-Path $env:TEMP "leancoder"'
+_WIN_REMOTE_MKDIR = (
+    f'{_WIN_REMOTE_TMP}; '
+    'New-Item -ItemType Directory -Force -Path $d | Out-Null; '
+    '[Console]::Out.Write($d)')
+
+# Embeddable-Python fallback for a Windows host with NO real interpreter. Stock Win11
+# ships none (only a Store stub), and we won't silently winget-install. Instead we
+# provision the official python-<ver>-embed-amd64.zip - a self-contained embeddable CPython
+# with a FULL stdlib (the import spike confirmed our executor imports cleanly under it:
+# all stdlib, all lazy imports guarded). It is CACHED under %LOCALAPPDATA% in a neutral
+# dir (survives our %TEMP% wipe, so we download once), and its python<ver>._pth is
+# rewritten to un-comment `import site` so the interpreter behaves normally. Prints the
+# path to python.exe on success, or 'ERR:<reason>'. Idempotent: reuses a cached unzip.
+_WIN_EMBED_VER = "3.12.7"
+_WIN_EMBED_URL = (f"https://www.python.org/ftp/python/{_WIN_EMBED_VER}/"
+                  f"python-{_WIN_EMBED_VER}-embed-amd64.zip")
+_WIN_PROVISION_EMBED = (
+    "$ErrorActionPreference='Stop'; try {"
+    "  $root = Join-Path $env:LOCALAPPDATA 'lc-runtime';"
+    "  $dir  = Join-Path $root 'py-embed-amd64';"
+    "  $exe  = Join-Path $dir 'python.exe';"
+    "  if (-not (Test-Path $exe)) {"
+    "    New-Item -ItemType Directory -Force -Path $root | Out-Null;"
+    "    $zip = Join-Path $root 'embed.zip';"
+    f"    Invoke-WebRequest -UseBasicParsing -Uri '{_WIN_EMBED_URL}' -OutFile $zip;"
+    "    if (Test-Path $dir) { Remove-Item -Recurse -Force $dir }"
+    "    Expand-Archive -Path $zip -DestinationPath $dir -Force;"
+    "    Remove-Item -Force $zip;"
+    "    Get-ChildItem -Path $dir -Filter 'python*._pth' | ForEach-Object {"
+    "      (Get-Content $_.FullName) -replace '^#\\s*import\\s+site','import site'"
+    "        | Set-Content $_.FullName };"
+    "  }"
+    "  [Console]::Out.Write($exe);"
+    "} catch { [Console]::Out.Write('ERR:' + $_.Exception.Message) }")
+
+# ---------------------------------------------------------------------------
+# POSIX embeddable Python (no-interpreter Linux/BSD boxes + zero-trace mode)
+# ---------------------------------------------------------------------------
+# Mirror of the Windows embed path for a POSIX host with no python3 (and for the
+# --ephemeral dogfood/zero-trace mode). We ship a self-contained CPython from
+# astral-sh/python-build-standalone: the `install_only` tarball is a normal
+# ./python/bin/python3 tree with a FULL stdlib (our executor is all-stdlib +
+# guarded lazy imports, so it runs cleanly under it). We pick the build by the
+# remote's C library: the `install_only` tarballs are DYNAMICALLY linked against
+# their libc's loader (gnu -> /lib64/ld-linux..., musl -> /lib/ld-musl-...), so a
+# musl binary will NOT run on a glibc box and vice-versa (only the '+static-full'
+# variants are truly static, and those aren't published as install_only). So we
+# probe the remote libc (glibc vs musl) and fetch the matching build. Release +
+# CPython version + per-(arch,libc) sha256 are PINNED here (reproducible,
+# verifiable) - never "latest". The driver DOWNLOADS the tarball once (local
+# cache, sha256-verified), then PUSHES it to the remote over the existing ssh
+# master - the remote never reaches the internet, so an air-gapped box works and
+# the transfer is auditable. Uncovered arch -> a hard, actionable error (never a
+# silent wrong-arch binary).
+_POSIX_EMBED_RELEASE = "20260718"        # python-build-standalone release tag (pinned)
+_POSIX_EMBED_PYVER = "3.10.20"           # CPython version in that release (pinned)
+# (arch slug, libc) -> sha256 of that install_only tarball. `libc` is "gnu" (glibc)
+# or "musl", chosen per-remote by _posix_embed_libc. uname -m tokens map to a slug.
+_POSIX_EMBED_UNAME = {
+    "x86_64": "x86_64", "amd64": "x86_64",
+    "aarch64": "aarch64", "arm64": "aarch64",
+}
+_POSIX_EMBED_SHA = {
+    ("x86_64", "gnu"):   "9c28d8017eeaf692f24dbaf26fd4679ce496c7f58e48b897d278739661794e37",
+    ("x86_64", "musl"):  "013ff8ab30357820d99df80745ea58b49fb693165a27b599b9fec09c4780dd20",
+    ("aarch64", "gnu"):  "506d003732d99a1598b63a40b53fa9359460a3be7488b9a3123ea6cf8ed1627b",
+    ("aarch64", "musl"): "1e3a67cd2a207b281815bfe7c9e7bc41b2881dd7460e7efb3c3705f651bdf731",
+}
 
 
-def _install_cmd(pm: str):
-    """Map a detected package manager to its python3 install command (or None)."""
-    for name, cmd in _PKG_INSTALL:
-        if name == pm:
-            return cmd
-    return None
+def _posix_embed_asset(uname_m: str, libc: str = "gnu"):
+    """Map a remote `uname -m` token + libc ('gnu'|'musl') to (asset_filename, url,
+    sha256) for the pinned install_only tarball, or None if the (arch, libc) pair
+    isn't covered (caller hard-errors). Normalises case/whitespace so 'X86_64\\n'
+    resolves. libc defaults to 'gnu' (the common case) so callers/tests can omit it."""
+    slug = _POSIX_EMBED_UNAME.get((uname_m or "").strip().lower())
+    if not slug:
+        return None
+    libc = (libc or "gnu").strip().lower()
+    sha = _POSIX_EMBED_SHA.get((slug, libc))
+    if not sha:
+        return None
+    fn = (f"cpython-{_POSIX_EMBED_PYVER}+{_POSIX_EMBED_RELEASE}-"
+          f"{slug}-unknown-linux-{libc}-install_only.tar.gz")
+    url = (f"https://github.com/astral-sh/python-build-standalone/releases/download/"
+           f"{_POSIX_EMBED_RELEASE}/{fn}")
+    return fn, url, sha
 
+
+def _posix_embed_cache_download(fn: str, url: str, sha: str) -> Path:
+    """Fetch the pinned tarball to the LOCAL driver cache (~/.cache/leancoder/
+    lc-runtime), verifying sha256; reuse a cached copy that already matches. Returns
+    the local Path. Raises ConnectionError on download/verify failure. Download-once:
+    a second POSIX embed connect reuses the file (no re-fetch)."""
+    cache = Path(os.path.expanduser("~/.cache/leancoder/lc-runtime"))
+    cache.mkdir(parents=True, exist_ok=True)
+    dest = cache / fn
+
+    def _sha(p: Path) -> str:
+        h = hashlib.sha256()
+        with open(p, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+        return h.hexdigest()
+
+    if dest.is_file() and _sha(dest) == sha:
+        return dest                                # cached + verified: reuse
+    tmp = dest.with_suffix(dest.suffix + ".part")
+    try:
+        with urllib.request.urlopen(url, timeout=120) as r, open(tmp, "wb") as out:
+            while True:
+                chunk = r.read(1 << 20)
+                if not chunk:
+                    break
+                out.write(chunk)
+    except (urllib.error.URLError, OSError) as e:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise ConnectionError(f"failed to download embeddable Python ({url}): {e}")
+    got = _sha(tmp)
+    if got != sha:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise ConnectionError(
+            f"embeddable Python tarball sha256 mismatch: got {got}, expected {sha}")
+    tmp.replace(dest)
+    return dest
+
+
+# Remote cache layout for the pushed embed runtime. Kept UNDER a fixed lc-runtime
+# leaf (like Windows' %LOCALAPPDATA%\\lc-runtime) so ephemeral teardown can wipe
+# exactly it and never an unrelated path. XDG_CACHE_HOME honoured, else ~/.cache.
+_POSIX_EMBED_ROOT = '${XDG_CACHE_HOME:-$HOME/.cache}/leancoder/lc-runtime'
+
+# Probe run over ssh at connect to detect the remote OS/shell family. A bare `uname`
+# is the most portable discriminator: a POSIX shell prints a known kernel token
+# ("Linux"/"Darwin"/"FreeBSD"/etc); Windows cmd/PowerShell have no `uname`, so the
+# channel prints an error / nothing recognisable. Detection is done driver-side by
+# _remote_is_posix() on the captured output (NOT on shell operators, which differ
+# between sh and PowerShell < 7). Kept trivial so it behaves in ANY remote shell.
+_OS_PROBE = "uname"
+_POSIX_UNAMES = ("linux", "darwin", "bsd", "sunos", "aix", "cygwin", "msys", "gnu")
+
+
+def _remote_is_posix(uname_out) -> bool:
+    """Classify a remote from the _OS_PROBE (`uname`) output. True = POSIX shell
+    (Linux/macOS/BSD/Termux): use the ControlMaster + sh push path unchanged. False =
+    Windows (uname absent -> error/empty/'not recognized'): use the non-multiplexed
+    ssh + PowerShell push path. Errs toward POSIX only on a clear kernel token, so an
+    ambiguous/empty answer is treated as Windows (the safer branch to probe further)."""
+    s = (uname_out or "").strip().lower()
+    return any(tok in s for tok in _POSIX_UNAMES)
+
+
+def _remote_os_label(uname_out) -> str:
+    """A short human name for the probed remote OS, from the _OS_PROBE (`uname`) output -
+    surfaced on the connect 'probed' line so a misdetect is visible immediately (before
+    the push path forks on it). POSIX kernels map to a friendly name; anything else (uname
+    absent/error) is 'Windows', matching _remote_is_posix's Windows branch."""
+    s = (uname_out or "").strip().lower()
+    if "linux" in s:
+        return "Linux"
+    if "darwin" in s:
+        return "macOS"
+    if "bsd" in s:
+        return "BSD"
+    if any(tok in s for tok in ("sunos", "aix", "cygwin", "msys", "gnu")):
+        return s.split()[0].strip() or "POSIX"
+    return "Windows"
 
 def _runtime_dir() -> Path:
     """Local ephemeral dir for control sockets. Prefers XDG_RUNTIME_DIR, then TMPDIR
@@ -6228,7 +6771,11 @@ def _ssh_master_alive(host, ctl) -> bool:
     """True if a LIVE ControlMaster socket exists at ctl for host (`ssh -O check`).
     Used by dispatch_worker to verify the parent's shared master is up BEFORE it
     launches a detached worker that will reuse it (a bg worker can't answer an auth
-    prompt, so a dead master must be caught in the foreground dispatch call)."""
+    prompt, so a dead master must be caught in the foreground dispatch call).
+    False when there's no ctl (Windows / non-multiplexed transport): there is no
+    master to check, so a worker can't ride one - callers must handle that."""
+    if not ctl:
+        return False
     try:
         return subprocess.run(["ssh", "-o", f"ControlPath={ctl}", "-O", "check", host],
                               capture_output=True, timeout=10).returncode == 0
@@ -6236,29 +6783,80 @@ def _ssh_master_alive(host, ctl) -> bool:
         return False
 
 
+def _ctl_opts(ctl):
+    """SSH options binding a call to a shared ControlMaster socket. Empty when ctl is
+    falsy: Windows OpenSSH has NO ControlMaster support (client or server), so the
+    Windows transport runs each ssh WITHOUT multiplexing (a fresh auth per channel, or
+    key-auth). On POSIX ctl is always set, so behaviour is byte-identical to before."""
+    return ["-o", f"ControlPath={ctl}"] if ctl else []
+
+
+def _scp_argv(host, ctl, local_path, remote_path):
+    """scp a local file to `remote_path` on `host`. Reuses the ControlMaster socket
+    when `ctl` is set (POSIX); on Windows (ctl falsy) it's a fresh key-auth transfer.
+    MEASURED on Win11 OpenSSH (192.0.2.16): a full 648KB agent.py lands byte-identical
+    in ~4s - so scp is the Windows push (the old 'scp truncates large files' claim was
+    wrong; it replaces the ~3-4min, deadlock-prone chunked base64 path)."""
+    return (["scp"] + _ctl_opts(ctl) + ["-o", "BatchMode=yes",
+             "-o", "StrictHostKeyChecking=accept-new", "-o", "LogLevel=ERROR",
+             "-p", local_path, f"{host}:{remote_path}"])
+
+
 def _ssh_run_argv(host, ctl, remote_cmd, tty=False):
     # reuses the master socket (BatchMode: auth is already done, so fail fast).
     # LogLevel=ERROR silences the "Shared connection to <host> closed." notice a
     # -tt channel prints when it ends (the master stays up; nothing real closes).
-    return (["ssh", "-o", f"ControlPath={ctl}", "-o", "BatchMode=yes",
+    return (["ssh"] + _ctl_opts(ctl) + ["-o", "BatchMode=yes",
              "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=8",
              "-o", "LogLevel=ERROR"]
             + (["-tt"] if tty else ["-T"]) + [host, remote_cmd])
 
 
-def _ssh_exec_argv(host, ctl, exec_cmd, cwd, lean_tools_dir=None):
+def _win_quote(s):
+    """Quote an argument for a Windows PowerShell command line (the DefaultShell on the
+    Win11 hosts). PowerShell single-quotes are literal (only '' escapes a quote), which
+    is exactly what we want for paths - and unlike shlex.quote (POSIX) an EMPTY string
+    becomes a real '' token PowerShell passes through, instead of being dropped so the
+    next flag swallows the following arg (that dropped-empty-cwd bug exited the executor
+    with an argparse usage error before the handshake)."""
+    return "'" + str(s).replace("'", "''") + "'"
+
+
+def _win_ps(cmd):
+    """Wrap a PowerShell command so it runs regardless of the remote sshd DefaultShell.
+    Windows OpenSSH runs an exec channel under whatever DefaultShell is configured -
+    cmd.exe by DEFAULT, PowerShell only if an admin set the registry key. Our Windows
+    commands are all PowerShell syntax, which cmd.exe can't parse (`'$d' is not
+    recognized`), so a stock box silently failed every remote command. base64-UTF16LE
+    -EncodedCommand is pure [A-Za-z0-9+/=] - it needs NO quoting and passes through ssh,
+    cmd.exe AND PowerShell byte-identically, so we no longer depend on the DefaultShell
+    being PowerShell. (-NonInteractive so it can never block on a prompt; the JSON stdio
+    protocol stays transparent - verified live on a cmd.exe-default Win11 box.)"""
+    b64 = base64.b64encode(cmd.encode("utf-16-le")).decode()
+    return f"powershell -NoProfile -NonInteractive -EncodedCommand {b64}"
+
+
+def _ssh_exec_argv(host, ctl, exec_cmd, cwd, lean_tools_dir=None, posix=True):
     # long-lived executor channel: -T (no PTY) keeps stdio clean for the protocol.
     # exec_cmd is the executor invocation prefix - "python3 '<dir>/agent.py'" for a
-    # pushed copy, or "lean_coder" for a matching provisioned install.
-    inner = f"{exec_cmd} --tool-exec --cwd {shlex.quote(cwd)}"
+    # pushed copy, or "lean_coder" for a matching provisioned install. Quoting is
+    # per-OS: POSIX shell (shlex) vs Windows PowerShell (_win_quote) - the target runs
+    # PowerShell, where POSIX single-quoting mis-parses (and an empty cwd vanishes).
+    q = shlex.quote if posix else _win_quote
+    inner = f"{exec_cmd} --tool-exec --cwd {q(cwd or '.')}"
     if lean_tools_dir:
-        inner += f" --lean-tools {shlex.quote(lean_tools_dir)}"
+        inner += f" --lean-tools {q(lean_tools_dir)}"
+    if not posix:
+        # Windows: wrap the whole launch in a base64 -EncodedCommand so the long-lived
+        # executor channel runs regardless of the sshd DefaultShell (cmd.exe by default).
+        # The JSON stdio protocol stays transparent through it (verified live).
+        inner = _win_ps(inner)
     # ServerAlive on this long-lived channel too: it multiplexes over the master
     # (which also has keepalives) but a multi-minute model turn with no traffic is
     # exactly when a stateful firewall/NAT drops the data channel - belt-and-braces.
-    return ["ssh", "-T", "-o", f"ControlPath={ctl}", "-o", "BatchMode=yes",
+    return (["ssh", "-T"] + _ctl_opts(ctl) + ["-o", "BatchMode=yes",
             "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=8",
-            "-o", "LogLevel=ERROR", host, inner]
+            "-o", "LogLevel=ERROR", host, inner])
 
 
 def _tools_to_sync(local, remote):
@@ -6274,7 +6872,7 @@ class RemoteWorkspace:
     """A bootstrapped remote executor reached over SSH. Same call() surface as
     ExecutorClient, so the agent loop (stage 3) can route tools through it."""
 
-    def __init__(self, host, cwd=".", lean_tool_paths=(), ctl=None):
+    def __init__(self, host, cwd=".", lean_tool_paths=(), ctl=None, ephemeral=False):
         self.host = host
         self.cwd = cwd
         # ctl given = ATTACH mode: reuse a master socket someone else already
@@ -6285,11 +6883,23 @@ class RemoteWorkspace:
         self.owns_master = ctl is None
         self.ctl = ctl or _ctl_path(host)
         self.lean_tool_paths = list(lean_tool_paths)
+        # ephemeral (Windows): FORCE the embeddable-Python fallback even when the host
+        # has a real interpreter, and WIPE the cached %LOCALAPPDATA% runtime on teardown -
+        # a zero-trace, no-install-left-behind mode (also the way to dogfood the embed path
+        # on a box that already has Python).
+        self.ephemeral = ephemeral
         self.remote_dir = None
         self.remote_cwd = None        # executor's resolved working dir (from handshake)
+        self.remote_posix = True      # set by the uname probe in connect(); False = Windows
         self.client = None
 
     def _run(self, remote_cmd, tty=False):
+        # Windows: every remote command we emit is PowerShell, but sshd runs the exec
+        # channel under its DefaultShell (cmd.exe by default). Wrap in a base64
+        # -EncodedCommand so it runs no matter the DefaultShell (see _win_ps). tty is a
+        # POSIX-only path (the sudo prompt), so it's never wrapped.
+        if not getattr(self, "remote_posix", True) and not tty:
+            remote_cmd = _win_ps(remote_cmd)
         if tty:                                    # interactive (sudo prompt is the user's)
             return subprocess.run(_ssh_run_argv(self.host, self.ctl, remote_cmd, tty=True)).returncode, "", ""
         r = subprocess.run(_ssh_run_argv(self.host, self.ctl, remote_cmd),
@@ -6297,25 +6907,88 @@ class RemoteWorkspace:
         return r.returncode, r.stdout, r.stderr
 
     def connect(self, batch=False):
-        """Open the ssh master + bootstrap the executor. batch=True forces a
+        """Open the ssh master (POSIX) + bootstrap the executor. batch=True forces a
         NON-INTERACTIVE open (BatchMode + a timeout) - for a reconnect that runs
         where we can't prompt (mid-tool-call): it must fail fast rather than hang on
         an invisible 'password:' prompt. A password host then needs an interactive
-        /connect. batch=False (default) is the interactive open (/connect can prompt)."""
+        /connect. batch=False (default) is the interactive open (/connect can prompt).
+
+        Windows: we PROBE the OS first over a plain masterless ssh (so a doomed master
+        is never opened blind), then TRY to multiplex - a Linux client CAN drive a
+        shared ControlMaster to Windows sshd, and we keep it only if `ssh -O check`
+        confirms it's live+reusable (_try_open_win_master), else fall back to per-call
+        connections (self.ctl=None, the old behaviour). All Windows commands are
+        stdin-free (powershell -EncodedCommand / scp), so the historic stdin-piped
+        deadlock can't recur. Multiplexing needs key auth (a password host prompts)."""
         print(dim(f"connecting to {self.host} ..."))
-        _clear_master(self.host, self.ctl)     # drop any stale socket first (#3)
-        argv = _ssh_master_argv(self.host, self.ctl, batch=batch)
-        try:
-            rc = subprocess.run(argv, timeout=30 if batch else None).returncode
-        except subprocess.TimeoutExpired:
-            raise ConnectionError(f"ssh connection to {self.host} timed out")
-        if rc != 0:
-            raise ConnectionError(f"ssh connection to {self.host} failed")
-        _, out, _ = self._run("command -v python3 || true")
-        if not out.strip():
-            self._install_python()
+        # Probe the remote OS BEFORE any master, over a plain (masterless) ssh - so a
+        # Windows target never gets a doomed ControlMaster. Uses BatchMode so it can't
+        # hang on a prompt; a POSIX box answers `uname` with a kernel token.
+        with _stage("probing host", done="probed") as _st:
+            _probe = subprocess.run(
+                ["ssh", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new",
+                 "-o", "ConnectTimeout=10", "-o", "LogLevel=ERROR", self.host, _OS_PROBE],
+                capture_output=True, text=True, timeout=30)
+            self.remote_posix = _remote_is_posix(_probe.stdout)
+            _st.done = f"probed · {_remote_os_label(_probe.stdout)}"
+        if self.remote_posix:
+            with _stage("opening ssh", done="ssh ready"):
+                _clear_master(self.host, self.ctl)     # drop any stale socket first (#3)
+                argv = _ssh_master_argv(self.host, self.ctl, batch=batch)
+                try:
+                    rc = subprocess.run(argv, timeout=30 if batch else None).returncode
+                except subprocess.TimeoutExpired:
+                    raise ConnectionError(f"ssh connection to {self.host} timed out")
+                if rc != 0:
+                    raise ConnectionError(f"ssh connection to {self.host} failed")
+            self._check_posix_python()
+        else:
+            # Windows: TRY to multiplex (a Linux client CAN drive a shared master to a
+            # Windows sshd - multiplexing is a client feature). But only KEEP it if the
+            # master actually comes up and `ssh -O check` confirms it: some Windows sshd
+            # builds don't honour session-reuse, and we must degrade cleanly. On any
+            # doubt we fall back to ctl=None (a fresh key-auth connection per call - the
+            # old, always-correct behaviour). All Windows commands are stdin-free
+            # (powershell -EncodedCommand / scp over its own channel), so the historic
+            # stdin-piped-channel deadlock against Windows sshd can't recur here.
+            if not self._try_open_win_master(batch=batch):
+                self.ctl = None                    # no reliable mux -> per-call connections
+            self._check_windows_python()
         self._bootstrap_executor()
         return self
+
+    def _try_open_win_master(self, batch=False):
+        """Windows only: attempt to open a shared ControlMaster and verify it's usable,
+        returning True if we should multiplex, False to fall back to per-call connections.
+
+        A Linux ssh client CAN multiplex to a Windows sshd (ControlMaster is a client
+        feature), which collapses the ~4-handshakes-per-file provisioning cost onto one
+        reused connection. But not every Windows sshd honours session-reuse, so we PROVE
+        it before trusting it: clear any stale socket, open a backgrounded master
+        (_ssh_master_argv, same as the POSIX path), then require `ssh -O check` to
+        confirm the master is genuinely live and reusable. Any failure (open
+        error, timeout, check fails) -> tear down and return False so the caller uses
+        ctl=None. self.ctl must already be set (the per-PID socket path)."""
+        if not self.ctl:
+            return False
+        try:
+            _clear_master(self.host, self.ctl)     # drop any stale socket first
+            argv = _ssh_master_argv(self.host, self.ctl, batch=batch)
+            try:
+                rc = subprocess.run(argv, timeout=30).returncode
+            except subprocess.TimeoutExpired:
+                _clear_master(self.host, self.ctl)
+                return False
+            if rc != 0:
+                return False
+            # The master opened - but only KEEP it if it's genuinely reusable.
+            if _ssh_master_alive(self.host, self.ctl):
+                return True
+            _clear_master(self.host, self.ctl)     # opened but not shareable - drop it
+            return False
+        except (OSError, subprocess.SubprocessError):
+            _clear_master(self.host, self.ctl)
+            return False
 
     def attach(self):
         """ATTACH to a master a PARENT already opened (worker reuse): DON'T open or
@@ -6338,6 +7011,8 @@ class RemoteWorkspace:
         ever runs `--version`, never leaves anything behind beyond the dir."""
         if not want:
             return None, None
+        if not self.remote_posix:
+            return self._reuse_executor_win(want)
         _, d, _ = self._run(_REMOTE_MKDIR)
         rdir = d.strip() or None
         if rdir is None:
@@ -6348,11 +7023,35 @@ class RemoteWorkspace:
             self.reused = "installed"
             return "lean_coder", rdir
         agent_py = rdir + "/agent.py"
+        py = getattr(self, "posix_python", None) or "python3"
         _, out, _ = self._run(f"[ -f {shlex.quote(agent_py)} ] && "
-                              f"python3 {shlex.quote(agent_py)} --version 2>/dev/null || true")
+                              f"{py} {shlex.quote(agent_py)} --version 2>/dev/null || true")
         if want in out.split():
             self.reused = "pushed"
-            return "python3 " + shlex.quote(agent_py), rdir
+            return f"{py} " + shlex.quote(agent_py), rdir
+        return None, rdir
+
+    def _reuse_executor_win(self, want):
+        """Windows variant of _reuse_executor: make the throwaway dir via the
+        PowerShell mkdir snippet and check for a prior pushed agent.py whose
+        --version matches. No provisioned `lean_coder` on PATH is assumed on
+        Windows, so we only ever reuse a prior push."""
+        _, d, _ = self._run(_WIN_REMOTE_MKDIR)
+        rdir = d.strip() or None
+        if rdir is None:
+            return None, None
+        agent_py = rdir + "\\agent.py"
+        py = getattr(self, "win_python", None) or "python"
+        # PowerShell: run --version only if the file exists; compare driver-side. The
+        # leading '&' (call operator) is REQUIRED when win_python is a quoted absolute
+        # path (the embeddable-runtime case) - PowerShell parses a statement that starts
+        # with a "quoted string" as a string LITERAL, not a command, without it. Harmless
+        # for a bare 'python'/'py -3'.
+        _, out, _ = self._run(
+            f'if (Test-Path "{agent_py}") {{ & {py} "{agent_py}" --version }}')
+        if want in out.split():
+            self.reused = "pushed"
+            return f'& {py} "{agent_py}"', rdir
         return None, rdir
 
     def _bootstrap_executor(self):
@@ -6364,13 +7063,32 @@ class RemoteWorkspace:
         if exec_cmd is None:                       # no match - push a fresh copy
             with open(__file__, "rb") as f:
                 src = f.read()
-            r = subprocess.run(_ssh_run_argv(self.host, self.ctl, _REMOTE_PUSH),
-                               input=src, capture_output=True, timeout=60)
-            self.remote_dir = r.stdout.decode(errors="replace").strip()
-            if r.returncode != 0 or not self.remote_dir:
-                raise ConnectionError(
-                    f"failed to push agent to {self.host}: {r.stderr.decode(errors='replace')[:200]}")
-            exec_cmd = "python3 " + shlex.quote(self.remote_dir + "/agent.py")
+            if self.remote_posix:
+                with _stage("pushing agent", done="agent pushed"):
+                    r = subprocess.run(_ssh_run_argv(self.host, self.ctl, _REMOTE_PUSH),
+                                       input=src, capture_output=True, timeout=60)
+                    self.remote_dir = r.stdout.decode(errors="replace").strip()
+                    if r.returncode != 0 or not self.remote_dir:
+                        raise ConnectionError(
+                            f"failed to push agent to {self.host}: "
+                            f"{r.stderr.decode(errors='replace')[:200]}")
+                py = getattr(self, "posix_python", None) or "python3"
+                exec_cmd = f"{py} " + shlex.quote(self.remote_dir + "/agent.py")
+            else:
+                # Windows: make the throwaway dir, then scp the agent in (stdin-piped
+                # push deadlocks vs Windows sshd; scp lands the file byte-exact via its
+                # own channel).
+                if not self.remote_dir:
+                    _, d, _ = self._run(_WIN_REMOTE_MKDIR)
+                    self.remote_dir = d.strip()
+                if not self.remote_dir:
+                    raise ConnectionError(f"failed to make remote dir on {self.host}")
+                with _stage("pushing agent", done="agent pushed"):
+                    self._win_scp_write(self.remote_dir + "\\agent.py", src)
+                py = getattr(self, "win_python", None) or "python"
+                # '&' call operator: required when py is a quoted embed-runtime path (see
+                # _reuse_executor_win); harmless for a bare python.
+                exec_cmd = f'& {py} "{self.remote_dir}\\agent.py"'
         # The single-file agent.py push is NOT self-contained: at import core runs
         # _load_builtins() from <dir>/lean-tools/builtins.py (the builtin tool surface was
         # extracted out of core). Ship that file beside agent.py so the remote import
@@ -6379,11 +7097,13 @@ class RemoteWorkspace:
         if self.reused != "installed":
             self._push_builtins()
         lean_tools_remote = self._push_lean_tools() if self.lean_tool_paths else None
-        self.client = ExecutorClient(
-            _ssh_exec_argv(self.host, self.ctl, exec_cmd, self.cwd, lean_tools_remote),
-            stderr=subprocess.DEVNULL)
-        self.client.host = self.host          # label the wait-spinner with the box
-        self.remote_cwd = self.client.ready.get("cwd")
+        with _stage("starting executor", done="ready"):
+            self.client = ExecutorClient(
+                _ssh_exec_argv(self.host, self.ctl, exec_cmd, self.cwd, lean_tools_remote,
+                               posix=self.remote_posix),
+                stderr=subprocess.DEVNULL)
+            self.client.host = self.host          # label the wait-spinner with the box
+            self.remote_cwd = self.client.ready.get("cwd")
 
     def read_raw(self, path):
         """Fetch exact remote file content for diff previews; None if unreadable.
@@ -6420,6 +7140,70 @@ class RemoteWorkspace:
         self._bootstrap_executor()
         return self
 
+    def _remote_sha256(self, remote_path):
+        """Return the remote file's sha256 hex, or '' if absent/unreadable. POSIX:
+        `sha256sum`. Windows: PowerShell `Get-FileHash -Algorithm SHA256` (its output
+        is UPPERCASE hex, so lowercase to match hashlib.hexdigest())."""
+        if self.remote_posix:
+            _, out, _ = self._run(f"sha256sum {shlex.quote(remote_path)} 2>/dev/null || true")
+            return out.split()[0] if out.split() else ""
+        _, out, _ = self._run(
+            f'if (Test-Path "{remote_path}") {{ (Get-FileHash -Algorithm SHA256 '
+            f'"{remote_path}").Hash }}')
+        return out.strip().lower()
+
+    def _remote_mkdir(self, remote_dir):
+        if self.remote_posix:
+            self._run(f"mkdir -p {shlex.quote(remote_dir)}")
+        else:
+            self._run(f'New-Item -ItemType Directory -Force -Path "{remote_dir}" | Out-Null')
+
+    def _remote_write(self, remote_path, data):
+        """Write bytes to a remote file over ssh. POSIX: `cat > path` over piped
+        stdin. Windows: scp (Windows sshd deadlocks on a stdin-piped channel, but scp
+        transfers a large file byte-exact in a few seconds - see _win_scp_write)."""
+        if self.remote_posix:
+            subprocess.run(_ssh_run_argv(self.host, self.ctl, f'cat > {shlex.quote(remote_path)}'),
+                           input=data, capture_output=True, timeout=60)
+        else:
+            self._win_scp_write(remote_path, data)
+
+    def _win_scp_write(self, remote_path, data):
+        """Byte-exact large-file push to a Windows remote via scp. Windows sshd
+        DEADLOCKS on a stdin-piped exec channel (so `cat > path` can't be used) and the
+        old command-line base64 chunking was slow (~3-4 min, 54 calls) and could hang on
+        a chunk. scp goes through the same sshd over its own channel: MEASURED on Win11
+        OpenSSH (192.0.2.16) a full 648KB agent.py lands byte-identical in ~4s. We write
+        the bytes to a local temp file, scp it across, verify sha256 (raises on
+        mismatch), and always clean the temp file up."""
+        import tempfile
+        want = hashlib.sha256(data).hexdigest()
+        tf = tempfile.NamedTemporaryFile(prefix="lc_push_", delete=False)
+        try:
+            tf.write(data)
+            tf.close()
+            # scp needs a forward-slash / drive-style remote path; the caller passes a
+            # backslash Windows path (\\...\\agent.py) - OpenSSH scp accepts it quoted.
+            r = subprocess.run(
+                _scp_argv(self.host, self.ctl, tf.name, remote_path.replace("\\", "/")),
+                capture_output=True, text=True, timeout=120)
+            if r.returncode != 0:
+                raise ConnectionError(
+                    f"scp push to {self.host} failed: {(r.stderr or '')[:200]}")
+        finally:
+            try:
+                os.unlink(tf.name)
+            except OSError:
+                pass
+        got = self._remote_sha256(remote_path)
+        if got != want:
+            raise ConnectionError(
+                f"scp push to {self.host} corrupted {remote_path}: "
+                f"sha256 {got or 'missing'} != {want}")
+
+    def _remote_sep(self):
+        return "/" if self.remote_posix else "\\"
+
     def _push_builtins(self):
         """Ship the bundled builtins module into <remote_dir>/lean-tools/builtins.py - the
         exact path the remote import's _load_builtins() reads (next to the pushed
@@ -6432,28 +7216,39 @@ class RemoteWorkspace:
             return
         data = local.read_bytes()
         want = hashlib.sha256(data).hexdigest()
-        bdir = self.remote_dir + "/lean-tools"
-        _, out, _ = self._run(f"sha256sum {shlex.quote(bdir + '/builtins.py')} 2>/dev/null || true")
-        if out.split() and out.split()[0] == want:
+        sep = self._remote_sep()
+        bdir = self.remote_dir + sep + "lean-tools"
+        target = bdir + sep + "builtins.py"
+        if self._remote_sha256(target) == want:
             return                                  # already current on the remote
-        self._run(f"mkdir -p {shlex.quote(bdir)}")
-        subprocess.run(_ssh_run_argv(self.host, self.ctl,
-                                     f'cat > {shlex.quote(bdir + "/builtins.py")}'),
-                       input=data, capture_output=True, timeout=60)
+        self._remote_mkdir(bdir)
+        self._remote_write(target, data)
 
     def _push_lean_tools(self):
         """Sync enabled lean-tool files into <remote_dir>/tools and return it.
         Hash-checks what's already there: pushes only changed/new tools and
         removes ones no longer enabled (the stable dir persists between connects,
         so this both saves transfers and prevents stale tools loading remotely)."""
-        pdir = self.remote_dir + "/tools"
-        self._run(f"mkdir -p {shlex.quote(pdir)}")
-        _, out, _ = self._run(f"sha256sum {shlex.quote(pdir)}/*.py 2>/dev/null || true")
+        sep = self._remote_sep()
+        pdir = self.remote_dir + sep + "tools"
+        self._remote_mkdir(pdir)
         remote = {}
-        for line in out.splitlines():
-            parts = line.split()
-            if len(parts) == 2:
-                remote[Path(parts[1]).name] = parts[0]
+        if self.remote_posix:
+            _, out, _ = self._run(f"sha256sum {shlex.quote(pdir)}/*.py 2>/dev/null || true")
+            for line in out.splitlines():
+                parts = line.split()
+                if len(parts) == 2:
+                    remote[Path(parts[1]).name] = parts[0]
+        else:
+            # PowerShell: name + hash per .py file, one per line
+            _, out, _ = self._run(
+                f'Get-ChildItem -Path "{pdir}\\*.py" -ErrorAction SilentlyContinue | '
+                f'ForEach-Object {{ $_.Name + " " + (Get-FileHash -Algorithm SHA256 '
+                f'$_.FullName).Hash }}')
+            for line in out.splitlines():
+                parts = line.split()
+                if len(parts) == 2:
+                    remote[parts[0]] = parts[1].lower()
         local, blobs = {}, {}
         for p in self.lean_tool_paths:
             p = Path(p)
@@ -6461,28 +7256,201 @@ class RemoteWorkspace:
             local[p.name] = hashlib.sha256(data).hexdigest()
             blobs[p.name] = data
         to_push, to_remove = _tools_to_sync(local, remote)
-        for name in to_push:
-            subprocess.run(_ssh_run_argv(self.host, self.ctl,
-                                         f'cat > {shlex.quote(pdir + "/" + name)}'),
-                           input=blobs[name], capture_output=True, timeout=60)
+        if to_push:
+            n = len(to_push)
+            for i, name in enumerate(to_push, 1):
+                with _stage(f"syncing tools [{i}/{n}] {name}",
+                            done=(f"{n} tool{'s' if n != 1 else ''} synced" if i == n else None)):
+                    self._remote_write(pdir + sep + name, blobs[name])
         if to_remove:
-            self._run("rm -f " + " ".join(shlex.quote(pdir + "/" + n) for n in to_remove))
+            if self.remote_posix:
+                self._run("rm -f " + " ".join(shlex.quote(pdir + "/" + n) for n in to_remove))
+            else:
+                for n in to_remove:
+                    self._run(f'Remove-Item -Force "{pdir}\\{n}" -ErrorAction SilentlyContinue')
         return pdir
 
-    def _install_python(self):
-        print(yellow(f"python3 not found on {self.host}; trying to install it ..."))
-        _, pm, _ = self._run(
-            "for p in apt-get dnf apk pacman zypper; do "
-            "command -v $p >/dev/null 2>&1 && { echo $p; break; }; done")
-        cmd = _install_cmd(pm.strip())
-        if not cmd:
-            raise ConnectionError(
-                f"no known package manager on {self.host}; install python3 yourself")
-        print(dim(f"  $ {cmd}   (any sudo prompt is yours to answer)"))
-        self._run(cmd, tty=True)                   # interactive: operator does sudo
+    def _posix_python(self):
+        """Return 'python3' if the POSIX remote already has a usable interpreter on
+        PATH, else None. A bare probe - no install, nothing left behind."""
         _, out, _ = self._run("command -v python3 || true")
-        if not out.strip():
-            raise ConnectionError(f"python3 still missing on {self.host} after install")
+        return "python3" if out.strip() else None
+
+    def _posix_embed_libc(self):
+        """Detect the remote's C library so we fetch a runnable install_only build:
+        'musl' if a musl loader (/lib/ld-musl-*) is present, else 'gnu' (glibc). The
+        install_only tarballs are dynamically linked to their libc's loader, so a musl
+        binary won't run on glibc and vice-versa - this picks the matching one. `ldd
+        --version` prints 'musl' on Alpine; the loader glob is the robust fallback."""
+        _, out, _ = self._run(
+            "if ls /lib/ld-musl-* >/dev/null 2>&1; then echo musl; "
+            "elif ldd --version 2>&1 | grep -qi musl; then echo musl; "
+            "else echo gnu; fi")
+        return "musl" if "musl" in (out or "").lower() else "gnu"
+
+    def _provision_posix_embed(self, forced=False):
+        """Fallback for a POSIX host with no python3 (and the mechanism behind
+        --ephemeral): provision a self-contained CPython from python-build-standalone.
+        The driver DOWNLOADS the pinned `install_only` tarball for the remote's
+        arch+libc once (local cache, sha256-verified), PUSHES it over the live master,
+        extracts it under a fixed lc-runtime cache dir and returns the absolute path to
+        its python3, or None on a soft failure. An UNCOVERED arch is a HARD error (never
+        a silent wrong-arch binary). Idempotent: a matching extracted runtime is reused.
+        `forced`=True means the caller CHOSE the embed runtime (--ephemeral) rather than
+        the remote lacking python3 - so the notice must not falsely claim 'no python3'."""
+        _, machine, _ = self._run("uname -m || true")
+        libc = self._posix_embed_libc()
+        asset = _posix_embed_asset(machine, libc)
+        if asset is None:
+            raise ConnectionError(
+                f"no python3 on {self.host} and no pinned embeddable build for its "
+                f"architecture/libc ({(machine or '').strip() or 'unknown'}/{libc}). "
+                f"Install python3 there (any 3.x), or connect to a covered arch "
+                f"({', '.join(sorted(set(_POSIX_EMBED_UNAME)))}).")
+        fn, url, sha = asset
+        # Resolve the remote cache dir + expected python3 path; reuse if already extracted.
+        _, root, _ = self._run(f'printf %s "{_POSIX_EMBED_ROOT}"')
+        root = root.strip()
+        if not root:
+            return None
+        # Extracted tree is ./python/bin/python3 (the install_only layout). Tag the dir
+        # with the pinned version so a version bump lands beside the old one, not over it.
+        rdir = f"{root}/py-{_POSIX_EMBED_PYVER}-{_POSIX_EMBED_RELEASE}"
+        py = f"{rdir}/python/bin/python3"
+        _, have, _ = self._run(
+            f'[ -x {shlex.quote(py)} ] && {shlex.quote(py)} -c '
+            f'"import sys;print(sys.executable)" 2>/dev/null || true')
+        if have.strip():
+            print(dim(f"  reusing embeddable Python at {py}"))
+            return py
+        if forced:
+            print(dim(f"  --ephemeral: pushing a private Python to remote {self.host} "
+                      f"(CPython {_POSIX_EMBED_PYVER} {libc}, one-time, cached)."))
+        else:
+            print(dim(f"no python3 on remote {self.host}; pushing a private one "
+                      f"(CPython {_POSIX_EMBED_PYVER} {libc}, one-time, cached). "
+                      f"Install python3 ON THE REMOTE to skip this next time."))
+        try:
+            tarball = _posix_embed_cache_download(fn, url, sha)
+        except ConnectionError as e:
+            print(yellow(f"  embeddable provision failed: {e}"))
+            return None
+        # Push the tarball to a temp path on the remote, extract, then remove it.
+        remote_tar = f"{root}/{fn}"
+        self._run(f"mkdir -p {shlex.quote(rdir)}")
+        try:
+            self._remote_write(remote_tar, tarball.read_bytes())
+        except (OSError, ConnectionError) as e:
+            print(yellow(f"  embeddable push failed: {e}"))
+            return None
+        rc, _, err = self._run(
+            f"tar -xzf {shlex.quote(remote_tar)} -C {shlex.quote(rdir)} && "
+            f"rm -f {shlex.quote(remote_tar)}")
+        if rc != 0:
+            self._run(f"rm -f {shlex.quote(remote_tar)}")
+            print(yellow(f"  embeddable extract failed: {(err or '').strip()[:200]}"))
+            return None
+        _, ver, _ = self._run(
+            f'{shlex.quote(py)} -c "import sys;print(sys.executable)" 2>/dev/null || true')
+        if not ver.strip():
+            print(yellow("  provisioned python3 did not run; falling back to error."))
+            return None
+        size = ""
+        _, mb, _ = self._run(
+            f"du -sm {shlex.quote(rdir)} 2>/dev/null | cut -f1 || true")
+        if mb.strip():
+            size = f" ({mb.strip()} MB on disk)"
+        print(dim(f"  provisioned embeddable Python at {py}{size}"))
+        return py
+
+    def _check_posix_python(self):
+        """POSIX target: use the system python3 if present; otherwise provision the
+        pinned embeddable CPython for its arch+libc (downloaded by the driver, pushed + extracted
+        under a fixed lc-runtime cache) so a box with NO interpreter works with zero
+        manual setup and NO sudo/package install. ephemeral=True SKIPS the system probe
+        and forces the embeddable runtime (wiped on teardown) - a zero-trace mode + the
+        way to dogfood the embed path on a box that already has Python. Caches the
+        working `python3` invocation on self.posix_python. An uncovered-arch host with
+        no python3 is a hard error (raised by _provision_posix_embed)."""
+        prefix = (self._provision_posix_embed(forced=True) if getattr(self, "ephemeral", False)
+                  else (self._posix_python() or self._provision_posix_embed()))
+        if not prefix:
+            raise ConnectionError(
+                f"no python3 on {self.host} and the embeddable-runtime fallback failed. "
+                f"Install python3 there (any 3.x) and reconnect.")
+        self.posix_python = prefix
+
+    def _win_python(self):
+        """Return the Windows Python invocation prefix ('python' or 'py -3'), or None
+        if neither is present. Stock Win11 ships NO Python (only a Store stub that
+        prints usage and exits nonzero), so we probe for a REAL interpreter by running
+        it. `py -3` (the launcher) is preferred when present; else `python`."""
+        for cand in ("py -3", "python"):
+            _, out, _ = self._run(f'{cand} -c "import sys;print(sys.executable)"')
+            if out.strip() and "\\" in out:           # a real path back == a real interpreter
+                return cand
+        return None
+
+    def _provision_win_embed(self, forced=False):
+        """Fallback for a Windows host with no real Python: provision the official
+        embeddable-amd64 zip (cached under %LOCALAPPDATA%\\lc-runtime, downloaded once)
+        and return a quoted 'python.exe' path to invoke it, or None on failure. The
+        import spike confirmed our --tool-exec executor runs cleanly under the embed
+        distro (all-stdlib, guarded lazy imports). `forced`=True means the caller CHOSE
+        the embed runtime (--ephemeral), not that the box lacks Python - so the notice
+        must not falsely claim 'no Python'."""
+        if forced:
+            print(dim(f"  --ephemeral: pushing a private Python to remote {self.host} "
+                      f"(CPython {_WIN_EMBED_VER} embeddable, one-time, cached)."))
+        else:
+            print(dim(f"no Python on remote {self.host}; pushing a private one "
+                      f"(CPython {_WIN_EMBED_VER} embeddable, one-time, cached). "
+                      f"Install Python ON THE REMOTE to skip this next time."))
+        rc, out, err = self._run(_WIN_PROVISION_EMBED)
+        out = (out or "").strip()
+        if rc != 0 or not out or out.startswith("ERR:"):
+            reason = out[4:] if out.startswith("ERR:") else (err or "").strip()[:200]
+            print(yellow(f"  embeddable provision failed: {reason or 'unknown error'}"))
+            return None
+        # Verify the provisioned interpreter actually runs before we commit to it. The
+        # '&' call operator is needed because `quoted` is a "quoted path" (see
+        # _reuse_executor_win) - PowerShell would treat it as a string literal without it.
+        quoted = f'"{out}"'
+        _, ver, _ = self._run(f'& {quoted} -c "import sys;print(sys.executable)"')
+        if not (ver.strip() and "\\" in ver):
+            print(yellow("  provisioned python.exe did not run; falling back to error."))
+            return None
+        # Report the ACTUAL on-disk footprint (no hardcoded transfer size): measure the
+        # provisioned dir. Best-effort - a failure just drops the size, never blocks.
+        size = ""
+        try:
+            _, mb, _ = self._run(
+                "$d = Split-Path -Parent '" + out + "'; "
+                "$b = (Get-ChildItem -Recurse -File $d | Measure-Object -Sum Length).Sum; "
+                "[Console]::Out.Write([math]::Round($b/1MB,1))")
+            if mb.strip():
+                size = f" ({mb.strip()} MB on disk)"
+        except Exception:
+            pass
+        print(dim(f"  provisioned embeddable Python at {out}{size}"))
+        return quoted
+
+    def _check_windows_python(self):
+        """Windows target: use a real Python if present ('py -3' or 'python'); otherwise
+        provision the official embeddable-amd64 zip (cached under %LOCALAPPDATA%) so a
+        stock Win11 box works with zero manual setup. Only if BOTH fail do we error with
+        an actionable message. Caches the working invocation prefix on self.win_python.
+        ephemeral=True SKIPS the installed-Python probe and forces the embeddable runtime
+        (which is wiped on teardown) - a zero-trace mode + the way to dogfood the embed
+        path on a box that already has Python."""
+        prefix = (self._provision_win_embed(forced=True) if getattr(self, "ephemeral", False)
+                  else (self._win_python() or self._provision_win_embed()))
+        if not prefix:
+            raise ConnectionError(
+                f"no Python on the Windows host {self.host} and the embeddable-runtime "
+                f"fallback failed. Install one (e.g. `winget install Python.Python.3`) or "
+                f"enable the py launcher, then reconnect.")
+        self.win_python = prefix
 
     def call(self, tool, args=None, should_abort=None):
         return self.client.call(tool, args, should_abort=should_abort)
@@ -6494,8 +7462,45 @@ class RemoteWorkspace:
         # master - killing it would drop the parent's live connection.
         if self.owns_master:
             self._wipe_remote()            # zero-trace: remove the pushed code first
-            subprocess.run(["ssh", "-o", f"ControlPath={self.ctl}", "-O", "exit", self.host],
-                           capture_output=True)
+            if self.ephemeral:             # ephemeral: also remove the cached embed runtime
+                if self.remote_posix:
+                    self._wipe_posix_embed()
+                else:
+                    self._wipe_win_embed()
+            if self.ctl:                   # Windows has no master socket to exit
+                subprocess.run(["ssh", "-o", f"ControlPath={self.ctl}", "-O", "exit", self.host],
+                               capture_output=True)
+
+    def _wipe_win_embed(self):
+        """Ephemeral teardown (Windows only): remove the cached embeddable-Python runtime
+        under %LOCALAPPDATA%\\lc-runtime so an --ephemeral session leaves NOTHING behind
+        (the interpreter we provisioned included). Best-effort, guarded to the fixed
+        lc-runtime leaf so it can never remove an unrelated path. Non-ephemeral sessions
+        KEEP the cache (that's the point - download once, reuse)."""
+        cmd = ('$p = Join-Path $env:LOCALAPPDATA "lc-runtime"; '
+               'if (Test-Path $p) { Remove-Item -Recurse -Force $p '
+               '-ErrorAction SilentlyContinue }')
+        try:
+            subprocess.run(_ssh_run_argv(self.host, self.ctl, _win_ps(cmd)),
+                           capture_output=True, timeout=30, start_new_session=True)
+        except BaseException:
+            pass
+
+    def _wipe_posix_embed(self):
+        """Ephemeral teardown (POSIX only): remove the pushed embeddable-Python runtime
+        under the fixed lc-runtime cache leaf so an --ephemeral session leaves NOTHING
+        behind (the provisioned interpreter included). Best-effort, guarded to the fixed
+        '.../leancoder/lc-runtime' path so it can never remove an unrelated dir. A
+        non-ephemeral session KEEPS the cache (download once, reuse). The LOCAL driver
+        cache (~/.cache/leancoder/lc-runtime tarballs) is never touched - it's the reuse
+        source, not a remote trace."""
+        cmd = (f'p="{_POSIX_EMBED_ROOT}"; '
+               'case "$p" in */leancoder/lc-runtime) rm -rf "$p" ;; esac')
+        try:
+            subprocess.run(_ssh_run_argv(self.host, self.ctl, cmd),
+                           capture_output=True, timeout=30, start_new_session=True)
+        except BaseException:
+            pass
 
     def _wipe_remote(self):
         """Zero-trace teardown: delete the pushed executor dir (agent.py + bundled
@@ -6507,10 +7512,16 @@ class RemoteWorkspace:
         Guarded to a '.../leancoder' path so a bad remote_dir can never rm elsewhere.
         Best-effort: runs over the master before it's torn down; any failure is
         swallowed (the files are secret-free code, and the dir is throwaway anyway)."""
-        d = (self.remote_dir or "").rstrip("/")
+        d = (self.remote_dir or "").rstrip("/\\")
         if getattr(self, "reused", None) == "installed":
             return
-        if not d or os.path.basename(d) != "leancoder":
+        # Separator-agnostic basename guard: the driver is POSIX but a Windows remote_dir
+        # uses backslashes, and os.path.basename (posixpath here) does NOT split on '\\',
+        # so it returned the whole "C:\...\leancoder" string - the guard then always
+        # failed and the Windows wipe silently returned EARLY (the pushed dir leaked every
+        # session). Split on BOTH separators so the leaf name is checked on either OS.
+        leaf = d.replace("\\", "/").rsplit("/", 1)[-1]
+        if not d or leaf != "leancoder":
             return
         # Remove the dir FIRST, then kill the watchdog. Order matters for robustness:
         # `rm -rf` drops the .lease/.watchdog.pid sidecars, so ANY watchdog (including
@@ -6522,10 +7533,29 @@ class RemoteWorkspace:
         # ^C^C/EOF quit - which SIGINTs the whole foreground process group - can't kill
         # this wipe's ssh mid-flight. Catch BaseException for the same reason (a pending
         # KeyboardInterrupt must not abort the wipe before rm lands).
-        q = shlex.quote(d)
-        cmd = (f'rm -rf {q}; '
-               f'p=$(cat {shlex.quote(d + "/.watchdog.pid")} 2>/dev/null) && '
-               f'kill "$p" 2>/dev/null; true')
+        if self.remote_posix:
+            q = shlex.quote(d)
+            cmd = (f'rm -rf {q}; '
+                   f'p=$(cat {shlex.quote(d + "/.watchdog.pid")} 2>/dev/null) && '
+                   f'kill "$p" 2>/dev/null; true')
+        else:
+            # PowerShell: kill the watchdog by its pid file, then Remove-Item with a
+            # short RETRY loop. client.close() already ended the executor (stdin close),
+            # so the only process still holding agent.py is the detached self-wipe
+            # watchdog (`python agent.py --wipe-watch`, named by .watchdog.pid). Killing
+            # it releases the lock, but Windows holds it for a beat after the process
+            # exits, so a single Remove-Item races and loses - loop until the dir is gone.
+            # (Deliberately NO per-iteration Get-CimInstance process scan: it's ~1-2s each
+            # on Windows, so a 20x loop blew the 30s ssh timeout and got killed mid-wipe,
+            # leaking the dir - the pid-file kill is enough.)
+            cmd = (f'$pf="{d}\\.watchdog.pid"; '
+                   f'if (Test-Path $pf) {{ $p=Get-Content $pf; '
+                   f'taskkill /F /T /PID $p 2>$null }}; '
+                   f'foreach ($i in 1..15) {{ '
+                   f'Remove-Item -Recurse -Force "{d}" -ErrorAction SilentlyContinue; '
+                   f'if (-not (Test-Path "{d}")) {{ break }}; '
+                   f'Start-Sleep -Milliseconds 300 }}')
+            cmd = _win_ps(cmd)   # run PowerShell regardless of the sshd DefaultShell
         try:
             subprocess.run(_ssh_run_argv(self.host, self.ctl, cmd),
                            capture_output=True, timeout=30, start_new_session=True)
@@ -7315,23 +8345,13 @@ class Agent:
                 signal.signal(signal.SIGINT, prev)
 
     def _system(self) -> str:
-        # the dir tools actually operate in (remote cwd when connected). Stated
-        # as a plain path - the model stays unaware it is remote.
-        cwd = (self.remote.remote_cwd or self.remote.cwd) if self.remote else self.cfg.cwd
         # NOTE: the leash/permissions note is deliberately NOT here. It varies with the
         # leash, and the system block is a global cache breakpoint - baking it in rewrote
         # that cache on every /leash toggle. Instead the tool surface reflects the tier and
-        # _leash_note() is injected into the next user turn on change (see run_turn). bg is
-        # always included (cache-stable) even when run_command isn't in the current tier.
-        bg = (f"\nrun_command waits up to {self.cfg.command_timeout}s; for a long-running "
-              f"or daemon process (a server, a watcher) end the command with ' &' to run "
-              f"it detached - it returns a pid + log path immediately instead of blocking.")
-        modes = []
-        if self.cfg.incognito:
-            modes.append("Incognito session: this conversation is not being saved "
-                         "locally. (This does not stop the model provider from "
-                         "processing or retaining it - it only avoids a local trace.)")
-        mode_note = ("\n" + "\n".join(modes)) if modes else ""
+        # _leash_note() is injected into the next user turn on change (see run_turn).
+        # NOTE: the run_command timeout/'&' note and the incognito mode note used to live
+        # here. Removed: models don't read/act on the bg note (it duplicates the tool
+        # schema), and neither is worth a line in the cache-pinned block.
         # NOTE: the pinned plan is deliberately NOT here. It's the goal+TODO the model
         # rewrites often (~every turn on an active task), and the system block is a cache
         # breakpoint - baking a volatile block in would rewrite system + everything after
@@ -7356,7 +8376,7 @@ class Agent:
                 addendum = spec["system_addendum"](self, self.cfg) or ""
             except Exception:
                 addendum = ""
-        return (read_prompt("system") or SYSTEM_PROMPT) + bg + mode_note + no_tools + addendum + f"\nWorking directory: {cwd}"
+        return (read_prompt("system") or SYSTEM_PROMPT) + no_tools + addendum
 
     # Delimited, self-labelling wrapper so the model can never mistake the plan for
     # something the user typed (the old "(Pinned plan...)" header read like user text
@@ -7417,28 +8437,60 @@ class Agent:
         body = self._plan_sparse(pinned) if sparse else pinned
         return f"\n\n{self._PLAN_HDR}\n{body}\n{self._PLAN_FTR}"
 
+    # Live session-env: the cwd every tool operates in + the shell family run_command
+    # runs under. Rides the SAME uncached tail as the plan (never cached, never persisted,
+    # so a /connect or /cd changes it for free). Deliberately NO "remote"/"local" wording:
+    # the model works one unified surface (files it reads == where commands run), and
+    # telling it "remote" only makes it second-guess whether the two match. Stating the
+    # SHELL FAMILY stops wasted cross-OS turns (no `ls`/`whoami` probing, no POSIX cmds on
+    # cmd.exe). Terse key:value + a self-labelling header so even a weak model consumes it
+    # as state and doesn't echo it (same convention as the plan block).
+    _ENV_HDR = ("=== LEANCODER SESSION ENV (internal state, re-injected every turn; "
+                "reference only, NOT a user message. Use it to target the right shell + "
+                "paths; do NOT repeat or remark on it.) ===")
+    _ENV_FTR = "=== END SESSION ENV ==="
+
+    def _shell_family(self) -> str:
+        """The shell run_command executes under, for the model to target commands at.
+        Remote: POSIX box -> sh, Windows box -> cmd.exe. Local: this box's os."""
+        if self.remote is not None:
+            return "sh (POSIX)" if self.remote.remote_posix else "cmd.exe (Windows)"
+        return "cmd.exe (Windows)" if os.name == "nt" else "sh (POSIX)"
+
+    def _session_env(self) -> str:
+        """The uncached session-env reminder (cwd + shell family). Same tail as the
+        plan; "" is never returned (cwd+shell always exist)."""
+        cwd = (self.remote.remote_cwd or self.remote.cwd) if self.remote else self.cfg.cwd
+        return (f"\n\n{self._ENV_HDR}\ncwd: {cwd}\nshell: {self._shell_family()}\n"
+                f"{self._ENV_FTR}")
+
     def _with_plan_reminder(self, msgs):
-        """Return a COPY of the sent slice with the pinned-plan reminder appended to the
-        last message's text. Non-destructive (never touches self.messages) and applied
-        after the last cache breakpoint, so the plan stays uncached + never persists.
-        No-op when there's no plan or no message to carry it. A tool result must stay
-        exact, so we don't append to a role:tool tail - we add a trailing user note
-        instead (rare: the slice normally ends on a user/assistant turn)."""
-        # One-shot suppression: the send right after an update_plan skips the reminder,
-        # so the model doesn't get its just-written plan echoed back and narrate it (a
-        # wasted turn). Re-arms automatically for the following send - and arms a FULL
+        """Return a COPY of the sent slice with the uncached session tail (live env +
+        pinned plan) appended to the last message's text. Non-destructive (never touches
+        self.messages) and applied after the last cache breakpoint, so the tail stays
+        uncached + never persists. A tool result must stay exact, so we don't append to a
+        role:tool tail - we add a trailing user note instead (rare: the slice normally
+        ends on a user/assistant turn)."""
+        # One-shot suppression: the send right after an update_plan skips the PLAN
+        # reminder, so the model doesn't get its just-written plan echoed back and narrate
+        # it (a wasted turn). Re-arms automatically for the following send - and arms a FULL
         # re-inject on that following send (the plan just changed; refresh it in full),
-        # sparse on every turn after that until the next update_plan.
+        # sparse on every turn after that until the next update_plan. NOTE: the session-env
+        # is NOT suppressed here - only the plan is (env is cheap state, never echoed).
         if getattr(self, "_skip_plan_reminder_once", False):
             self._skip_plan_reminder_once = False
             self._plan_full_next = True
-            return msgs
-        # Event-driven full/sparse: FULL on the turn right after an update_plan, SPARSE
-        # thereafter. Refreshes on CHANGE, not a clock. Cache-free: the plan rides the
-        # uncached tail, so shrinking it busts nothing (see _with_plan_reminder docstring).
-        full = getattr(self, "_plan_full_next", True)
-        self._plan_full_next = False
-        reminder = self._plan_reminder(sparse=not full)
+            reminder = self._session_env()
+        else:
+            # Event-driven full/sparse: FULL on the turn right after an update_plan, SPARSE
+            # thereafter. Refreshes on CHANGE, not a clock. Cache-free: the plan rides the
+            # uncached tail, so shrinking it busts nothing (see _with_plan_reminder docstring).
+            full = getattr(self, "_plan_full_next", True)
+            self._plan_full_next = False
+            # The live session-env ALWAYS rides the tail (cwd + shell family); the plan
+            # rides it only when pinned. Env first so the plan (the richer block) sits last
+            # = most recent = highest attention.
+            reminder = self._session_env() + self._plan_reminder(sparse=not full)
         if not reminder or not msgs:
             return msgs
         out = list(msgs)
@@ -7516,15 +8568,24 @@ class Agent:
         return "\n\n".join(l for l in lines if l)
 
     def _has_bg_optins(self) -> bool:
-        """True if any live bg task THIS session owns opted into a per-job push
-        (notify_on_exit / heartbeat_timeout / max_runtime). Lets the wake path stay
-        armed for those jobs even when global wake_on_bg_finish is off - cheap
+        """True if any live bg job THIS session owns needs the idle wake path armed:
+          - a plain TASK that opted into a per-job push (notify_on_exit /
+            heartbeat_timeout / max_runtime), OR
+          - ANY live WORKER. A worker ALWAYS needs the idle path: its finish wakes the
+            agent via the wake-hook registry, AND - critically - the idle path is where
+            its LEASE gets bumped while the parent sits idle (see bg_wake_turn). Without
+            counting workers here, a parent with only workers live never arms the wake
+            path, never bumps the lease, and the worker self-terminates (exit 137) ~30min
+            into an AFK stretch - the 'worker died with no output' bug.
+        Lets the wake path stay armed even when global wake_on_bg_finish is off - cheap
         registry read, best-effort."""
         try:
             me = os.getpid()
             for r in _bg_load():
-                if r.get("owner") != me or r.get("kind", "task") != "task":
+                if r.get("owner") != me:
                     continue
+                if r.get("kind", "task") == "worker":
+                    return True
                 if (r.get("notify_on_exit") or r.get("heartbeat_timeout")
                         or r.get("max_runtime")):
                     return True
@@ -7549,6 +8610,16 @@ class Agent:
         heartbeat_timeout / max_runtime) - only_notify restricts the finished notices to
         those. Wrapped in autonomous-wake framing + an explicit react instruction, since
         no operator prompt accompanies it."""
+        # Attend our leased bg tasks/workers HERE too, not just in run_turn: a parent
+        # sitting IDLE at the prompt (operator AFK) is still alive, but run_turn - the
+        # only other lease-bump site - doesn't fire without a turn. Without this, a
+        # dispatched worker (idle_timeout=1800) self-terminates ~30min into an AFK stretch
+        # with exit 137 = the "worker died with no output" bug. This wake_check runs every
+        # idle tick (~0.25s); throttle the bump to once per ~30s so it's ~free.
+        now = time.monotonic()
+        if now - getattr(self, "_last_idle_lease_bump", 0.0) >= 30:
+            self._last_idle_lease_bump = now
+            self._bg_bump_session()
         global_wake = bool(getattr(self.cfg, "wake_on_bg_finish", False))
         parts = []
         note = self._bg_finished_note(only_notify=not global_wake)
@@ -7659,12 +8730,114 @@ class Agent:
         already within the bound, returns `msgs` unchanged. If no clean boundary
         falls within range, returns `msgs` unchanged (skip windowing this round
         rather than risk an orphaned/!user-leading send). See
-        docs/cost-reduction-roadmap.md."""
+        docs/cost-reduction-roadmap.md.
+
+        A TOKEN budget (cfg.window_tokens) takes precedence over the message-count bound:
+        it keeps as many whole recent turns as fit under the token ceiling. 'auto' resolves
+        to the detected context window minus a reply reserve (see _resolve_window_tokens),
+        so it's a pure overflow backstop. See _window_by_tokens."""
+        tok_budget = self._resolve_window_tokens()
+        if tok_budget > 0:
+            return self._window_by_tokens(msgs, tok_budget)
         start = self._keep_tail_start(msgs, max_msgs)
         if start is None:
             return msgs
         head = msgs[:1] if msgs and msgs[0].get("role") == "system" else []
         return head + msgs[start:]
+
+    # Reply reserve for 'auto': room the model needs to GENERATE its answer, kept out of
+    # the prompt budget so an auto-window never fills the whole context and starves output
+    # (on ollama num_ctx is shared prompt+generation; a 100% prompt = no room to reply).
+    # max(fixed floor, fraction of the window) so it scales from a 4k model up to a 200k one.
+    _AUTO_WINDOW_RESERVE = 1024
+    _AUTO_WINDOW_RESERVE_FRAC = 0.15
+
+    def _resolve_window_tokens(self) -> int:
+        """The numeric per-send token budget from cfg.window_tokens: a positive int is used
+        as-is (hard cap); 'auto' -> detected ctx_window minus a reply reserve (the overflow
+        backstop); 0 / off / anything else -> 0 (windowing off). Best-effort: never raises."""
+        cfg = getattr(self, "cfg", None)
+        raw = getattr(cfg, "window_tokens", 0)
+        if isinstance(raw, str):
+            if raw.strip().lower() != "auto":
+                return 0
+            try:
+                ctx = int(cfg.ctx_window())
+            except Exception:
+                return 0
+            if ctx <= 0:
+                return 0
+            reserve = max(self._AUTO_WINDOW_RESERVE, int(ctx * self._AUTO_WINDOW_RESERVE_FRAC))
+            return max(0, ctx - reserve)
+        try:
+            return max(0, int(raw))
+        except (TypeError, ValueError):
+            return 0
+
+    def _window_by_tokens(self, msgs, budget):
+        """System message + the largest clean-boundary TAIL of `msgs` that keeps the whole
+        send at/under `budget` CALIBRATED tokens (messages_tokens - the same fixed meter the
+        ctx line/handover use, so the bound matches reality). ALWAYS kept + counted first:
+        the system message, the tool schemas, and a reserve for the env/plan tail that
+        _with_plan_reminder appends AFTER this (so the real send never blows past budget).
+        The conversation tail is then grown one WHOLE turn at a time (each user boundary)
+        from newest back until the next older turn wouldn't fit, cut at that user boundary
+        so a tool result is never orphaned. Non-destructive. Returns `msgs` unchanged when
+        it already fits, or when even the last turn alone can't fit (we never send an empty
+        or orphaned slice - overflow is then the model/provider's own truncation to handle,
+        exactly as with no window)."""
+        head = msgs[:1] if msgs and msgs[0].get("role") == "system" else []
+        body = msgs[len(head):]
+        if not body:
+            return msgs
+        # Fixed overhead that is ALWAYS on the wire: system + tools + the env/plan tail
+        # reserve. Count them against the budget up front so the conversation only gets
+        # what's left. messages_tokens is the calibrated meter (never the raw char count).
+        reserve = head + [{"role": "user", "content": self._reminder_probe()}]
+        overhead = messages_tokens(reserve, self.tool_defs)
+        remaining = budget - overhead
+        if remaining <= 0:
+            # Budget can't even hold the fixed surface; keep the last turn so we still send
+            # something coherent (provider truncates if it must) rather than an empty body.
+            start = self._first_user_from(body, len(body) - 1)
+            return (head + body[start:]) if start is not None else msgs
+        # Grow the tail newest-first, snapping each candidate start to a user boundary, and
+        # keep the largest slice that fits. Walk user boundaries from the end backwards.
+        best = None
+        for i in range(len(body) - 1, -1, -1):
+            if body[i].get("role") != "user":
+                continue
+            cand = body[i:]
+            if messages_tokens(cand, None) <= remaining:
+                best = i
+            else:
+                break                          # older turns only get bigger; stop
+        if best is None:
+            # Not even the last turn fits the remaining budget: send the last turn anyway
+            # (coherent over empty); the provider handles the overflow like the no-window case.
+            start = self._first_user_from(body, len(body) - 1)
+            return (head + body[start:]) if start is not None else msgs
+        if best == 0:
+            return msgs                         # whole history fits -> unchanged
+        return head + body[best:]
+
+    def _first_user_from(self, body, from_idx):
+        """Index of the nearest user message at or before `from_idx` in `body` (so a slice
+        starts on a clean turn), or None if there is none."""
+        for i in range(min(from_idx, len(body) - 1), -1, -1):
+            if body[i].get("role") == "user":
+                return i
+        return None
+
+    def _reminder_probe(self):
+        """A worst-case-ish stand-in for the env/plan tail _with_plan_reminder appends after
+        windowing, so _window_by_tokens can RESERVE room for it. Uses the live env + a FULL
+        (non-sparse) plan reminder - the largest form - so the reserve never under-counts.
+        Best-effort: any failure returns '' (reserve just 0, still safe-ish)."""
+        try:
+            return self._session_env() + self._plan_reminder(sparse=False)
+        except Exception:
+            return ""
 
     def _keep_tail_start(self, msgs, max_msgs):
         """Index into `msgs` where the kept tail begins: the first user-message
@@ -7735,6 +8908,39 @@ class Agent:
                 break
         return parsed, missing, attempt, turn_text
 
+    def _finish_handover(self, parsed, *, summary_prefix, tail=None,
+                         autostart=False, stamp_clock=False):
+        """Shared epilogue for handover() + auto_handover(): once the marked blocks
+        are parsed, install the pinned plan, rebuild history as [system, summary(+tail)],
+        set the stable cache boundary, and reset the per-turn counters. The two callers
+        differ only in the four knobs:
+          - summary_prefix: how the compacted summary is introduced;
+          - tail: recent verbatim messages kept AFTER the summary (auto only; None = a
+            clean [system, summary] cut for an operator-driven /handover);
+          - autostart: queue the model's next-step self-prompt (auto only - nobody's
+            watching to type it);
+          - stamp_clock: bump the anti-thrash loop guard (auto only).
+        Returns the handover text block."""
+        block = parsed["handover"]
+        if parsed["plan"]:
+            self.pinned_plan = parsed["plan"]   # survives handover (uncached send-time reminder)
+        self.messages = [
+            {"role": "system", "content": self._system()},
+            {"role": "user", "content": summary_prefix + block, "cache_boundary": True},
+        ] + (tail or [])
+        # Cache-boundary signal: after a handover the prefix [system][summary] is STABLE,
+        # so a client with a spare breakpoint can pin it and re-read the prefix at ~0.1x.
+        # 2 = system + the one compacted-summary user message.
+        self._handover_boundary = 2
+        self.last_prompt_tokens = None
+        self.tools.changed_files.clear()
+        if stamp_clock:
+            self._last_compact_ts = time.time()
+        if autostart and parsed["next"] and self.cfg.handover_for()["autostart"]:
+            self._autostart_pending = parsed["next"]
+        self.handovers += 1
+        return block
+
     def handover(self):
         """Agentic /handover: the model gets a real (tool-capable) turn to update +
         commit any durable docs, then write its future-self handover as marked text
@@ -7746,27 +8952,14 @@ class Agent:
             return None
         instr = read_prompt("handover") or HANDOVER_INSTR
         parsed, missing, attempt, _turn_text = self._solicit_handover(instr)
-        block = parsed["handover"]
-        if not block:        # no usable handover (truly empty) -> leave history untouched
+        if not parsed["handover"]:   # no usable handover (truly empty) -> leave history untouched
             return None
         if parsed["tier"] >= 3 or missing:
             self._log_activity("handover",
                                f"degraded parse (tier {parsed['tier']}, missing {missing})",
                                "model dropped marker discipline; salvaged via tolerant parser")
-        plan = parsed["plan"]
-        if plan:
-            self.pinned_plan = plan          # survives the handover (uncached send-time reminder)
-        self.messages = [
-            {"role": "system", "content": self._system()},
-            {"role": "user",
-             "content": "Session handover (prior context summarized):\n" + block,
-             "cache_boundary": True},
-        ]
-        self._handover_boundary = 2      # stable prefix (system + summary) - see auto_handover()
-        self.last_prompt_tokens = None
-        self.tools.changed_files.clear()
-        self.handovers += 1
-        return block
+        return self._finish_handover(
+            parsed, summary_prefix="Session handover (prior context summarized):\n")
 
     def _update_plan(self, plan: str):
         """The update_plan tool body: replace the pinned GOAL + TODO and refresh the
@@ -7860,32 +9053,11 @@ class Agent:
         # accepted that tier - so a strict _extract_* here would silently throw away the
         # salvage for exactly the models the tolerant parser exists to rescue, dropping
         # both the pinned plan and the autostart self-prompt. Same source as handover().
-        selfprompt = parsed["next"]
-        plan = parsed["plan"]
-        if plan:
-            self.pinned_plan = plan          # survives the handover (uncached send-time reminder)
-        summary_msg = {"role": "user",
-                       "content": "Earlier context (compacted summary):\n" + block,
-                       "cache_boundary": True}
-        self.messages = [
-            {"role": "system", "content": self._system()},
-            summary_msg,
-        ] + tail
-        # Cache-boundary signal for the provider client: after a handover the prefix
-        # [system][summary] is STABLE (it won't change turn to turn), so a client with a
-        # spare cache breakpoint can pin it there and re-read the whole prefix at ~0.1x.
-        # The signal rides the message itself ("cache_boundary": True) so it survives
-        # windowing/repair as long as the message is sent; the client decides whether/how
-        # to use it (this stays gitignored-provider territory). We also publish the index
-        # for /info. 2 = system + the one compacted-summary user message.
-        self._handover_boundary = 2
-        self.last_prompt_tokens = None
-        self.tools.changed_files.clear()
-        self._last_compact_ts = time.time()
-        if selfprompt and self.cfg.handover_for()["autostart"]:
-            self._autostart_pending = selfprompt
-        self.handovers += 1
-        return block
+        # Auto differs from /handover only in the four knobs below: keep the recent
+        # verbatim tail, queue the next-step self-prompt, and stamp the loop guard.
+        return self._finish_handover(
+            parsed, summary_prefix="Earlier context (compacted summary):\n",
+            tail=tail, autostart=True, stamp_clock=True)
 
     def _dispatch(self, name: str, args: dict) -> str:
         if name.startswith(MCP_NS):
@@ -9224,12 +10396,14 @@ _SETTINGS_FIELDS = [
     ("leash", "capability ceiling", tuple(LEASH_LEVELS)),
     ("confirm_reads", "ask-on-read (confirm read tools too)", "bool"),
     ("auto_reconnect", "reconnect to a session's remote on load (off = ask)", "bool"),
+    ("ephemeral", "/connect default: force embed runtime + wipe on teardown (zero-trace)", "bool"),
     ("show_snapshots", "show pre-handover safety snapshots in the /load picker + /session list", "bool"),
     ("statusline", "status rows above the prompt", "bool"),
     ("statusline_every", "reprint status every N prompts (1 = every turn, 0 = only on change)", "int"),
     ("statusline_iter", "reprint status every N model iterations within a long turn (0 = off)", "int"),
     # --- context management (send-window + auto-handover) ---
-    ("window_messages", "send-window size (0 = off, full history)", "int"),
+    ("window_messages", "send-window size in messages (0 = off, full history)", "int"),
+    ("window_tokens", "send-window token cap: 'auto' (=ctx-reserve, default), an int (hard cap), or 0 (off)", "int_or_auto"),
     ("auto_handover", "auto-handover (self-managing context)", "bool"),
     ("handover_soft", "handover soft-zone start (fraction of ctx)", "float"),
     ("handover_hard", "handover hard threshold (fraction of ctx)", "float"),
@@ -9258,6 +10432,10 @@ def _coerce_setting(raw, kind):
     """Parse a raw string to the field's type; raise ValueError on a bad value."""
     if kind == "int":
         return int(raw)
+    if kind == "int_or_auto":              # 'auto' sentinel OR an int (e.g. window_tokens)
+        if isinstance(raw, str) and raw.strip().lower() == "auto":
+            return "auto"
+        return int(raw)
     if kind == "float":
         return float(raw)
     if kind == "bool":
@@ -9265,11 +10443,18 @@ def _coerce_setting(raw, kind):
     return raw
 
 
-def _set_setting_field(agent, cfg, key, raw):
+def _set_setting_field(agent, cfg, key, raw, scope="session"):
     """Set one /set config field from a raw string, APPLYING it to the live agent when
     the field affects its tool surface or system prompt (leash, ask_user_to_run) -
     not just the cfg value. Returns True on success. `agent` may be None for headless
-    callers (then live-apply is skipped)."""
+    callers (then live-apply is skipped).
+
+    scope controls where the value lands (the uniform DEFAULTS/OVERRIDE model):
+      "session" (default): a per-session OVERRIDE - live cfg + cfg.session_overrides[key]
+                 (carried in the session meta by autosave). config.toml is NOT touched.
+      "config":  the config.toml DEFAULT - live cfg + cfg._defaults[key], AND the session
+                 override for that key is CLEARED so the new default shows through. The
+                 caller persists via save_config."""
     if key not in _SETTINGS_BY_KEY:
         print(yellow(f"unknown setting '{key}' (try: {', '.join(_SETTINGS_BY_KEY)})"))
         return False
@@ -9285,12 +10470,18 @@ def _set_setting_field(agent, cfg, key, raw):
     if key == "approval":
         set_approval(cfg, val)
     elif key == "leash" and agent is not None:
-        _apply_leash(agent, cfg, val)        # live: rebuild tools + system prompt + AI note
+        _apply_leash(agent, cfg, val, persist=(scope == "config"))  # live rebuild
     else:
         setattr(cfg, key, val)
         # ask_user_to_run adds/removes a tool, so the live surface must rebuild too.
         if key == "ask_user_to_run" and agent is not None:
             agent.refresh_tools()
+    # Record where the value belongs in the DEFAULTS/OVERRIDE layer.
+    if scope == "config":
+        cfg._defaults[key] = getattr(cfg, key)   # the new config.toml default
+        cfg.session_overrides.pop(key, None)      # let the new default show through
+    else:
+        cfg.session_overrides[key] = getattr(cfg, key)  # per-session override
     return True
 
 
@@ -9344,15 +10535,43 @@ def _settings_sessions_view(agent, cfg):
 
 
 def handle_settings_command(agent, cfg, arg):
-    """/set - granular editor over the app config (config.toml). No arg: interactive
-    menu. `key value`: set one field directly. Persists with save_config().
+    """/set - granular editor over the working state. No arg: interactive menu.
+    `key value`: a per-SESSION override (live + carried in the session, config.toml
+    untouched). `--config key value`: write that ONE key as the config.toml DEFAULT and
+    clear its session override (so the new default shows through). `--config key` with
+    no value: clear the session override for that key (revert to the config default).
     (Provider-specific backend knobs live in /provider set.)"""
     if arg:
+        to_config = False
+        if arg.split(maxsplit=1)[0] in ("--config", "--default"):
+            to_config = True
+            arg = arg.split(maxsplit=1)[1] if len(arg.split(maxsplit=1)) > 1 else ""
         parts = arg.split(maxsplit=1)
-        if len(parts) == 2 and _set_setting_field(agent, cfg, parts[0], parts[1]):
-            save_config(cfg, quiet=True)
+        if to_config and len(parts) == 1 and parts[0] in _SETTINGS_BY_KEY:
+            # `/set --config key` (no value): drop the session override so the live cfg
+            # reverts to the config.toml default for that key.
+            key = parts[0]
+            cfg.session_overrides.pop(key, None)
+            if key in cfg._defaults:
+                if key == "leash" and agent is not None:
+                    _apply_leash(agent, cfg, cfg._defaults[key], persist=False)
+                elif key == "approval":
+                    set_approval(cfg, cfg._defaults[key])
+                else:
+                    setattr(cfg, key, cfg._defaults[key])
+                    if key == "ask_user_to_run" and agent is not None:
+                        agent.refresh_tools()
+            print(dim(f"{key} -> {getattr(cfg, key)}  (session override cleared)"))
+            return
+        scope = "config" if to_config else "session"
+        if len(parts) == 2 and _set_setting_field(agent, cfg, parts[0], parts[1], scope=scope):
+            if to_config:
+                save_config(cfg, quiet=True)
+            else:
+                autosave_session(agent, cfg)      # carry the override in the session
             if parts[0] not in _LIVE_APPLY:       # live-apply keys announce themselves
-                print(dim(f"{parts[0]} -> {getattr(cfg, parts[0])}"))
+                tag = "" if to_config else "  (session override)"
+                print(dim(f"{parts[0]} -> {getattr(cfg, parts[0])}{tag}"))
         elif len(parts) == 1:                     # bare key -> edit that one field
             if parts[0] in _SETTINGS_BY_KEY:
                 label, kind = _SETTINGS_BY_KEY[parts[0]]
@@ -9557,7 +10776,12 @@ def _status_rows(agent, cfg):
         p.append(f"max {mi} rounds" if mi else "no round cap")
     if cfg.confirm_reads:
         p.append("ask-read")
-    if cfg.window_messages > 0:               # only show when on - don't nag with 'window off'
+    _wt = cfg.window_tokens
+    if isinstance(_wt, str) and _wt.strip().lower() == "auto":
+        p.append("window auto")               # backstop: ctx - reply reserve, recomputed
+    elif isinstance(_wt, int) and _wt > 0:    # a hard token cap
+        p.append(f"window {_wt}tok")
+    elif cfg.window_messages > 0:             # only show when on - don't nag with 'window off'
         p.append(f"window {cfg.window_messages}")
     c = cfg.handover_for()
     p.append(f"handover {c['hard'] * 100:.0f}%" if c.get("auto") else "handover off")
@@ -9670,6 +10894,22 @@ def handle_info_command(agent, cfg, arg=""):
         print(f"  modes:    {', '.join(modes)}")
 
 
+# Per-command flags a user can add anywhere in the arg (order-agnostic, matching how
+# the handlers parse them - e.g. handle_connect_command pulls --ephemeral from any
+# position). Kept as completion candidates so the "Tab completes inline arguments"
+# contract (HELP_FOOTER) actually covers a command's own flags. `--plain`/`--fallback`
+# are universal (dispatch_command strips them from any command) so they're offered too.
+_COMMAND_FLAGS = {
+    "/connect": ["--ephemeral", "--no-ephemeral"],
+}
+_UNIVERSAL_FLAGS = ["--plain", "--fallback"]
+
+
+def _command_flags(cmd):
+    """Flags offerable at ANY arg position for `cmd` (its own + the universal ones)."""
+    return _COMMAND_FLAGS.get(cmd, []) + _UNIVERSAL_FLAGS
+
+
 def _arg_completions(agent, cfg, cmd):
     """Inline first-arg Tab completions for a slash command. Reads live state
     (active backend's models, registered providers, hosts, open remotes). Returns
@@ -9712,6 +10952,8 @@ def _arg_completions(agent, cfg, cmd):
             return list(agent.mcp.stale_enabled())
         except Exception:
             return []
+    if cmd == "/expand":                            # msg -> conversation view (else tool-call ids)
+        return ["msg"]
     if cmd == "/connect":
         return ["remove"] + sorted(set(list(cfg.connect_hosts) + list(getattr(agent, "remotes", {}))))
     if cmd == "/connect remove":
@@ -9765,6 +11007,12 @@ def _completion_options(agent, cfg, left):
         # alongside a command's own completions when the cursor is on its first argument.
         if len(path) == 1 and path[0] != "/help":
             opts = list(opts) + ["?"]
+        # Flags (a command's own + the universal --plain/--fallback) complete at ANY arg
+        # position, mirroring the handlers that accept them order-agnostically - so e.g.
+        # `/connect 8 --ephe<Tab>` offers --ephemeral. Skip already-present ones.
+        if text.startswith("-"):
+            flags = [f for f in _command_flags(path[0]) if f not in tokens]
+            opts = list(opts) + flags
         return [o for o in opts if o.startswith(text)]
     if buf.startswith("/"):                  # still on the command itself
         return [c for c in SLASH_COMMANDS if c.startswith(text)]
@@ -9805,9 +11053,10 @@ def _setup_readline(agent, cfg):
 
 
 def handle_save_command(agent, cfg, arg):
-    """/save [name] - snapshot the current conversation under a name. No arg
-    prompts for one. Config persists automatically and is NOT what /save means
-    any more (autosave handles it)."""
+    """/save [name] - DEPRECATED alias: autosave already persists the conversation
+    (and now its per-session overrides) each turn, so a manual save is rarely needed.
+    Still works: it snapshots + names the session (autosave then continues into it).
+    No arg prompts for a name. Config persists automatically - /save never writes it."""
     name = arg.strip()
     if not any(m.get("role") != "system" for m in agent.messages):
         # Empty conversation: a bare `/save` has nothing to snapshot, but an
@@ -9905,14 +11154,16 @@ def _restore_backend_for(agent, cfg, meta):
     return ""
 
 
-def _print_session_tail(messages, n: int = 4, width: int = 100):
-    """Echo the last few non-system messages so a resumed session shows what you were
-    doing, not just a one-line banner. Roles are labelled + coloured (you / lc /
-    tool); tool results and long lines collapse so it stays scannable. No-op for an
-    empty conversation."""
+def _render_message_tail(messages, n: int = 4, width: int = 100, hint: bool = False):
+    """Echo the last `n` non-system messages so a resumed (or /expand msg) view shows
+    what you were doing. Roles are labelled + coloured (you / lc / tool); long lines
+    collapse so it stays scannable. `n` is clamped to [1, len] so a silly count never
+    errors or under-shows. `hint` appends the '/expand msg N' pointer when the view is
+    partial. No-op for an empty conversation."""
     body = [m for m in messages if m.get("role") != "system"]
     if not body:
-        return
+        return False
+    n = max(1, min(int(n), len(body)))               # clamp: never error, never over-read
     tail = body[-n:]
     print(yellow(f"  recent context ({len(tail)} of {len(body)} messages):"))
     for m in tail:
@@ -9932,7 +11183,17 @@ def _print_session_tail(messages, n: int = 4, width: int = 100):
         if len(text) > width:
             text = text[:width] + GLYPH["ellipsis"]
         print(f"    {label} {dim(GLYPH['dot'])} {dim(text) if role != 'user' else text}")
+    if hint and len(tail) < len(body):
+        print(dim(f"    … /expand msg {min(len(body), max(n * 2, 20))} to see further back"))
     print()
+    return True
+
+
+def _print_session_tail(messages, n: int = 4, width: int = 100):
+    """Resume-banner view: the last few messages plus the '/expand msg N' hint so a
+    user knows they can scroll further back without a reload. Thin wrapper over
+    _render_message_tail (shared with /expand msg)."""
+    _render_message_tail(messages, n=n, width=width, hint=True)
 
 
 def _restore_session_state(agent, cfg, meta):
@@ -9965,12 +11226,32 @@ def _restore_session_state(agent, cfg, meta):
         if val is not None and val != cfg.setting(key):
             cfg.set_setting(key, val)
 
+    # Per-key SESSION OVERRIDES (the uniform working-state layer): re-apply the loaded
+    # session's overrides onto the LIVE cfg at RUNTIME only - never save_config here, so
+    # a worker/auto session can't clobber the config.toml defaults (the old approval->
+    # auto root bug). The legacy top-level meta "approval"/"leash" (below) still restore
+    # for sessions saved before this layer; going forward they ride session_overrides.
+    overrides = meta.get("session_overrides")
+    if isinstance(overrides, dict):
+        cfg.session_overrides = dict(overrides)
+        for k, v in overrides.items():
+            if k not in _SETTINGS_BY_KEY or k == "leash":  # leash handled below (escalation notice)
+                continue
+            if k == "approval":
+                if v in APPROVAL_MODES:
+                    set_approval(cfg, v)
+            else:
+                setattr(cfg, k, v)
+        if "ask_user_to_run" in overrides:
+            agent.refresh_tools()
+
     approval = meta.get("approval")
     if approval in APPROVAL_MODES and approval != cfg.approval:
-        set_approval(cfg, approval)
+        set_approval(cfg, approval)                        # runtime only (not autosaved)
 
     escalated_from = None
-    want = meta.get("leash")
+    # A leash session-override takes precedence over the legacy top-level meta field.
+    want = (meta.get("session_overrides") or {}).get("leash") or meta.get("leash")
     if want in LEASH_LEVELS and want != cfg.leash:
         if LEASH_LEVELS.index(want) > LEASH_LEVELS.index(cfg.leash):
             escalated_from = cfg.leash                     # this load RAISES the ceiling
@@ -10179,18 +11460,6 @@ def handle_session_command(agent, cfg, arg):
                       f"/set show_snapshots true to show)"))
         return
 
-    if sub == "delete":
-        if not rest:
-            rest = _session_picker("delete session:")
-            if not rest:
-                return
-        print(green(f"deleted session '{rest}'.") if delete_session(rest)
-              else red(f"no such session: {rest}"))
-        return
-
-    print(dim("usage: /session list | delete <name>   (save -> /save, load -> /load)"))
-
-
 def _remote_alive(ws) -> bool:
     """Best-effort: is this pooled connection still usable? A rebooted/dropped box
     makes the executor process exit or its pipe error, which we detect here so a
@@ -10205,16 +11474,17 @@ def _remote_alive(ws) -> bool:
         return False
 
 
-def _do_connect(agent, cfg, rhost, rpath=".", offer_save=False):
+def _do_connect(agent, cfg, rhost, rpath=".", offer_save=False, ephemeral=False):
     """Connect to / switch to `rhost`, routing tools there. Switching to an
     already-open box is instant (no re-push); a pooled box that died (reboot) is
     transparently reconnected. Push is implicit (no prompt); any failure leaves
-    the session where it was. `offer_save` remembers an ad-hoc host."""
+    the session where it was. `offer_save` remembers an ad-hoc host. `ephemeral`
+    (Windows) forces the embeddable-Python runtime and wipes it on teardown."""
     if agent.remote and agent.remote.host == rhost:
         print(dim(f"already active on {rhost}."))
         return
     pooled = agent.remotes.get(rhost)
-    if pooled is not None:
+    if pooled is not None and not ephemeral:
         if _remote_alive(pooled):
             agent.set_remote(pooled)              # instant switch
             print(green(f"switched to {rhost} (tools run there)."))
@@ -10224,12 +11494,19 @@ def _do_connect(agent, cfg, rhost, rpath=".", offer_save=False):
     where = f"on {agent.remote.host}" if agent.remote else "local"
     try:
         ws = RemoteWorkspace(
-            rhost, rpath, lean_tool_paths=agent.lean_tools.enabled_paths()).connect()
+            rhost, rpath, lean_tool_paths=agent.lean_tools.enabled_paths(),
+            ephemeral=ephemeral).connect()
     except (ConnectionError, OSError) as e:
         print(red(f"connect failed (staying {where}): {e}"))
         return
     agent.set_remote(ws)
     print(green(f"connected: tools now run on {rhost} (agent at {ws.remote_dir})"))
+    # /sh drops into the box's LOGIN shell (its sshd DefaultShell), which on Windows is
+    # cmd.exe unless an admin set PowerShell - distinct from run_command's shell. Say so
+    # once so a /sh isn't a surprise.
+    if not ws.remote_posix:
+        print(dim("  note: /sh here opens the host's default shell (cmd.exe unless "
+                  "PowerShell is set); run_command runs cmd.exe commands."))
     print(dim("  /local detaches (keeps it open to switch back); /connect <host> switches."))
     if (offer_save and rhost not in cfg.connect_hosts
             and rhost not in cfg.connect_hosts.values()):
@@ -10708,9 +11985,10 @@ def _resolve_model_arg(arg, sel_rows):
     listed rows, a 'provider:model' qualifier, or a bare model name (first match
     wins, preferring the active provider). Returns a row or None. Pure."""
     arg = arg.strip()
-    if arg.isdigit():
-        i = int(arg) - 1
-        return sel_rows[i] if 0 <= i < len(sel_rows) else None
+    # MENU CONTRACT: a bare 1-based integer selects the Nth listed row (see menu_resolve).
+    picked = menu_resolve(arg, sel_rows)
+    if picked is not None:
+        return picked
     if ":" in arg:
         p, _, m = arg.partition(":")
         # ollama model tags contain ':' (e.g. qwen3:30b), so only treat the prefix
@@ -11020,6 +12298,8 @@ def _maybe_autostart_provider(agent, cfg):
             want = "ollama"               # the bundled, out-of-the-box default
     if not want:
         cfg.provider = ""
+        agent._provider_fail_reason = ("no backend could be started - every provider "
+                                       "is disabled/unconfigured on this box")
         return None                       # no provider at all -> no backend
     try:
         prep = get_provider(want).get("prepare")
@@ -11035,8 +12315,11 @@ def _maybe_autostart_provider(agent, cfg):
             try:
                 agent.activate_provider("ollama")
                 return agent.active_provider()
-            except Exception:
-                pass
+            except Exception as e2:
+                agent._provider_fail_reason = (f"provider '{want}' failed to start ({e}); "
+                                               f"ollama fallback also failed ({e2})")
+        else:
+            agent._provider_fail_reason = f"provider '{want}' failed to start: {e}"
         cfg.provider = ""
         return None
 
@@ -11073,14 +12356,18 @@ def handle_incognito_command(agent, cfg, arg):
                   "autosave setting again."))
 
 
-def _apply_leash(agent, cfg, want):
+def _apply_leash(agent, cfg, want, persist=True):
     """Set the capability ceiling, rebuild the system prompt + tool surface live, and
-    announce the grant. Used by /leash."""
+    announce the grant. Used by /leash. `persist=True` autosaves the leash as a
+    config.toml DEFAULT (the /leash command's behaviour); `persist=False` applies it
+    live only (a /set session override records it in session_overrides itself)."""
     cfg.leash = want
     agent.messages[0] = {"role": "system", "content": agent._system()}
     agent.refresh_tools()
     agent._pending_ai_note = _leash_note(want)   # tell the model on its next turn (not via the cached prompt)
-    autosave_config(cfg)
+    if persist:
+        cfg._defaults["leash"] = want
+        autosave_config(cfg)
     print(bold(f"leash: {want}") + dim(f"  - {_LEASH_GRANTS[want]}  "
                                        f"({len(agent.tool_defs)} tools)"))
     if want == "rwe":
@@ -11196,10 +12483,23 @@ def handle_new_command(agent, cfg, arg):
 
 
 def handle_connect_command(agent, cfg, arg):
-    """/connect <[user@]host> [remote-path] - enter/switch a remote workspace: all
-    file/exec tools then run there, transparently to the model. Bare /connect with saved
-    [connect] hosts (or open ones) opens a menu. /connect remove <name> forgets a saved
-    target. Any failure leaves you where you were."""
+    """/connect <[user@]host> [remote-path] [--ephemeral] - enter/switch a remote
+    workspace: all file/exec tools then run there, transparently to the model. Bare
+    /connect with saved [connect] hosts (or open ones) opens a menu. /connect remove
+    <name> forgets a saved target. --ephemeral (Windows) forces the embeddable-Python
+    runtime and wipes it on teardown (zero-trace; also dogfoods the embed path). Any
+    failure leaves you where you were."""
+    # Pull an --ephemeral / -e flag out of anywhere in the arg (order-agnostic). The
+    # flag is a per-connect OVERRIDE of the cfg.ephemeral default (which a user can set
+    # to always-wipe via /set ephemeral on); --no-ephemeral forces off for one connect.
+    toks = arg.split()
+    ephemeral = getattr(cfg, "ephemeral", False)
+    if any(t in ("--ephemeral", "-e") for t in toks):
+        ephemeral = True
+    if "--no-ephemeral" in toks:
+        ephemeral = False
+    arg = " ".join(t for t in toks
+                   if t not in ("--ephemeral", "-e", "--no-ephemeral"))
     if not arg:
         if cfg.connect_hosts or agent.remotes:
             active = agent.remote.host if agent.remote else None
@@ -11207,18 +12507,26 @@ def handle_connect_command(agent, cfg, arg):
                                        open_hosts=list(agent.remotes),
                                        active=active)
             if target:
-                _do_connect(agent, cfg, target)
+                _do_connect(agent, cfg, target, ephemeral=ephemeral)
         else:
-            print(dim("usage: /connect <[user@]host> [remote-path]  "
+            print(dim("usage: /connect <[user@]host> [remote-path] [--ephemeral]  "
                       "(or add a [connect] section to the config)"))
     elif arg.split(maxsplit=1)[0] == "remove":
         _connect_remove(agent, cfg, arg.split(maxsplit=1)[1].strip() if len(arg.split(maxsplit=1)) > 1 else "")
     else:
         sp = arg.split(maxsplit=1)
+        rpath = sp[1] if len(sp) > 1 else "."
+        # MENU CONTRACT: a bare 1-based integer selects from the SAME ordered list the
+        # bare-/connect menu shows (saved [connect] targets, then open-but-unsaved
+        # sessions) - so `/connect 8` means "the 8th menu row", NOT a host literally
+        # named 8 (which ssh would dial as a bare-integer address). See menu_resolve.
+        picked = menu_resolve(sp[0], _connect_menu_order(cfg, agent))
+        if picked is not None:
+            _do_connect(agent, cfg, picked, rpath, offer_save=True, ephemeral=ephemeral)
+            return
         # a bare token may be a saved [connect] name -> resolve to its target
         rhost = cfg.connect_hosts.get(sp[0], sp[0])
-        rpath = sp[1] if len(sp) > 1 else "."
-        _do_connect(agent, cfg, rhost, rpath, offer_save=True)
+        _do_connect(agent, cfg, rhost, rpath, offer_save=True, ephemeral=ephemeral)
 
 
 def _connect_remove(agent, cfg, name):
@@ -11650,14 +12958,26 @@ def handle_handover_command(agent, cfg, arg):
     history is then replaced with the handover."""
     print(dim("handover: update + commit durable docs, then write the "
               f"handover between {HANDOVER_MARK} markers and finalize…"))
-    # snapshot the full pre-handover conversation so it stays loadable
-    autosave_session(agent, cfg)
+    # Snapshot the full pre-handover conversation as a <name>-prehandover-N sidecar
+    # (NOT under the live name) so it stays loadable AND the live session keeps its
+    # name. Mirrors auto_handover: an explicit /handover must not fork a named session
+    # into a fresh auto- one (the "it's auto again" bug) - you continue IN the session
+    # you handed over, now carrying the compacted summary.
+    try:
+        rhost = agent.remote.host if agent.remote else None
+        origin = getattr(agent, "autosave_name", "") or "session"
+        existing = [nm for nm, _ in list_sessions()]
+        save_session(list(agent.messages), cfg, _prehandover_name(origin, existing),
+                     remote=rhost, pinned_plan=getattr(agent, "pinned_plan", ""))
+    except Exception:
+        pass
     summary = agent.handover()
     if summary is None:
         print(yellow("\nno handover captured - history left intact. (Write it "
                      f"between {HANDOVER_MARK} markers as visible text.)"))
     else:
-        agent.autosave_name = _new_autosave_name()
+        # Keep the live autosave_name: the next autosave writes the compacted history
+        # back into the SAME session, so a named session stays named.
         print(dim("\nhistory replaced with the handover above; "
                   "new cache boundary set on the summary."))
         agent._print_ctx()
@@ -11763,12 +13083,30 @@ def handle_expand_command(agent, cfg, arg):
     recent tool call. Bare /expand = the most recent call; /expand N = the call
     tagged '#N' on its line. On-screen tool-call lines truncate args to 50 chars;
     this shows all of it (a diff renders colorized) plus the tool's output, capped
-    so it can't flood the terminal."""
+    so it can't flood the terminal.
+
+    /expand msg [N] (alias: messages) - re-print the last N conversation messages
+    (default 10) in the resume-banner style, so you can scroll back without a reload.
+    N is clamped to what exists (a silly count never errors)."""
+    arg = (arg or "").strip()
+    # /expand msg [N] - conversation view (distinct from the tool-call ring below).
+    parts = arg.split()
+    if parts and parts[0].lower() in ("msg", "messages", "m"):
+        n = 10
+        if len(parts) > 1:
+            try:
+                n = int(parts[1])
+            except ValueError:
+                print(dim("  usage: /expand msg [N]  (N = how many recent messages; default 10)"))
+                return
+        if not _render_message_tail(agent.messages, n=n, width=100):
+            print(dim("  no messages yet this session."))
+        return
     calls = getattr(agent, "_tool_calls", None)
     if not calls:
         print(dim("  no tool calls to expand yet this session."))
         return
-    arg = (arg or "").strip().lstrip("#")
+    arg = arg.lstrip("#")
     if not arg:
         entry = calls[-1]
     else:
@@ -12409,12 +13747,16 @@ def run_agent_brief(args) -> int:
     if not cfg.cwd.is_dir():
         return _fail(f"cwd is not a directory: {cfg.cwd}")
 
-    _register_dir_providers(cfg)
-    agent = Agent(cfg)
+    try:
+        _register_dir_providers(cfg)
+        agent = Agent(cfg)
+    except Exception as e:
+        return _fail(f"worker failed to initialise (Agent build): {e}")
     prov = _maybe_autostart_provider(agent, cfg)
     if prov is None or agent.client is None:
-        return _fail("no provider/model available on this box (worker needs the "
-                     "driver's activated provider + auth)")
+        why = getattr(agent, "_provider_fail_reason", "") or (
+            "worker needs the driver's activated provider + auth")
+        return _fail(f"no provider/model available on this box: {why}")
 
     # Attach to the parent's remote (its brain runs here on the driver, but its TOOLS
     # run where the PARENT's do - same box, same codebase). Reuse the parent's live ssh
@@ -12452,14 +13794,18 @@ def run_agent_brief(args) -> int:
     # the activated default and note it - a worker must never die on a bad model name.
     want_model = grant.get("model")
     if want_model and want_model != cfg.active_model():
-        spec = agent.active_provider()
-        avail = list(spec["list_models"]() or []) if spec else []
-        if want_model in avail:
-            cfg.set_active_model(want_model)
-            agent.use_client(spec["make_client"](cfg))
-            agent.messages[0] = {"role": "system", "content": agent._system()}
-        else:
-            print(yellow(f"agent-run: model '{want_model}' not available here; "
+        try:
+            spec = agent.active_provider()
+            avail = list(spec["list_models"]() or []) if spec else []
+            if want_model in avail:
+                cfg.set_active_model(want_model)
+                agent.use_client(spec["make_client"](cfg))
+                agent.messages[0] = {"role": "system", "content": agent._system()}
+            else:
+                print(yellow(f"agent-run: model '{want_model}' not available here; "
+                             f"using '{cfg.active_model()}'"))
+        except Exception as e:
+            print(yellow(f"agent-run: could not switch to model '{want_model}' ({e}); "
                          f"using '{cfg.active_model()}'"))
 
     # Preamble: tell the worker it's headless + how to return its answer.
@@ -12666,6 +14012,8 @@ def main():
                     help="continuously stub acted-on tool results to cut tokens sent (see docs)")
     ap.add_argument("--window-messages", type=int, dest="window_messages",
                     help="send only the last N messages per request (default 30; 0 = unbounded)")
+    ap.add_argument("--window-tokens", dest="window_tokens",
+                    help="cap each send by tokens: 'auto' (=ctx-reserve), an int (hard cap), or 0 (off)")
     ap.add_argument("--cwd", help="project directory (default: current dir)")
     ap.add_argument("-r", "--resume", metavar="NAME",
                     help="resume a saved session by name (see /load)")
@@ -12693,6 +14041,12 @@ def main():
     ap.add_argument("--top-p", type=float, dest="top_p")
     ap.add_argument("--top-k", type=int, dest="top_k")
     ap.add_argument("--repeat-penalty", type=float, dest="repeat_penalty")
+    ap.add_argument("--bg-run", dest="bg_run",
+                    help="(internal) detached backgrounded-command runner: JSON cfg; "
+                         "the cross-platform twin of the POSIX shell bg wrapper")
+    ap.add_argument("--wipe-watch", dest="wipe_watch",
+                    help="(internal) detached self-wipe watchdog for a pushed remote "
+                         "executor: JSON cfg (dir/ttl/chk); cross-platform")
     ap.add_argument("--tool-exec", action="store_true", dest="tool_exec",
                     help="run as a hermetic tool executor (JSON over stdio); internal")
     ap.add_argument("--lean-tools", dest="lean_tools_exec",
@@ -12718,6 +14072,17 @@ def main():
 
     if args.version:                   # version probe: print self-hash, do nothing else
         print(source_hash())           # /connect parses this exact line (hash only)
+        return
+    if args.bg_run:                    # detached bg-runner role: run one command, write sidecars, exit
+        try:
+            sys.exit(run_bg_child(json.loads(args.bg_run)) or 0)
+        except Exception:
+            sys.exit(1)
+    if args.wipe_watch:                # detached self-wipe watchdog for a pushed executor
+        try:
+            run_wipe_watchdog(json.loads(args.wipe_watch))
+        except Exception:
+            pass
         return
     if args.tool_exec:                 # hermetic executor role: no config, no model
         run_tool_executor(args.cwd or ".", args.lean_tools_exec)

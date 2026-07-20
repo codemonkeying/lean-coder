@@ -1,5 +1,5 @@
 """Offline smoke test of lean_coder internals (no Ollama required)."""
-import shutil, sys, tempfile, atexit
+import shutil, sys, tempfile, atexit, os, subprocess
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # repo root (this file lives in tests/)
 import lean_coder as lc
@@ -631,6 +631,100 @@ check("lease: _bg_clean_sidecars removes the .lease too",
       not Path(_llog + ".lease").exists() and not Path(_llog + ".exit").exists())
 lc._bg_save([])
 
+# AFK lease-bump regression (the "worker died with no output" bug, commit 93d489b):
+# a parent idle at the prompt must keep a leased WORKER alive via bg_wake_turn's idle
+# tick, not just per-turn run_turn. Guards the exact seam that once had no test.
+lc._bg_save([])
+_afklog = str(lc.CONFIG_DIR / "bg" / "afk-worker.log")
+Path(_afklog).parent.mkdir(parents=True, exist_ok=True)
+Path(_afklog).write_text("")
+_afk_lease = Path(_afklog + ".lease"); _afk_lease.write_text("")
+_afk_old = _t_bg.time() - 100                                # 100s-stale lease (unattended)
+_os_bg.utime(_afk_lease, (_afk_old, _afk_old))
+lc._bg_register(424242, "fake worker", _afklog, kind="worker", idle_timeout=1800)
+_afk_ag = lc.Agent.__new__(lc.Agent)
+_afk_ag.cfg = lc.Config(model="m"); _afk_ag.remote = None; _afk_ag._bg_announced = set()
+# 1. a worker-only session arms the idle-wake path (the root-cause miss)
+check("afk lease: _has_bg_optins arms for a worker-only session",
+      lc.Agent._has_bg_optins(_afk_ag) is True)
+# 2. bg_wake_turn bumps the stale lease -> the AFK worker survives (no exit 137)
+_afk_before = _afk_lease.stat().st_mtime
+lc.Agent.bg_wake_turn(_afk_ag)
+_afk_after = _afk_lease.stat().st_mtime
+check("afk lease: bg_wake_turn bumps a stale worker lease (survives AFK)",
+      _afk_after > _afk_before)
+# 3. throttle: a second immediate call does NOT re-bump (~free per idle tick)
+_afk_m2 = _afk_lease.stat().st_mtime
+lc.Agent.bg_wake_turn(_afk_ag)
+check("afk lease: bump throttled within 30s", _afk_lease.stat().st_mtime == _afk_m2)
+# 4. past the throttle window it bumps again (steady-state keep-alive)
+_afk_ag._last_idle_lease_bump = _t_bg.monotonic() - 31
+_t_bg.sleep(0.02)
+lc.Agent.bg_wake_turn(_afk_ag)
+check("afk lease: bump resumes after the 30s throttle window",
+      _afk_lease.stat().st_mtime > _afk_m2)
+lc._bg_clean_sidecars({"log": _afklog})
+lc._bg_save([])
+
+# 10d. cross-platform bg-runner (run_bg_child / --bg-run). This is the pure-Python
+# twin of the POSIX shell wrapper used on Windows (no /bin/sh). Assert it reproduces
+# the sidecar contract: plain exit code, and the 137 kill on max_runtime.
+import json as _json_bgr, subprocess as _sp_bgr
+check("bg: _detached_popen_kwargs posix uses start_new_session",
+      lc.os.name == "nt" or lc._detached_popen_kwargs() == {"start_new_session": True})
+check("bg: _kill_tree never raises on a dead/absent pid", lc._kill_tree(2 ** 31 - 1) is None)
+_bgc_dir = Path(tempfile.mkdtemp(prefix="lc_bgchild_"))
+_clog = str(_bgc_dir / "c.log"); Path(_clog).touch()
+_ccfg = {"cmd": "exit 5", "exitf": _clog + ".exit", "leasef": _clog + ".lease", "logf": _clog}
+_crc = lc.run_bg_child(_ccfg)
+check("bg-runner: plain exit code returned + written to sidecar",
+      _crc == 5 and Path(_clog + ".exit").read_text().strip() == "5")
+_mlog = str(_bgc_dir / "m.log"); Path(_mlog).touch()
+_mcfg = {"cmd": "sleep 30", "exitf": _mlog + ".exit", "leasef": _mlog + ".lease",
+         "logf": _mlog, "max_runtime": 2, "kill_on_max": True}
+_argv = [sys.executable, str(Path(lc.__file__).resolve()), "--bg-run", _json_bgr.dumps(_mcfg)]
+_p = _sp_bgr.Popen(_argv, stdout=_sp_bgr.DEVNULL, stderr=_sp_bgr.DEVNULL,
+                   stdin=_sp_bgr.DEVNULL, **lc._detached_popen_kwargs())
+_p.wait()
+check("bg-runner: --bg-run entrypoint enforces max_runtime (exit 137 sidecar)",
+      Path(_mlog + ".exit").read_text().strip() == "137")
+shutil.rmtree(_bgc_dir, ignore_errors=True)
+
+# 10e. self-wipe watchdog (run_wipe_watchdog / --wipe-watch): the cross-platform twin
+# of the old POSIX sh loop. A stale lease -> the pushed dir is rmtree'd; a bumped lease
+# self-heals (no wipe). Uses the real detached --wipe-watch subprocess.
+_ww_dir = Path(tempfile.mkdtemp(prefix="lc_wipe_")) / "leancoder"
+_ww_dir.mkdir(parents=True); (_ww_dir / ".lease").touch(); (_ww_dir / "agent.py").touch()
+_wwargv = [sys.executable, str(Path(lc.__file__).resolve()), "--wipe-watch",
+           _json_bgr.dumps({"dir": str(_ww_dir), "ttl": 2, "chk": 1})]
+_wwp = _sp_bgr.Popen(_wwargv, stdin=_sp_bgr.DEVNULL, stdout=_sp_bgr.DEVNULL,
+                     stderr=_sp_bgr.DEVNULL, **lc._detached_popen_kwargs())
+for _ in range(80):                                     # stale lease -> wipe within TTL+poll
+    if not _ww_dir.is_dir(): break
+    _t_bg.sleep(0.1)
+check("wipe-watch: stale lease -> pushed dir is wiped", not _ww_dir.is_dir())
+
+# 10f. cross-platform ssh transport groundwork: OS-detect + multiplex-aware argv.
+# Windows OpenSSH has NO ControlMaster, so with no ctl the argv builders must drop
+# the ControlPath option; POSIX (ctl set) stays byte-identical. _remote_is_posix
+# classifies the `uname` probe output.
+check("_remote_is_posix: Linux -> True", lc._remote_is_posix("Linux"))
+check("_remote_is_posix: Darwin -> True", lc._remote_is_posix("Darwin"))
+check("_remote_is_posix: empty -> False (Windows)", not lc._remote_is_posix(""))
+check("_remote_is_posix: cmd error -> False",
+      not lc._remote_is_posix("'uname' is not recognized as an internal or external command"))
+check("_remote_is_posix: None -> False", not lc._remote_is_posix(None))
+check("_ctl_opts: with ctl -> ControlPath", lc._ctl_opts("/x") == ["-o", "ControlPath=/x"])
+check("_ctl_opts: no ctl -> empty (no multiplexing)", lc._ctl_opts(None) == [])
+check("_ssh_run_argv: posix carries ControlPath",
+      "ControlPath=/x" in " ".join(lc._ssh_run_argv("h", "/x", "cmd")))
+check("_ssh_run_argv: windows (no ctl) drops ControlPath",
+      "ControlPath" not in " ".join(lc._ssh_run_argv("h", None, "cmd")))
+check("_ssh_exec_argv: windows (no ctl) drops ControlPath, keeps --tool-exec",
+      "ControlPath" not in " ".join(lc._ssh_exec_argv("h", None, "python agent.py", "."))
+      and "--tool-exec" in " ".join(lc._ssh_exec_argv("h", None, "python agent.py", ".")))
+check("_ssh_master_alive: no ctl -> False (no master to check)",
+      lc._ssh_master_alive("h", None) is False)
 # --- worker engine (--agent-run): brief/grant parsing + result harvest --------
 # The full headless run is hand-tested (needs a live provider); here we cover the
 # pure logic that shapes a worker run so a regression is caught offline.
@@ -900,12 +994,13 @@ _nondefault = {
     "bg_max_concurrent": 2, "worker_max_concurrent": 4, "worker_idle_timeout": 900,
     "worker_max_iterations": 15, "editor": "vim", "approval": "auto", "confirm_reads": True,
     "auto_reconnect": True, "statusline": False, "statusline_every": 3, "statusline_iter": 20,
-    "auto_evict": True, "auto_evict_keep": 5, "window_messages": 12, "auto_handover": False,
+    "auto_evict": True, "auto_evict_keep": 5, "window_messages": 12, "window_tokens": 4000,
+    "auto_handover": False,
     "handover_soft": 0.42, "handover_hard": 0.61, "handover_emergency": 0.99,
     "handover_min_interval": 33.0, "autostart_after_handover": False,
     "auto_compact_interval": 8, "auto_compact_hysteresis": 0.4, "auto_compact_keep": 6,
     "wake_on_bg_finish": True, "lean_tools_dir": "/tmp/lt", "providers_dir": "/tmp/pv",
-    "user_name": "dide", "model": "some-model:1b",
+    "user_name": "dide", "model": "some-model:1b", "ephemeral": True,
 }
 # every persisted scalar must have a probe value here (so nothing is left untested)
 _missing_probe = [k for k in lc._PERSISTED_SCALAR_KEYS if k not in _nondefault]
@@ -1017,6 +1112,32 @@ try:
           {"soft": 0.6, "hard": 0.85})
 finally:
     lc.CONFIG_PATH = _orig_cpB
+
+# handover_overrides + non-default global thresholds SURVIVE a save_config round-trip.
+# Regression: save_config had no serializer for handover_overrides (a BESPOKE key), so
+# every autosave_config() rewrote config.toml WITHOUT them - they vanished and the next
+# load fell back to the global defaults (0.70/0.95 -> the "handover 95%" reset). Model
+# names carry ':'/'.' so the table header MUST be quoted or the whole file won't parse.
+_hop2 = _plA.Path(_tfA.mkdtemp()) / "ho2.toml"
+_orig_cpC = lc.CONFIG_PATH
+lc.CONFIG_PATH = _hop2
+try:
+    _cfg = lc.Config()
+    _cfg.handover_soft = 0.2
+    _cfg.handover_hard = 0.25
+    _cfg.handover_overrides = {"qwen3:32b": {"soft": 0.6, "hard": 0.85},
+                               "claude-opus-4-8": {"auto": False}}
+    lc.save_config(_cfg, quiet=True)
+    _rl = lc.load_config(A())
+    check("save_config preserves non-default global thresholds",
+          (_rl.handover_soft, _rl.handover_hard) == (0.2, 0.25),
+          (_rl.handover_soft, _rl.handover_hard))
+    check("save_config preserves handover_overrides (colon/dot model names)",
+          _rl.handover_overrides == {"qwen3:32b": {"soft": 0.6, "hard": 0.85},
+                                     "claude-opus-4-8": {"auto": False}},
+          _rl.handover_overrides)
+finally:
+    lc.CONFIG_PATH = _orig_cpC
 
 # 12. /compact - stub old tool results, keep last N in full
 ag = lc.Agent(lc.Config(cwd=FIX, approval="auto"))
@@ -1148,6 +1269,59 @@ _noturn = [{"role": "system", "content": "S"},
 check("_window with no user boundary in range returns unchanged",
       wm._window_messages(_noturn, 2) is _noturn)
 check("window_messages defaults to 0 (off - full context)", lc.Config().window_messages == 0)
+
+# 12d'. _window_by_tokens: HARD token cap wins over window_messages, keeps whole recent
+# turns under budget, always keeps system + reserves the env/plan tail, non-destructive.
+check("window_tokens defaults to 'auto' (overflow backstop on)", lc.Config().window_tokens == "auto")
+wt = lc.Agent.__new__(lc.Agent)
+wt.cfg = lc.Config(model="m")
+wt.cfg.window_tokens = 0                      # tests below drive the numeric path explicitly
+wt.tool_defs = []
+wt.tool_defs = []
+wt.pinned_plan = ""
+wt._skip_plan_reminder_once = False
+wt._plan_full_next = True
+wt.remote = None
+_big = [{"role": "system", "content": "S"}]
+for _i in range(1, 21):
+    _big.append({"role": "user", "content": f"user turn number {_i} " * 4})
+    _big.append({"role": "assistant", "content": f"assistant reply number {_i} " * 4})
+check("window_tokens: ample budget returns history unchanged",
+      wt._window_by_tokens(_big, 100000) is _big)
+_wt = wt._window_by_tokens(_big, 400)
+check("window_tokens: keeps the system message first", _wt[0]["role"] == "system")
+check("window_tokens: body starts on a clean user boundary (no orphan)",
+      _wt[1]["role"] == "user")
+check("window_tokens: actually trimmed the history", len(_wt) < len(_big))
+check("window_tokens: kept slice is the most RECENT turns",
+      _wt[-1]["content"] == _big[-1]["content"])
+check("window_tokens: non-destructive (history intact)", len(_big) == 41)
+wt.cfg.window_tokens = 400
+wt.cfg.window_messages = 99
+check("_window_messages: window_tokens takes precedence over window_messages",
+      len(wt._window_messages(_big, 99)) < len(_big))
+wt.cfg.window_tokens = 0
+check("_window_messages: falls back to window_messages when window_tokens is 0",
+      wt._window_messages(_big, 99) is _big)
+# _resolve_window_tokens: 'auto' -> ctx_window minus a reply reserve; int passthrough; off-cases
+wt.cfg.window_messages = 0
+wt.cfg.window_tokens = "auto"
+wt.cfg.num_ctx = 8192                          # ollama path: ctx_window() reads num_ctx
+_auto = wt._resolve_window_tokens()
+check("_resolve_window_tokens: 'auto' = ctx minus reply reserve (< ctx, > 0)",
+      0 < _auto < 8192)
+check("_resolve_window_tokens: 'auto' leaves a sane reply reserve (>= 15% of ctx)",
+      8192 - _auto >= int(8192 * 0.15))
+wt.cfg.window_tokens = 4000
+check("_resolve_window_tokens: an int passes through as the hard cap",
+      wt._resolve_window_tokens() == 4000)
+wt.cfg.window_tokens = 0
+check("_resolve_window_tokens: 0 -> off", wt._resolve_window_tokens() == 0)
+wt.cfg.window_tokens = "off"
+check("_resolve_window_tokens: junk string -> off", wt._resolve_window_tokens() == 0)
+wt.cfg.window_tokens = "auto"                 # backstop no-op on a small history (fits ctx)
+check("window_tokens 'auto': no-op when the history fits the window",
+      wt._window_messages(_big, 0) is _big)
 
 # 12d-bis. _auto_resume_pick: most-recent session wins, NOT cwd-scoped, snapshots skipped
 _ar_rows = [
@@ -1323,9 +1497,13 @@ _ppt = lc.Agent(lc.Config(cwd=FIX)); _ppt.pinned_plan = "GOAL: x"
 _st = _ppt._with_plan_reminder([{"role": "tool", "tool_name": "read_file", "content": "DATA"}])
 check("_with_plan_reminder keeps a tool result exact, adds a trailing user note",
       _st[0]["content"] == "DATA" and _st[-1]["role"] == "user" and "GOAL: x" in _st[-1]["content"])
-check("_with_plan_reminder no-op when no plan",
-      lc.Agent(lc.Config(cwd=FIX))._with_plan_reminder([{"role": "user", "content": "q"}])
-      == [{"role": "user", "content": "q"}])
+# With no plan pinned the PLAN block is absent, but the live session-env ALWAYS rides
+# the uncached tail (cwd + shell family) - so the last message gains the ENV block only.
+_npr = lc.Agent(lc.Config(cwd=FIX))._with_plan_reminder([{"role": "user", "content": "q"}])
+check("_with_plan_reminder: no plan -> env rides, no plan block",
+      _npr[-1]["content"].startswith("q")
+      and "SESSION ENV" in _npr[-1]["content"]
+      and "PINNED PLAN" not in _npr[-1]["content"])
 
 # soft-zone nudge: throttled, soft zone only, injected (not in the cached prompt)
 sn = lc.Agent.__new__(lc.Agent)
@@ -1578,6 +1756,68 @@ check("_menu_index parses valid", lc._menu_index("3", 4) == 2)
 check("_menu_index rejects 0/oob/nonnum",
       lc._menu_index("0", 4) is None and lc._menu_index("5", 4) is None
       and lc._menu_index("x", 4) is None)
+
+# --- MENU CONTRACT: a bare 1-based integer arg selects the Nth item from the SAME
+# ordered list the command's picker renders. One resolver (menu_resolve) backs every
+# menu-fronting command; these guard against a command re-drifting to a literal (the
+# `/connect 8` -> bare-integer-address bug).
+_mc = ["user@a", "user@b", "user@c"]
+check("menu_resolve: 1-based index -> item", lc.menu_resolve("2", _mc) == "user@b")
+check("menu_resolve: out-of-range -> None", lc.menu_resolve("9", _mc) is None)
+check("menu_resolve: 0 -> None", lc.menu_resolve("0", _mc) is None)
+check("menu_resolve: non-numeric -> None (caller does literal)",
+      lc.menu_resolve("user@a", _mc) is None)
+check("menu_resolve: empty list -> None", lc.menu_resolve("1", []) is None)
+# _connect_menu_order must match the picker ordering (saved targets, then open-unsaved)
+class _FakeAg:
+    def __init__(self, remotes): self.remotes = remotes
+_cord = lc._connect_menu_order(
+    lc.Config(connect_hosts={"box1": "user@192.0.2.1", "box2": "user@192.0.2.2"}),
+    _FakeAg(["user@open"]))
+check("connect menu order: saved-then-open",
+      _cord == ["user@192.0.2.1", "user@192.0.2.2", "user@open"])
+check("connect menu order: numeric arg picks the same row menu shows",
+      lc.menu_resolve("3", _cord) == "user@open")
+# the picker renders from the SAME items builder -> can't drift from the arg path
+check("connect: picker + arg path share one order",
+      [t for _n, t in lc._connect_menu_items(
+          {"box1": "user@192.0.2.1", "box2": "user@192.0.2.2"}, ["user@open"])] == _cord)
+# every menu-fronting command's numeric branch routes through menu_resolve
+import inspect as _insp
+_src_rma = _insp.getsource(lc._resolve_model_arg)
+check("contract: _resolve_model_arg uses menu_resolve (no ad-hoc isdigit index)",
+      "menu_resolve(" in _src_rma and "int(arg) - 1" not in _src_rma)
+_src_conn = _insp.getsource(lc.handle_connect_command)
+check("contract: handle_connect_command uses menu_resolve",
+      "menu_resolve(" in _src_conn)
+
+# --- /expand msg [N]: conversation view with clamp safeguards (never errors on a silly
+# count, never under-reads). _render_message_tail is the shared renderer.
+import io as _io_em, contextlib as _cl_em
+_em_msgs = ([{"role": "system", "content": "sys"}]
+            + [{"role": ("user" if i % 2 == 0 else "assistant"), "content": f"m{i}"}
+               for i in range(6)])                 # 6 non-system messages
+def _em_render(n):
+    with _cl_em.redirect_stdout(_io_em.StringIO()) as _b:
+        ok = lc._render_message_tail(_em_msgs, n=n)
+    return ok, _b.getvalue()
+_ok3, _o3 = _em_render(3)
+check("expand msg: shows last N", _ok3 and "3 of 6 messages" in _o3
+      and "m5" in _o3 and "m3" in _o3 and "m2" not in _o3)
+_okBig, _oBig = _em_render(324221341341323)         # absurd count -> clamp to all, no error
+check("expand msg: absurd N clamps to all (no error)", _okBig and "6 of 6 messages" in _oBig)
+_ok0, _o0 = _em_render(0)                           # 0/negative -> clamp up to 1
+check("expand msg: 0 clamps up to 1", _ok0 and "1 of 6 messages" in _o0)
+_okNeg, _oNeg = _em_render(-5)
+check("expand msg: negative clamps up to 1", _okNeg and "1 of 6 messages" in _oNeg)
+with _cl_em.redirect_stdout(_io_em.StringIO()):     # empty conversation -> False, no crash
+    _okEmpty = lc._render_message_tail([{"role": "system", "content": "s"}], n=10)
+check("expand msg: empty conversation -> no-op False", _okEmpty is False)
+# the resume banner appends the /expand msg hint when the view is partial
+with _cl_em.redirect_stdout(_io_em.StringIO()) as _bh:
+    lc._print_session_tail(_em_msgs, n=2)
+check("expand msg: resume banner hints /expand msg when partial",
+      "/expand msg" in _bh.getvalue())
 
 class FakeClient:
     def __init__(self, models): self._m = models
@@ -1900,8 +2140,24 @@ check("_tools_to_sync: pushes new + changed only",
 check("_tools_to_sync: removes de-selected remote tools", _l2s_rm == ["d.py"])
 check("_tools_to_sync: nothing to do when in sync",
       lc._tools_to_sync({"a.py": "h"}, {"a.py": "h"}) == ([], []))
-check("install_cmd maps apt-get", lc._install_cmd("apt-get").startswith("sudo apt-get"))
-check("install_cmd unknown -> None", lc._install_cmd("nope") is None)
+check("posix_embed_asset x86_64 defaults to gnu",
+      lc._posix_embed_asset("x86_64")[0].endswith("x86_64-unknown-linux-gnu-install_only.tar.gz"))
+check("posix_embed_asset musl build selectable",
+      lc._posix_embed_asset("x86_64", "musl")[0].endswith("x86_64-unknown-linux-musl-install_only.tar.gz"))
+check("posix_embed_asset gnu != musl (different sha)",
+      lc._posix_embed_asset("x86_64", "gnu")[2] != lc._posix_embed_asset("x86_64", "musl")[2])
+check("posix_embed_asset maps aarch64 (arm64 alias)",
+      lc._posix_embed_asset("arm64") == lc._posix_embed_asset("aarch64")
+      and "aarch64" in lc._posix_embed_asset("arm64")[0])
+check("posix_embed_asset normalises case/whitespace",
+      lc._posix_embed_asset(" X86_64\n") == lc._posix_embed_asset("x86_64"))
+check("posix_embed_asset uncovered arch -> None (caller hard-errors)",
+      lc._posix_embed_asset("mips") is None)
+check("posix_embed_asset uncovered libc -> None",
+      lc._posix_embed_asset("x86_64", "uclibc") is None)
+check("posix_embed_asset returns (fn, url, 64-hex sha256)",
+      len(lc._posix_embed_asset("x86_64")[2]) == 64
+      and lc._posix_embed_asset("x86_64")[1].startswith("https://github.com/astral-sh/"))
 
 # 20b. remote tool gating + driver-side confirm (stage 3)
 c0 = lc.Config()
@@ -1944,22 +2200,21 @@ _rt = pathlib.Path(tempfile.mkdtemp())
 _e, _clip, _tot, _shown = lc._read_raw_b64(_rt / "x", max_bytes=3)
 check("_read_raw_b64 clips with real counts (no marker)",
       _clip and _tot == 5 and _shown == 3 and _b64mod.b64decode(_e) == b"ABC")
-check("_read_raw_b64 exact + unclipped under cap",
-      lc._read_raw_b64(_rt / "x")[1] is False)
-shutil.rmtree(_rt, ignore_errors=True)
-
-# minor 1: system prompt names the dir tools act on (remote when connected), no "remote" leak
+# minor 1: the live session-env (uncached tail) names the dir tools act on (remote when
+# connected) + the shell family, and never leaks "remote"/"local" to the model.
 class _WS:
-    host = "gpu"; cwd = "."; remote_cwd = "/srv/app"
+    host = "gpu"; cwd = "."; remote_cwd = "/srv/app"; remote_posix = True
     def read_raw(self, p): return None
 agm = lc.Agent(lc.Config(cwd=FIX))
-check("system cwd is local by default", str(FIX) in agm.messages[0]["content"])
+check("session-env cwd is local by default", str(FIX) in agm._session_env())
+check("cached system block no longer carries the cwd", str(FIX) not in agm.messages[0]["content"])
 agm.set_remote(_WS())
-check("system cwd switches to remote dir on connect", "/srv/app" in agm.messages[0]["content"])
-check("system prompt does not leak 'remote' to the model",
-      "remote" not in agm.messages[0]["content"].lower())
+check("session-env cwd switches to remote dir on connect", "/srv/app" in agm._session_env())
+check("session-env does not leak 'remote'/'local' to the model",
+      "remote" not in agm._session_env().lower() and "local" not in agm._session_env().lower())
+check("session-env states the shell family (POSIX remote)", "sh (POSIX)" in agm._session_env())
 agm.set_remote(None)
-check("system cwd returns to local on disconnect", str(FIX) in agm.messages[0]["content"])
+check("session-env cwd returns to local on disconnect", str(FIX) in agm._session_env())
 
 # 22. lean-tools: load, dispatch (safe vs confirm), config round-trip
 plugdir = pathlib.Path(tempfile.mkdtemp(prefix="lc_plug_"))
@@ -2309,8 +2564,8 @@ try:
     ag.set_remote(ws)
     check("agent remote mode: no ssh in surface (it's an opt-in lean-tool now)",
           "ssh" not in [t["function"]["name"] for t in ag.tool_defs])
-    check("system prompt picks up the remote cwd (handshake)",
-          bool(ws.remote_cwd) and ws.remote_cwd in ag.messages[0]["content"])
+    check("session-env picks up the remote cwd (handshake)",
+          bool(ws.remote_cwd) and ws.remote_cwd in ag._session_env())
     check("remote read_raw fetches file content",
           "print('hi')" in (ws.read_raw("hello.py") or ""))
     check("router: read-only runs remote (no confirm)",
@@ -2364,6 +2619,143 @@ shutil.rmtree(shimdir, ignore_errors=True)
 shutil.rmtree(proj, ignore_errors=True)
 shutil.rmtree(plugdir, ignore_errors=True)
 
+# 22b. Windows transport branches (remote_posix=False): the remote file helpers must
+# emit PowerShell, not POSIX sh. We drive a RemoteWorkspace whose _run captures the
+# command string (and returns canned output) instead of touching ssh - so the branch
+# selection is asserted offline, before a real Win11 box exists.
+_wsw = lc.RemoteWorkspace.__new__(lc.RemoteWorkspace)
+_wsw.host = "winbox"; _wsw.ctl = "/tmp/x.sock"; _wsw.remote_posix = False
+_wsw.remote_dir = r"C:\Users\me\AppData\Local\Temp\leancoder"
+_wcaps = []
+# Simulate the Windows box for the scp push: capture the scp argv, "receive" the file
+# by reading the local temp file scp would have sent, and answer Get-FileHash with the
+# sha256 of those bytes so the end-to-end verify passes.
+_wstate = {"files": {}}
+def _wsw_run(cmd, tty=False, _caps=_wcaps):
+    import re as _re
+    _caps.append(cmd)
+    if "New-Item" in cmd and "Directory" in cmd and "agent.py" not in cmd:
+        return 0, _wsw.remote_dir, ""
+    if "Get-FileHash" in cmd:
+        m = _re.search(r'Test-Path "([^"]*)"', cmd)
+        data = _wstate["files"].get(m.group(1)) if m else None
+        return (0, lc.hashlib.sha256(data).hexdigest().upper(), "") if data is not None else (0, "", "")
+    return 0, "", ""
+_wsw._run = _wsw_run
+_wwrites = []
+_orig_ssh_run = lc.subprocess.run
+def _cap_ssh_run(argv, *a, **k):
+    # scp argv is ["scp", ..., <localtmp>, "winbox:C:/.../big"]: emulate the transfer by
+    # reading the local temp file and recording it under the (backslash) remote path.
+    _wwrites.append((argv, k.get("input")))
+    if argv and argv[0] == "scp":
+        localtmp = argv[-2]
+        remote = argv[-1].split(":", 1)[1].replace("/", "\\")
+        try:
+            _wstate["files"][remote] = open(localtmp, "rb").read()
+        except OSError:
+            pass
+    class _R:  # noqa
+        returncode = 0; stdout = b""; stderr = b""
+    return _R()
+# _remote_write / push go through subprocess.run(_scp_argv(...)); capture those
+lc.subprocess.run = _cap_ssh_run
+try:
+    _wsw._remote_mkdir(r"C:\tmp\d")
+    check("win: _remote_mkdir emits PowerShell New-Item",
+          "New-Item -ItemType Directory" in _wcaps[-1] and "mkdir" not in _wcaps[-1])
+    _wsw._remote_sha256(r"C:\tmp\f")
+    check("win: _remote_sha256 emits Get-FileHash SHA256",
+          "Get-FileHash -Algorithm SHA256" in _wcaps[-1] and "sha256sum" not in _wcaps[-1])
+    check("win: _remote_sep is backslash", _wsw._remote_sep() == "\\")
+    _wsw._remote_write(r"C:\tmp\big", b"data" * 20000)
+    check("win: _remote_write pushes via scp (no stdin, no cat >, no Add-Content)",
+          any(a[0] and a[0][0] == "scp" for a in _wwrites)
+          and all("cat >" not in c for c in _wcaps)
+          and all("Add-Content" not in c for c in _wcaps))
+    check("win: scp push reconstructs bytes end-to-end (sha256 verified)",
+          _wstate["files"].get(r"C:\tmp\big") == b"data" * 20000)
+    check("win: scp argv reuses the ControlPath + BatchMode",
+          any("BatchMode=yes" in a[0] and any("ControlPath" in x for x in a[0])
+              for a in _wwrites if a[0] and a[0][0] == "scp"))
+    _wsw.win_python = "py -3"
+    _ex, _rd = _wsw._reuse_executor_win("deadbeef")
+    check("win: _reuse_executor_win probes agent.py via Test-Path + py",
+          any("Test-Path" in c and "--version" in c for c in _wcaps))
+finally:
+    lc.subprocess.run = _orig_ssh_run
+# _check_windows_python: a real interpreter path passes; a bare stub fails
+_wsp = lc.RemoteWorkspace.__new__(lc.RemoteWorkspace)
+_wsp.host = "winbox"
+_wsp._run = lambda cmd, tty=False: (0, r"C:\Python312\python.exe", "")   # real path back
+_wsp._check_windows_python()
+check("win: _check_windows_python accepts a real interpreter", getattr(_wsp, "win_python", None) in ("py -3", "python"))
+_wsp2 = lc.RemoteWorkspace.__new__(lc.RemoteWorkspace)
+_wsp2.host = "winbox"
+_wsp2._run = lambda cmd, tty=False: (0, "", "")                          # no interpreter
+try:
+    _wsp2._check_windows_python()
+    check("win: _check_windows_python errors when Python absent", False)
+except ConnectionError as _e:
+    check("win: _check_windows_python errors when Python absent", "no Python" in str(_e))
+
+# 22c. Regression cover for the Windows live-connect fixes (all found on 192.0.2.16):
+# (i) _kill_tree default sig must NOT be signal.SIGKILL (absent on Windows -> import
+#     crash). Resolves to SIGTERM when SIGKILL is missing; here (POSIX) SIGKILL exists.
+import inspect as _inspect
+check("win: _kill_tree default sig is a None sentinel (no import-time SIGKILL)",
+      _inspect.signature(lc._kill_tree).parameters["sig"].default is None)
+# (ii) _win_quote makes an EMPTY arg a real '' token (shlex.quote drops it, so PowerShell
+#      swallowed the next flag -> the empty-cwd argparse crash that killed the executor).
+check("win: _win_quote('') -> real empty quoted token", lc._win_quote("") == "''")
+check("win: _win_quote escapes a literal quote by doubling", lc._win_quote("a'b") == "'a''b'")
+# Windows commands are now wrapped as `powershell -NoProfile -NonInteractive
+# -EncodedCommand <base64-UTF16LE>` (shell-agnostic: runs under cmd.exe OR PowerShell,
+# so a stock box whose sshd DefaultShell is cmd.exe no longer fails every command).
+# Decode the payload back to the PowerShell text so the branch asserts still inspect it.
+import base64 as _b64
+def _decode_ps(s):
+    """Return the decoded PowerShell text if s is an -EncodedCommand wrapper, else s."""
+    m = _re.search(r'-EncodedCommand\s+([A-Za-z0-9+/=]+)', s)
+    return _b64.b64decode(m.group(1)).decode("utf-16-le") if m else s
+check("win: _win_ps wraps as base64 -EncodedCommand (shell-agnostic)",
+      "-EncodedCommand" in lc._win_ps("Write-Output hi")
+      and _decode_ps(lc._win_ps("Write-Output hi")) == "Write-Output hi")
+# (iii) _ssh_exec_argv quotes per-OS: POSIX shlex vs Windows PowerShell (_win_quote), and
+#       a None/empty cwd becomes '.' not a dropped token. (Windows: inside the wrapper.)
+_ewin = _decode_ps(lc._ssh_exec_argv("h", None, 'python "a.py"', None, posix=False)[-1])
+check("win: _ssh_exec_argv (posix=False) uses '.' for a None cwd, PowerShell-quoted",
+      "--cwd '.'" in _ewin and "--cwd ''" not in _ewin)
+_eposix = lc._ssh_exec_argv("h", "/c", "python3 agent.py", "/p", posix=True)[-1]
+check("win: _ssh_exec_argv (posix=True) keeps POSIX shlex quoting", "--cwd /p" in _eposix)
+# (iv) _wipe_remote basename guard is separator-agnostic: a backslash Windows remote_dir
+#      whose leaf is 'leancoder' must ACTUALLY wipe (posixpath.basename returned the whole
+#      string -> early return -> the pushed dir leaked every session). Capture the emitted
+#      command; a non-leancoder leaf must still be refused.
+_wr = lc.RemoteWorkspace.__new__(lc.RemoteWorkspace)
+_wr.host = "winbox"; _wr.ctl = None; _wr.remote_posix = False; _wr.reused = None
+_wr.remote_dir = r"C:\Users\me\AppData\Local\Temp\leancoder"
+_wcmd = {}
+def _cap_wipe(argv, *a, **k):
+    _wcmd["cmd"] = argv[-1]
+    class _R:  # noqa
+        returncode = 0; stdout = b""; stderr = b""
+    return _R()
+_orig_wipe_run = lc.subprocess.run
+lc.subprocess.run = _cap_wipe
+try:
+    _wr._wipe_remote()
+    _wcmd_ps = _decode_ps(_wcmd.get("cmd", ""))
+    check("win: _wipe_remote runs on a backslash 'leancoder' path (guard not early-return)",
+          bool(_wcmd) and "Remove-Item" in _wcmd_ps and ".watchdog.pid" in _wcmd_ps)
+    _wcmd.clear()
+    _wr.remote_dir = r"C:\Users\me\AppData\Local\Temp\notours"
+    _wr._wipe_remote()
+    check("win: _wipe_remote REFUSES a non-leancoder leaf (safety guard holds)", not _wcmd)
+finally:
+    lc.subprocess.run = _orig_wipe_run
+
+# 23. install.sh --remote: stage + run the installer on another box over SSH
 # 23. install.sh --remote: stage + run the installer on another box over SSH
 import subprocess as _subp
 INSTALL = str(Path(lc.__file__).parent / "install.sh")
@@ -2793,8 +3185,9 @@ _resag.last_prompt_tokens = 9999
 _rn = _resag.restore(_smsgs)
 check("agent.restore: returns body turn count", _rn == 3)
 check("agent.restore: system rebuilt for current cwd (not 'OLD SYS')",
-      _resag.messages[0]["role"] == "system" and str(FIX) in _resag.messages[0]["content"]
-      and "OLD SYS" not in _resag.messages[0]["content"])
+      _resag.messages[0]["role"] == "system"
+      and "OLD SYS" not in _resag.messages[0]["content"]
+      and str(FIX) in _resag._session_env())
 check("agent.restore: only one system message", sum(
     1 for m in _resag.messages if m["role"] == "system") == 1)
 check("agent.restore: body preserved after system",
@@ -3031,12 +3424,20 @@ check("_status_rows hides handovers count when none have happened",
       "handovers" not in _plain)
 check("_status_rows shows the round-cap only in auto mode", "max 25 rounds" in _plain)
 check("_status_rows row1 shows the session name with a colon", "session: sess-x" in _plain)
-# window ON -> the size is shown; handovers count appears once any have happened
+# window ON -> the size is shown; handovers count appears once any have happened.
+# window_tokens (default 'auto') takes precedence in the row, so turn it off to exercise
+# the message-count display.
+_srag.cfg.window_tokens = 0
 _srag.cfg.window_messages = 40
 _srag.handovers = 2
 _plain_w = "\n".join(_re.sub(r"\x1b\[[0-9;]*m", "", r) for r in lc._status_rows(_srag, _srag.cfg))
 check("_status_rows shows 'window N' when window is on", "window 40" in _plain_w)
 check("_status_rows shows handovers count once any happened", "2 handovers" in _plain_w)
+# window_tokens 'auto' renders as 'window auto' and wins over a message-count window
+_srag.cfg.window_tokens = "auto"
+_plain_a = "\n".join(_re.sub(r"\x1b\[[0-9;]*m", "", r) for r in lc._status_rows(_srag, _srag.cfg))
+check("_status_rows shows 'window auto' when window_tokens is auto", "window auto" in _plain_a)
+_srag.cfg.window_tokens = 0
 _srag.cfg.window_messages = 0
 _srag.handovers = 0
 _srag.cfg.statusline = False
@@ -4326,11 +4727,12 @@ try:
           "run_command" not in [t["function"]["name"] for t in _mag.tool_defs]
           and "read-write" in (_mag._pending_ai_note or "")
           and "Read-write" not in _mag.messages[0]["content"])
-
-    # incognito: model is told + no local session persistence
+    # incognito: no local session persistence. (The incognito NOTICE was removed from
+    # the system prompt - the model is no longer told; only the on-disk behaviour matters.)
     _iag = lc.Agent(lc.Config(cwd=FIX, incognito=True))
     _iag.autosave_name = "auto-incog-test"
-    check("incognito: system prompt tells the model", "Incognito" in _iag.messages[0]["content"])
+    check("incognito: notice NOT in the (trimmed) system prompt",
+          "Incognito" not in _iag.messages[0]["content"])
     _isd = lc.SESSIONS_DIR
     lc.SESSIONS_DIR = Path(tempfile.mkdtemp(prefix="lc_incog_"))
     _iag.messages.append({"role": "user", "content": "secret"})
@@ -4412,6 +4814,16 @@ check("argcomp: /session load + /session save key to the same name list",
 check("argcomp: /autosave on/off", lc._arg_completions(_fa, _fc, "/autosave") == ["on", "off"])
 check("argcomp: /connect saved + open hosts",
       "dev" in lc._arg_completions(_fa, _fc, "/connect") and "box1" in lc._arg_completions(_fa, _fc, "/connect"))
+# CLI contract: a command's flags Tab-complete at ANY arg position (mirrors the handlers
+# that parse them order-agnostically) - the `/connect 8 --ephe<Tab>` gap.
+check("flagcomp: --ephemeral offered on /connect first arg",
+      "--ephemeral" in lc._completion_options(_fa, _fc, "/connect --eph"))
+check("flagcomp: --ephemeral offered after a positional arg",
+      lc._completion_options(_fa, _fc, "/connect 8 --ephe") == ["--ephemeral"])
+check("flagcomp: universal --plain/--fallback offered on any command",
+      set(["--plain", "--fallback"]).issubset(set(lc._completion_options(_fa, _fc, "/connect 8 --"))))
+check("flagcomp: an already-typed flag is not re-offered",
+      "--ephemeral" not in lc._completion_options(_fa, _fc, "/connect --ephemeral 8 --"))
 check("argcomp: /local open remotes", lc._arg_completions(_fa, _fc, "/local") == ["box1"])
 check("argcomp: unknown command -> no completions", lc._arg_completions(_fa, _fc, "/quit") == [])
 check("argcomp: /approve modes", lc._arg_completions(_fa, _fc, "/approve") == list(lc.APPROVAL_MODES))
@@ -4518,6 +4930,57 @@ check("_set_setting_field: leash applies live (cfg + reduced tool surface)",
       _lag.cfg.leash == "r" and len(_lag.tool_defs) < _n_rwe)
 check("_set_setting_field: leash with agent=None just sets cfg (headless-safe)",
       lc._set_setting_field(None, lc.Config(leash="rwe"), "leash", "r") is True)
+
+# --- GOAL C: uniform DEFAULTS / SESSION-OVERRIDE layer -----------------------
+# (a) /set (session scope) records a session override, NOT a config default.
+_ovc = lc.Config(model="m", temperature=0.7)
+_ovc._defaults = {k: getattr(_ovc, k) for k in lc._PERSISTED_SCALAR_KEYS}
+lc._set_setting_field(None, _ovc, "temperature", "0.2", scope="session")
+check("goal C: /set session override sets live cfg", _ovc.temperature == 0.2)
+check("goal C: /set session override recorded in session_overrides",
+      _ovc.session_overrides.get("temperature") == 0.2)
+check("goal C: /set session override does NOT touch _defaults",
+      _ovc._defaults.get("temperature") == 0.7)
+# (b) save_config writes scalar lines FROM _defaults, so the override never leaks.
+import tomllib as _ttc
+_ocp = lc.CONFIG_PATH
+_ocf = pathlib.Path(tempfile.mktemp(suffix=".toml")); lc.CONFIG_PATH = _ocf
+lc.save_config(_ovc, quiet=True)
+check("goal C: save_config writes the DEFAULT, not the session override",
+      _ttc.loads(_ocf.read_text()).get("temperature") == 0.7)
+# (c) /set --config writes ONE key to the default AND clears the session override.
+lc._set_setting_field(None, _ovc, "temperature", "0.9", scope="config")
+check("goal C: /set --config updates _defaults", _ovc._defaults.get("temperature") == 0.9)
+check("goal C: /set --config clears the session override",
+      "temperature" not in _ovc.session_overrides)
+lc.save_config(_ovc, quiet=True)
+check("goal C: /set --config persisted the new default",
+      _ttc.loads(_ocf.read_text()).get("temperature") == 0.9)
+# (d) session load applies overrides at RUNTIME only, never writing config.toml.
+_load_cfg = lc.Config(model="m", approval="ask")
+_load_cfg._defaults = {k: getattr(_load_cfg, k) for k in lc._PERSISTED_SCALAR_KEYS}
+class _StubAg:
+    def __init__(self): self.messages = [{"role": "system", "content": ""}]; self.pinned_plan = ""
+    def refresh_tools(self): pass
+    def _system(self): return ""
+_meta = {"session_overrides": {"approval": "auto"}, "leash": "rwe"}
+_before = _ocf.read_text()
+lc._restore_backend_for = (lambda *a, **k: "")  # neutralize backend switch for this stub
+lc._restore_session_state(_StubAg(), _load_cfg, _meta)
+check("goal C: session load applies the override to live cfg", _load_cfg.approval == "auto")
+check("goal C: session load leaves _defaults (config) unchanged",
+      _load_cfg._defaults.get("approval") == "ask")
+check("goal C: session load did NOT rewrite config.toml", _ocf.read_text() == _before)
+# (e) handover_for: session override > per-model handover_overrides > global.
+_hc = lc.Config(model="m", handover_soft=0.70,
+                handover_overrides={"m": {"soft": 0.50}})
+_hc.set_active_model("m")
+check("goal C: handover_for uses per-model override when no session override",
+      _hc.handover_for("m")["soft"] == 0.50)
+_hc.session_overrides["handover_soft"] = 0.33; _hc.handover_soft = 0.33
+check("goal C: handover_for session override beats per-model",
+      _hc.handover_for("m")["soft"] == 0.33)
+lc.CONFIG_PATH = _ocp; _ocf.unlink(missing_ok=True)
 
 # --- leash HARD dispatch lock (defense in depth behind the surface filter) ---
 check("_leash_allows_tool: read rides at r", lc._leash_allows_tool("r", "read_file") is True)
@@ -4906,5 +5369,21 @@ _c = lc.Config()
 check("mcp config defaults empty", _c.mcp_servers == {} and _c.mcp_enabled == [])
 
 shutil.rmtree(FIX, ignore_errors=True)
+
+# Hygiene sweep as a HARD gate: the leak of a real internal IP into tracked source
+# slipped through because tests/_sweep.sh (the lint that catches exactly that) was
+# never run - no pre-commit hook invoked it, and this smoketest didn't either. Fold
+# it in here so the one command we DO run before every commit also fails on a stray
+# non-example IP / email / key / MAC / unicode dash. Skipped only if bash is absent.
+_sweep = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_sweep.sh")
+if os.path.isfile(_sweep) and shutil.which("bash"):
+    _sw = subprocess.run(["bash", _sweep], capture_output=True, text=True)
+    if _sw.returncode == 0:
+        check("hygiene sweep clean (no stray IP/email/key/unicode in tracked source)", True)
+    else:
+        _tail = (_sw.stdout or "").strip().splitlines()
+        check("hygiene sweep clean (no stray IP/email/key/unicode in tracked source)",
+              False, "\n    " + "\n    ".join(_tail[-12:]))
+
 print("\n" + ("ALL PASS" if ok else "SOME FAILED"))
 sys.exit(0 if ok else 1)
