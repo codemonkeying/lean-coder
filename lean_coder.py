@@ -3516,9 +3516,15 @@ class IgnoreMatcher:
             rel = path.resolve().relative_to(self._root_resolved).as_posix()
         except ValueError:
             return False
+        except OSError:
+            # e.g. a Windows junction / untrusted mount point (WinError 448)
+            return True
         if not rel or rel == ".":
             return False
-        is_dir = path.is_dir()
+        try:
+            is_dir = path.is_dir()
+        except OSError:
+            is_dir = False
         parts = rel.split("/")
         for pat in self.patterns:
             anchored = pat.startswith("/")
