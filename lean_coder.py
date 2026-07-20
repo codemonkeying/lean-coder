@@ -3698,6 +3698,12 @@ class Config:
     confirm_reads: bool = False      # ask-on-read: read tools confirm too, not just writes
     incognito: bool = False          # no session persistence this run; the model is told
                                      # (ephemeral - never written to config; --incognito to start)
+    ephemeral: bool = False          # default for /connect: FORCE the embeddable-Python
+                                     # runtime on a remote (even if it has a real one) and
+                                     # WIPE the cached runtime on teardown - a zero-trace,
+                                     # no-install-left-behind mode. Persisted so a user can
+                                     # opt into always-wipe; a per-/connect --ephemeral flag
+                                     # overrides it for one connection.
     hosts: list = field(default_factory=list)  # tiered failover list (priority order)
     host_models: dict = field(default_factory=dict)  # per-host default model (url -> model)
     model_explicit: bool = False     # model came from --model / env (skip per-host override)
@@ -3901,7 +3907,7 @@ _PERSISTED_SCALAR_KEYS = (
     "handover_emergency", "handover_min_interval", "autostart_after_handover",
     "auto_compact_interval", "auto_compact_hysteresis", "auto_compact_keep",
     "wake_on_bg_finish",
-    "lean_tools_dir", "providers_dir", "user_name",
+    "lean_tools_dir", "providers_dir", "user_name", "ephemeral",
 )
 # EPHEMERAL: deliberately NEVER persisted. These are per-launch state - saving them
 # would let one session silently narrow/alter the NEXT launch's default. `composer` is
@@ -10182,6 +10188,7 @@ _SETTINGS_FIELDS = [
     ("leash", "capability ceiling", tuple(LEASH_LEVELS)),
     ("confirm_reads", "ask-on-read (confirm read tools too)", "bool"),
     ("auto_reconnect", "reconnect to a session's remote on load (off = ask)", "bool"),
+    ("ephemeral", "/connect default: force embed runtime + wipe on teardown (zero-trace)", "bool"),
     ("show_snapshots", "show pre-handover safety snapshots in the /load picker + /session list", "bool"),
     ("statusline", "status rows above the prompt", "bool"),
     ("statusline_every", "reprint status every N prompts (1 = every turn, 0 = only on change)", "int"),
@@ -10685,7 +10692,7 @@ def handle_info_command(agent, cfg, arg=""):
 # contract (HELP_FOOTER) actually covers a command's own flags. `--plain`/`--fallback`
 # are universal (dispatch_command strips them from any command) so they're offered too.
 _COMMAND_FLAGS = {
-    "/connect": ["--ephemeral"],
+    "/connect": ["--ephemeral", "--no-ephemeral"],
 }
 _UNIVERSAL_FLAGS = ["--plain", "--fallback"]
 
@@ -12274,10 +12281,17 @@ def handle_connect_command(agent, cfg, arg):
     <name> forgets a saved target. --ephemeral (Windows) forces the embeddable-Python
     runtime and wipes it on teardown (zero-trace; also dogfoods the embed path). Any
     failure leaves you where you were."""
-    # Pull an --ephemeral / -e flag out of anywhere in the arg (order-agnostic).
+    # Pull an --ephemeral / -e flag out of anywhere in the arg (order-agnostic). The
+    # flag is a per-connect OVERRIDE of the cfg.ephemeral default (which a user can set
+    # to always-wipe via /set ephemeral on); --no-ephemeral forces off for one connect.
     toks = arg.split()
-    ephemeral = any(t in ("--ephemeral", "-e") for t in toks)
-    arg = " ".join(t for t in toks if t not in ("--ephemeral", "-e"))
+    ephemeral = getattr(cfg, "ephemeral", False)
+    if any(t in ("--ephemeral", "-e") for t in toks):
+        ephemeral = True
+    if "--no-ephemeral" in toks:
+        ephemeral = False
+    arg = " ".join(t for t in toks
+                   if t not in ("--ephemeral", "-e", "--no-ephemeral"))
     if not arg:
         if cfg.connect_hosts or agent.remotes:
             active = agent.remote.host if agent.remote else None
