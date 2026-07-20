@@ -43,7 +43,7 @@ check("/mcp fully wired (dispatch+slash+help)",
 # ~2k core; ceiling gives headroom for later additions without lying in the README.
 sys_msg = {"role": "system", "content": lc.SYSTEM_PROMPT + "\nWorking directory: /x"}
 overhead = lc.messages_tokens([sys_msg], lc.active_tools(lc.Config()))
-check("fixed overhead < 2200 tokens (~2k README claim + headroom)", overhead < 2200, f"~{overhead} tokens")
+check("fixed overhead < 2500 tokens (~2k README claim + headroom)", overhead < 2500, f"~{overhead} tokens")
 # the hot metering path must survive non-string content (int/None from a loaded or
 # synthesised history) and size a block LIST by its JSON length, not its element count
 # (a crash/skew here would feed a bad ctx meter into handover decisions).
@@ -56,9 +56,9 @@ check("_raw_messages_tokens: block list sized by JSON, not element count",
       > lc._raw_messages_tokens([{"role": "user", "content": [{"type": "text", "text": "x"}]}], []) + 50)
 check("8 base tools (ssh moved to a lean-tool; bg_status added)", len(lc.TOOLS) == 8, f"{len(lc.TOOLS)}")
 check("bg_status is a core tool", "bg_status" in [t["function"]["name"] for t in lc.TOOLS])
-check("active_tools adds ask_user_to_run by default", len(lc.active_tools(lc.Config())) == 10)
+check("active_tools adds ask_user_to_run by default", len(lc.active_tools(lc.Config())) == 11)
 check("active_tools drops it when disabled",
-      len(lc.active_tools(lc.Config(ask_user_to_run=False))) == 9)
+      len(lc.active_tools(lc.Config(ask_user_to_run=False))) == 10)
 check("update_plan is on the surface at every non-chat tier",
       all("update_plan" in [t["function"]["name"] for t in lc.active_tools(lc.Config(leash=l))]
           for l in ("r", "rw", "rwe")))
@@ -1074,7 +1074,7 @@ _nondefault = {
     "handover_soft": 0.42, "handover_hard": 0.61, "handover_emergency": 0.99,
     "handover_min_interval": 33.0, "autostart_after_handover": False,
     "auto_compact_interval": 8, "auto_compact_hysteresis": 0.4, "auto_compact_keep": 6,
-    "wake_on_bg_finish": True, "lean_tools_dir": "/tmp/lt", "providers_dir": "/tmp/pv",
+    "wake_on_bg_finish": True, "notes_spool": 500, "lean_tools_dir": "/tmp/lt", "providers_dir": "/tmp/pv",
     "user_name": "dide", "model": "some-model:1b", "ephemeral": True,
     "gen_connect_timeout": 7.0, "gen_ttft_timeout": 120.0, "gen_idle_timeout": 30.0,
 }
@@ -4789,7 +4789,7 @@ try:
     check("leash chat -> no tools", lc.active_tools(lc.Config(leash="chat")) == [])
     _rn = _names(lc.Config(leash="r"))
     check("leash r -> read tools only",
-          set(_rn) == set(lc.SAFE_TOOLS) | {"update_plan"} and "write_file" not in _rn and "run_command" not in _rn)
+          set(_rn) == set(lc.SAFE_TOOLS) | {"update_plan", "note"} and "write_file" not in _rn and "run_command" not in _rn)
     _rwn = _names(lc.Config(leash="rw"))
     check("leash rw -> + write, no exec",
           "write_file" in _rwn and "apply_diff" in _rwn and "run_command" not in _rwn

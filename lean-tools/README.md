@@ -12,7 +12,7 @@ protocol, no server, no core dependency - the lean alternative to MCP.
   `tier` (read / write / exec).
 - **`dispatch_worker.py`, `shell_session.py`, `update.py`** - other bundled tools.
 - The rest (`web_fetch`, `web_screenshot`, `brave_search`, `git_summary`,
-  `diagnostics`, `symbols`, `note`, `word_count`, `ssh`, `notify`, `provision`) are
+  `diagnostics`, `symbols`, `word_count`, `ssh`, `notify`, `provision`) are
   bundled extras, toggled with `/tools`.
 
 ## Writing one
