@@ -169,8 +169,8 @@ import io as _io_note, contextlib as _ctx_note
 _ncmdag = lc.Agent(lc.Config(cwd=FIX))
 with _ctx_note.redirect_stdout(_io_note.StringIO()):
     lc.handle_note_command(_ncmdag, _ncmdag.cfg, "a manual operator note")   # bare text -> add
-check("/note <text> adds an entry via the shared _note path",
-      len(_ncmdag.notes) == 1 and _ncmdag.notes[0]["text"] == "a manual operator note")
+check("/note <text> adds an entry tagged operator: via the shared _note path",
+      len(_ncmdag.notes) == 1 and _ncmdag.notes[0]["text"] == "operator: a manual operator note")
 with _ctx_note.redirect_stdout(_io_note.StringIO()):
     lc.handle_note_command(_ncmdag, _ncmdag.cfg, "clear")
 check("/note clear empties the notebook", _ncmdag.notes == [])
