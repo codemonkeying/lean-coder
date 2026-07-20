@@ -413,7 +413,7 @@ class _ApiKeyClient:
 
         spin = _lc["Spinner"]("thinking", _lc["THINK_FRAMES"]).start()
         try:
-            for raw in resp:
+            for raw in _lc["stream_tiered"](resp, self.cfg):
                 if should_abort and should_abort():
                     aborted = True
                     break
@@ -511,7 +511,9 @@ class _ApiKeyClient:
                 headers=hdrs,
             )
             try:
-                with urllib.request.urlopen(req, timeout=600) as resp:
+                with urllib.request.urlopen(
+                        req,
+                        timeout=(getattr(self.cfg, "gen_connect_timeout", None) or 600)) as resp:
                     self._last_rl = {k.lower(): v for k, v in resp.headers.items()}
                     return self._consume_urllib(resp, should_abort)
             except urllib.error.HTTPError as e:

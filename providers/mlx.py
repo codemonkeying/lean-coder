@@ -78,7 +78,7 @@ class MLXClient:
 
         spin = _lc["Spinner"]("thinking", _lc["THINK_FRAMES"]).start()
         try:
-            for raw in resp:
+            for raw in _lc["stream_tiered"](resp, self.cfg):
                 if should_abort and should_abort():
                     aborted = True
                     break
@@ -233,7 +233,9 @@ class MLXClient:
         try:
             # Generous timeout: MLX cold-loads a model on first request (downloads
             # from HF if absent), and a heavy multi-turn probe can take minutes.
-            with urllib.request.urlopen(req, timeout=600) as resp:
+            with urllib.request.urlopen(
+                    req,
+                    timeout=(getattr(self.cfg, "gen_connect_timeout", None) or 600)) as resp:
                 return self._consume(resp, should_abort, tools)
         except urllib.error.HTTPError as e:
             detail = e.read().decode("utf-8", "replace")[:300]
