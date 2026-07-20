@@ -643,6 +643,31 @@ REQUEST_HANDOVER_TOOL = {"type": "function", "function": {
     "parameters": {"type": "object", "properties": {}, "required": []}}}
 
 
+# Session-scoped episodic memory. A core agent tool (handled in _run_tool like
+# update_plan - never routed to a remote executor), so notes always live with the
+# LOCAL session and travel with it: they persist in the session JSON and restore 1:1
+# on /load or when a saved session is pushed to another leancoder. Entries are
+# DTG-stamped and kept like a spooling log (trimmed to cfg.notes_spool lines); reads
+# are hard-capped so a recall can never flood context.
+NOTE_TOOL = {"type": "function", "function": {
+    "name": "note",
+    "description": (
+        "Your persistent session NOTEBOOK - episodic memory that survives compaction and "
+        "travels with the session (saved/restored on /load). Jot decisions, findings, "
+        "gotchas you couldn't re-derive from code or git. Actions: add (default; bare `text` "
+        "appends a timestamped entry) | recent (newest `n`, default 40) | grep (`pattern`) | "
+        "range (`from` alone = since then; `from`+`to` = between; timestamps 'YYYY-MM-DD "
+        "HH:MM', bare date = whole day). No args shows recent; reads are capped."),
+    "parameters": {"type": "object", "properties": {
+        "text": {"type": "string", "description": "Note to append (add)."},
+        "action": {"type": "string", "enum": ["add", "recent", "grep", "range"]},
+        "pattern": {"type": "string", "description": "Substring/regex (grep)."},
+        "n": {"type": "integer", "description": "How many (recent)."},
+        "from": {"type": "string", "description": "Start ts (range)."},
+        "to": {"type": "string", "description": "End ts (range; omit = now)."}},
+        "required": []}}}
+
+
 def active_tools(cfg, remote=False, lean_tool_schemas=(), model_tools=True,
                  offer_handover=False):
     """The tool list the model actually sees, gated by the /leash capability ceiling:
@@ -661,7 +686,7 @@ def active_tools(cfg, remote=False, lean_tool_schemas=(), model_tools=True,
         return []                    # chat-only (user ceiling OR model can't tool-call)
     allow_write = leash in ("rw", "rwe")
     allow_exec = leash == "rwe"
-    tools = [UPDATE_PLAN_TOOL]       # plan upkeep: no fs/exec, available at every non-chat tier
+    tools = [UPDATE_PLAN_TOOL, NOTE_TOOL]  # plan upkeep + session notebook: no fs/exec, every non-chat tier
     if offer_handover:               # soft zone: let the model elect a handover at a break
         tools.append(REQUEST_HANDOVER_TOOL)
     for t in TOOLS:
@@ -716,7 +741,7 @@ def _leash_allows_tool(leash, name, lean_safe=None):
     loaded message, a tool wrongly leaked onto the surface - it is refused here unless
     `leash` truly permits it. Mirrors active_tools()'s tiering exactly. update_plan /
     request_handover is agent-internal (no fs/exec) and allowed at any tier."""
-    if name in ("update_plan", "request_handover"):
+    if name in ("update_plan", "request_handover", "note"):
         return True
     if leash == "chat":
         return False                         # no tools at all
@@ -3798,6 +3823,12 @@ class Config:
                                      # surfacing the notice on the next human turn. OFF by
                                      # default: an idle-wake loop changes REPL semantics and can
                                      # burn quota unattended. Composer (idle-poll) path only.
+    notes_spool: int = 2000          # session-scoped notes (the note tool) are kept like a
+                                     # spooling log: append DTG-stamped entries, trim to the
+                                     # newest N LINES on write. ~2000 lines ~= 760KB ~= one full
+                                     # 200k window; raise for a heavy-logging session. Reads are
+                                     # separately hard-capped (400 lines) so a recall can't flood
+                                     # context. /set notes_spool <n>.
     ask_user_to_run: bool = True     # expose the ask_user_to_run handoff tool
     composer: bool = True            # pinned bottom input line (type while it works)
     statusline: bool = True          # status rows above each prompt (perms, context
@@ -4041,7 +4072,7 @@ _PERSISTED_SCALAR_KEYS = (
     "window_messages", "window_tokens", "auto_handover", "handover_soft", "handover_hard",
     "handover_emergency", "handover_min_interval", "autostart_after_handover",
     "auto_compact_interval", "auto_compact_hysteresis", "auto_compact_keep",
-    "wake_on_bg_finish",
+    "wake_on_bg_finish", "notes_spool",
     "gen_connect_timeout", "gen_ttft_timeout", "gen_idle_timeout",
     "lean_tools_dir", "providers_dir", "user_name", "ephemeral",
 )
@@ -4337,6 +4368,8 @@ def save_config(cfg: Config, quiet: bool = False):
         lines.append(f"auto_compact_keep = {cfg.auto_compact_keep}")
     if cfg.wake_on_bg_finish:                  # default off; persist an opt-IN
         lines.append("wake_on_bg_finish = true")
+    if cfg.notes_spool != 2000:                # default 2000 lines; persist when changed
+        lines.append(f"notes_spool = {cfg.notes_spool}")
     if cfg.always_expand:                       # default = [] (diffs stay collapsed)
         lines.append("always_expand = [" + ", ".join(_toml_value(x) for x in cfg.always_expand) + "]")
     if cfg.show_snapshots:                      # default off (snapshots hidden in /load)
@@ -4524,7 +4557,7 @@ def _atomic_write_text(path: Path, text: str):
         path.write_text(text)
 
 
-def save_session(messages, cfg, name: str, remote=None, pinned_plan=""):
+def save_session(messages, cfg, name: str, remote=None, pinned_plan="", notes=None):
     """Write the conversation to ~/.config/leancoder/sessions/<name>.json with a
     metadata header. Returns (path, meta). Raises ValueError on a bad name.
 
@@ -4552,6 +4585,7 @@ def save_session(messages, cfg, name: str, remote=None, pinned_plan=""):
         "title": _session_title(messages),
         "turns": len(body),
         "pinned_plan": pinned_plan or "",
+        "notes": list(notes or []),          # session-scoped episodic memory (note tool)
         "session_overrides": dict(getattr(cfg, "session_overrides", {}) or {}),
         "tok_factor": _tok_factor(),         # learned estimate->actual factor (calibrated meter)
     }
@@ -4752,7 +4786,8 @@ def autosave_session(agent, cfg):
     try:
         rhost = agent.remote.host if getattr(agent, "remote", None) else None
         save_session(agent.messages, cfg, name, remote=rhost,
-                     pinned_plan=getattr(agent, "pinned_plan", ""))
+                     pinned_plan=getattr(agent, "pinned_plan", ""),
+                     notes=getattr(agent, "notes", None))
         _write_lock(name)
         _prune_autosaves()
     except (ValueError, OSError):
@@ -8218,6 +8253,9 @@ class Agent:
         # permissions note for the model, injected into the next user turn (not the cached
         # system prompt). Seeded at startup only if the leash is restricted (rwe = full = no note).
         self._pending_ai_note = _leash_note(cfg.leash) if cfg.leash != "rwe" else None
+        self.notes = []                  # session-scoped episodic memory: list of {dtg, text}
+                                         # (the note tool). Persisted in the session JSON, so it
+                                         # travels with /load and a pushed session - resume 1:1.
         self.pinned_plan = ""            # goal + TODO the model maintains; rides an uncached
                                          # prompt tail and survives compaction (===PLAN=== block)
         self._tool_calls = []            # ring (cap 100) of {id,name,args} for /expand:
@@ -8477,6 +8515,8 @@ class Agent:
             return self._request_handover()
         if name == "update_plan":            # pinned-plan upkeep (local agent state, never remote)
             return self._update_plan(args.get("plan", ""))
+        if name == "note":                   # session notebook (local agent state, never remote)
+            return self._note(args)
         is_mcp = name.startswith(MCP_NS)
         plug = self.lean_tools.get(name)
         safe = bool(plug and plug["safe"])
@@ -9215,6 +9255,93 @@ class Agent:
         done = plan.count("[x]") + plan.count("[X]")
         todo = plan.count("[ ]")
         return f"plan pinned ({done} done, {todo} to go)."
+
+    # Session notebook (the note tool). Notes are {dtg, text} dicts kept on self.notes,
+    # persisted in the session JSON so they travel 1:1 with /load and a pushed session.
+    # A fixed read cap keeps any recall from flooding context; the spool cap
+    # (cfg.notes_spool) trims the oldest on write so the log can't grow unbounded.
+    _NOTES_READ_CAP = 400                     # max LINES any read (recent/grep/range) returns
+
+    @staticmethod
+    def _note_lines(entries):
+        """Render entries as '- [dtg] text' lines (text may itself be multi-line)."""
+        return [f"- [{e.get('dtg', '?')}] {e.get('text', '')}" for e in entries]
+
+    def _note_cap(self, entries, label):
+        """Cap a rendered read to _NOTES_READ_CAP LINES, keeping the MOST RECENT. Returns
+        the capped string with an elision note when it overflowed."""
+        lines = self._note_lines(entries)
+        total = len(lines)
+        if total <= self._NOTES_READ_CAP:
+            return "\n".join(lines) if lines else f"no notes {label}."
+        kept = lines[-self._NOTES_READ_CAP:]
+        return (f"[showing the latest {self._NOTES_READ_CAP} of {total} lines {label}; "
+                f"narrow with grep/range]\n" + "\n".join(kept))
+
+    def _note(self, args):
+        """The note tool body. action=add (default when text given) appends a DTG-stamped
+        entry and spool-trims; recent/grep/range are capped reads. Pure agent state - never
+        touches the filesystem or the remote."""
+        action = (args.get("action") or "").strip().lower()
+        text = (args.get("text") or "").strip()
+        if not action:
+            action = "add" if text else "recent"
+        if action == "add":
+            if not text:
+                return "error: nothing to note (pass text)."
+            dtg = time.strftime("%Y-%m-%d %H:%M")
+            self.notes.append({"dtg": dtg, "text": text})
+            # spool-trim to the newest notes_spool LINES (an entry may span several lines)
+            cap = max(1, int(getattr(self.cfg, "notes_spool", 2000) or 2000))
+            lines = 0
+            keep_from = len(self.notes)
+            for i in range(len(self.notes) - 1, -1, -1):
+                lines += (self.notes[i].get("text", "").count("\n") + 2)  # text + dtg line
+                if lines > cap:
+                    break
+                keep_from = i
+            trimmed = keep_from
+            if trimmed:
+                self.notes = self.notes[trimmed:]
+            n = len(self.notes)
+            extra = f" ({trimmed} old trimmed)" if trimmed else ""
+            return f"noted [{dtg}]{extra}. {n} entr{'y' if n == 1 else 'ies'} in the notebook."
+        if not self.notes:
+            return "the notebook is empty."
+        if action == "recent":
+            n = args.get("n")
+            try:
+                n = int(n) if n is not None else 40
+            except (TypeError, ValueError):
+                n = 40
+            n = max(1, n)
+            return self._note_cap(self.notes[-n:], "recent")
+        if action == "grep":
+            pat = args.get("pattern") or ""
+            if not pat:
+                return "error: grep needs a pattern."
+            try:
+                rx = re.compile(pat, re.IGNORECASE)
+                match = lambda e: rx.search(f"[{e.get('dtg','')}] {e.get('text','')}")
+            except re.error:
+                match = lambda e: pat.lower() in f"[{e.get('dtg','')}] {e.get('text','')}".lower()
+            hits = [e for e in self.notes if match(e)]
+            if not hits:
+                return f"no notes match {pat!r}."
+            return self._note_cap(hits, f"matching {pat!r}")
+        if action == "range":
+            frm = (args.get("from") or "").strip()
+            to = (args.get("to") or "").strip()
+            if not frm:
+                return "error: range needs a 'from' timestamp (YYYY-MM-DD [HH:MM])."
+            # a bare date is inclusive of the whole day; pad to/from accordingly.
+            lo = frm if len(frm) > 10 else frm + " 00:00"
+            hi = (to if to and len(to) > 10 else (to + " 23:59") if to else "9999-12-31 23:59")
+            sel = [e for e in self.notes if lo <= e.get("dtg", "") <= hi]
+            if not sel:
+                return f"no notes in range {lo} .. {hi}."
+            return self._note_cap(sel, f"in {lo} .. {hi}")
+        return f"error: unknown note action {action!r} (add|recent|grep|range)."
 
     def _request_handover(self):
         """The request_handover tool body: the model elects a handover at a clean break.
@@ -10653,6 +10780,7 @@ _SETTINGS_FIELDS = [
     ("auto_compact_interval", "auto-compact: strip old tool outputs every N tokens (0 = off)", "int"),
     ("auto_compact_hysteresis", "auto-compact re-arm margin (fraction of interval)", "float"),
     ("auto_compact_keep", "tool results kept in full by an auto-compact strip", "int"),
+    ("notes_spool", "note memory: keep the newest N lines (spooling log; default 2000)", "int"),
     ("auto_evict", "continuous tool-output eviction", "bool"),
     ("auto_evict_keep", "tool results kept verbatim by auto_evict", "int"),
     ("keep_alive", "ollama: model keep-alive (e.g. 10m, -1, 0)", "str"),
@@ -11357,7 +11485,8 @@ def handle_save_command(agent, cfg, arg):
     try:
         rhost = agent.remote.host if getattr(agent, "remote", None) else None
         path, meta = save_session(agent.messages, cfg, name, remote=rhost,
-                                  pinned_plan=getattr(agent, "pinned_plan", ""))
+                                  pinned_plan=getattr(agent, "pinned_plan", ""),
+                                  notes=getattr(agent, "notes", None))
     except ValueError:
         print(red(f"invalid session name: {name!r}"))
         return
@@ -11486,6 +11615,12 @@ def _restore_session_state(agent, cfg, meta):
     plan = meta.get("pinned_plan")
     if plan is not None:
         agent.pinned_plan = plan
+
+    # Restore session-scoped episodic notes (the note tool). Absent in older sessions
+    # -> keep whatever's live (don't clobber). Coerced to a clean list of {dtg,text}.
+    notes = meta.get("notes")
+    if isinstance(notes, list):
+        agent.notes = [n for n in notes if isinstance(n, dict) and n.get("text")]
 
     # Restore the learned token calibration factor so the meter is accurate on the very
     # first (pre-prompt_eval) render after a load, instead of under-reporting until the
@@ -13241,7 +13376,8 @@ def handle_handover_command(agent, cfg, arg):
         origin = getattr(agent, "autosave_name", "") or "session"
         existing = [nm for nm, _ in list_sessions()]
         save_session(list(agent.messages), cfg, _prehandover_name(origin, existing),
-                     remote=rhost, pinned_plan=getattr(agent, "pinned_plan", ""))
+                     remote=rhost, pinned_plan=getattr(agent, "pinned_plan", ""),
+                     notes=getattr(agent, "notes", None))
     except Exception:
         pass
     summary = agent.handover()
