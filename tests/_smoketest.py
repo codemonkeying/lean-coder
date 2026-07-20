@@ -2140,15 +2140,21 @@ check("_tools_to_sync: pushes new + changed only",
 check("_tools_to_sync: removes de-selected remote tools", _l2s_rm == ["d.py"])
 check("_tools_to_sync: nothing to do when in sync",
       lc._tools_to_sync({"a.py": "h"}, {"a.py": "h"}) == ([], []))
-check("posix_embed_asset maps x86_64",
-      lc._posix_embed_asset("x86_64")[0].endswith("x86_64-unknown-linux-musl-install_only.tar.gz"))
+check("posix_embed_asset x86_64 defaults to gnu",
+      lc._posix_embed_asset("x86_64")[0].endswith("x86_64-unknown-linux-gnu-install_only.tar.gz"))
+check("posix_embed_asset musl build selectable",
+      lc._posix_embed_asset("x86_64", "musl")[0].endswith("x86_64-unknown-linux-musl-install_only.tar.gz"))
+check("posix_embed_asset gnu != musl (different sha)",
+      lc._posix_embed_asset("x86_64", "gnu")[2] != lc._posix_embed_asset("x86_64", "musl")[2])
 check("posix_embed_asset maps aarch64 (arm64 alias)",
-      lc._posix_embed_asset("arm64")[0] == lc._posix_embed_asset("aarch64")[0]
+      lc._posix_embed_asset("arm64") == lc._posix_embed_asset("aarch64")
       and "aarch64" in lc._posix_embed_asset("arm64")[0])
 check("posix_embed_asset normalises case/whitespace",
       lc._posix_embed_asset(" X86_64\n") == lc._posix_embed_asset("x86_64"))
 check("posix_embed_asset uncovered arch -> None (caller hard-errors)",
       lc._posix_embed_asset("mips") is None)
+check("posix_embed_asset uncovered libc -> None",
+      lc._posix_embed_asset("x86_64", "uclibc") is None)
 check("posix_embed_asset returns (fn, url, 64-hex sha256)",
       len(lc._posix_embed_asset("x86_64")[2]) == 64
       and lc._posix_embed_asset("x86_64")[1].startswith("https://github.com/astral-sh/"))

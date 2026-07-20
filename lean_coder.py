@@ -6536,38 +6536,48 @@ _WIN_PROVISION_EMBED = (
 # --ephemeral dogfood/zero-trace mode). We ship a self-contained CPython from
 # astral-sh/python-build-standalone: the `install_only` tarball is a normal
 # ./python/bin/python3 tree with a FULL stdlib (our executor is all-stdlib +
-# guarded lazy imports, so it runs cleanly under it). We ALWAYS pick the musl
-# build - it is statically linked against musl libc with NO shared-library
-# dependencies, so one binary runs on glibc AND musl distros alike (the gnu
-# builds would fault on Alpine). The release + CPython version + per-arch sha256
-# are PINNED here (reproducible, verifiable) - never "latest". The driver
-# DOWNLOADS the tarball once (local cache, sha256-verified), then PUSHES it to
-# the remote over the existing ssh master (scp) - the remote never reaches the
-# internet, so an air-gapped box works and the transfer is auditable. Uncovered
-# arch -> a hard, actionable error (never a silent wrong-arch binary).
+# guarded lazy imports, so it runs cleanly under it). We pick the build by the
+# remote's C library: the `install_only` tarballs are DYNAMICALLY linked against
+# their libc's loader (gnu -> /lib64/ld-linux..., musl -> /lib/ld-musl-...), so a
+# musl binary will NOT run on a glibc box and vice-versa (only the '+static-full'
+# variants are truly static, and those aren't published as install_only). So we
+# probe the remote libc (glibc vs musl) and fetch the matching build. Release +
+# CPython version + per-(arch,libc) sha256 are PINNED here (reproducible,
+# verifiable) - never "latest". The driver DOWNLOADS the tarball once (local
+# cache, sha256-verified), then PUSHES it to the remote over the existing ssh
+# master - the remote never reaches the internet, so an air-gapped box works and
+# the transfer is auditable. Uncovered arch -> a hard, actionable error (never a
+# silent wrong-arch binary).
 _POSIX_EMBED_RELEASE = "20260718"        # python-build-standalone release tag (pinned)
 _POSIX_EMBED_PYVER = "3.10.20"           # CPython version in that release (pinned)
-# uname -m token -> (asset arch slug, sha256 of the musl install_only tarball).
-# Only arches we have a verified hash for are covered; anything else hard-errors.
-_POSIX_EMBED_ARCH = {
-    "x86_64":  ("x86_64",  "013ff8ab30357820d99df80745ea58b49fb693165a27b599b9fec09c4780dd20"),
-    "amd64":   ("x86_64",  "013ff8ab30357820d99df80745ea58b49fb693165a27b599b9fec09c4780dd20"),
-    "aarch64": ("aarch64", "1e3a67cd2a207b281815bfe7c9e7bc41b2881dd7460e7efb3c3705f651bdf731"),
-    "arm64":   ("aarch64", "1e3a67cd2a207b281815bfe7c9e7bc41b2881dd7460e7efb3c3705f651bdf731"),
+# (arch slug, libc) -> sha256 of that install_only tarball. `libc` is "gnu" (glibc)
+# or "musl", chosen per-remote by _posix_embed_libc. uname -m tokens map to a slug.
+_POSIX_EMBED_UNAME = {
+    "x86_64": "x86_64", "amd64": "x86_64",
+    "aarch64": "aarch64", "arm64": "aarch64",
+}
+_POSIX_EMBED_SHA = {
+    ("x86_64", "gnu"):   "9c28d8017eeaf692f24dbaf26fd4679ce496c7f58e48b897d278739661794e37",
+    ("x86_64", "musl"):  "013ff8ab30357820d99df80745ea58b49fb693165a27b599b9fec09c4780dd20",
+    ("aarch64", "gnu"):  "506d003732d99a1598b63a40b53fa9359460a3be7488b9a3123ea6cf8ed1627b",
+    ("aarch64", "musl"): "1e3a67cd2a207b281815bfe7c9e7bc41b2881dd7460e7efb3c3705f651bdf731",
 }
 
 
-def _posix_embed_asset(uname_m: str):
-    """Map a remote `uname -m` token to (asset_filename, url, sha256) for the pinned
-    musl install_only tarball, or None if the arch isn't covered (caller hard-errors).
-    Normalises case/whitespace so 'X86_64\\n' etc. still resolve."""
-    key = (uname_m or "").strip().lower()
-    hit = _POSIX_EMBED_ARCH.get(key)
-    if not hit:
+def _posix_embed_asset(uname_m: str, libc: str = "gnu"):
+    """Map a remote `uname -m` token + libc ('gnu'|'musl') to (asset_filename, url,
+    sha256) for the pinned install_only tarball, or None if the (arch, libc) pair
+    isn't covered (caller hard-errors). Normalises case/whitespace so 'X86_64\\n'
+    resolves. libc defaults to 'gnu' (the common case) so callers/tests can omit it."""
+    slug = _POSIX_EMBED_UNAME.get((uname_m or "").strip().lower())
+    if not slug:
         return None
-    slug, sha = hit
+    libc = (libc or "gnu").strip().lower()
+    sha = _POSIX_EMBED_SHA.get((slug, libc))
+    if not sha:
+        return None
     fn = (f"cpython-{_POSIX_EMBED_PYVER}+{_POSIX_EMBED_RELEASE}-"
-          f"{slug}-unknown-linux-musl-install_only.tar.gz")
+          f"{slug}-unknown-linux-{libc}-install_only.tar.gz")
     url = (f"https://github.com/astral-sh/python-build-standalone/releases/download/"
            f"{_POSIX_EMBED_RELEASE}/{fn}")
     return fn, url, sha
@@ -7264,22 +7274,35 @@ class RemoteWorkspace:
         _, out, _ = self._run("command -v python3 || true")
         return "python3" if out.strip() else None
 
+    def _posix_embed_libc(self):
+        """Detect the remote's C library so we fetch a runnable install_only build:
+        'musl' if a musl loader (/lib/ld-musl-*) is present, else 'gnu' (glibc). The
+        install_only tarballs are dynamically linked to their libc's loader, so a musl
+        binary won't run on glibc and vice-versa - this picks the matching one. `ldd
+        --version` prints 'musl' on Alpine; the loader glob is the robust fallback."""
+        _, out, _ = self._run(
+            "if ls /lib/ld-musl-* >/dev/null 2>&1; then echo musl; "
+            "elif ldd --version 2>&1 | grep -qi musl; then echo musl; "
+            "else echo gnu; fi")
+        return "musl" if "musl" in (out or "").lower() else "gnu"
+
     def _provision_posix_embed(self):
         """Fallback for a POSIX host with no python3 (and the mechanism behind
         --ephemeral): provision a self-contained CPython from python-build-standalone.
-        The driver DOWNLOADS the pinned musl `install_only` tarball once (local cache,
-        sha256-verified), PUSHES it to the remote over the live ssh master (scp), then
+        The driver DOWNLOADS the pinned `install_only` tarball for the remote's
+        arch+libc once (local cache, sha256-verified), PUSHES it over the live master,
         extracts it under a fixed lc-runtime cache dir and returns the absolute path to
         its python3, or None on a soft failure. An UNCOVERED arch is a HARD error (never
         a silent wrong-arch binary). Idempotent: a matching extracted runtime is reused."""
         _, machine, _ = self._run("uname -m || true")
-        asset = _posix_embed_asset(machine)
+        libc = self._posix_embed_libc()
+        asset = _posix_embed_asset(machine, libc)
         if asset is None:
             raise ConnectionError(
                 f"no python3 on {self.host} and no pinned embeddable build for its "
-                f"architecture ({(machine or '').strip() or 'unknown'}). Install python3 "
-                f"there (any 3.x), or connect from/to a covered arch "
-                f"({', '.join(sorted(_POSIX_EMBED_ARCH))}).")
+                f"architecture/libc ({(machine or '').strip() or 'unknown'}/{libc}). "
+                f"Install python3 there (any 3.x), or connect to a covered arch "
+                f"({', '.join(sorted(set(_POSIX_EMBED_UNAME)))}).")
         fn, url, sha = asset
         # Resolve the remote cache dir + expected python3 path; reuse if already extracted.
         _, root, _ = self._run(f'printf %s "{_POSIX_EMBED_ROOT}"')
@@ -7297,7 +7320,7 @@ class RemoteWorkspace:
             print(dim(f"  reusing embeddable Python at {py}"))
             return py
         print(dim(f"no python3 on {self.host}; provisioning the embeddable runtime "
-                  f"(one-time: CPython {_POSIX_EMBED_PYVER} musl, cached)…"))
+                  f"(one-time: CPython {_POSIX_EMBED_PYVER} {libc}, cached)…"))
         try:
             tarball = _posix_embed_cache_download(fn, url, sha)
         except ConnectionError as e:
@@ -7333,7 +7356,7 @@ class RemoteWorkspace:
 
     def _check_posix_python(self):
         """POSIX target: use the system python3 if present; otherwise provision the
-        pinned embeddable musl CPython (downloaded by the driver, pushed + extracted
+        pinned embeddable CPython for its arch+libc (downloaded by the driver, pushed + extracted
         under a fixed lc-runtime cache) so a box with NO interpreter works with zero
         manual setup and NO sudo/package install. ephemeral=True SKIPS the system probe
         and forces the embeddable runtime (wiped on teardown) - a zero-trace mode + the
