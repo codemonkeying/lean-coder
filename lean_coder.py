@@ -6260,6 +6260,7 @@ def _emit_json(stream, obj):
 # cap/rstrip and is binary-safe.
 RAW_READ = "__read_raw__"
 BG_POLL  = "__bg_poll__"        # driver-only: finished bg tasks the executor owns
+BG_LIST  = "__bg_list__"        # driver-only: all bg tasks (running+finished) it owns, for /bg
 
 
 def _read_raw_b64(path: Path, max_bytes=RAW_READ_MAX):
@@ -6504,6 +6505,10 @@ def run_tool_executor(cwd, lean_tools_dir=None):
                     _bg_bump_lease(_r)
             _emit_json(proto, {"id": rid, "ok": True,
                                "result": _bg_finished_here(_me)})
+            continue
+        if tool == BG_LIST:                # driver-only: all bg tasks (running+finished) WE own here
+            _emit_json(proto, {"id": rid, "ok": True,
+                               "result": _bg_status_items(os.getpid())})
             continue
         plug = lean_tools.get(tool) if lean_tools else None
         if tool not in EXEC_TOOLS and not plug:
@@ -7314,6 +7319,17 @@ class RemoteWorkspace:
         actual message behind it - it'll report on the next turn instead."""
         try:
             obj = self.client.request(BG_POLL, deadline=time.monotonic() + 3)
+        except (ConnectionError, OSError, TimeoutError):
+            return []
+        return obj.get("result") or [] if obj.get("ok") else []
+
+    def bg_list(self):
+        """All bg tasks (running + finished) the REMOTE executor owns, as
+        _bg_status_items rows [{pid, cmd, state, runtime, started, tail}] - the
+        data behind /bg for a connected session (the registry lives on that box).
+        [] on any error (never break the command over a poll)."""
+        try:
+            obj = self.client.request(BG_LIST, deadline=time.monotonic() + 3)
         except (ConnectionError, OSError, TimeoutError):
             return []
         return obj.get("result") or [] if obj.get("ok") else []
@@ -10891,10 +10907,28 @@ def handle_providers_command(agent, cfg, arg):
 
 
 def handle_bg_command(agent, cfg, arg):
-    """/bg - list running background tasks; /bg kill <pid|all> - stop them."""
+    """/bg - list background tasks; /bg kill <pid|all> - stop them. When the session
+    is /connect'ed the tasks run in the REMOTE executor and its registry lives on that
+    box, so both list + kill are routed there (via BG_LIST / a remote kill); a LOCAL
+    session reads its own registry directly."""
+    remote = getattr(agent, "remote", None)
     parts = arg.split()
     if parts and parts[0].lower() == "kill":
         tgt = parts[1] if len(parts) > 1 else ""
+        if remote is not None:
+            rows = [r for r in remote.bg_list() if r.get("state") == "running"]
+            if tgt == "all":
+                pids = [r.get("pid") for r in rows]
+            elif tgt.isdigit() and any(r.get("pid") == int(tgt) for r in rows):
+                pids = [int(tgt)]
+            else:
+                print(dim("usage: /bg kill <pid|all>"
+                          + ("" if rows else "  (no background tasks running)")))
+                return
+            for pid in pids:
+                remote.call("run_command", {"cmd": f"kill {int(pid)} 2>/dev/null || true"})
+            print(dim(f"killed {len(pids)} background task(s) on {remote.host}."))
+            return
         running = _bg_running()
         if tgt == "all":
             killed = [r.get("pid") for r in running]
@@ -10908,6 +10942,22 @@ def handle_bg_command(agent, cfg, arg):
             _bg_kill(pid)
         _bg_save([r for r in _bg_load() if r.get("pid") not in set(killed)])
         print(dim(f"killed {len(killed)} background task(s)."))
+        return
+    if remote is not None:
+        rows = remote.bg_list()
+        if not rows:
+            print(dim(f"no background tasks on {remote.host}.  "
+                      f"(end a command with ' &' to start one)"))
+            return
+        print(bold(f"background tasks (remote {remote.host}):"))
+        for r in rows:
+            st = r.get("state", "?")
+            label = green("running") if st == "running" else (
+                green(st) if st == "exit 0" else red(st))
+            print(f"  {bold(cyan(str(r.get('pid'))))}  {label}  "
+                  f"(ran {r.get('runtime', '?')})  {r.get('cmd', '?')}")
+            if st == "running":
+                print(dim(f"      /bg kill {r.get('pid')}"))
         return
     me = os.getpid()
     recs = _bg_load()
