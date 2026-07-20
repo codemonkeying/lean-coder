@@ -4770,6 +4770,16 @@ check("argcomp: /session load + /session save key to the same name list",
 check("argcomp: /autosave on/off", lc._arg_completions(_fa, _fc, "/autosave") == ["on", "off"])
 check("argcomp: /connect saved + open hosts",
       "dev" in lc._arg_completions(_fa, _fc, "/connect") and "box1" in lc._arg_completions(_fa, _fc, "/connect"))
+# CLI contract: a command's flags Tab-complete at ANY arg position (mirrors the handlers
+# that parse them order-agnostically) - the `/connect 8 --ephe<Tab>` gap.
+check("flagcomp: --ephemeral offered on /connect first arg",
+      "--ephemeral" in lc._completion_options(_fa, _fc, "/connect --eph"))
+check("flagcomp: --ephemeral offered after a positional arg",
+      lc._completion_options(_fa, _fc, "/connect 8 --ephe") == ["--ephemeral"])
+check("flagcomp: universal --plain/--fallback offered on any command",
+      set(["--plain", "--fallback"]).issubset(set(lc._completion_options(_fa, _fc, "/connect 8 --"))))
+check("flagcomp: an already-typed flag is not re-offered",
+      "--ephemeral" not in lc._completion_options(_fa, _fc, "/connect --ephemeral 8 --"))
 check("argcomp: /local open remotes", lc._arg_completions(_fa, _fc, "/local") == ["box1"])
 check("argcomp: unknown command -> no completions", lc._arg_completions(_fa, _fc, "/quit") == [])
 check("argcomp: /approve modes", lc._arg_completions(_fa, _fc, "/approve") == list(lc.APPROVAL_MODES))

@@ -10679,6 +10679,22 @@ def handle_info_command(agent, cfg, arg=""):
         print(f"  modes:    {', '.join(modes)}")
 
 
+# Per-command flags a user can add anywhere in the arg (order-agnostic, matching how
+# the handlers parse them - e.g. handle_connect_command pulls --ephemeral from any
+# position). Kept as completion candidates so the "Tab completes inline arguments"
+# contract (HELP_FOOTER) actually covers a command's own flags. `--plain`/`--fallback`
+# are universal (dispatch_command strips them from any command) so they're offered too.
+_COMMAND_FLAGS = {
+    "/connect": ["--ephemeral"],
+}
+_UNIVERSAL_FLAGS = ["--plain", "--fallback"]
+
+
+def _command_flags(cmd):
+    """Flags offerable at ANY arg position for `cmd` (its own + the universal ones)."""
+    return _COMMAND_FLAGS.get(cmd, []) + _UNIVERSAL_FLAGS
+
+
 def _arg_completions(agent, cfg, cmd):
     """Inline first-arg Tab completions for a slash command. Reads live state
     (active backend's models, registered providers, hosts, open remotes). Returns
@@ -10774,6 +10790,12 @@ def _completion_options(agent, cfg, left):
         # alongside a command's own completions when the cursor is on its first argument.
         if len(path) == 1 and path[0] != "/help":
             opts = list(opts) + ["?"]
+        # Flags (a command's own + the universal --plain/--fallback) complete at ANY arg
+        # position, mirroring the handlers that accept them order-agnostically - so e.g.
+        # `/connect 8 --ephe<Tab>` offers --ephemeral. Skip already-present ones.
+        if text.startswith("-"):
+            flags = [f for f in _command_flags(path[0]) if f not in tokens]
+            opts = list(opts) + flags
         return [o for o in opts if o.startswith(text)]
     if buf.startswith("/"):                  # still on the command itself
         return [c for c in SLASH_COMMANDS if c.startswith(text)]
