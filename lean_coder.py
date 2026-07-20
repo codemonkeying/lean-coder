@@ -5970,16 +5970,43 @@ def _menu_index(sel: str, count: int):
     return None
 
 
-def pick_connect_menu(connect_hosts, open_hosts=(), active=None, prompt=input):
-    """Numbered picker over saved [connect] targets plus any currently-open
-    sessions (marked). Returns the chosen ssh target, or None on cancel/empty.
-    No liveness probe - SSH handles auth (passwordless straight in, else prompts)."""
-    items, seen = [], set()                       # (label, target)
+def menu_resolve(arg, ordered):
+    """MENU CONTRACT (single source of truth). A command that opens a numbered menu on
+    bare invocation MUST accept a bare 1-based integer arg as "pick that item from the
+    SAME ordered list the menu shows" - so `/connect 8` == the 8th menu row, never a
+    host literally named 8. Returns the chosen item, or None when `arg` isn't a valid
+    in-range index (caller then falls through to its name/literal handling). Pure; the
+    ordering passed in must match what the command's picker renders. Built on
+    _menu_index so the CLI-arg path and the interactive picker share one index rule."""
+    idx = _menu_index(str(arg).strip(), len(ordered))
+    return ordered[idx] if idx is not None else None
+
+
+def _connect_menu_items(connect_hosts, open_hosts=()):
+    """MENU CONTRACT: the ordered (name, target) list backing BOTH the bare-/connect
+    picker AND the `/connect <N>` numeric arg path - saved [connect] targets first (in
+    config order), then open-but-unsaved sessions. One source so the two can never
+    drift (a numeric arg must select exactly the row the menu renders). Pure."""
+    items, seen = [], set()                       # (name, target)
     for name, target in connect_hosts.items():
         items.append((name, target)); seen.add(target)
     for host in open_hosts:                        # open-but-unsaved targets too
         if host not in seen:
             items.append((host, host)); seen.add(host)
+    return items
+
+
+def _connect_menu_order(cfg, agent):
+    """The list of ssh TARGETS in menu order (see _connect_menu_items) - what a bare
+    integer /connect arg indexes into. Kept beside the picker so both share it."""
+    return [t for _n, t in _connect_menu_items(cfg.connect_hosts, list(agent.remotes))]
+
+
+def pick_connect_menu(connect_hosts, open_hosts=(), active=None, prompt=input):
+    """Numbered picker over saved [connect] targets plus any currently-open
+    sessions (marked). Returns the chosen ssh target, or None on cancel/empty.
+    No liveness probe - SSH handles auth (passwordless straight in, else prompts)."""
+    items = _connect_menu_items(connect_hosts, open_hosts)
     if not items:
         print(dim("no saved connect targets; use /connect <[user@]host>, or add a "
                   "[connect] section to the config."))
@@ -11663,9 +11690,10 @@ def _resolve_model_arg(arg, sel_rows):
     listed rows, a 'provider:model' qualifier, or a bare model name (first match
     wins, preferring the active provider). Returns a row or None. Pure."""
     arg = arg.strip()
-    if arg.isdigit():
-        i = int(arg) - 1
-        return sel_rows[i] if 0 <= i < len(sel_rows) else None
+    # MENU CONTRACT: a bare 1-based integer selects the Nth listed row (see menu_resolve).
+    picked = menu_resolve(arg, sel_rows)
+    if picked is not None:
+        return picked
     if ":" in arg:
         p, _, m = arg.partition(":")
         # ollama model tags contain ':' (e.g. qwen3:30b), so only treat the prefix
@@ -12185,24 +12213,17 @@ def handle_connect_command(agent, cfg, arg):
         _connect_remove(agent, cfg, arg.split(maxsplit=1)[1].strip() if len(arg.split(maxsplit=1)) > 1 else "")
     else:
         sp = arg.split(maxsplit=1)
-        # a bare integer selects from the SAME ordered list the menu shows (saved
-        # [connect] targets, then open-but-unsaved sessions) - so `/connect 8` means
-        # "the 8th menu item", NOT a host literally named "8" (which ssh would dial as
-        # 0.0.0.8). Only when there's no matching item does it fall through as a literal.
-        if sp[0].isdigit():
-            ordered = list(cfg.connect_hosts.values())
-            for h in agent.remotes:
-                if h not in cfg.connect_hosts.values():
-                    ordered.append(h)
-            idx = int(sp[0])
-            if 1 <= idx <= len(ordered):
-                rpath = sp[1] if len(sp) > 1 else "."
-                _do_connect(agent, cfg, ordered[idx - 1], rpath,
-                            offer_save=True, ephemeral=ephemeral)
-                return
+        rpath = sp[1] if len(sp) > 1 else "."
+        # MENU CONTRACT: a bare 1-based integer selects from the SAME ordered list the
+        # bare-/connect menu shows (saved [connect] targets, then open-but-unsaved
+        # sessions) - so `/connect 8` means "the 8th menu row", NOT a host literally
+        # named 8 (which ssh would dial as 0.0.0.8). See menu_resolve / _connect_menu_order.
+        picked = menu_resolve(sp[0], _connect_menu_order(cfg, agent))
+        if picked is not None:
+            _do_connect(agent, cfg, picked, rpath, offer_save=True, ephemeral=ephemeral)
+            return
         # a bare token may be a saved [connect] name -> resolve to its target
         rhost = cfg.connect_hosts.get(sp[0], sp[0])
-        rpath = sp[1] if len(sp) > 1 else "."
         _do_connect(agent, cfg, rhost, rpath, offer_save=True, ephemeral=ephemeral)
 
 

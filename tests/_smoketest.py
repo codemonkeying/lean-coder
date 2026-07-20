@@ -1757,6 +1757,40 @@ check("_menu_index rejects 0/oob/nonnum",
       lc._menu_index("0", 4) is None and lc._menu_index("5", 4) is None
       and lc._menu_index("x", 4) is None)
 
+# --- MENU CONTRACT: a bare 1-based integer arg selects the Nth item from the SAME
+# ordered list the command's picker renders. One resolver (menu_resolve) backs every
+# menu-fronting command; these guard against a command re-drifting to a literal (the
+# `/connect 8` -> 0.0.0.8 bug).
+_mc = ["user@a", "user@b", "user@c"]
+check("menu_resolve: 1-based index -> item", lc.menu_resolve("2", _mc) == "user@b")
+check("menu_resolve: out-of-range -> None", lc.menu_resolve("9", _mc) is None)
+check("menu_resolve: 0 -> None", lc.menu_resolve("0", _mc) is None)
+check("menu_resolve: non-numeric -> None (caller does literal)",
+      lc.menu_resolve("user@a", _mc) is None)
+check("menu_resolve: empty list -> None", lc.menu_resolve("1", []) is None)
+# _connect_menu_order must match the picker ordering (saved targets, then open-unsaved)
+class _FakeAg:
+    def __init__(self, remotes): self.remotes = remotes
+_cord = lc._connect_menu_order(
+    lc.Config(connect_hosts={"box1": "user@192.0.2.1", "box2": "user@192.0.2.2"}),
+    _FakeAg(["user@open"]))
+check("connect menu order: saved-then-open",
+      _cord == ["user@192.0.2.1", "user@192.0.2.2", "user@open"])
+check("connect menu order: numeric arg picks the same row menu shows",
+      lc.menu_resolve("3", _cord) == "user@open")
+# the picker renders from the SAME items builder -> can't drift from the arg path
+check("connect: picker + arg path share one order",
+      [t for _n, t in lc._connect_menu_items(
+          {"box1": "user@192.0.2.1", "box2": "user@192.0.2.2"}, ["user@open"])] == _cord)
+# every menu-fronting command's numeric branch routes through menu_resolve
+import inspect as _insp
+_src_rma = _insp.getsource(lc._resolve_model_arg)
+check("contract: _resolve_model_arg uses menu_resolve (no ad-hoc isdigit index)",
+      "menu_resolve(" in _src_rma and "int(arg) - 1" not in _src_rma)
+_src_conn = _insp.getsource(lc.handle_connect_command)
+check("contract: handle_connect_command uses menu_resolve",
+      "menu_resolve(" in _src_conn)
+
 class FakeClient:
     def __init__(self, models): self._m = models
     def list_models(self): return self._m
