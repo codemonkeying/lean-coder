@@ -1001,6 +1001,7 @@ _nondefault = {
     "auto_compact_interval": 8, "auto_compact_hysteresis": 0.4, "auto_compact_keep": 6,
     "wake_on_bg_finish": True, "lean_tools_dir": "/tmp/lt", "providers_dir": "/tmp/pv",
     "user_name": "dide", "model": "some-model:1b", "ephemeral": True,
+    "gen_connect_timeout": 7.0, "gen_ttft_timeout": 120.0, "gen_idle_timeout": 30.0,
 }
 # every persisted scalar must have a probe value here (so nothing is left untested)
 _missing_probe = [k for k in lc._PERSISTED_SCALAR_KEYS if k not in _nondefault]
