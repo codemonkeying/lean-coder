@@ -38,6 +38,15 @@ If your model handles MCP well, brilliant: add all the servers you like on top, 
 big fans. We just didn't want the platform *itself* to be the thing eating your
 context. This is open source, built for the folks running local and open models first.
 
+> **Why bet on local?** Two curves are bending our way at once. Open-weight models now
+> trail the closed frontier by only ~3-4 months on [Epoch AI's Capability Index](https://epoch.ai/data-insights/open-weights-vs-closed-weights-models)
+> (down from years) - and the [*densing law*](https://arxiv.org/abs/2412.04315) finds
+> capability density doubling roughly every ~3.5 months, i.e. the same ability in
+> exponentially fewer parameters over time. Together that means the models keep getting
+> both **smarter and smaller**: what needs a datacenter today runs on a consumer GPU
+> tomorrow. A lean platform that already runs the small/open models is a bet on where
+> that curve is heading, not just where it is.
+
 The same tiny codebase scales across the whole range:
 
 - drive a **small local model with a few thousand tokens of context** - the ~2k
