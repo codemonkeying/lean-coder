@@ -10737,6 +10737,8 @@ def _arg_completions(agent, cfg, cmd):
             return list(agent.mcp.stale_enabled())
         except Exception:
             return []
+    if cmd == "/expand":                            # msg -> conversation view (else tool-call ids)
+        return ["msg"]
     if cmd == "/connect":
         return ["remove"] + sorted(set(list(cfg.connect_hosts) + list(getattr(agent, "remotes", {}))))
     if cmd == "/connect remove":
@@ -10937,14 +10939,16 @@ def _restore_backend_for(agent, cfg, meta):
     return ""
 
 
-def _print_session_tail(messages, n: int = 4, width: int = 100):
-    """Echo the last few non-system messages so a resumed session shows what you were
-    doing, not just a one-line banner. Roles are labelled + coloured (you / lc /
-    tool); tool results and long lines collapse so it stays scannable. No-op for an
-    empty conversation."""
+def _render_message_tail(messages, n: int = 4, width: int = 100, hint: bool = False):
+    """Echo the last `n` non-system messages so a resumed (or /expand msg) view shows
+    what you were doing. Roles are labelled + coloured (you / lc / tool); long lines
+    collapse so it stays scannable. `n` is clamped to [1, len] so a silly count never
+    errors or under-shows. `hint` appends the '/expand msg N' pointer when the view is
+    partial. No-op for an empty conversation."""
     body = [m for m in messages if m.get("role") != "system"]
     if not body:
-        return
+        return False
+    n = max(1, min(int(n), len(body)))               # clamp: never error, never over-read
     tail = body[-n:]
     print(yellow(f"  recent context ({len(tail)} of {len(body)} messages):"))
     for m in tail:
@@ -10964,7 +10968,17 @@ def _print_session_tail(messages, n: int = 4, width: int = 100):
         if len(text) > width:
             text = text[:width] + GLYPH["ellipsis"]
         print(f"    {label} {dim(GLYPH['dot'])} {dim(text) if role != 'user' else text}")
+    if hint and len(tail) < len(body):
+        print(dim(f"    … /expand msg {min(len(body), max(n * 2, 20))} to see further back"))
     print()
+    return True
+
+
+def _print_session_tail(messages, n: int = 4, width: int = 100):
+    """Resume-banner view: the last few messages plus the '/expand msg N' hint so a
+    user knows they can scroll further back without a reload. Thin wrapper over
+    _render_message_tail (shared with /expand msg)."""
+    _render_message_tail(messages, n=n, width=width, hint=True)
 
 
 def _restore_session_state(agent, cfg, meta):
@@ -12847,12 +12861,30 @@ def handle_expand_command(agent, cfg, arg):
     recent tool call. Bare /expand = the most recent call; /expand N = the call
     tagged '#N' on its line. On-screen tool-call lines truncate args to 50 chars;
     this shows all of it (a diff renders colorized) plus the tool's output, capped
-    so it can't flood the terminal."""
+    so it can't flood the terminal.
+
+    /expand msg [N] (alias: messages) - re-print the last N conversation messages
+    (default 10) in the resume-banner style, so you can scroll back without a reload.
+    N is clamped to what exists (a silly count never errors)."""
+    arg = (arg or "").strip()
+    # /expand msg [N] - conversation view (distinct from the tool-call ring below).
+    parts = arg.split()
+    if parts and parts[0].lower() in ("msg", "messages", "m"):
+        n = 10
+        if len(parts) > 1:
+            try:
+                n = int(parts[1])
+            except ValueError:
+                print(dim("  usage: /expand msg [N]  (N = how many recent messages; default 10)"))
+                return
+        if not _render_message_tail(agent.messages, n=n, width=100):
+            print(dim("  no messages yet this session."))
+        return
     calls = getattr(agent, "_tool_calls", None)
     if not calls:
         print(dim("  no tool calls to expand yet this session."))
         return
-    arg = (arg or "").strip().lstrip("#")
+    arg = arg.lstrip("#")
     if not arg:
         entry = calls[-1]
     else:

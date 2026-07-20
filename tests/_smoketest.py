@@ -1791,6 +1791,34 @@ _src_conn = _insp.getsource(lc.handle_connect_command)
 check("contract: handle_connect_command uses menu_resolve",
       "menu_resolve(" in _src_conn)
 
+# --- /expand msg [N]: conversation view with clamp safeguards (never errors on a silly
+# count, never under-reads). _render_message_tail is the shared renderer.
+import io as _io_em, contextlib as _cl_em
+_em_msgs = ([{"role": "system", "content": "sys"}]
+            + [{"role": ("user" if i % 2 == 0 else "assistant"), "content": f"m{i}"}
+               for i in range(6)])                 # 6 non-system messages
+def _em_render(n):
+    with _cl_em.redirect_stdout(_io_em.StringIO()) as _b:
+        ok = lc._render_message_tail(_em_msgs, n=n)
+    return ok, _b.getvalue()
+_ok3, _o3 = _em_render(3)
+check("expand msg: shows last N", _ok3 and "3 of 6 messages" in _o3
+      and "m5" in _o3 and "m3" in _o3 and "m2" not in _o3)
+_okBig, _oBig = _em_render(324221341341323)         # absurd count -> clamp to all, no error
+check("expand msg: absurd N clamps to all (no error)", _okBig and "6 of 6 messages" in _oBig)
+_ok0, _o0 = _em_render(0)                           # 0/negative -> clamp up to 1
+check("expand msg: 0 clamps up to 1", _ok0 and "1 of 6 messages" in _o0)
+_okNeg, _oNeg = _em_render(-5)
+check("expand msg: negative clamps up to 1", _okNeg and "1 of 6 messages" in _oNeg)
+with _cl_em.redirect_stdout(_io_em.StringIO()):     # empty conversation -> False, no crash
+    _okEmpty = lc._render_message_tail([{"role": "system", "content": "s"}], n=10)
+check("expand msg: empty conversation -> no-op False", _okEmpty is False)
+# the resume banner appends the /expand msg hint when the view is partial
+with _cl_em.redirect_stdout(_io_em.StringIO()) as _bh:
+    lc._print_session_tail(_em_msgs, n=2)
+check("expand msg: resume banner hints /expand msg when partial",
+      "/expand msg" in _bh.getvalue())
+
 class FakeClient:
     def __init__(self, models): self._m = models
     def list_models(self): return self._m
