@@ -28,7 +28,7 @@ def run(args, cwd):                            # -> str (the model receives this
 
 That is the whole interface. Many runnable lean-tools ship bundled in
 [`lean-tools/`](lean-tools/) (disabled until you `/tools`-enable them):
-`word_count.py` (read-only), `note.py` (mutating), `diagnostics.py` (runs the
+`word_count.py` (read-only), `diagnostics.py` (runs the
 installed linter/typechecker for a file's language - the agent's feedback loop),
 `git_summary.py` (a one-call read-only repo snapshot: branch, status, diffstat,
 recent commits), `web_fetch.py` (GET an http(s) URL - network egress, never
