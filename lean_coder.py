@@ -91,7 +91,7 @@ def _prehandover_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.8.13"
+__version__ = "0.9.0"
 
 
 def _prerelease_key(pre):
@@ -4223,6 +4223,8 @@ def save_config(cfg: Config, quiet: bool = False):
         lines.append("confirm_reads = true")
     if cfg.auto_reconnect:
         lines.append("auto_reconnect = true")
+    if cfg.ephemeral:                         # default off; persist an opt-IN (always-wipe)
+        lines.append("ephemeral = true")
     if not cfg.statusline:                    # default on; persist only when turned off
         lines.append("statusline = false")
     if cfg.statusline_every != 1:             # default 1 (every prompt); persist if changed
