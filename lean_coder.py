@@ -6820,11 +6820,13 @@ class RemoteWorkspace:
         an invisible 'password:' prompt. A password host then needs an interactive
         /connect. batch=False (default) is the interactive open (/connect can prompt).
 
-        Windows: a Linux client's ControlMaster socket technically opens against
-        Windows sshd but a stdin-piped channel over it never receives EOF (the push
-        hangs). So we PROBE the OS first over a plain masterless ssh, and for Windows
-        drop multiplexing entirely (self.ctl=None): every call is a fresh key-auth
-        connection. This needs key auth (a password host would prompt per call)."""
+        Windows: we PROBE the OS first over a plain masterless ssh (so a doomed master
+        is never opened blind), then TRY to multiplex - a Linux client CAN drive a
+        shared ControlMaster to Windows sshd, and we keep it only if `ssh -O check`
+        confirms it's live+reusable (_try_open_win_master), else fall back to per-call
+        connections (self.ctl=None, the old behaviour). All Windows commands are
+        stdin-free (powershell -EncodedCommand / scp), so the historic stdin-piped
+        deadlock can't recur. Multiplexing needs key auth (a password host prompts)."""
         print(dim(f"connecting to {self.host} ..."))
         # Probe the remote OS BEFORE any master, over a plain (masterless) ssh - so a
         # Windows target never gets a doomed ControlMaster. Uses BatchMode so it can't
