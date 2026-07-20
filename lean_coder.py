@@ -12519,7 +12519,7 @@ def handle_connect_command(agent, cfg, arg):
         # MENU CONTRACT: a bare 1-based integer selects from the SAME ordered list the
         # bare-/connect menu shows (saved [connect] targets, then open-but-unsaved
         # sessions) - so `/connect 8` means "the 8th menu row", NOT a host literally
-        # named 8 (which ssh would dial as 0.0.0.8). See menu_resolve / _connect_menu_order.
+        # named 8 (which ssh would dial as a bare-integer address). See menu_resolve.
         picked = menu_resolve(sp[0], _connect_menu_order(cfg, agent))
         if picked is not None:
             _do_connect(agent, cfg, picked, rpath, offer_save=True, ephemeral=ephemeral)
