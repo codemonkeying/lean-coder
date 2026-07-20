@@ -88,6 +88,93 @@ check("operator_note flags an edit",
       "(edited from: ls)" in lc.operator_note("ls -a", 1, proposed="ls"))
 check("operator_note: not run -> (not run)", "(not run)" in lc.operator_note("x", None))
 
+# --- tool-schema SHAPE contract: every model-facing schema (core builtins + the
+# always-on agent tools) must be a well-formed OpenAI function tool. A malformed
+# schema 400s the API, so this is a hard shape gate covering NOTE_TOOL too.
+_all_schemas = list(lc.TOOLS) + [lc.UPDATE_PLAN_TOOL, lc.REQUEST_HANDOVER_TOOL, lc.NOTE_TOOL]
+def _schema_wellformed(t):
+    if t.get("type") != "function":
+        return False
+    fn = t.get("function")
+    if not isinstance(fn, dict):
+        return False
+    if not (isinstance(fn.get("name"), str) and fn["name"]):
+        return False
+    if not (isinstance(fn.get("description"), str) and fn["description"]):
+        return False
+    p = fn.get("parameters")
+    if not (isinstance(p, dict) and p.get("type") == "object" and isinstance(p.get("properties"), dict)):
+        return False
+    req = p.get("required", [])
+    if not isinstance(req, list) or not set(req).issubset(set(p["properties"])):
+        return False   # required must be a subset of declared properties
+    return True
+_bad_schema = [t.get("function", {}).get("name", "?") for t in _all_schemas if not _schema_wellformed(t)]
+check("tool schema shape: every core/agent schema is well-formed", not _bad_schema, f"malformed: {_bad_schema}")
+check("NOTE_TOOL is a well-formed schema with the four actions",
+      _schema_wellformed(lc.NOTE_TOOL)
+      and set(lc.NOTE_TOOL["function"]["parameters"]["properties"]["action"]["enum"])
+          == {"add", "recent", "grep", "range"})
+check("note is agent-internal (allowed at every tier, never a routed builtin)",
+      lc._leash_allows_tool("r", "note") and lc._leash_allows_tool("chat", "note")
+      and "note" not in lc.EXEC_TOOLS)
+check("note is on the surface at every non-chat tier",
+      all("note" in [t["function"]["name"] for t in lc.active_tools(lc.Config(leash=l))]
+          for l in ("r", "rw", "rwe")))
+
+# --- note tool BEHAVIOUR: add/recent/grep/range, default action, spool trim, read cap
+_nag = lc.Agent(lc.Config(cwd=FIX, notes_spool=2000))
+check("note: fresh notebook is empty list", _nag.notes == [])
+_nag._note({"text": "first finding about X"})          # bare text -> add
+check("note add (default action) appends a dtg entry",
+      len(_nag.notes) == 1 and _nag.notes[0]["text"] == "first finding about X"
+      and "-" in _nag.notes[0]["dtg"])
+_nag._note({"action": "add", "text": "second thing"})
+check("note recent (default read) shows entries",
+      "first finding" in _nag._note({}) and "second thing" in _nag._note({}))
+check("note recent honours n", "second thing" in _nag._note({"action": "recent", "n": 1})
+      and "first finding" not in _nag._note({"action": "recent", "n": 1}))
+check("note grep matches", "second" in _nag._note({"action": "grep", "pattern": "second"})
+      and "first" not in _nag._note({"action": "grep", "pattern": "second"}))
+check("note grep no-match message", "no notes match" in _nag._note({"action": "grep", "pattern": "zzzzz"}))
+# range: force known dtgs, then query
+_nag.notes = [{"dtg": "2026-01-01 09:00", "text": "jan entry"},
+              {"dtg": "2026-06-15 12:00", "text": "jun entry"}]
+check("note range from-only (since)", "jun entry" in _nag._note({"action": "range", "from": "2026-03-01"})
+      and "jan entry" not in _nag._note({"action": "range", "from": "2026-03-01"}))
+check("note range between two dates",
+      "jan entry" in _nag._note({"action": "range", "from": "2026-01-01", "to": "2026-02-01"})
+      and "jun entry" not in _nag._note({"action": "range", "from": "2026-01-01", "to": "2026-02-01"}))
+check("note range needs a from", "needs a 'from'" in _nag._note({"action": "range"}))
+# spool trim: a tiny spool keeps only the newest lines
+_sag = lc.Agent(lc.Config(cwd=FIX, notes_spool=3))
+for _i in range(20):
+    _sag._note({"text": f"entry {_i}"})
+check("note spool trims to newest ~notes_spool lines",
+      1 <= len(_sag.notes) <= 3 and _sag.notes[-1]["text"] == "entry 19")
+# read cap: many entries, recall is capped to _NOTES_READ_CAP lines
+_cag = lc.Agent(lc.Config(cwd=FIX, notes_spool=100000))
+for _i in range(1000):
+    _cag._note({"text": f"line {_i}"})
+_dump = _cag._note({"action": "recent", "n": 1000})
+check("note read is line-capped (recall can't flood context)",
+      _dump.count("\n") <= lc.Agent._NOTES_READ_CAP + 2 and "showing the latest" in _dump)
+
+# --- /note command dispatch + tab-completion contract
+check("/note is a registered builtin command", "/note" in lc._BUILTIN_COMMANDS and "/note" in lc.SLASH_COMMANDS)
+check("/note is in the help table", any(c[0].startswith("/note") for c in lc.HELP_COMMANDS))
+check("argcomp: /note subcommands",
+      lc._arg_completions(object(), lc.Config(cwd=FIX), "/note") == ["recent", "grep", "range", "add", "clear"])
+import io as _io_note, contextlib as _ctx_note
+_ncmdag = lc.Agent(lc.Config(cwd=FIX))
+with _ctx_note.redirect_stdout(_io_note.StringIO()):
+    lc.handle_note_command(_ncmdag, _ncmdag.cfg, "a manual operator note")   # bare text -> add
+check("/note <text> adds an entry via the shared _note path",
+      len(_ncmdag.notes) == 1 and _ncmdag.notes[0]["text"] == "a manual operator note")
+with _ctx_note.redirect_stdout(_io_note.StringIO()):
+    lc.handle_note_command(_ncmdag, _ncmdag.cfg, "clear")
+check("/note clear empties the notebook", _ncmdag.notes == [])
+
 # /sh must run where the session points: forward agent.remote into
 # run_direct_command (regression - the handler used to drop it and run local).
 _cap = {}

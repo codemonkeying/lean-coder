@@ -10376,7 +10376,7 @@ SLASH_COMMANDS = ["/clear", "/new", "/compact", "/handover", "/session", "/save"
                   "/prompt", "/sh", "/connect", "/machines", "/local", "/disconnect", "/tools", "/reload",
                   "/model", "/provider", "/think", "/effort",
                   "/set", "/usage", "/approve", "/leash", "/autosave", "/incognito",
-                  "/askread", "/bg", "/mcp", "/info", "/ctx", "/activity", "/expand", "/help", "/quit"]
+                  "/askread", "/bg", "/note", "/mcp", "/info", "/ctx", "/activity", "/expand", "/help", "/quit"]
 
 # Built-in command names are the shadow-protection set: lean-tool commands can't claim
 # any of them. It is DERIVED from _BUILTIN_COMMANDS_TABLE (every builtin command + alias)
@@ -10587,6 +10587,7 @@ HELP_COMMANDS = [
     ("/incognito [on|off]", "don't save the session locally"),
     ("/askread [on|off]", "confirm read tools too"),
     ("/bg [kill <pid>]", "list/kill background tasks"),
+    ("/note [grep|range|add|clear]", "the session notebook (episodic memory); no arg = recent"),
     ("/info", "live session read-out"),
     ("/ctx", "context-token estimate"),
     ("/activity [n|all]", "what the system did automatically (compaction, handover, fallback, ...)"),
@@ -11111,6 +11112,40 @@ def handle_bg_command(agent, cfg, arg):
         print(dim(f"      log: {r.get('log', '?')}"))
 
 
+def handle_note_command(agent, cfg, arg):
+    """/note - show the session notebook (recent entries); the same episodic memory
+    the model keeps via the note tool. Subcommands:
+      /note                 recent entries (capped)
+      /note <text>          add a timestamped entry yourself
+      /note add <text>      add (explicit)
+      /note grep <pattern>  entries matching a substring/regex
+      /note range <from> [to]   entries in a time window (ts 'YYYY-MM-DD HH:MM'; bare date = whole day)
+      /note clear           wipe the notebook for this session
+    Notes live with the session (saved + restored on /load), so /note lets you read +
+    curate what the agent has recorded - the same way /bg surfaces background tasks."""
+    parts = arg.split()
+    sub = parts[0].lower() if parts else ""
+    if sub == "clear":
+        n = len(agent.notes)
+        agent.notes = []
+        print(dim(f"notebook cleared ({n} entr{'y' if n == 1 else 'ies'} removed)."))
+        return
+    if sub == "grep":
+        out = agent._note({"action": "grep", "pattern": " ".join(parts[1:])})
+    elif sub == "range":
+        out = agent._note({"action": "range",
+                           "from": parts[1] if len(parts) > 1 else "",
+                           "to": parts[2] if len(parts) > 2 else ""})
+    elif sub == "add":
+        out = agent._note({"action": "add", "text": arg[len("add"):].strip()})
+    elif sub == "recent" or not arg.strip():
+        out = agent._note({"action": "recent",
+                           "n": parts[1] if sub == "recent" and len(parts) > 1 else None})
+    else:                                     # bare text -> add it
+        out = agent._note({"action": "add", "text": arg.strip()})
+    print(out)
+
+
 def _provider_usage_str(agent, cfg, verbose=False) -> str:
     """The active backend's usage/quota tail (e.g. the '5h .. wk ..' meters), already
     styled, or '' if the backend reports none. Core does the rendering so every
@@ -11341,6 +11376,8 @@ def _arg_completions(agent, cfg, cmd):
         return list(LEASH_LEVELS)
     if cmd == "/bg":
         return ["kill"]
+    if cmd == "/note":
+        return ["recent", "grep", "range", "add", "clear"]
     if cmd == "/mcp":
         return ["list", "add", "remove", "reconnect", "clean"]
     if cmd in ("/mcp remove", "/mcp reconnect"):   # complete a configured server name
@@ -13574,6 +13611,7 @@ _BUILTIN_COMMANDS_TABLE = {
     "/save": handle_save_command,
     "/load": handle_load_command,
     "/bg": handle_bg_command,
+    "/note": handle_note_command,
     "/autosave": handle_autosave_command,
     "/incognito": handle_incognito_command,
     "/leash": handle_leash_command,
