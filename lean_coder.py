@@ -3976,6 +3976,7 @@ _PERSISTED_SCALAR_KEYS = (
     "handover_emergency", "handover_min_interval", "autostart_after_handover",
     "auto_compact_interval", "auto_compact_hysteresis", "auto_compact_keep",
     "wake_on_bg_finish",
+    "gen_connect_timeout", "gen_ttft_timeout", "gen_idle_timeout",
     "lean_tools_dir", "providers_dir", "user_name", "ephemeral",
 )
 # EPHEMERAL: deliberately NEVER persisted. These are per-launch state - saving them
@@ -4233,6 +4234,13 @@ def save_config(cfg: Config, quiet: bool = False):
         lines.append(f"num_ctx = {cfg.num_ctx}")
     if cfg.keep_alive and cfg.keep_alive != "10m":
         lines.append(f'keep_alive = "{cfg.keep_alive}"')
+    # ollama streaming timeouts: persist only a non-default (prod defaults stay implicit).
+    if cfg.gen_connect_timeout != 10.0:
+        lines.append(f"gen_connect_timeout = {cfg.gen_connect_timeout}")
+    if cfg.gen_ttft_timeout != 600.0:
+        lines.append(f"gen_ttft_timeout = {cfg.gen_ttft_timeout}")
+    if cfg.gen_idle_timeout is not None:
+        lines.append(f"gen_idle_timeout = {cfg.gen_idle_timeout}")
     if cfg.auto_evict:
         lines.append("auto_evict = true")
     if cfg.auto_evict_keep != 3:
@@ -6725,9 +6733,11 @@ def _remote_is_posix(uname_out) -> bool:
 
 def _remote_os_label(uname_out) -> str:
     """A short human name for the probed remote OS, from the _OS_PROBE (`uname`) output -
-    surfaced on the connect 'probed' line so a misdetect is visible immediately (before
-    the push path forks on it). POSIX kernels map to a friendly name; anything else (uname
-    absent/error) is 'Windows', matching _remote_is_posix's Windows branch."""
+    surfaced on the connect 'probed' line so a misdetect is visible immediately. POSIX
+    kernels map to a friendly name. Anything without a recognisable kernel token is
+    'unknown' - we do NOT assume Windows here (that call belongs to the caller, which
+    knows the box connected fine and simply lacks `uname`); an empty/garbled answer
+    that could be anything must not masquerade as a confident 'Windows'."""
     s = (uname_out or "").strip().lower()
     if "linux" in s:
         return "Linux"
@@ -6737,7 +6747,49 @@ def _remote_os_label(uname_out) -> str:
         return "BSD"
     if any(tok in s for tok in ("sunos", "aix", "cygwin", "msys", "gnu")):
         return s.split()[0].strip() or "POSIX"
-    return "Windows"
+    return "unknown"
+
+
+# ssh exits 255 for its OWN failures (can't connect, auth refused, timeout) as
+# opposed to relaying the remote command's exit code. That's how we tell "the box
+# is genuinely Windows (connected fine, no `uname`)" from "we never reached a
+# shell at all" - the latter must NOT be misread as Windows (it was, and the real
+# ssh error got buried under a doomed embeddable-Python push).
+_SSH_UNREACHABLE = (
+    "network is unreachable", "no route to host", "connection refused",
+    "connection timed out", "connection closed", "operation timed out",
+    "could not resolve", "name or service not known", "timed out",
+    "host is down", "no address associated",
+)
+_SSH_AUTH_DENIED = (
+    "permission denied", "authentication failed", "too many authentication",
+    "password", "publickey", "host key verification failed",
+)
+
+
+def _classify_ssh_probe(rc, stdout, stderr):
+    """Classify the connect-time OS probe. Returns (kind, detail):
+      "posix"       - reached a POSIX shell (uname kernel token in stdout)
+      "windows"     - CONNECTED (rc 0) but no uname -> a real Windows box
+      "auth"        - reachable but ssh couldn't authenticate (needs a password/key;
+                      BatchMode refused it). Caller retries WITHOUT BatchMode.
+      "unreachable" - never reached the host (network/route/DNS/refused/timeout).
+    rc 255 is ssh's own-failure code; anything else means the remote shell ran."""
+    if _remote_is_posix(stdout):
+        return "posix", ""
+    err = (stderr or "").strip()
+    low = err.lower()
+    if rc == 255 or rc is None:
+        if any(tok in low for tok in _SSH_AUTH_DENIED) and not any(
+                tok in low for tok in _SSH_UNREACHABLE):
+            return "auth", err
+        if any(tok in low for tok in _SSH_UNREACHABLE) or not err:
+            return "unreachable", err or "ssh could not connect"
+        # An unrecognised 255 is a connection-level failure too - surface it.
+        return "unreachable", err
+    # rc != 255: ssh connected and ran the command; no uname => genuine Windows.
+    return "windows", ""
+
 
 def _runtime_dir() -> Path:
     """Local ephemeral dir for control sockets. Prefers XDG_RUNTIME_DIR, then TMPDIR
@@ -6976,88 +7028,79 @@ class RemoteWorkspace:
         return r.returncode, r.stdout, r.stderr
 
     def connect(self, batch=False):
-        """Open the ssh master (POSIX) + bootstrap the executor. batch=True forces a
+        """Open the ssh master + bootstrap the executor. batch=True forces a
         NON-INTERACTIVE open (BatchMode + a timeout) - for a reconnect that runs
-        where we can't prompt (mid-tool-call): it must fail fast rather than hang on
-        an invisible 'password:' prompt. A password host then needs an interactive
-        /connect. batch=False (default) is the interactive open (/connect can prompt).
+        where we can't prompt (mid-tool-call, or a detached worker): it must fail
+        fast rather than hang on an invisible 'password:' prompt. A password host
+        then needs an interactive /connect. batch=False (default) is the interactive
+        open where ssh may prompt ONCE for a password/passphrase.
 
-        Windows: we PROBE the OS first over a plain masterless ssh (so a doomed master
-        is never opened blind), then TRY to multiplex - a Linux client CAN drive a
-        shared ControlMaster to Windows sshd, and we keep it only if `ssh -O check`
-        confirms it's live+reusable (_try_open_win_master), else fall back to per-call
-        connections (self.ctl=None, the old behaviour). All Windows commands are
-        stdin-free (powershell -EncodedCommand / scp), so the historic stdin-piped
-        deadlock can't recur. Multiplexing needs key auth (a password host prompts)."""
+        Order: open the ControlMaster FIRST (the single auth - key OR one interactive
+        password prompt), THEN detect the OS by running `uname` OVER that master
+        (BatchMode reuse, no second auth). A Linux client can drive a shared master
+        to both POSIX and Windows sshd, so we don't need to know the OS to open it -
+        and this is the one place auth happens, so a password host is asked exactly
+        once (the old probe-then-master order asked twice). If ssh never reaches the
+        host, or auth fails, we surface the REAL ssh error here instead of misreading
+        empty output as 'Windows' and marching into a doomed embeddable-Python push.
+
+        Windows/unknown boxes: not every Windows sshd honours session-reuse, so we
+        keep the master only if `ssh -O check` confirms it live+reusable; otherwise
+        we drop to per-call connections (self.ctl=None, the old always-correct
+        behaviour). All Windows commands are stdin-free (powershell -EncodedCommand /
+        scp over its own channel), so the historic stdin-piped deadlock can't recur."""
         print(dim(f"connecting to {self.host} ..."))
-        # Probe the remote OS BEFORE any master, over a plain (masterless) ssh - so a
-        # Windows target never gets a doomed ControlMaster. Uses BatchMode so it can't
-        # hang on a prompt; a POSIX box answers `uname` with a kernel token.
-        with _stage("probing host", done="probed") as _st:
-            _probe = subprocess.run(
-                ["ssh", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new",
-                 "-o", "ConnectTimeout=10", "-o", "LogLevel=ERROR", self.host, _OS_PROBE],
-                capture_output=True, text=True, timeout=30)
-            self.remote_posix = _remote_is_posix(_probe.stdout)
-            _st.done = f"probed · {_remote_os_label(_probe.stdout)}"
-        if self.remote_posix:
-            with _stage("opening ssh", done="ssh ready"):
-                _clear_master(self.host, self.ctl)     # drop any stale socket first (#3)
-                argv = _ssh_master_argv(self.host, self.ctl, batch=batch)
-                try:
-                    rc = subprocess.run(argv, timeout=30 if batch else None).returncode
-                except subprocess.TimeoutExpired:
-                    raise ConnectionError(f"ssh connection to {self.host} timed out")
-                if rc != 0:
-                    raise ConnectionError(f"ssh connection to {self.host} failed")
-            self._check_posix_python()
-        else:
-            # Windows: TRY to multiplex (a Linux client CAN drive a shared master to a
-            # Windows sshd - multiplexing is a client feature). But only KEEP it if the
-            # master actually comes up and `ssh -O check` confirms it: some Windows sshd
-            # builds don't honour session-reuse, and we must degrade cleanly. On any
-            # doubt we fall back to ctl=None (a fresh key-auth connection per call - the
-            # old, always-correct behaviour). All Windows commands are stdin-free
-            # (powershell -EncodedCommand / scp over its own channel), so the historic
-            # stdin-piped-channel deadlock against Windows sshd can't recur here.
-            if not self._try_open_win_master(batch=batch):
-                self.ctl = None                    # no reliable mux -> per-call connections
-            self._check_windows_python()
-        self._bootstrap_executor()
-        return self
-
-    def _try_open_win_master(self, batch=False):
-        """Windows only: attempt to open a shared ControlMaster and verify it's usable,
-        returning True if we should multiplex, False to fall back to per-call connections.
-
-        A Linux ssh client CAN multiplex to a Windows sshd (ControlMaster is a client
-        feature), which collapses the ~4-handshakes-per-file provisioning cost onto one
-        reused connection. But not every Windows sshd honours session-reuse, so we PROVE
-        it before trusting it: clear any stale socket, open a backgrounded master
-        (_ssh_master_argv, same as the POSIX path), then require `ssh -O check` to
-        confirm the master is genuinely live and reusable. Any failure (open
-        error, timeout, check fails) -> tear down and return False so the caller uses
-        ctl=None. self.ctl must already be set (the per-PID socket path)."""
-        if not self.ctl:
-            return False
-        try:
+        with _stage("opening ssh", done="ssh ready") as _st:
             _clear_master(self.host, self.ctl)     # drop any stale socket first
             argv = _ssh_master_argv(self.host, self.ctl, batch=batch)
             try:
-                rc = subprocess.run(argv, timeout=30).returncode
+                # capture_output so we can classify a failure from ssh's own stderr;
+                # an interactive password prompt still reaches the tty regardless.
+                r = subprocess.run(argv, capture_output=True, text=True,
+                                   timeout=30 if batch else None)
             except subprocess.TimeoutExpired:
                 _clear_master(self.host, self.ctl)
-                return False
-            if rc != 0:
-                return False
-            # The master opened - but only KEEP it if it's genuinely reusable.
-            if _ssh_master_alive(self.host, self.ctl):
-                return True
-            _clear_master(self.host, self.ctl)     # opened but not shareable - drop it
-            return False
-        except (OSError, subprocess.SubprocessError):
-            _clear_master(self.host, self.ctl)
-            return False
+                raise ConnectionError(f"ssh connection to {self.host} timed out")
+            if r.returncode != 0:
+                kind, detail = _classify_ssh_probe(r.returncode, "", r.stderr)
+                _clear_master(self.host, self.ctl)
+                if kind in ("unreachable", "auth"):
+                    _st.done = "unreachable" if kind == "unreachable" else "auth failed"
+                    raise ConnectionError(f"can't reach {self.host}: {detail}")
+                # Connected + authed but the shared master didn't hold (a Windows
+                # sshd that won't multiplex): fall back to per-call connections.
+                self.ctl = None
+                _st.done = "ssh ready (per-call)"
+        # Master (or per-call fallback) is up. Detect the OS by running `uname` over
+        # it - reuses the master when we have one (BatchMode, no re-auth).
+        with _stage("probing host", done="probed") as _st:
+            uname_out = uname_err = ""
+            try:
+                _p = subprocess.run(_ssh_run_argv(self.host, self.ctl, _OS_PROBE),
+                                    capture_output=True, text=True, timeout=30)
+                uname_out, uname_err = _p.stdout, _p.stderr
+            except (subprocess.SubprocessError, OSError):
+                pass
+            self.remote_posix = _remote_is_posix(uname_out)
+            if self.remote_posix:
+                label = _remote_os_label(uname_out)
+            elif any(t in (uname_err or "").lower() for t in
+                     ("not recognized", "commandnotfound", "cmdlet")):
+                label = "Windows"          # ran the channel, no uname -> genuine Windows
+            else:
+                label = "unknown"          # connected but couldn't tell (never assume)
+            _st.done = f"probed · {label}"
+        if self.remote_posix:
+            self._check_posix_python()
+        else:
+            # Windows/unknown: keep the master only if it's genuinely reusable; some
+            # Windows sshd builds don't honour session-reuse. Else drop to per-call.
+            if self.ctl and not _ssh_master_alive(self.host, self.ctl):
+                _clear_master(self.host, self.ctl)
+                self.ctl = None
+            self._check_windows_python()
+        self._bootstrap_executor()
+        return self
 
     def attach(self):
         """ATTACH to a master a PARENT already opened (worker reuse): DON'T open or
