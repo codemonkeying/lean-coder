@@ -7286,14 +7286,16 @@ class RemoteWorkspace:
             "else echo gnu; fi")
         return "musl" if "musl" in (out or "").lower() else "gnu"
 
-    def _provision_posix_embed(self):
+    def _provision_posix_embed(self, forced=False):
         """Fallback for a POSIX host with no python3 (and the mechanism behind
         --ephemeral): provision a self-contained CPython from python-build-standalone.
         The driver DOWNLOADS the pinned `install_only` tarball for the remote's
         arch+libc once (local cache, sha256-verified), PUSHES it over the live master,
         extracts it under a fixed lc-runtime cache dir and returns the absolute path to
         its python3, or None on a soft failure. An UNCOVERED arch is a HARD error (never
-        a silent wrong-arch binary). Idempotent: a matching extracted runtime is reused."""
+        a silent wrong-arch binary). Idempotent: a matching extracted runtime is reused.
+        `forced`=True means the caller CHOSE the embed runtime (--ephemeral) rather than
+        the remote lacking python3 - so the notice must not falsely claim 'no python3'."""
         _, machine, _ = self._run("uname -m || true")
         libc = self._posix_embed_libc()
         asset = _posix_embed_asset(machine, libc)
@@ -7319,9 +7321,13 @@ class RemoteWorkspace:
         if have.strip():
             print(dim(f"  reusing embeddable Python at {py}"))
             return py
-        print(dim(f"no python3 on remote {self.host}; pushing a private one "
-                  f"(CPython {_POSIX_EMBED_PYVER} {libc}, one-time, cached). "
-                  f"Install python3 ON THE REMOTE to skip this next time."))
+        if forced:
+            print(dim(f"  --ephemeral: pushing a private Python to remote {self.host} "
+                      f"(CPython {_POSIX_EMBED_PYVER} {libc}, one-time, cached)."))
+        else:
+            print(dim(f"no python3 on remote {self.host}; pushing a private one "
+                      f"(CPython {_POSIX_EMBED_PYVER} {libc}, one-time, cached). "
+                      f"Install python3 ON THE REMOTE to skip this next time."))
         try:
             tarball = _posix_embed_cache_download(fn, url, sha)
         except ConnectionError as e:
@@ -7364,7 +7370,7 @@ class RemoteWorkspace:
         way to dogfood the embed path on a box that already has Python. Caches the
         working `python3` invocation on self.posix_python. An uncovered-arch host with
         no python3 is a hard error (raised by _provision_posix_embed)."""
-        prefix = (self._provision_posix_embed() if getattr(self, "ephemeral", False)
+        prefix = (self._provision_posix_embed(forced=True) if getattr(self, "ephemeral", False)
                   else (self._posix_python() or self._provision_posix_embed()))
         if not prefix:
             raise ConnectionError(
@@ -7383,15 +7389,21 @@ class RemoteWorkspace:
                 return cand
         return None
 
-    def _provision_win_embed(self):
+    def _provision_win_embed(self, forced=False):
         """Fallback for a Windows host with no real Python: provision the official
         embeddable-amd64 zip (cached under %LOCALAPPDATA%\\lc-runtime, downloaded once)
         and return a quoted 'python.exe' path to invoke it, or None on failure. The
         import spike confirmed our --tool-exec executor runs cleanly under the embed
-        distro (all-stdlib, guarded lazy imports)."""
-        print(dim(f"no Python on remote {self.host}; pushing a private one "
-                  f"(CPython {_WIN_EMBED_VER} embeddable, one-time, cached). "
-                  f"Install Python ON THE REMOTE to skip this next time."))
+        distro (all-stdlib, guarded lazy imports). `forced`=True means the caller CHOSE
+        the embed runtime (--ephemeral), not that the box lacks Python - so the notice
+        must not falsely claim 'no Python'."""
+        if forced:
+            print(dim(f"  --ephemeral: pushing a private Python to remote {self.host} "
+                      f"(CPython {_WIN_EMBED_VER} embeddable, one-time, cached)."))
+        else:
+            print(dim(f"no Python on remote {self.host}; pushing a private one "
+                      f"(CPython {_WIN_EMBED_VER} embeddable, one-time, cached). "
+                      f"Install Python ON THE REMOTE to skip this next time."))
         rc, out, err = self._run(_WIN_PROVISION_EMBED)
         out = (out or "").strip()
         if rc != 0 or not out or out.startswith("ERR:"):
@@ -7429,7 +7441,7 @@ class RemoteWorkspace:
         ephemeral=True SKIPS the installed-Python probe and forces the embeddable runtime
         (which is wiped on teardown) - a zero-trace mode + the way to dogfood the embed
         path on a box that already has Python."""
-        prefix = (self._provision_win_embed() if getattr(self, "ephemeral", False)
+        prefix = (self._provision_win_embed(forced=True) if getattr(self, "ephemeral", False)
                   else (self._win_python() or self._provision_win_embed()))
         if not prefix:
             raise ConnectionError(
