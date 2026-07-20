@@ -115,14 +115,36 @@ def _clean(raw_bytes):
     return text
 
 
-def _drain(fd, timeout):
+def _beyond_echo(acc, echo):
+    """True once `acc` (bytes read so far) contains anything BEYOND the pty's echo
+    of the just-sent input. The pty echoes a typed line back within milliseconds;
+    that echo must NOT be mistaken for the command's actual output (which, over ssh
+    / a slow remote, lands hundreds of ms later). We strip one leading copy of the
+    echoed bytes (CR-insensitive) and report whether non-whitespace remains."""
+    a = acc.replace(b"\r", b"")
+    e = (echo or b"").replace(b"\r", b"")
+    if e:
+        idx = a.find(e)
+        if idx != -1:
+            a = a[:idx] + a[idx + len(e):]
+    return bool(a.strip())
+
+
+def _drain(fd, timeout, echo=b""):
     """Read whatever the child has produced, up to `timeout` seconds. Returns bytes.
-    Waits up to `timeout` for the FIRST output, then stops after a short quiet gap
-    (_READ_QUIET) so an idle prompt doesn't burn the whole timeout."""
+
+    Waits up to `timeout` for REAL output (anything past the pty echo of `echo`),
+    then stops after a short quiet gap (_READ_QUIET) once that output has settled -
+    so an idle prompt doesn't burn the whole timeout. Passing `echo` (the bytes just
+    written by _send) is what fixes the latency race: the instant command echo no
+    longer trips the quiet-gap early-exit before the command's output arrives, which
+    made a slow/remote command return only its own echo (output landing a call late).
+    With echo=b"" (a bare `read`) the first byte of anything counts, as before."""
     chunks = []
     deadline = time.time() + max(0.0, timeout)
+    seen_real = False
     while time.time() < deadline:
-        wait = _READ_QUIET if chunks else (deadline - time.time())
+        wait = _READ_QUIET if seen_real else (deadline - time.time())
         try:
             r, _, _ = select.select([fd], [], [], max(0.0, wait))
         except (OSError, ValueError):
@@ -135,7 +157,9 @@ def _drain(fd, timeout):
             if not data:                 # EOF - child's pty closed
                 break
             chunks.append(data)
-        elif chunks:                     # had output, now quiet -> done
+            if not seen_real and _beyond_echo(b"".join(chunks), echo):
+                seen_real = True
+        elif seen_real:                  # had real output, now quiet -> done
             break
     return b"".join(chunks)
 
@@ -224,15 +248,16 @@ def _send(args, cwd):
     text = args.get("input", "")
     if not text.endswith("\n") and text != "":
         text += "\n"
+    echo = text.encode("utf-8", "replace")
     try:
-        os.write(sess["fd"], text.encode("utf-8", "replace"))
+        os.write(sess["fd"], echo)
     except OSError as e:
         return f"error: write to session {sid} failed: {e}"
     try:
         timeout = float(args.get("timeout") or _READ_DEFAULT)
     except (TypeError, ValueError):
         timeout = _READ_DEFAULT
-    out = _clean(_drain(sess["fd"], timeout))
+    out = _clean(_drain(sess["fd"], timeout, echo=echo))
     if not _alive(sess):
         _reap(sid, sess)
         return (out + f"\n[session {sid} exited (rc {sess['proc'].returncode})]").strip()

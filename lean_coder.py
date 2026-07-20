@@ -2369,7 +2369,8 @@ class MarkdownStream:
             self._emit(self._buf, False)
             self._buf = ""
 
-_active_spinner = None             # so _ask() can pause it before prompting
+_active_spinner = None             # the TOP spinner (so _ask() can pause it before prompting)
+_spinner_stack = []                # nesting stack: only the top spinner paints the status line
 
 
 WATCHDOG_ELAPSED_AT = 6      # s before the status starts showing an elapsed counter
@@ -2406,14 +2407,24 @@ class Spinner:
         self.color, self.interval = color, interval
         self._stop = None
         self._thread = None
-
     def start(self):
         global _active_spinner
         # A live elapsed/escape ticker runs in BOTH modes so a long or wedged step
         # keeps updating (the worker thread is separate from the stuck main thread).
+        # Spinners NEST (a mid-tool-call reconnect starts connect()'s stage spinners
+        # while the outer tool spinner is still alive). Only the TOP of the stack may
+        # paint the shared status line - otherwise two ticker threads fight over it
+        # every ~0.1s and the display flip-flops. On start we suspend the current top
+        # (stop its thread, leave it on the stack) and become the new top; on stop we
+        # pop and RESUME whoever was underneath.
         self._stop = threading.Event()
-        t0 = time.monotonic()
+        self._t0 = time.monotonic()
         pid = os.getpid()
+
+        if _spinner_stack:                       # pause the current top's painter
+            _spinner_stack[-1]._pause()
+        _spinner_stack.append(self)
+        _active_spinner = self
 
         if _active_composer is not None:     # composer owns the status line
             comp = _active_composer
@@ -2421,7 +2432,7 @@ class Spinner:
             def tick_composer():
                 comp.status = self.label
                 while not self._stop.wait(0.5):
-                    base = _activity_label(self.label, time.monotonic() - t0, pid)
+                    base = _activity_label(self.label, time.monotonic() - self._t0, pid)
                     q = len(getattr(comp, "queued", []))
                     comp.status = base + (f"  ·  {q} queued (^C to send)" if q else "")
 
@@ -2435,15 +2446,57 @@ class Spinner:
             for fr in itertools.cycle(self.frames):
                 if self._stop.is_set():
                     break
-                lbl = _activity_label(self.label, time.monotonic() - t0, pid)
+                lbl = _activity_label(self.label, time.monotonic() - self._t0, pid)
                 sys.stdout.write("\r\033[K" + self.color(f"{fr} {lbl}"))
                 sys.stdout.flush()
                 self._stop.wait(self.interval)
 
         self._thread = threading.Thread(target=run, daemon=True)
-        _active_spinner = self
         self._thread.start()
         return self
+
+    def _pause(self):
+        """Stop this spinner's painter thread WITHOUT popping it from the stack -
+        it stays suspended while a nested spinner is on top, and _resume() restarts
+        it when the nested one pops."""
+        if self._stop is not None:
+            self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=0.5)
+        self._thread = None
+
+    def _resume(self):
+        """Restart this spinner's painter after a nested spinner popped off above
+        it. Keeps its original t0 so the elapsed counter is continuous."""
+        pid = os.getpid()
+        self._stop = threading.Event()
+        if _active_composer is not None:
+            comp = _active_composer
+
+            def tick_composer():
+                comp.status = self.label
+                while not self._stop.wait(0.5):
+                    base = _activity_label(self.label, time.monotonic() - self._t0, pid)
+                    q = len(getattr(comp, "queued", []))
+                    comp.status = base + (f"  ·  {q} queued (^C to send)" if q else "")
+
+            self._thread = threading.Thread(target=tick_composer, daemon=True)
+            self._thread.start()
+            return
+        if not _TTY:
+            return
+
+        def run():
+            for fr in itertools.cycle(self.frames):
+                if self._stop.is_set():
+                    break
+                lbl = _activity_label(self.label, time.monotonic() - self._t0, pid)
+                sys.stdout.write("\r\033[K" + self.color(f"{fr} {lbl}"))
+                sys.stdout.flush()
+                self._stop.wait(self.interval)
+
+        self._thread = threading.Thread(target=run, daemon=True)
+        self._thread.start()
 
     def stop(self):
         global _active_spinner
@@ -2452,14 +2505,27 @@ class Spinner:
         if self._thread:
             self._thread.join(timeout=0.5)
         self._stop = self._thread = None
+        # Pop from the stack (we may not be the top if stops interleave oddly).
+        if self in _spinner_stack:
+            _spinner_stack.remove(self)
         if _active_composer is not None:
-            _active_composer.status = ""
+            if _spinner_stack:                   # resume whoever's underneath
+                _active_spinner = _spinner_stack[-1]
+                _active_spinner._resume()
+            else:
+                _active_spinner = None
+                _active_composer.status = ""
             return
         if not _TTY:
+            _active_spinner = _spinner_stack[-1] if _spinner_stack else None
             return
         sys.stdout.write("\r\033[K")          # clear the spinner line
         sys.stdout.flush()
-        if _active_spinner is self:
+        if _spinner_stack:                       # resume the one underneath
+            _active_spinner = _spinner_stack[-1]
+            _active_spinner._resume()
+        else:
+            _active_spinner = None
             _active_spinner = None
 
     def __enter__(self):
@@ -6463,10 +6529,17 @@ class ExecutorClient:
         # with the driver's locale while a Windows executor emits cp1252, so any non-ASCII
         # char in a tool result (e.g. the '·' separators) mojibakes to 'Â·'. errors=replace
         # keeps a stray undecodable byte from tearing the whole channel down.
+        # start_new_session: run the ssh channel in its OWN process group so a
+        # terminal ^C (SIGINT to the whole foreground group) does NOT reach the ssh
+        # child. Without this, ^C to abort a turn killed the exec channel -> the next
+        # request hit a dead pipe -> _route_remote misread it as a link drop and
+        # reconnected. Now ^C only trips the cooperative self._abort path (clean
+        # abort, master + channel intact). Windows: its own group, same effect.
         self.proc = subprocess.Popen(
             argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=stderr, text=True, bufsize=1,
-            encoding="utf-8", errors="replace")
+            encoding="utf-8", errors="replace",
+            **_detached_popen_kwargs())
         self._id = 0
         self.host = None                # set by RemoteWorkspace for wait-spinner labels
         self.ready = self._read_obj()   # consume the {"ready": ...} handshake
