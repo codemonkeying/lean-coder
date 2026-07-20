@@ -816,6 +816,65 @@ check("_beyond_echo: output past the echo IS real",
       _ss._beyond_echo(b"qm list\nVMID NAME\n", b"qm list\n") is True)
 check("_beyond_echo: no echo passed -> any non-space is real (bare read)",
       _ss._beyond_echo(b"data\n", b"") is True and _ss._beyond_echo(b"  \n", b"") is False)
+# --- shell_session sentinel-marker draining (deterministic completion) ----------
+# _mode_for: shells/ssh get marker mode; REPLs/listeners/unknown get raw.
+check("_mode_for: bare shell -> shell", _ss._mode_for("") == "shell")
+check("_mode_for: ssh -> shell (far end is a login shell)", _ss._mode_for("ssh user@host") == "shell")
+check("_mode_for: sudo/su -> shell", _ss._mode_for("sudo -s") == "shell")
+check("_mode_for: python -i -> raw", _ss._mode_for("python3 -i") == "raw")
+check("_mode_for: nc listener -> raw", _ss._mode_for("nc -lvnp 4444") == "raw")
+check("_mode_for: unknown command -> raw (never inject a marker blindly)",
+      _ss._mode_for("some-weird-repl") == "raw")
+# _strip_marker: output is exactly the lines BETWEEN the echoed injected line and the
+# <mark><rc> terminator - so echo AND trailing prompt both drop.
+_MK = "__LC_DONE_1_2_"
+_cap = ("echo hi; printf '\\n%s' \"$?\"\n"   # echo of our injected line (has mark)
+        "hi\n"                                # the real output
+        f"{_MK}0\n"                           # the terminator
+        "user@box:~$ ")                       # next prompt (must be dropped)
+_cap = _cap.replace("%s", _MK)
+check("_strip_marker: keeps only output between echo and terminator",
+      _ss._strip_marker(_cap, _MK).strip() == "hi")
+check("_strip_marker: fallback filters mark lines when anchors missing",
+      _ss._strip_marker(f"just output\n{_MK}0", _MK).strip() == "just output")
+# End-to-end through a real pty (POSIX only): the cases that broke before -
+# lagged/bursty output, exit code surfaced, clean-exit stays quiet, prompt/echo
+# never leak. Guarded so a no-pty platform just skips.
+try:
+    import pty as _pty_probe  # noqa: F401
+    _has_pty = True
+except ImportError:
+    _has_pty = False
+if _has_pty:
+    _ss._H["_clean_captured"] = getattr(lc, "_clean_captured", lambda t: t)
+    def _sss(inp, timeout=6):
+        return _ss.run({"action": "send", "id": _sid, "input": inp, "timeout": timeout}, "/tmp")
+    _startres = _ss._start({}, "/tmp")
+    _sid = _startres.split()[1]              # "session sN started ..."
+    # bursty: output split by a mid-command sleep longer than the quiet-gap
+    _r = _sss("echo A; sleep 1; echo B_LATE")
+    check("shell_session e2e: bursty output fully captured (marker drain)",
+          "A" in _r and "B_LATE" in _r and "__LC_DONE" not in _r, repr(_r))
+    # exit code surfaced on failure, quiet on clean success
+    check("shell_session e2e: non-zero exit surfaced", "[exit 1]" in _sss("false"), )
+    check("shell_session e2e: clean exit stays quiet (no [exit 0])",
+          "[exit" not in _sss("true"))
+    # no prompt / echo / marker leakage
+    _r = _sss("echo HELLO")
+    check("shell_session e2e: output is clean (no prompt/echo/marker leak)",
+          _r.strip() == "HELLO", repr(_r))
+    # state persists across sends
+    _sss("cd /etc && export _LCT=zzz")
+    check("shell_session e2e: cwd + env persist across sends",
+          _ss.run({"action": "send", "id": _sid, "input": 'echo "$PWD/$_LCT"'}, "/tmp").strip()
+          == "/etc/zzz")
+    # timeout < command -> 'still running', rest retrievable via read
+    _r = _sss("sleep 3; echo TARDY", timeout=1)
+    check("shell_session e2e: timeout reports still-running (not a false empty)",
+          "still running" in _r)
+    check("shell_session e2e: the late output is retrievable via read",
+          "TARDY" in _ss.run({"action": "read", "id": _sid, "timeout": 4}, "/tmp"))
+    _ss.run({"action": "close", "id": _sid}, "/tmp")
 
 # --- web_screenshot lean-tool: MUST be driver_only ----------------------------
 # The browser + playwright live on the driver; if this tool is pushed to a remote
