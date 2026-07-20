@@ -2584,11 +2584,13 @@ def _stage(label, done=None):
             yield h
         finally:
             sp.stop()
-            print(dim(f"  {GLYPH.get('ok', 'v')} {h.done}"))
+            if h.done:                           # empty .done -> suppress the line entirely
+                print(dim(f"  {GLYPH.get('ok', 'v')} {h.done}"))
     else:
         print(dim(f"  {label}…"))
         yield h
-        print(dim(f"  {h.done} done"))
+        if h.done:
+            print(dim(f"  {h.done} done"))
 
 @contextmanager
 def suppress_echo():
@@ -7202,7 +7204,6 @@ class RemoteWorkspace:
                 label = "Windows"          # ran the channel, no uname -> genuine Windows
             else:
                 label = "unknown"          # connected but couldn't tell (never assume)
-            _st.done = f"probed · {label}"
             if self.remote_posix:
                 self._check_posix_python()
             else:
@@ -7212,8 +7213,8 @@ class RemoteWorkspace:
                     _clear_master(self.host, self.ctl)
                     self.ctl = None
                 self._check_windows_python()
-            if getattr(self, "remote_py_desc", ""):
-                _st.done = f"probed · {label} · {self.remote_py_desc}"
+            _st.done = ""                  # suppress the 'probed' line: OS + python version
+                                           # are already shown by the provision/probe stages
         self._bootstrap_executor()
         return self
 
