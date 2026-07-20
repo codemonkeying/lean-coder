@@ -102,8 +102,17 @@ class Tools:
             if depth > TREE_DEFAULT_DEPTH or count >= TREE_MAX_ENTRIES:
                 return
             try:
-                entries = sorted(d.iterdir(), key=lambda x: (x.is_file(), x.name))
-            except PermissionError:
+                # is_file() in the sort key can itself raise on a junction/reparse
+                # point (Windows WinError 448), so guard it per-entry too.
+                def _isfile(x):
+                    try:
+                        return x.is_file()
+                    except OSError:
+                        return True
+                entries = sorted(d.iterdir(), key=lambda x: (_isfile(x), x.name))
+            except OSError:
+                # PermissionError, or a Windows untrusted-mount-point junction
+                # (WinError 448) - skip this dir rather than abort the whole listing.
                 return
             for e in entries:
                 if count >= TREE_MAX_ENTRIES:
@@ -111,10 +120,14 @@ class Tools:
                     return
                 if self.ignore.ignored(e):
                     continue
+                try:
+                    is_dir = e.is_dir()
+                except OSError:
+                    continue
                 rel = _rel(e)
-                out.append(rel + ("/" if e.is_dir() else ""))
+                out.append(rel + ("/" if is_dir else ""))
                 count += 1
-                if e.is_dir():
+                if is_dir:
                     walk(e, depth + 1)
 
         walk(base, 1)
