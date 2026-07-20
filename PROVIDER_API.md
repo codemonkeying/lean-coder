@@ -7,9 +7,10 @@ Ollama - a hosted API, an OAuth subscription, anything. It is its own plugin typ
 to a `/connect` remote and exposes no model tool; it wires in through a native
 registry, so it never has to monkey-patch core or mutate `cfg`.
 
-Ollama is the bundled default (`provider = "ollama"`); several hosted providers ship
-bundled too (`anthropic_api`, `gemini`, `groq`, `openai`, `openrouter`), disabled until you
-enable and key them. Config **autosaves** - no manual `/save` step.
+Ollama is the bundled default (`provider = "ollama"`); more providers ship bundled too
+(`anthropic_api`, `anthropic_plan`, `gemini`, `groq`, `openai`, `openrouter`, plus the
+local servers `llamacpp` and `mlx`), disabled until you enable and key them. Config
+**autosaves** - no manual `/save` step.
 
 To start your own, copy the annotated template at
 [`examples/providers/example.py`](examples/providers/example.py).
