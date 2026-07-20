@@ -91,7 +91,7 @@ def _prehandover_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.9.1"
+__version__ = "0.9.2"
 
 
 def _prerelease_key(pre):
@@ -10379,7 +10379,7 @@ SLASH_COMMANDS = ["/clear", "/new", "/compact", "/handover", "/session", "/save"
                   "/prompt", "/sh", "/connect", "/machines", "/local", "/disconnect", "/tools", "/reload",
                   "/model", "/provider", "/think", "/effort",
                   "/set", "/usage", "/approve", "/leash", "/autosave", "/incognito",
-                  "/askread", "/bg", "/note", "/mcp", "/info", "/ctx", "/activity", "/expand", "/help", "/quit"]
+                  "/askread", "/bg", "/note", "/plan", "/mcp", "/info", "/ctx", "/activity", "/expand", "/help", "/quit"]
 
 # Built-in command names are the shadow-protection set: lean-tool commands can't claim
 # any of them. It is DERIVED from _BUILTIN_COMMANDS_TABLE (every builtin command + alias)
@@ -10591,6 +10591,7 @@ HELP_COMMANDS = [
     ("/askread [on|off]", "confirm read tools too"),
     ("/bg [kill <pid>]", "list/kill background tasks"),
     ("/note [grep|range|add|clear]", "the session notebook (episodic memory); no arg = recent"),
+    ("/plan [set|goal|add|done|clear]", "view/steer the pinned GOAL+TODO; no arg = show"),
     ("/info", "live session read-out"),
     ("/ctx", "context-token estimate"),
     ("/activity [n|all]", "what the system did automatically (compaction, handover, fallback, ...)"),
@@ -11151,6 +11152,79 @@ def handle_note_command(agent, cfg, arg):
     print(out)
 
 
+def handle_plan_command(agent, cfg, arg):
+    """/plan - view or set the pinned GOAL + TODO plan the model otherwise maintains
+    via the update_plan tool. The plan rides compaction/handover and is saved + restored
+    with the session, so /plan lets the operator steer it directly. Subcommands:
+      /plan                 show the current plan
+      /plan <text>          set the whole plan (multi-line ok; replaces it)
+      /plan set <text>      set (explicit)
+      /plan goal <text>     set/replace just the GOAL: line (keeps the TODO list)
+      /plan add <task>      append a '- [ ] task'
+      /plan done <n|text>   tick task #n (1-based) or the first open task matching text
+      /plan clear           wipe the plan
+    Mirrors /note: the operator drives the same agent state the model reads each turn."""
+    parts = arg.split(maxsplit=1)
+    sub = parts[0].lower() if parts else ""
+    rest = parts[1].strip() if len(parts) > 1 else ""
+    cur = getattr(agent, "pinned_plan", "") or ""
+
+    if not arg.strip():                       # bare: show it
+        print(cur if cur.strip() else dim("no plan pinned. `/plan <text>` to set one."))
+        return
+    if sub == "clear":
+        agent._update_plan("")
+        print(dim("plan cleared."))
+        return
+    if sub == "goal":
+        if not rest:
+            print("error: `/plan goal <text>` needs the goal text.")
+            return
+        lines = [l for l in cur.splitlines() if not l.strip().lower().startswith("goal:")]
+        # drop a leading blank left behind, then prepend the new GOAL line
+        body = "\n".join(lines).lstrip("\n")
+        new = f"GOAL: {rest}" + (f"\n{body}" if body.strip() else "")
+        print(agent._update_plan(new))
+        return
+    if sub == "add":
+        if not rest:
+            print("error: `/plan add <task>` needs the task text.")
+            return
+        new = (cur.rstrip() + "\n" if cur.strip() else "") + f"- [ ] {rest}"
+        print(agent._update_plan(new))
+        return
+    if sub == "done":
+        if not cur.strip():
+            print("no plan pinned.")
+            return
+        if not rest:
+            print("error: `/plan done <n|text>` needs a task number or matching text.")
+            return
+        lines = cur.splitlines()
+        # collect indices of OPEN tasks in order
+        open_idx = [i for i, l in enumerate(lines) if l.strip().startswith("- [ ]")]
+        target = None
+        if rest.isdigit():
+            k = int(rest)
+            if 1 <= k <= len(open_idx):
+                target = open_idx[k - 1]
+        if target is None:                    # fall back to first open task matching text
+            low = rest.lower()
+            for i in open_idx:
+                if low in lines[i].lower():
+                    target = i
+                    break
+        if target is None:
+            print(f"no open task matches {rest!r}.")
+            return
+        lines[target] = lines[target].replace("- [ ]", "- [x]", 1)
+        print(agent._update_plan("\n".join(lines)))
+        return
+    # `set <text>` or a bare plan body -> replace the whole plan
+    body = rest if sub == "set" else arg.strip()
+    print(agent._update_plan(body))
+
+
 def _provider_usage_str(agent, cfg, verbose=False) -> str:
     """The active backend's usage/quota tail (e.g. the '5h .. wk ..' meters), already
     styled, or '' if the backend reports none. Core does the rendering so every
@@ -11383,6 +11457,16 @@ def _arg_completions(agent, cfg, cmd):
         return ["kill"]
     if cmd == "/note":
         return ["recent", "grep", "range", "add", "clear"]
+    if cmd == "/plan":
+        return ["set", "goal", "add", "done", "clear"]
+    if cmd == "/plan done":                    # complete with the OPEN task texts
+        cur = getattr(agent, "pinned_plan", "") or ""
+        out = []
+        for l in cur.splitlines():
+            s = l.strip()
+            if s.startswith("- [ ]"):
+                out.append(s[len("- [ ]"):].strip())
+        return out
     if cmd == "/mcp":
         return ["list", "add", "remove", "reconnect", "clean"]
     if cmd in ("/mcp remove", "/mcp reconnect"):   # complete a configured server name
@@ -13617,6 +13701,7 @@ _BUILTIN_COMMANDS_TABLE = {
     "/load": handle_load_command,
     "/bg": handle_bg_command,
     "/note": handle_note_command,
+    "/plan": handle_plan_command,
     "/autosave": handle_autosave_command,
     "/incognito": handle_incognito_command,
     "/leash": handle_leash_command,
