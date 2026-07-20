@@ -1,5 +1,5 @@
 """Offline smoke test of lean_coder internals (no Ollama required)."""
-import shutil, sys, tempfile, atexit
+import shutil, sys, tempfile, atexit, os, subprocess
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # repo root (this file lives in tests/)
 import lean_coder as lc
@@ -1760,7 +1760,7 @@ check("_menu_index rejects 0/oob/nonnum",
 # --- MENU CONTRACT: a bare 1-based integer arg selects the Nth item from the SAME
 # ordered list the command's picker renders. One resolver (menu_resolve) backs every
 # menu-fronting command; these guard against a command re-drifting to a literal (the
-# `/connect 8` -> 0.0.0.8 bug).
+# `/connect 8` -> bare-integer-address bug).
 _mc = ["user@a", "user@b", "user@c"]
 check("menu_resolve: 1-based index -> item", lc.menu_resolve("2", _mc) == "user@b")
 check("menu_resolve: out-of-range -> None", lc.menu_resolve("9", _mc) is None)
@@ -5369,5 +5369,21 @@ _c = lc.Config()
 check("mcp config defaults empty", _c.mcp_servers == {} and _c.mcp_enabled == [])
 
 shutil.rmtree(FIX, ignore_errors=True)
+
+# Hygiene sweep as a HARD gate: the leak of a real internal IP into tracked source
+# slipped through because tests/_sweep.sh (the lint that catches exactly that) was
+# never run - no pre-commit hook invoked it, and this smoketest didn't either. Fold
+# it in here so the one command we DO run before every commit also fails on a stray
+# non-example IP / email / key / MAC / unicode dash. Skipped only if bash is absent.
+_sweep = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_sweep.sh")
+if os.path.isfile(_sweep) and shutil.which("bash"):
+    _sw = subprocess.run(["bash", _sweep], capture_output=True, text=True)
+    if _sw.returncode == 0:
+        check("hygiene sweep clean (no stray IP/email/key/unicode in tracked source)", True)
+    else:
+        _tail = (_sw.stdout or "").strip().splitlines()
+        check("hygiene sweep clean (no stray IP/email/key/unicode in tracked source)",
+              False, "\n    " + "\n    ".join(_tail[-12:]))
+
 print("\n" + ("ALL PASS" if ok else "SOME FAILED"))
 sys.exit(0 if ok else 1)
