@@ -93,9 +93,9 @@ class Tools:
             # listing OUTSIDE cwd (e.g. an absolute /var/log) into garbage like 'g/f'.
             rp = p.resolve()
             try:
-                return rp.relative_to(root).as_posix()
+                return str(rp.relative_to(root))
             except ValueError:
-                return rp.as_posix()
+                return str(rp)
 
         def walk(d, depth: int):
             nonlocal count
@@ -125,7 +125,7 @@ class Tools:
                 except OSError:
                     continue
                 rel = _rel(e)
-                out.append(rel + ("/" if is_dir else ""))
+                out.append(rel + (os.sep if is_dir else ""))
                 count += 1
                 if is_dir:
                     walk(e, depth + 1)
