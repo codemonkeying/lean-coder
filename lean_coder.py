@@ -7319,8 +7319,9 @@ class RemoteWorkspace:
         if have.strip():
             print(dim(f"  reusing embeddable Python at {py}"))
             return py
-        print(dim(f"no python3 on {self.host}; provisioning the embeddable runtime "
-                  f"(one-time: CPython {_POSIX_EMBED_PYVER} {libc}, cached)…"))
+        print(dim(f"no python3 on remote {self.host}; pushing a private one "
+                  f"(CPython {_POSIX_EMBED_PYVER} {libc}, one-time, cached). "
+                  f"Install python3 ON THE REMOTE to skip this next time."))
         try:
             tarball = _posix_embed_cache_download(fn, url, sha)
         except ConnectionError as e:
@@ -7388,8 +7389,9 @@ class RemoteWorkspace:
         and return a quoted 'python.exe' path to invoke it, or None on failure. The
         import spike confirmed our --tool-exec executor runs cleanly under the embed
         distro (all-stdlib, guarded lazy imports)."""
-        print(dim(f"no Python on {self.host}; provisioning the embeddable runtime "
-                  f"(one-time: CPython {_WIN_EMBED_VER} embeddable, cached)…"))
+        print(dim(f"no Python on remote {self.host}; pushing a private one "
+                  f"(CPython {_WIN_EMBED_VER} embeddable, one-time, cached). "
+                  f"Install Python ON THE REMOTE to skip this next time."))
         rc, out, err = self._run(_WIN_PROVISION_EMBED)
         out = (out or "").strip()
         if rc != 0 or not out or out.startswith("ERR:"):
