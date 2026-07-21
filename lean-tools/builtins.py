@@ -14,6 +14,10 @@
 #   write -> rides at /leash rw+  (edits files)
 #   exec  -> rides at /leash rwe  (runs commands)
 # Core DERIVES its SAFE_TOOLS / _WRITE_TIER / _EXEC_TIER / EXEC_TOOLS tuples from these.
+#
+# The tool-authoring contract these schemas follow (description-token economy,
+# note-style verb dispatch, progressive-disclosure params) is documented in
+# LEAN_TOOLS.md ("Shaping parameters" + "Built-in tools"). Keep the two in sync.
 
 import os
 import re
@@ -28,7 +32,7 @@ from pathlib import Path
 _INJECT = (
     "IgnoreMatcher", "resolve_in_project", "_parse_search_replace", "_confirm_action",
     "_bg_running", "_bg_register", "_bg_status_items", "_bg_status_msg",
-    "_bg_spawn_detached",
+    "_bg_spawn_detached", "_bg_kill",
     "READ_MAX_LINES", "READ_HEAD", "READ_TAIL", "TREE_DEFAULT_DEPTH", "TREE_MAX_ENTRIES",
     "SEARCH_MAX_MATCHES", "SEARCH_LINE_MAX", "SEARCH_MAX_FILE_BYTES",
     "OUTPUT_MAX_CHARS", "OUTPUT_HEAD", "OUTPUT_TAIL",
@@ -299,16 +303,9 @@ class Tools:
         verb = "overwrote" if original is not None else "created"
         return f"{verb} {path} ({len(content.splitlines())} lines)"
 
-    def run_command(self, cmd: str, notify_on_exit=None, heartbeat_timeout=None,
-                    max_runtime=None, kill_on_max=None) -> str:
-        bg = cmd.rstrip().endswith("&")        # trailing & = "background this"
+    def run_command(self, cmd: str) -> str:
         if not _confirm_action(self.cfg, "exec", cmd=cmd):
             return "user declined to run the command"
-        if bg:
-            return self._run_background(
-                cmd.rstrip()[:-1].rstrip(),
-                notify_on_exit=notify_on_exit, heartbeat_timeout=heartbeat_timeout,
-                max_runtime=max_runtime, kill_on_max=kill_on_max)
         to = self.cfg.command_timeout
         try:
             # stdin=DEVNULL: never let a child read the live terminal. With the
@@ -319,8 +316,8 @@ class Tools:
                                stdin=subprocess.DEVNULL)
         except subprocess.TimeoutExpired:
             return (f"error: command timed out after {to}s (no output captured). "
-                    f"For a long-running command, end it with ' &' to run it in the "
-                    f"background - returns a pid immediately; poll with bg_status.")
+                    f"For a long-running command, use the `background` tool - it "
+                    f"returns a pid immediately; check it with background(pid=...).")
         except Exception as e:
             return f"error running command: {e}"
         out = ""
@@ -358,8 +355,8 @@ class Tools:
         cap = self.cfg.bg_max_concurrent
         if cap and len(_bg_running(kind=None)) >= cap:
             return (f"error: at the background-task limit ({cap} running). Free a slot by "
-                    f"stopping a finished/unneeded one with `kill <pid>` (use bg_status to "
-                    f"list them), then retry.")
+                    f"stopping a finished/unneeded one with background(action='kill', pid=...) "
+                    f"(background() lists them), then retry.")
         def _posint(v):
             try:
                 n = int(v)
@@ -397,8 +394,8 @@ class Tools:
         note = ("  ·  " + "  ·  ".join(notes)) if notes else ""
         return (f"started in background: pid {p.pid} (detached; killed when you exit "
                 f"lean-coder)\noutput -> {log}\n"
-                f"track: bg_status  (exit code -> '{exitf}')  ·  list/stop: /bg  "
-                f"·  stop now: kill {p.pid}{note}")
+                f"track: background(pid={p.pid})  (exit code -> '{exitf}')  ·  "
+                f"stop: background(action='kill', pid={p.pid}){note}")
 
     @staticmethod
     def _bg_wrap(cmd: str, exitf: str, leasef: str, idle_timeout=None,
@@ -479,11 +476,36 @@ class Tools:
             f"[ -f '{exitf}' ] || printf %s \"$__rc\" > '{exitf}'; exit $__rc")
         return loop
 
-    # --- read-only: check on backgrounded tasks ---------------------------
-    def bg_status(self, pid=None) -> str:
-        """Report on background tasks THIS session started (state / runtime / recent
-        output). No pid -> list them all; a pid -> just that one. Plain tasks only -
-        the filtering lives in the core helper."""
+    # --- run + manage backgrounded tasks (note-style verb dispatch) -------
+    def background(self, cmd=None, action=None, pid=None, notify_on_exit=None,
+                   heartbeat_timeout=None, max_runtime=None, kill_on_max=None) -> str:
+        """Run/manage detached background tasks. action defaults to 'run' when a cmd
+        is given, else 'status'. run -> start detached (returns pid + log); status ->
+        no pid lists all this session's tasks, a pid shows just that one; kill -> stop
+        a task by pid. Plain tasks only - the filtering lives in the core helper."""
+        act = (action or "").strip().lower() or ("run" if cmd else "status")
+        if act == "run":
+            if not cmd:
+                return "error: background(action='run') needs a cmd."
+            if not _confirm_action(self.cfg, "exec", cmd=cmd):
+                return "user declined to run the command"
+            return self._run_background(
+                cmd, notify_on_exit=notify_on_exit, heartbeat_timeout=heartbeat_timeout,
+                max_runtime=max_runtime, kill_on_max=kill_on_max)
+        if act == "kill":
+            if pid is None:
+                return "error: background(action='kill') needs a pid."
+            try:
+                pid = int(pid)
+            except (TypeError, ValueError):
+                return "error: pid must be an integer"
+            rows = [r for r in _bg_status_items(os.getpid()) if r.get("pid") == pid]
+            if not rows:
+                return (f"no background task with pid {pid} owned by this session on "
+                        f"this box (it may have been reaped, or belongs to another session).")
+            _bg_kill(pid)
+            return f"killed background task pid {pid}."
+        # status (default)
         owner = os.getpid()
         rows = _bg_status_items(owner)
         if pid is not None:
@@ -661,18 +683,20 @@ BUILTIN_TOOLS = [
                        "content": {"type": "string", "description": "Full new contents of the file."}},
         "required": ["path", "content"]}},
     {"name": "run_command", "tier": "exec",
-     "description": "Run a non-interactive shell command (builds, tests, git, file ops); returns exit code + stdout/stderr (truncated - if clipped, pipe to a file or grep/head/tail it). Fresh shell each call - cd/env don't persist, chain with '&&'. Foreground runs are killed at {command_timeout}s (set via /settings) returning only a timeout error, so anything slower, or any server/daemon/watcher, MUST be backgrounded: end with ' &' to get a pid immediately (poll with bg_status). Backgrounded jobs and workers die on session exit; to outlive it use nohup/systemd, NOT ' &'. For sudo/interactive use ask_user_to_run; for a persistent shell (REPL, ssh) use shell_session.",
+     "description": "Run a non-interactive shell command (builds, tests, git, file ops); returns exit code + stdout/stderr (truncated - if clipped, pipe to a file or grep/head/tail it). Fresh shell each call - cd/env don't persist, chain with '&&'. Runs in the FOREGROUND and is killed at {command_timeout}s: for anything slower, or any server/daemon/watcher, use the `background` tool instead. For sudo/interactive use ask_user_to_run; for a persistent shell (REPL, ssh) use shell_session.",
      "parameters": {"type": "object",
-        "properties": {"cmd": {"type": "string", "description": "The shell command to run. End with ' &' to background it."},
-                       "notify_on_exit": {"type": "boolean", "description": "Bg jobs (' &') only: push exit code + output tail back when it finishes."},
-                       "heartbeat_timeout": {"type": "integer", "description": "Bg jobs only: alert once if no output for N secs. Never kills (silence != dead)."},
-                       "max_runtime": {"type": "integer", "description": "Bg jobs only: wall-clock ceiling (secs); notify + auto-kill on trip."},
-                       "kill_on_max": {"type": "boolean", "description": "With max_runtime: false = notify only, keep running (default true = kill)."}},
+        "properties": {"cmd": {"type": "string", "description": "The shell command to run."}},
         "required": ["cmd"]}},
-    {"name": "bg_status", "tier": "read",
-     "description": "Poll the background jobs THIS session started with ' &' on run_command: returns state (running/exited/killed), runtime, recent output. No pid = all; a pid = just that one. (Does NOT show dispatched workers - use dispatch_worker action='status'.)",
+    {"name": "background", "tier": "exec",
+     "description": "Run/manage long-lived tasks (dev servers, watchers, builds) that would blow run_command's foreground timeout. action: run (default when cmd given) starts a detached task, returns pid + log; status (default, no cmd) lists this session's tasks, or one with pid; kill needs pid. Detached tasks die on exit; use nohup/systemd to outlive that.",
      "parameters": {"type": "object",
-        "properties": {"pid": {"type": "integer", "description": "A specific job's pid (optional; omit to list all)."}},
+        "properties": {"cmd": {"type": "string", "description": "Command to run detached (run)."},
+                       "action": {"type": "string", "enum": ["run", "status", "kill"], "description": "Verb; defaults to run when cmd is given, else status."},
+                       "pid": {"type": "integer", "description": "Which task (status one / kill)."},
+                       "notify_on_exit": {"type": "boolean", "description": "Push exit code + tail back on finish."},
+                       "heartbeat_timeout": {"type": "integer", "description": "Alert once if silent N secs (never kills)."},
+                       "max_runtime": {"type": "integer", "description": "Wall-clock ceiling (secs); notify + auto-kill on trip."},
+                       "kill_on_max": {"type": "boolean", "description": "max_runtime: false = notify only (default true = kill)."}},
         "required": []}},
 ]
 

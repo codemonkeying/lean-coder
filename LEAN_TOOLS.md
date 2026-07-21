@@ -11,7 +11,7 @@ writing a tool? lean-coder is also a generic MCP client - see [MCP.md](MCP.md).)
 ```python
 TOOL = {
     "name": "word_count",                      # unique; becomes the tool name
-    "description": "Count lines/words/chars.",  # ONE line (serialized every request)
+    "description": "Count lines/words/chars.",  # earn every token (sent every request)
     "parameters": {                            # JSON Schema for the arguments
         "type": "object",
         "properties": {"path": {"type": "string"}},
@@ -44,7 +44,7 @@ read-only) and `weather.py` (API-backed with a key + network egress).
 | key | required | notes |
 |-----|----------|-------|
 | `name` | yes | The tool name the model calls. Must be unique and must not collide with a built-in (`read_file`, `run_command`, ...). |
-| `description` | yes | **Keep it to one line.** It is sent in *every* request, so it is a direct context cost. |
+| `description` | yes | **Earn every token.** It is sent in *every* request, so it is a direct context cost - but a *when-to-use* cue (or a short disambiguation for a weak model) is worth the tokens if it stops a misfire. Terse by default; multi-sentence only when it pays for itself (the builtins below are deliberately verbose for exactly this reason). |
 | `parameters` | yes | A JSON Schema object describing the arguments. Match what `run` reads. |
 | `safe` | no | `True` for a read-only tool: it runs without a confirmation prompt **and becomes eligible to run concurrently** (see below). Omit (or `False`) for anything that writes, runs commands, or holds state - lean-coder will ask first (auto-approve mode waives that) and always runs it serially. |
 | `glyph` | no | A short display string used as this tool's icon on its call line. Overrides the auto-derived category icon (see below). Give it an ASCII-safe or well-supported symbol; omit to use the category default. |
@@ -80,7 +80,7 @@ automatically by **category**, so your lean-tool gets a sensible icon with no ef
 | meta  | `◇` | agent-internal (`update_plan`, `note`, ...) |
 | gear  | `⚙` | anything uncategorised (the fallback) |
 
-A **backgrounded** `run_command` (trailing `&`) always shows `⚡` regardless.
+A **`background` run** (starting a detached task) always shows `⚡` regardless.
 
 To give your tool a **signature icon**, set `TOOL["glyph"]` - it wins over the derived
 category:
@@ -105,6 +105,54 @@ def setup(lc, cfg):
     global _tick
     _tick = lc.g("✓", "+")   # ✓ on UTF-8 terminals, + otherwise
 ```
+
+### Shaping `parameters`: verb dispatch and progressive disclosure
+
+Two schema shapes keep a capable tool from ballooning the context budget or
+splintering into a fleet of near-identical tools. Both are used by the bundled
+tools (`note`, `background`, `dispatch_worker`); copy them.
+
+**One multi-verb tool, not N tools (note-style verb dispatch).** When several
+actions share a subject, fold them into ONE tool with an `action` enum rather than
+shipping a separate tool per verb - one schema in the request instead of many, and
+the model picks the verb. Give `action` a **sensible default keyed off which other
+arg is present**, so the common call needs no `action` at all:
+
+```python
+"parameters": {
+    "type": "object",
+    "properties": {
+        "action": {"enum": ["run", "status", "kill"]},  # default: run if cmd given, else status
+        "cmd":    {"type": "string"},
+        "pid":    {"type": "integer"},
+    },
+},
+```
+
+`background` is exactly this: `cmd` present -> `run`; no cmd -> `status`;
+`action="kill"` + `pid` -> `kill`. `note` likewise (`text` -> add, else recent).
+Document the defaulting in the `description` so the model knows the bare call works.
+
+**Progressive disclosure for optional params.** Keep `required` to the minimal core
+a first call needs; expose advanced knobs as **omittable params with sane defaults**
+baked into `run()`, not into the caller's obligation. The model reaches for them
+only when it needs them, and a weak model isn't taxed deciding values it can ignore.
+`background`'s watchdog params (`max_runtime`, `heartbeat_timeout`, `notify_on_exit`)
+are optional-with-defaults for this reason - do **not** hoist them into `required`.
+
+**Declare the default two ways** when it is a fixed value. Small/local models are
+more reliable when the schema is the single source of truth (prefer `enum` over an
+open string; encode the constraint *in* the schema), so:
+
+- put a machine-readable **`"default"`** key on the property (`{"type": "string",
+  "enum": ["outline", "def"], "default": "outline"}`), **and**
+- say **how** the defaulting behaves in the `description` - a weak model needs to be
+  told, not left to infer it.
+
+Only when the default is *computed* (e.g. `background`: run if `cmd` is present else
+status; an "auto" that adapts to output size) can JSON Schema's `default` not express
+it - then the `description` prose carries it alone. A fixed default (`port` 22,
+`leash` `"r"`, `mobile` false) always gets both.
 
 ### Built-in tools (`lean-tools/builtins.py`)
 
@@ -324,13 +372,13 @@ How it works (it piggybacks the background-task machinery, no new transport):
 
 Collecting results: `/worker` lists dispatched workers with state + whether a result
 is ready; `/worker <pid>` prints that worker's full result. Workers are deliberately
-hidden from `/bg` and the `bg_status` tool, so a session without this tool never sees
+hidden from `/bg` and the `background` tool, so a session without this tool never sees
 them.
 
 
 ## Autonomous wake on background finish (`wake_on_bg_finish`)
 
-By default a finished background job (a plain `' &'` task **or** a dispatched worker)
+By default a finished background job (a plain `background` task **or** a dispatched worker)
 surfaces **passively**: its notice rides the *next turn you type*. If you never type,
 the agent never sees it. That's fine when you're driving, but it means a long job
 that finishes while you're away just waits.
@@ -387,8 +435,9 @@ session is connected to a remote.
 
 ## Context discipline
 
-Every enabled lean-tool's schema is in every request. Keep `description` to one
-line and `parameters` minimal, and only enable the lean-tools you are actually
+Every enabled lean-tool's schema is in every request. Make `description` earn
+every token (terse by default, a when-to-use cue where it prevents a misfire) and
+keep `parameters` minimal, and only enable the lean-tools you are actually
 using. An empty/disabled lean-tool set costs nothing.
 
 ## Gotchas (read before you debug)
@@ -436,7 +485,7 @@ raising.
 
 Before you ship a lean-tool:
 
-- [ ] `description` is **one line**; `parameters` only lists args `run()` actually reads.
+- [ ] `description` **earns every token** (terse, plus a when-to-use cue only where it pays); `parameters` only lists args `run()` actually reads.
 - [ ] `name` is unique and doesn't shadow a built-in.
 - [ ] `safe` set **only** if read-only, side-effect-free, and thread-safe.
 - [ ] All paths resolved against `cwd`; nothing hardcoded.

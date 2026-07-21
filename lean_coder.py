@@ -91,7 +91,7 @@ def _prehandover_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.9.2"
+__version__ = "0.9.3"
 
 
 def _prerelease_key(pre):
@@ -179,7 +179,16 @@ SYSTEM_PROMPT = (
     "confirm intent first unless the operator has clearly asked for exactly that. "
     "The operator approving an action once does NOT mean it's approved in every "
     "later context. Never commit unless asked. "
-    # Function-result clearing (standing, not just at compaction).
+    # Can't-run-it -> reach for the tool, don't narrate it.
+    "If you can't run something yourself, call ask_user_to_run - never just tell the "
+    "operator to run it in prose. "
+    # When to keep a pinned plan (kept out of the tool schema to save tokens).
+    "Use update_plan for a task with 3+ steps or several sub-tasks, keeping one step in "
+    "progress at a time; skip it for a single trivial task or a conversational reply. "
+    # Decision surfacing format (keeps a terse reply like '1b 2a' unambiguous).
+    "When surfacing decisions for the operator, number the decisions and letter the "
+    "options (1/2/3, a/b/c). "
+    # Function-result-clearing (standing, not just at compaction).
     "Older tool results may be cleared from context as the conversation grows, so "
     "copy any critical values - file paths, command output, error messages, IDs - "
     "into your prose while you still have them; don't rely on a past tool result "
@@ -414,13 +423,12 @@ def _handover_nudge_missing(missing) -> str:
 # Auto-compaction instruction: the model gets a full tool-capable turn to wrap up,
 # then writes BOTH a handover block (@#!, kept as continuing context) and a
 # self-prompt (%%^^, autostarted as the next turn). Recent turns are kept verbatim.
-# Forced (hard/emergency) handover. IMPORTANT ordering lesson (measured, model-eval/
-# tune_handover.py): the OLD version opened with an optional "update docs with your
-# tools" step, which invited a chatty preamble ("I'll compact the context...") that
-# smaller models emitted and then STOPPED - no blocks, failed handover. The fix that
-# tested best (qwen3-coder:30b 4/4 vs a flaky ~3/4 before) is blocks-FIRST, an explicit
-# "start your reply with the first marker - no preamble", and durable-doc saving demoted
-# to an AFTER option. Keep that shape if you edit this.
+# Forced (hard/emergency) handover. IMPORTANT ordering lesson: the OLD version opened
+# with an optional "update docs with your tools" step, which invited a chatty preamble
+# ("I'll compact the context...") that smaller models emitted and then STOPPED - no
+# blocks, failed handover. The shape that holds up is blocks-FIRST, an explicit "start
+# your reply with the first marker - no preamble", and durable-doc saving demoted to an
+# AFTER option. Keep that shape if you edit this.
 AUTO_HANDOVER_INSTR = (
     "Your context is full - compact it yourself now (recent turns are kept; older ones "
     "get replaced by what you write here). You are writing a note to YOURSELF in a fresh "
@@ -597,7 +605,7 @@ def _norm_leash(s):
 # operator can edit it, runs it in a real terminal, and the result returns here.
 ASK_USER_TOOL = {"type": "function", "function": {
     "name": "ask_user_to_run",
-    "description": "Hand a command to the operator to run in their own terminal; the exact command and its exit code return to you (never any password). Use when run_command can't: needs sudo/root, an interactive prompt, a typed password or secret, or your judgement before acting. Also the right fallback when run_command failed because it required one of those. They may edit the command before running. Don't use it for ordinary commands run_command can handle.",
+    "description": "Hand a command to the operator to run in their own terminal; the exact command and its exit code come back to you (never any password). Use when run_command can't: sudo/root, an interactive prompt, or a typed secret. They may edit it before running.",
     "parameters": {"type": "object",
         "properties": {"cmd": {"type": "string", "description": "The command to hand over."},
                        "reason": {"type": "string", "description": "Brief why this needs the operator (e.g. 'needs sudo')."}},
@@ -608,15 +616,10 @@ ASK_USER_TOOL = {"type": "function", "function": {
 # extracts the @#! ... @#! block from the handover turn and replaces history with it.
 UPDATE_PLAN_TOOL = {"type": "function", "function": {
     "name": "update_plan",
-    "description": ("Set/replace your PINNED plan: the GOAL plus a TODO checklist. It stays "
-                    "pinned to the system prompt, visible every turn, and SURVIVES "
-                    "compaction/handover - so it's how you keep long-horizon work on track. "
-                    "Call it whenever the plan changes: at the start to lay out the GOAL and "
-                    "tasks, and again as you finish steps (flip '- [ ]' to '- [x]') or "
-                    "re-scope. Pass the FULL plan each time - it replaces the previous one. "
-                    "Pass an empty string to clear it. Keep it short. Use it for tasks with "
-                    "3+ steps or several distinct sub-tasks; keep only ONE step in progress "
-                    "at a time. Don't use it for a single trivial task or a conversational reply."),
+    "description": ("Set/replace your PINNED plan: a GOAL plus a TODO checklist that stays "
+                    "pinned to the system prompt and survives compaction/handover. Pass the "
+                    "FULL plan each time (it replaces the previous); flip '- [ ]' to '- [x]' "
+                    "as you finish steps; empty string clears it."),
     "parameters": {"type": "object",
         "properties": {"plan": {"type": "string", "description":
             "The full plan text, e.g.\nGOAL: ship feature X\nTODO:\n- [x] done step\n- [ ] next step"}},
@@ -653,11 +656,9 @@ NOTE_TOOL = {"type": "function", "function": {
     "name": "note",
     "description": (
         "Your persistent session NOTEBOOK - episodic memory that survives compaction and "
-        "travels with the session (saved/restored on /load). Jot decisions, findings, "
-        "gotchas you couldn't re-derive from code or git. Actions: add (default; bare `text` "
-        "appends a timestamped entry) | recent (newest `n`, default 40) | grep (`pattern`) | "
-        "range (`from` alone = since then; `from`+`to` = between; timestamps 'YYYY-MM-DD "
-        "HH:MM', bare date = whole day). No args shows recent; reads are capped."),
+        "travels with the session. Jot decisions, findings, gotchas you couldn't re-derive "
+        "from code or git. Actions: add (default when `text` given) | recent | grep | range. "
+        "No args = recent; reads are capped."),
     "parameters": {"type": "object", "properties": {
         "text": {"type": "string", "description": "Note to append (add)."},
         "action": {"type": "string", "enum": ["add", "recent", "grep", "range"]},
@@ -2283,17 +2284,34 @@ _MD_BOLD = re.compile(r"\*\*(.+?)\*\*|__(.+?)__")
 # operands reject a marker adjacent to whitespace so "a * b" and "2 * 3" pass through.
 _MD_ITALIC = re.compile(r"(?<![\*\w])\*(?!\s)([^*\n]+?)(?<!\s)\*(?![\*\w])"
                         r"|(?<![_\w])_(?!\s)([^_\n]+?)(?<!\s)_(?![_\w])")
+# Blockquote: one or more leading '>' (nested), each optionally followed by a space.
+# The model emits these when it drafts "a message to send" - without handling, the
+# raw '> ' leaks on every line. We strip the markers and re-style as a dim, bar-led
+# quote so it reads as a set-apart block, not literal text.
+_MD_QUOTE = re.compile(r"^\s{0,3}((?:>\s?)+)(.*)$")
 
 
 def style_md_line(line: str) -> str:
     """Style one COMPLETE markdown line: strip heading hashes / ** / backticks
     (always), add bold/cyan when the terminal allows. Lists, italics, and other
     text pass through untouched."""
+    q = _MD_QUOTE.match(line)
+    if q:
+        # Strip the '>' marker(s); render the remaining text (still inline-styled) as a
+        # dim quote led by a bar glyph, so the block is visually set apart from prose.
+        inner = style_md_inline(q.group(2))
+        return dim(GLYPH["userbar"] + " ") + inner
     h = _MD_H.match(line)
     if h:
         inner = _MD_CODE.sub(lambda m: m.group(1), h.group(2))      # strip backticks
         inner = _MD_BOLD.sub(lambda m: m.group(1) or m.group(2), inner)  # strip **
         return bold(inner)
+    return style_md_inline(line)
+
+
+def style_md_inline(line: str) -> str:
+    """Inline styling only (code / bold / italic), no line-level heading or quote
+    handling. Split out so the quote branch can reuse it on the quoted text."""
     line = _MD_CODE.sub(lambda m: cyan(m.group(1)), line)
     line = _MD_BOLD.sub(lambda m: bold(m.group(1) or m.group(2)), line)
     line = _MD_ITALIC.sub(lambda m: italic(m.group(1) or m.group(2)), line)
@@ -3850,7 +3868,7 @@ class Config:
     update_track: str = "stable"     # which /update track to follow: 'stable' (the main
                                      # branch) or 'beta' (pre-release branch). Selects the
                                      # branch /update fetches VERSION + lean_coder.py from.
-    command_timeout: int = 300       # foreground run_command timeout (s); long tasks use ' &'
+    command_timeout: int = 300       # foreground run_command timeout (s); long tasks use the background tool
     bg_max_concurrent: int = 5       # max background tasks at once (0 = unlimited)
     worker_max_concurrent: int = 10   # dispatch_worker: max worker agents alive at once (0 = unlimited)
     worker_idle_timeout: int = 1800  # dispatch_worker: worker lease secs; unattended self-kill
@@ -4859,9 +4877,9 @@ def _bg_register(pid, cmd, log, kind="task", idle_timeout=None,
     THAT box; the host field lets a reader tell 'my box' (pid is authoritative)
     from a foreign record (never mine to reap) - see _proc_alive_here.
 
-    `kind` tags what the record is: "task" (a plain backgrounded run_command, the
+    `kind` tags what the record is: "task" (a plain background task, the
     default) or "worker" (a dispatched agent). Both share this lifecycle, but the
-    plain bg surface (/bg, the bg_status tool, non-agent finished-notify) FILTERS
+    plain bg surface (/bg, the background tool, non-agent finished-notify) FILTERS
     to kind="task" so a session without the worker tool never sees - or is
     confused by - a worker. Workers surface only through the worker tool's path.
 
@@ -5210,7 +5228,7 @@ def _bg_alert_msg(items):
         if it.get("kind") == "silent":
             head = (f"background task STILL RUNNING but silent: `{cmd}` (pid {pid}) has "
                     f"produced no output for ~{it.get('secs')}s. It was NOT killed. "
-                    f"Check on it (bg_status), keep waiting, or `kill {pid}`.")
+                    f"Check on it (background(pid={pid})), keep waiting, or `kill {pid}`.")
         else:
             head = (f"background task hit max_runtime: `{cmd}` (pid {pid}) ran past its "
                     f"{it.get('secs')}s ceiling and is STILL RUNNING (kill_on_max=false). "
@@ -5233,7 +5251,7 @@ def _bg_clear_alert(log, akind):
 
 def _bg_status_items(owner, kind="task"):
     """Status rows for this-box bg tasks owned by `owner` (a pid), for the
-    model-facing bg_status tool. Each row: {pid, cmd, state ('running' | 'exit N'),
+    model-facing background tool. Each row: {pid, cmd, state ('running' | 'exit N'),
     runtime (human elapsed), tail (last lines)}. Filtered to `kind` (default 'task',
     so workers stay off the plain-bg surface). Only records on THIS box - a foreign
     record's pid isn't ours to probe."""
@@ -5260,13 +5278,13 @@ def _bg_status_items(owner, kind="task"):
 
 
 def _bg_status_msg(rows, pid=None) -> str:
-    """Render _bg_status_items rows into the string the bg_status tool returns to
+    """Render _bg_status_items rows into the string the background tool returns to
     the model. pid given but no row -> a clear 'no such task'. Empty -> a plain note."""
     if pid is not None and not rows:
         return (f"no background task with pid {pid} owned by this session on this box "
                 f"(it may have been reaped, or belongs to another session).")
     if not rows:
-        return "no background tasks from this session.  (end a run_command with ' &' to start one)"
+        return "no background tasks from this session.  (start one with the `background` tool)"
     out = []
     for r in rows:
         head = f"pid {r['pid']}  {r['state']}  (ran {r['runtime']})  {r['cmd']}"
@@ -7030,9 +7048,10 @@ def _ctl_opts(ctl):
 def _scp_argv(host, ctl, local_path, remote_path):
     """scp a local file to `remote_path` on `host`. Reuses the ControlMaster socket
     when `ctl` is set (POSIX); on Windows (ctl falsy) it's a fresh key-auth transfer.
-    MEASURED on Win11 OpenSSH (192.0.2.16): a full 648KB agent.py lands byte-identical
-    in ~4s - so scp is the Windows push (the old 'scp truncates large files' claim was
-    wrong; it replaces the ~3-4min, deadlock-prone chunked base64 path)."""
+    when `ctl` is set (POSIX); on Windows (ctl falsy) it's a fresh key-auth transfer.
+    scp is the Windows push: it goes through the same sshd over its own channel and
+    lands the agent byte-identical, replacing the slow, deadlock-prone chunked base64
+    path (Windows sshd DEADLOCKS on a stdin-piped `cat > path` exec channel)."""
     return (["scp"] + _ctl_opts(ctl) + ["-o", "BatchMode=yes",
              "-o", "StrictHostKeyChecking=accept-new", "-o", "LogLevel=ERROR",
              "-p", local_path, f"{host}:{remote_path}"])
@@ -7233,7 +7252,7 @@ class RemoteWorkspace:
 
     def _reuse_executor(self, want):
         """Find an EXISTING remote executor whose source hash == `want`, so we can
-        skip the ~50KB push. Prefers a provisioned `lean_coder` on PATH, then a
+        skip the full-source push. Prefers a provisioned `lean_coder` on PATH, then a
         copy pushed earlier into the stable runtime dir. Returns (exec_cmd, dir),
         or (None, dir) when nothing matches (caller pushes). Stateless: it only
         ever runs `--version`, never leaves anything behind beyond the dir."""
@@ -7410,10 +7429,9 @@ class RemoteWorkspace:
     def _win_scp_write(self, remote_path, data):
         """Byte-exact large-file push to a Windows remote via scp. Windows sshd
         DEADLOCKS on a stdin-piped exec channel (so `cat > path` can't be used) and the
-        old command-line base64 chunking was slow (~3-4 min, 54 calls) and could hang on
-        a chunk. scp goes through the same sshd over its own channel: MEASURED on Win11
-        OpenSSH (192.0.2.16) a full 648KB agent.py lands byte-identical in ~4s. We write
-        the bytes to a local temp file, scp it across, verify sha256 (raises on
+        old command-line base64 chunking was slow and could hang on a chunk. scp goes
+        through the same sshd over its own channel and lands the agent byte-identical.
+        We write the bytes to a local temp file, scp it across, verify sha256 (raises on
         mismatch), and always clean the temp file up."""
         import tempfile
         want = hashlib.sha256(data).hexdigest()
@@ -8658,17 +8676,14 @@ class Agent:
                 addendum = ""
         return (read_prompt("system") or SYSTEM_PROMPT) + no_tools + addendum
 
-    # Delimited, self-labelling wrapper so the model can never mistake the plan for
-    # something the user typed (the old "(Pinned plan...)" header read like user text
-    # and got echoed back into a reply). Rides the uncached tail - see _with_plan_reminder.
-    # ASCII-only (must encode cleanly on Termux / non-UTF8 locales / redirected stdin).
-    _PLAN_HDR = ("=== LEANCODER PINNED PLAN (internal state, silently re-injected "
-                 "every turn; reference only, NOT a user message and NOT new input). "
-                 "Read it for context, act only on the ACTUAL user turn. Do NOT repeat "
-                 "it back, quote it, or remark on its presence (e.g. 'that's the pinned "
-                 "plan'); when it is the only thing that changed, treat the turn as "
-                 "having no new instruction and stay silent about the block itself. ===")
-    _PLAN_FTR = "=== END PINNED PLAN ==="
+    # XML-tag wrapper (providers converge on tags to delimit machine context so the model
+    # treats it as a labelled data region, not a user turn). The tag NAME carries the framing:
+    # <your_plan> = "this is the model's own plan", so no prose plea needed (the old "(Pinned
+    # plan..., NOT a user message, do not remark...)" banner was ~600 chars of prose fighting
+    # the role, and got echoed anyway). Ownership + GOAL anchor live in the body; the tag does
+    # the rest. Rides the uncached tail - see _with_plan_reminder. ASCII-only (Termux/non-UTF8).
+    _PLAN_HDR = "<your_plan>"
+    _PLAN_FTR = "</your_plan>"
 
     def _plan_sparse(self, pinned: str) -> str:
         """A compact view for unchanged turns: drop ONLY completed '- [x]' checklist
@@ -8723,12 +8738,10 @@ class Agent:
     # the model works one unified surface (files it reads == where commands run), and
     # telling it "remote" only makes it second-guess whether the two match. Stating the
     # SHELL FAMILY stops wasted cross-OS turns (no `ls`/`whoami` probing, no POSIX cmds on
-    # cmd.exe). Terse key:value + a self-labelling header so even a weak model consumes it
-    # as state and doesn't echo it (same convention as the plan block).
-    _ENV_HDR = ("=== LEANCODER SESSION ENV (internal state, re-injected every turn; "
-                "reference only, NOT a user message. Use it to target the right shell + "
-                "paths; do NOT repeat or remark on it.) ===")
-    _ENV_FTR = "=== END SESSION ENV ==="
+    # as state and doesn't echo it (same XML-tag convention as the plan block: the tag
+    # name self-labels it, so no prose caveat is needed - see _PLAN_HDR note).
+    _ENV_HDR = "<session_env>"
+    _ENV_FTR = "</session_env>"
 
     def _shell_family(self) -> str:
         """The shell run_command executes under, for the model to target commands at.
@@ -8746,11 +8759,17 @@ class Agent:
 
     def _with_plan_reminder(self, msgs):
         """Return a COPY of the sent slice with the uncached session tail (live env +
-        pinned plan) appended to the last message's text. Non-destructive (never touches
+        pinned plan) merged into the last message's text. Non-destructive (never touches
         self.messages) and applied after the last cache breakpoint, so the tail stays
-        uncached + never persists. A tool result must stay exact, so we don't append to a
-        role:tool tail - we add a trailing user note instead (rare: the slice normally
-        ends on a user/assistant turn)."""
+        uncached + never persists.
+
+        MID-LOOP (last message is a role:tool result) we append NOTHING: a standalone
+        role:user block after a tool result lands in the 'next instruction' slot, and a
+        recency-biased model (esp. small/quantised) reads it as the ask and re-acts on its
+        own TODO - a self-sustaining spiral. The plan/env already rode the tail of the real
+        user turn that opened this loop, so the model has them; re-showing every iteration is
+        pure recency-poison. So the reminder only merges onto a genuine user/assistant tail
+        (turn boundary), never a phantom turn after a tool result."""
         # One-shot suppression: the send right after an update_plan skips the PLAN
         # reminder, so the model doesn't get its just-written plan echoed back and narrate
         # it (a wasted turn). Re-arms automatically for the following send - and arms a FULL
@@ -8776,17 +8795,23 @@ class Agent:
         out = list(msgs)
         last = dict(out[-1])
         if last.get("role") == "tool":
-            out.append({"role": "user", "content": reminder.lstrip("\n")})
-            return out
+            # Mid-loop: do NOT append a phantom role:user turn after a tool result (the
+            # recency trap - see docstring). Leave the slice exactly as-is; the model keeps
+            # its momentum on the tool result and already has the plan from the turn's start.
+            return msgs
+        # Turn boundary: PREPEND the state block so the user's own words stay LAST - the
+        # final thing the model reads is the actual ask, not a trailing checklist (keeps the
+        # action slot on real input; the plan/env sit just above as leading reference).
+        head = reminder.lstrip("\n") + "\n\n"
         content = last.get("content")
         if isinstance(content, str):
-            last["content"] = content + reminder
-        elif isinstance(content, list) and content and content[-1].get("type") == "text":
+            last["content"] = head + content
+        elif isinstance(content, list) and content and content[0].get("type") == "text":
             blocks = list(content)
-            blocks[-1] = dict(blocks[-1], text=blocks[-1].get("text", "") + reminder)
+            blocks[0] = dict(blocks[0], text=head + blocks[0].get("text", ""))
             last["content"] = blocks
         elif isinstance(content, list):
-            last["content"] = content + [{"type": "text", "text": reminder.lstrip("\n")}]
+            last["content"] = [{"type": "text", "text": head}] + content
         else:
             return msgs
         out[-1] = last
@@ -10118,9 +10143,12 @@ def _fmt_call_args(name: str, args: dict) -> str:
 
 
 def _is_bg_call(name: str, args: dict) -> bool:
-    """True when this is a backgrounded (detached) run_command - a trailing '&' on
-    the cmd."""
-    return name == "run_command" and str(args.get("cmd", "")).rstrip().endswith("&")
+    """True when this call STARTS a detached background task (background tool, run
+    action - explicit or the cmd-implies-run default)."""
+    if name != "background":
+        return False
+    act = (str(args.get("action", "")).strip().lower() or ("run" if args.get("cmd") else "status"))
+    return act == "run"
 
 
 # name -> display glyph, populated from a lean-tool's optional TOOL["glyph"] as it
@@ -10136,7 +10164,7 @@ _NET_TOOLS = frozenset({
     "web_fetch", "web_search", "brave_search", "web_screenshot", "render_url", "ssh",
     "fetch", "curl", "http_get"})
 # Agent-internal / bookkeeping tools: no fs, no exec, no net - a distinct 'meta' icon.
-_META_TOOLS = frozenset({"update_plan", "request_handover", "note", "bg_status"})
+_META_TOOLS = frozenset({"update_plan", "request_handover", "note"})
 
 
 def _tool_category(name: str, args: dict) -> str:
@@ -11081,7 +11109,7 @@ def handle_bg_command(agent, cfg, arg):
         rows = remote.bg_list()
         if not rows:
             print(dim(f"no background tasks on {remote.host}.  "
-                      f"(end a command with ' &' to start one)"))
+                      f"(start one with the `background` tool)"))
             return
         print(bold(f"background tasks (remote {remote.host}):"))
         for r in rows:
@@ -11101,7 +11129,7 @@ def handle_bg_command(agent, cfg, arg):
     finished = [r for r in recs if not _proc_alive(r.get("pid"))
                 and _bg_exit_code(r) is not None]
     if not running and not finished:
-        print(dim("no background tasks running.  (end a command with ' &' to start one)"))
+        print(dim("no background tasks running.  (start one with the `background` tool)"))
         return
     print(bold("background tasks:"))
     for r in running:

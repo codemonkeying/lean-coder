@@ -9,7 +9,7 @@
 
 TOOL = {
     "name": "word_count",
-    # one line: it is serialized into every request, so keep it terse
+    # earn every token: it is serialized into every request, so keep it terse
     "description": "Count lines, words, and characters in a file.",
     "parameters": {
         "type": "object",
