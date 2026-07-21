@@ -10602,7 +10602,7 @@ HELP_COMMANDS = [
     ("/save [name]", "name the current session"),
     ("/load [name]", "resume a session (no arg = picker)"),
     ("/session", "list | delete <name>"),
-    ("/prompt [name]", "view/edit prompt files"),
+    ("/prompt [name]", "fire a saved prompt as your next turn (no arg = picker; edit/reset to manage)"),
     ("/sh [cmd]", "run a command in a terminal (no arg: drop into your $SHELL)"),
     ("/connect [host]", "run tools on a remote over SSH"),
     ("/machines", "manage saved remote hosts (list; remove <name>)"),
@@ -10704,12 +10704,18 @@ def _use_prompt(agent, name):
 
 
 def handle_prompt_command(agent, cfg, arg):
-    """/prompt: view/edit prompt files, or fire one as a one-shot turn.
-      /prompt                 menu
-      /prompt <name>          edit (create a custom prompt if absent)
-      /prompt use <name>      inject a saved custom prompt as the next turn (one-shot)
-      /prompt reset <name>    restore a built-in to its baked default"""
+    """/prompt: fire a saved prompt as a one-shot turn, or manage prompt files.
+      /prompt                 picker: choose a saved prompt to USE (fires next turn)
+      /prompt <name>          USE that prompt directly (fires as the next turn)
+      /prompt edit <name>     view/edit a prompt file (create a custom one if absent)
+      /prompt reset <name>    restore a built-in to its baked default
+
+    The verbs edit/use/reset are reserved: `/prompt use foo` always means the USE
+    verb, even if you have a prompt literally named 'use' (pick it from the no-arg
+    picker instead). Bare `/prompt <name>` USES it - the common case - so a saved
+    instruction fires without retyping."""
     arg = arg.strip()
+    # Reserved verbs win over a same-named prompt literal.
     if arg.startswith(("reset ", "restore ")):
         name = arg.split(maxsplit=1)[1].strip()
         if restore_prompt(name):
@@ -10718,56 +10724,39 @@ def handle_prompt_command(agent, cfg, arg):
         else:
             print(dim(f"'{name}' has no override to restore (already default)."))
         return
-    if arg.startswith("use "):
+    if arg == "use":
+        arg = ""                                  # bare 'use' -> fall through to the picker
+    elif arg.startswith("use "):
         _use_prompt(agent, arg[4:].strip())
         return
     if arg.startswith("edit "):
-        arg = arg[5:].strip()
-    if arg:
-        _edit_prompt_file(agent, cfg, arg)
+        _edit_prompt_file(agent, cfg, arg[5:].strip())
         return
-    # no arg -> menu. Only the user's own prompts (+ any system prompt they've already
-    # overridden) are listed; the untouched internal system prompts stay hidden but
-    # remain editable by name (e.g. /prompt system) - hinted below.
+    if arg == "edit":
+        print(yellow("usage: /prompt edit <name>"))
+        return
+    if arg:
+        # Bare `/prompt <name>` = USE it (the common case). An unknown name is
+        # reported by _use_prompt with a hint to create it via /prompt edit.
+        _use_prompt(agent, arg)
+        return
+    # no arg -> picker to USE one. Lists the user's own prompts (+ any system prompt
+    # they've already overridden); untouched internal system prompts stay hidden but
+    # remain reachable by name. Editing/resetting is behind the explicit verbs.
     builtins, custom = list_prompts()
     names = builtins + custom
-    print(bold("prompts:"))
     if not names:
-        print(dim("  (none yet - type a new name to create a custom prompt)"))
-    for i, n in enumerate(names, 1):
+        print(dim("no saved prompts yet - create one with /prompt edit <name>, "
+                  f"then /prompt <name> fires it. (files live in {PROMPTS_DIR})"))
+        return
+    labels = []
+    for n in names:
         kind = "system" if n in BUILTIN_PROMPTS else "custom"
         edited = ", edited" if prompt_file(n).is_file() else ""
-        print(f"  {i}) {n}" + dim(f"  ({kind}{edited})"))
-    print(dim("  number = edit  |  'u <n>' = use as a one-shot turn  |  "
-              "'r <n>' = restore a system default  |  a new name = create  |  blank = cancel"))
-    _sys_hidden = sorted(n for n in BUILTIN_PROMPTS if not prompt_file(n).is_file())
-    if _sys_hidden:
-        print(dim(f"  advanced: system prompts ({', '.join(_sys_hidden)}) - "
-                  f"edit by name, e.g. /prompt {_sys_hidden[0]}"))
-    try:
-        sel = input("prompt: ").strip()
-    except (EOFError, KeyboardInterrupt):
-        print()
-        return
-    if not sel:
-        return
-    if sel.startswith("r ") and sel[2:].strip().isdigit():
-        i = int(sel[2:].strip())
-        if 1 <= i <= len(names):
-            nm = names[i - 1]
-            if restore_prompt(nm):
-                print(dim(f"restored '{nm}'."))
-                _refresh_system_prompt(agent, nm)
-            else:
-                print(dim(f"'{nm}' already default."))
-        return
-    if sel.startswith("u ") and sel[2:].strip().isdigit():
-        i = int(sel[2:].strip())
-        if 1 <= i <= len(names):
-            _use_prompt(agent, names[i - 1])
-        return
-    name = names[int(sel) - 1] if (sel.isdigit() and 1 <= int(sel) <= len(names)) else sel
-    _edit_prompt_file(agent, cfg, name)
+        labels.append(f"{n}  " + dim(f"({kind}{edited})"))
+    chosen = pick_one("use a prompt (fires as your next turn):", names, labels=labels)
+    if chosen is not None:
+        _use_prompt(agent, chosen)
 
 
 # Config fields /set can edit directly. (model/host/num_ctx have dedicated
@@ -11524,8 +11513,13 @@ def _arg_completions(agent, cfg, cmd):
     if cmd in ("/local", "/disconnect"):
         return list(getattr(agent, "remotes", {}))
     if cmd == "/prompt":
-        b, c = list_prompts(all_builtins=True)   # completion offers every system prompt by name
+        b, c = list_prompts(all_builtins=True)   # bare /prompt <name> = USE; verbs first
         return ["edit", "use", "reset"] + b + c
+    if cmd in ("/prompt use", "/prompt edit"):   # name-complete after the verb
+        b, c = list_prompts(all_builtins=True)
+        return b + c
+    if cmd in ("/prompt reset", "/prompt restore"):   # only overridden built-ins can be reset
+        return sorted(n for n in BUILTIN_PROMPTS if prompt_file(n).is_file())
     if cmd == "/approve":
         return list(APPROVAL_MODES)
     if cmd == "/set":                             # app-config keys (was /settings)
