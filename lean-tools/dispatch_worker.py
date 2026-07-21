@@ -67,6 +67,7 @@ TOOL = {
         "properties": {
             "action": {"type": "string",
                        "enum": ["dispatch", "status", "result", "cancel", "inject"],
+                       "default": "dispatch",
                        "description": "What to do (default 'dispatch'): 'dispatch' launches a "
                                       "new worker from `task`; 'status' reports your dispatched "
                                       "workers (state, runtime, whether a result is ready); "
@@ -108,7 +109,7 @@ TOOL = {
                                     "host is prompted ONCE here - a worker can't answer prompts."},
             "cwd": {"type": "string",
                     "description": "Optional working directory (defaults to current)."},
-            "leash": {"type": "string", "enum": ["r", "rw", "rwe"],
+            "leash": {"type": "string", "enum": ["r", "rw", "rwe"], "default": "r",
                       "description": "Worker capability: r=read-only (default), rw=edit, rwe=edit+run. "
                                      "Capped at your own leash."},
         },

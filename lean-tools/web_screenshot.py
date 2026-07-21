@@ -59,18 +59,22 @@ TOOL = {
             },
             "full_page": {
                 "type": "boolean",
+                "default": False,
                 "description": "Capture the full scrollable page (default false = viewport only).",
             },
             "width": {
                 "type": "integer",
+                "default": 1280,
                 "description": "Viewport width in pixels (default 1280).",
             },
             "height": {
                 "type": "integer",
+                "default": 800,
                 "description": "Viewport height in pixels (default 800).",
             },
             "mobile": {
                 "type": "boolean",
+                "default": False,
                 "description": "Emulate a mobile device: 390x844 viewport, mobile user-agent, touch, 2x scale (default false). Overridden by device.",
             },
             "device": {
@@ -79,6 +83,7 @@ TOOL = {
             },
             "dark": {
                 "type": "boolean",
+                "default": False,
                 "description": "Emulate prefers-color-scheme: dark (default false = light).",
             },
             "breakpoints": {
@@ -92,6 +97,7 @@ TOOL = {
             },
             "dom": {
                 "type": "boolean",
+                "default": False,
                 "description": "Include a full accessibility-tree text dump alongside the screenshot (default false).",
             },
             "browser": {

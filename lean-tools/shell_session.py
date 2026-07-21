@@ -63,7 +63,7 @@ TOOL = {
             "input": {"type": "string",
                       "description": "send only: text typed into the session. A newline is added "
                                      "unless you end with one (end with '' to send a bare keystroke)."},
-            "timeout": {"type": "number",
+            "timeout": {"type": "number", "default": 4,
                         "description": "send/read only: seconds to wait for output "
                                        "(default 4). Raise it for a slow command."},
             "raw": {"type": "boolean",
