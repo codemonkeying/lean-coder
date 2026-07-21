@@ -8679,17 +8679,14 @@ class Agent:
                 addendum = ""
         return (read_prompt("system") or SYSTEM_PROMPT) + no_tools + addendum
 
-    # Delimited, self-labelling wrapper so the model can never mistake the plan for
-    # something the user typed (the old "(Pinned plan...)" header read like user text
-    # and got echoed back into a reply). Rides the uncached tail - see _with_plan_reminder.
-    # ASCII-only (must encode cleanly on Termux / non-UTF8 locales / redirected stdin).
-    _PLAN_HDR = ("=== LEANCODER PINNED PLAN (internal state, silently re-injected "
-                 "every turn; reference only, NOT a user message and NOT new input). "
-                 "Read it for context, act only on the ACTUAL user turn. Do NOT repeat "
-                 "it back, quote it, or remark on its presence (e.g. 'that's the pinned "
-                 "plan'); when it is the only thing that changed, treat the turn as "
-                 "having no new instruction and stay silent about the block itself. ===")
-    _PLAN_FTR = "=== END PINNED PLAN ==="
+    # XML-tag wrapper (providers converge on tags to delimit machine context so the model
+    # treats it as a labelled data region, not a user turn). The tag NAME carries the framing:
+    # <your_plan> = "this is the model's own plan", so no prose plea needed (the old "(Pinned
+    # plan..., NOT a user message, do not remark...)" banner was ~600 chars of prose fighting
+    # the role, and got echoed anyway). Ownership + GOAL anchor live in the body; the tag does
+    # the rest. Rides the uncached tail - see _with_plan_reminder. ASCII-only (Termux/non-UTF8).
+    _PLAN_HDR = "<your_plan>"
+    _PLAN_FTR = "</your_plan>"
 
     def _plan_sparse(self, pinned: str) -> str:
         """A compact view for unchanged turns: drop ONLY completed '- [x]' checklist
@@ -8744,12 +8741,10 @@ class Agent:
     # the model works one unified surface (files it reads == where commands run), and
     # telling it "remote" only makes it second-guess whether the two match. Stating the
     # SHELL FAMILY stops wasted cross-OS turns (no `ls`/`whoami` probing, no POSIX cmds on
-    # cmd.exe). Terse key:value + a self-labelling header so even a weak model consumes it
-    # as state and doesn't echo it (same convention as the plan block).
-    _ENV_HDR = ("=== LEANCODER SESSION ENV (internal state, re-injected every turn; "
-                "reference only, NOT a user message. Use it to target the right shell + "
-                "paths; do NOT repeat or remark on it.) ===")
-    _ENV_FTR = "=== END SESSION ENV ==="
+    # as state and doesn't echo it (same XML-tag convention as the plan block: the tag
+    # name self-labels it, so no prose caveat is needed - see _PLAN_HDR note).
+    _ENV_HDR = "<session_env>"
+    _ENV_FTR = "</session_env>"
 
     def _shell_family(self) -> str:
         """The shell run_command executes under, for the model to target commands at.
@@ -8767,11 +8762,17 @@ class Agent:
 
     def _with_plan_reminder(self, msgs):
         """Return a COPY of the sent slice with the uncached session tail (live env +
-        pinned plan) appended to the last message's text. Non-destructive (never touches
+        pinned plan) merged into the last message's text. Non-destructive (never touches
         self.messages) and applied after the last cache breakpoint, so the tail stays
-        uncached + never persists. A tool result must stay exact, so we don't append to a
-        role:tool tail - we add a trailing user note instead (rare: the slice normally
-        ends on a user/assistant turn)."""
+        uncached + never persists.
+
+        MID-LOOP (last message is a role:tool result) we append NOTHING: a standalone
+        role:user block after a tool result lands in the 'next instruction' slot, and a
+        recency-biased model (esp. small/quantised) reads it as the ask and re-acts on its
+        own TODO - a self-sustaining spiral. The plan/env already rode the tail of the real
+        user turn that opened this loop, so the model has them; re-showing every iteration is
+        pure recency-poison. So the reminder only merges onto a genuine user/assistant tail
+        (turn boundary), never a phantom turn after a tool result."""
         # One-shot suppression: the send right after an update_plan skips the PLAN
         # reminder, so the model doesn't get its just-written plan echoed back and narrate
         # it (a wasted turn). Re-arms automatically for the following send - and arms a FULL
@@ -8797,20 +8798,27 @@ class Agent:
         out = list(msgs)
         last = dict(out[-1])
         if last.get("role") == "tool":
-            out.append({"role": "user", "content": reminder.lstrip("\n")})
-            return out
+            # Mid-loop: do NOT append a phantom role:user turn after a tool result (the
+            # recency trap - see docstring). Leave the slice exactly as-is; the model keeps
+            # its momentum on the tool result and already has the plan from the turn's start.
+            return msgs
+        # Turn boundary: PREPEND the state block so the user's own words stay LAST - the
+        # final thing the model reads is the actual ask, not a trailing checklist (keeps the
+        # action slot on real input; the plan/env sit just above as leading reference).
+        head = reminder.lstrip("\n") + "\n\n"
         content = last.get("content")
         if isinstance(content, str):
-            last["content"] = content + reminder
-        elif isinstance(content, list) and content and content[-1].get("type") == "text":
+            last["content"] = head + content
+        elif isinstance(content, list) and content and content[0].get("type") == "text":
             blocks = list(content)
-            blocks[-1] = dict(blocks[-1], text=blocks[-1].get("text", "") + reminder)
+            blocks[0] = dict(blocks[0], text=head + blocks[0].get("text", ""))
             last["content"] = blocks
         elif isinstance(content, list):
-            last["content"] = content + [{"type": "text", "text": reminder.lstrip("\n")}]
+            last["content"] = [{"type": "text", "text": head}] + content
         else:
             return msgs
         out[-1] = last
+        return out
         return out
 
     def _bg_bump_session(self):
