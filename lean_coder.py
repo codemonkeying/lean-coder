@@ -155,8 +155,11 @@ DEFAULT_IGNORES = [
     ".git/", "node_modules/", "dist/", "build/", "out/", ".next/",
     "__pycache__/", ".venv/", "venv/", ".mypy_cache/", ".pytest_cache/",
     ".cache/", ".mozilla/", ".config/",   # avoid flooding ctx when cwd is $HOME
-    "*.lock", "*.log", "*.min.js", "*.map", "*.pyc", "*.so", "*.o",
-    "*.bin", "*.png", "*.jpg", "*.jpeg", "*.gif", "*.pdf", "*.zip",
+    # NB: no by-extension filtering here. A file LISTER must not hide files that
+    # plainly exist (pdf/png/zip/etc) - that reports a full dir as "(empty)" and
+    # sends the model down the wrong path. This mirrors ripgrep/fd, which respect
+    # .gitignore + hidden + (for CONTENT) binary detection, never an extension list.
+    # search_files skips binary CONTENT via its own NUL-byte sniff, not by suffix.
 ]
 
 SYSTEM_PROMPT = (
