@@ -88,7 +88,7 @@ class Tools:
             return f"error: no such path: {path}"
         if base.is_file():
             return path
-        out, count = [], 0
+        out, count, hidden = [], 0, 0
         root = self.cfg.cwd.resolve()
 
         def _rel(p):
@@ -102,7 +102,7 @@ class Tools:
                 return str(rp)
 
         def walk(d, depth: int):
-            nonlocal count
+            nonlocal count, hidden
             if depth > TREE_DEFAULT_DEPTH or count >= TREE_MAX_ENTRIES:
                 return
             try:
@@ -123,6 +123,7 @@ class Tools:
                     out.append("…[more entries truncated]…")
                     return
                 if self.ignore.ignored(e):
+                    hidden += 1
                     continue
                 try:
                     is_dir = e.is_dir()
@@ -133,8 +134,13 @@ class Tools:
                 count += 1
                 if is_dir:
                     walk(e, depth + 1)
-
         walk(base, 1)
+        if out:
+            return "\n".join(out)
+        # Don't lie: a dir full of ignored files is NOT "(empty)". Say so, so the
+        # model doesn't conclude there's nothing here (regression: a Downloads
+        # folder of PDFs reported empty).
+        return f"(empty - {hidden} entries hidden by ignore rules)" if hidden else "(empty)"
         return "\n".join(out) if out else "(empty)"
 
     def search_files(self, pattern: str, path: str = "", context: int = 0) -> str:
