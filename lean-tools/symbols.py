@@ -33,7 +33,7 @@ TOOL = {
         "properties": {
             "path": {"type": "string",
                      "description": "A .py file or a directory to scan (recursively)."},
-            "mode": {"type": "string", "enum": ["outline", "def"],
+            "mode": {"type": "string", "enum": ["outline", "def"], "default": "outline",
                      "description": "outline (default) = structure; def = locate a definition."},
             "name": {"type": "string",
                      "description": "For mode='def': the class/function/method name to locate."},

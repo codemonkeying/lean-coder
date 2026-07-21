@@ -7,7 +7,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
 ![Core dependencies: none](https://img.shields.io/badge/core%20dependencies-none%20(stdlib%20only)-brightgreen.svg)
-![Baseline overhead: ~2k tokens](https://img.shields.io/badge/baseline%20overhead-~2k%20tokens-orange.svg)
+![Baseline overhead: ~2.5k tokens](https://img.shields.io/badge/baseline%20overhead-~2.5k%20tokens-orange.svg)
 
 [Install](#install) &middot; [Quick start](#quick-start) &middot; [Why it exists](#why-it-exists) &middot; [Providers](#providers-pick-a-model-backend) &middot; [Safety](#safety-two-axes) &middot; [Tools](#tools) &middot; [Handover](#handover-the-agent-documents-its-work-before-a-memory-wipe)
 
@@ -22,11 +22,11 @@ API, and it's built around one idea most agents ignore: **your context window is
 scarce resource, so don't waste it describing the tool.**
 
 Mainstream coding agents spend a lot of your window on themselves before you type a
-word. Measurements put the big ones at tens of thousands of tokens of system prompt
-and built-in tool scaffolding per session, and that's *before* you connect any MCP
-servers, which add anywhere from hundreds to tens of thousands of tokens each on top.
-That's context that can't hold your actual code. lean-coder's *entire* shipped tool
-surface plus its system prompt costs about **~2k tokens**. It's just a different
+word. The big ones run to tens of thousands of tokens of system prompt and built-in
+tool scaffolding per session, and that's *before* you connect any MCP servers, which
+add anywhere from hundreds to tens of thousands of tokens each on top. That's context
+that can't hold your actual code. lean-coder's *entire* shipped tool surface plus its
+system prompt costs about **~2.5k tokens**. It's just a different
 category: the platform stays out of the way so the window holds your work, and it's
 usable on small local models, not just frontier ones.
 
@@ -49,7 +49,7 @@ context. This is open source, built for the folks running local and open models 
 
 The same tiny codebase scales across the whole range:
 
-- drive a **small local model with a few thousand tokens of context** - the ~2k
+- drive a **small local model with a few thousand tokens of context** - the ~2.5k
   baseline leaves room to actually work;
 - point it at a **frontier model and let it spawn parallel background workers** on
   scoped sub-tasks, running a job far bigger than one context window;
@@ -61,7 +61,7 @@ The same tiny codebase scales across the whole range:
 It's a compact, **stdlib-only** Python codebase, no third-party packages. The core
 is one script (`lean_coder.py`); alongside it ship a required builtin-tools module
 (`lean-tools/builtins.py`) and a set of model provider adapters in `providers/`
-(Ollama, Anthropic, Gemini, Groq, OpenAI, OpenRouter). Point it at a local model via
+(Ollama, llama.cpp, MLX, Anthropic, Gemini, Groq, OpenAI, OpenRouter). Point it at a local model via
 [Ollama](https://ollama.com) (bundled and default-enabled) and you get an interactive
 REPL that edits code, runs commands, and shows a diff before it touches anything.
 
@@ -70,7 +70,7 @@ What a session looks like:
 ```
 $ lean_coder
 lean-coder  <your-model> @ <your-provider>
-  cwd: ~/myproject   ·   baseline overhead (system + always-on tools): ~2k tokens
+  cwd: ~/myproject   ·   baseline overhead (system + always-on tools): ~2.5k tokens
 › add a --json flag to the export command and update the tests
 ● I'll look at the export command first.
   ⚙ read_file(path=src/export.py)
@@ -159,30 +159,30 @@ and the growing history) to the model. On a small local model with a 32k window,
 a bloated system prompt or a verbose tool schema is context that can't hold your
 actual code. lean-coder treats context as the scarce resource it is:
 
-- **Baseline overhead around ~2k tokens** for the system prompt *and* the entire
-  always-on tool surface combined (measured, with a test that enforces a ceiling).
-  The surface scales with the leash, so you only pay for what you've enabled:
+- **Baseline overhead around ~2.5k tokens** for the system prompt *and* the entire
+  always-on tool surface combined (a test enforces the ceiling). The surface scales
+  with the leash, so you only pay for what you've enabled:
 
   | tier | ~tokens | what's in it |
   |---|---|---|
   | chat | ~500 | system prompt alone, no tools |
-  | read (`r`) | ~1.1k | + read_file, list_files, search_files, bg_status, update_plan |
-  | write (`rw`) | ~1.5k | + apply_diff, replace_lines, write_file |
-  | exec (`rwe`) | **~2k** | + run_command, ask_user_to_run - the fresh-session floor |
+  | read (`r`) | ~1.2k | + update_plan, note, read_file, list_files, search_files |
+  | write (`rw`) | ~1.65k | + apply_diff, replace_lines, write_file |
+  | exec (`rwe`) | **~2.4k** | + run_command, background, ask_user_to_run - the fresh-session floor |
 
-  That **~2k** is the whole shipped agent: system prompt plus all eleven always-on
+  That **~2.4k** is the whole shipped agent: system prompt plus all eleven always-on
   builtin tools. On top, the **optional bundled lean-tools** are off by default and
   cost nothing until you `/tools` them on. Roughly:
 
   | lean-tool | ~tokens | | lean-tool | ~tokens |
   |---|---|---|---|---|
-  | dispatch_worker | 745 | | web_fetch | 180 |
-  | web_screenshot | 498 | | brave_search | 159 |
-  | symbols | 327 | | ssh | 134 |
-  | shell_session | 291 | | diagnostics | 65 |
-  | git_summary | 63 | | word_count | 56 |
+  | dispatch_worker | ~860 | | web_fetch | ~180 |
+  | web_screenshot | ~525 | | brave_search | ~165 |
+  | shell_session | ~360 | | ssh | ~145 |
+  | symbols | ~335 | | diagnostics | ~65 |
+  | git_summary | ~65 | | word_count | ~55 |
 
-  Turn on **every** one and the total is still **under ~5k tokens**. The meter always
+  Turn on **every** one and the total is still **under ~5.5k tokens**. The meter always
   shows the real current figure.
 
   **For scale:** a *single* MCP server's tool definitions are commonly
@@ -358,12 +358,14 @@ the context budget. Eight file/shell tools live in the required builtin-tools mo
 | `apply_diff`    | **Preferred edit tool.** SEARCH/REPLACE blocks - sends/returns only changed lines. |
 | `replace_lines` | Replace a line range by number (simpler than a diff when you have the line numbers). |
 | `write_file`    | Create or overwrite a whole file (mainly for new files). |
-| `run_command`   | Run a shell command in the project dir; stdout/stderr truncated; trailing `&` backgrounds it (with optional notify/heartbeat/max-runtime watchdog). |
-| `bg_status`     | Poll / reap background tasks started with a trailing `&`. |
+| `run_command`   | Run a foreground shell command in the project dir; stdout/stderr truncated. |
+| `background`    | Run + manage long-lived tasks (dev servers, watchers, builds): `run` starts one detached, `status` lists/inspects, `kill` stops one - with optional notify/heartbeat/max-runtime watchdog. |
 
 Alongside these the model always has **`update_plan`** (maintains a pinned goal +
-TODO that survives compaction) and, by default, **`ask_user_to_run`**, the escape
-hatch for anything `run_command` can't do itself: a command needing **sudo/root**, an
+TODO that survives compaction) and **`note`** (a session notebook - episodic memory
+that survives compaction and travels with the session), plus, by default,
+**`ask_user_to_run`**, the escape hatch for anything `run_command` can't do itself: a
+command needing **sudo/root**, an
 **interactive prompt**, or a **typed password or secret**. Instead of running it, the
 agent hands the exact command back to *you* to run in your own terminal; only the
 command and its exit code return to the agent. **Whatever you type (the password,
