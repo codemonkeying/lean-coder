@@ -2600,6 +2600,19 @@ _pb2, _ = lc.list_prompts()
 check("list_prompts: an overridden system prompt IS surfaced",
       "handover" in _pb2 and "system" not in _pb2)
 lc.restore_prompt("handover")
+# /prompt completion: name-complete after the use/edit verbs; reset only offers
+# overridden built-ins (research is custom, so it's usable+editable but not resettable).
+check("argcomp: /prompt use completes prompt names",
+      "research" in lc._arg_completions(None, None, "/prompt use")
+      and "system" in lc._arg_completions(None, None, "/prompt use"))
+check("argcomp: /prompt edit completes prompt names",
+      "research" in lc._arg_completions(None, None, "/prompt edit"))
+lc.seed_prompt_file("handover")   # override -> now resettable
+check("argcomp: /prompt reset offers only overridden built-ins",
+      "handover" in lc._arg_completions(None, None, "/prompt reset")
+      and "research" not in lc._arg_completions(None, None, "/prompt reset")
+      and "system" not in lc._arg_completions(None, None, "/prompt reset"))
+lc.restore_prompt("handover")
 check("open_in_editor: no editor/TTY -> False (graceful)", lc.open_in_editor(_pf) is False)
 lc.PROMPTS_DIR, lc.SYSTEM_PROMPTS_DIR = _orig_pd, _orig_spd
 
