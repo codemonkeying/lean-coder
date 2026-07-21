@@ -1637,10 +1637,10 @@ _pp = lc.Agent(lc.Config(cwd=FIX))
 check("system prompt never carries the plan (unset)", "PINNED PLAN" not in _pp.messages[0]["content"])
 _pp.pinned_plan = "GOAL: bind ollama\nTODO:\n- [ ] restart\n- [x] done"
 check("plan stays OUT of _system() (cache-stable)", "GOAL: bind ollama" not in _pp._system())
-check("_plan_reminder carries the plan + self-labelling header",
+check("_plan_reminder carries the plan in a self-labelling <your_plan> tag",
       "GOAL: bind ollama" in _pp._plan_reminder()
-      and "PINNED PLAN" in _pp._plan_reminder()
-      and "not a user message" in _pp._plan_reminder().lower())
+      and "<your_plan>" in _pp._plan_reminder()
+      and "</your_plan>" in _pp._plan_reminder())
 check("_plan_reminder empty when no plan",
       lc.Agent(lc.Config(cwd=FIX))._plan_reminder() == "")
 # sparse view: keeps GOAL + open [ ] items, drops done [x] items
@@ -1648,25 +1648,28 @@ _sp = _pp._plan_reminder(sparse=True)
 check("_plan_reminder sparse keeps GOAL + open items",
       "GOAL: bind ollama" in _sp and "- [ ] restart" in _sp)
 check("_plan_reminder sparse drops completed [x] items", "- [x] done" not in _sp)
-# _with_plan_reminder stitches onto the SENT slice only, never into stored history
+# _with_plan_reminder stitches onto the SENT slice only, never into stored history.
+# Turn boundary: the block is PREPENDED (state leads, the user's own words stay last).
 _pp.messages = [{"role": "system", "content": "s"}, {"role": "user", "content": "hi"}]
 _sent = _pp._with_plan_reminder(_pp.messages)
-check("_with_plan_reminder appends the plan to the sent slice's last message",
+check("_with_plan_reminder prepends the plan to the sent slice's last message",
       "GOAL: bind ollama" in _sent[-1]["content"])
+check("_with_plan_reminder keeps the user's words LAST (block leads, ask trails)",
+      _sent[-1]["content"].endswith("hi"))
 check("_with_plan_reminder does NOT mutate stored history",
       "GOAL: bind ollama" not in _pp.messages[-1]["content"])
-# a tool-tailed slice gets a trailing user note (never appends to a role:tool result)
+# a tool-tailed slice is left EXACTLY as-is (mid-loop: no phantom role:user turn after a
+# tool result - that's the recency trap that makes small models re-act on their own TODO)
 _ppt = lc.Agent(lc.Config(cwd=FIX)); _ppt.pinned_plan = "GOAL: x"
-_st = _ppt._with_plan_reminder([{"role": "tool", "tool_name": "read_file", "content": "DATA"}])
-check("_with_plan_reminder keeps a tool result exact, adds a trailing user note",
-      _st[0]["content"] == "DATA" and _st[-1]["role"] == "user" and "GOAL: x" in _st[-1]["content"])
-# With no plan pinned the PLAN block is absent, but the live session-env ALWAYS rides
-# the uncached tail (cwd + shell family) - so the last message gains the ENV block only.
+_tool_slice = [{"role": "tool", "tool_name": "read_file", "content": "DATA"}]
+_st = _ppt._with_plan_reminder(_tool_slice)
+check("_with_plan_reminder leaves a tool-tailed slice untouched (no phantom user turn)",
+      _st == _tool_slice)
 _npr = lc.Agent(lc.Config(cwd=FIX))._with_plan_reminder([{"role": "user", "content": "q"}])
 check("_with_plan_reminder: no plan -> env rides, no plan block",
-      _npr[-1]["content"].startswith("q")
-      and "SESSION ENV" in _npr[-1]["content"]
-      and "PINNED PLAN" not in _npr[-1]["content"])
+      _npr[-1]["content"].endswith("q")
+      and "<session_env>" in _npr[-1]["content"]
+      and "<your_plan>" not in _npr[-1]["content"])
 
 # soft-zone nudge: throttled, soft zone only, injected (not in the cached prompt)
 sn = lc.Agent.__new__(lc.Agent)
