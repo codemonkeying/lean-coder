@@ -8816,7 +8816,6 @@ class Agent:
             return msgs
         out[-1] = last
         return out
-        return out
 
     def _bg_bump_session(self):
         """Attend this session's leased bg tasks so their watchdogs keep them alive.
