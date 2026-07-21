@@ -20,9 +20,9 @@ TOOL = {
         "properties": {
             "host": {"type": "string"},
             "cmd": {"type": "string"},
-            "port": {"type": "integer", "description": "SSH port (default 22)."},
+            "port": {"type": "integer", "default": 22, "description": "SSH port (default 22)."},
             "identity": {"type": "string", "description": "Path to private key file (passed as -i)."},
-            "timeout": {"type": "integer", "description": "Command timeout in seconds (default 300)."},
+            "timeout": {"type": "integer", "default": 300, "description": "Command timeout in seconds (default 300)."},
         },
         "required": ["host", "cmd"],
     },

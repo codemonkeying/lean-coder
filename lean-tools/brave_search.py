@@ -27,9 +27,9 @@ TOOL = {
         "type": "object",
         "properties": {
             "query": {"type": "string"},
-            "count": {"type": "integer", "description": "max results, default 8"},
+            "count": {"type": "integer", "default": 8, "description": "max results, default 8"},
             "freshness": {"type": "string", "description": "time filter: 'pd' (past day), 'pw' (past week), 'pm' (past month), 'py' (past year), or a date range 'YYYY-MM-DDtoYYYY-MM-DD'."},
-            "offset": {"type": "integer", "description": "result offset for paging (default 0). Use to get the next page of results."},
+            "offset": {"type": "integer", "default": 0, "description": "result offset for paging (default 0). Use to get the next page of results."},
         },
         "required": ["query"],
     },

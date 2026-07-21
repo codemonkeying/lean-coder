@@ -179,10 +179,15 @@ SYSTEM_PROMPT = (
     "confirm intent first unless the operator has clearly asked for exactly that. "
     "The operator approving an action once does NOT mean it's approved in every "
     "later context. Never commit unless asked. "
-    # Decision surfacing format (so a voice/terse reply like '1b 2a' is unambiguous).
-    "When you surface decisions for the operator to make, number the decisions 1, 2, 3 "
-    "and letter the options a, b, c under each; end with a one-liner: "
-    "'Respond like 1b 2a to choose.' "
+    # Can't-run-it -> reach for the tool, don't narrate it.
+    "If you can't run something yourself, call ask_user_to_run - never just tell the "
+    "operator to run it in prose. "
+    # When to keep a pinned plan (kept out of the tool schema to save tokens).
+    "Use update_plan for a task with 3+ steps or several sub-tasks, keeping one step in "
+    "progress at a time; skip it for a single trivial task or a conversational reply. "
+    # Decision surfacing format (keeps a terse reply like '1b 2a' unambiguous).
+    "When surfacing decisions for the operator, number the decisions and letter the "
+    "options (1/2/3, a/b/c). "
     # Function-result-clearing (standing, not just at compaction).
     "Older tool results may be cleared from context as the conversation grows, so "
     "copy any critical values - file paths, command output, error messages, IDs - "
@@ -418,13 +423,12 @@ def _handover_nudge_missing(missing) -> str:
 # Auto-compaction instruction: the model gets a full tool-capable turn to wrap up,
 # then writes BOTH a handover block (@#!, kept as continuing context) and a
 # self-prompt (%%^^, autostarted as the next turn). Recent turns are kept verbatim.
-# Forced (hard/emergency) handover. IMPORTANT ordering lesson (measured, model-eval/
-# tune_handover.py): the OLD version opened with an optional "update docs with your
-# tools" step, which invited a chatty preamble ("I'll compact the context...") that
-# smaller models emitted and then STOPPED - no blocks, failed handover. The fix that
-# tested best (qwen3-coder:30b 4/4 vs a flaky ~3/4 before) is blocks-FIRST, an explicit
-# "start your reply with the first marker - no preamble", and durable-doc saving demoted
-# to an AFTER option. Keep that shape if you edit this.
+# Forced (hard/emergency) handover. IMPORTANT ordering lesson: the OLD version opened
+# with an optional "update docs with your tools" step, which invited a chatty preamble
+# ("I'll compact the context...") that smaller models emitted and then STOPPED - no
+# blocks, failed handover. The shape that holds up is blocks-FIRST, an explicit "start
+# your reply with the first marker - no preamble", and durable-doc saving demoted to an
+# AFTER option. Keep that shape if you edit this.
 AUTO_HANDOVER_INSTR = (
     "Your context is full - compact it yourself now (recent turns are kept; older ones "
     "get replaced by what you write here). You are writing a note to YOURSELF in a fresh "
@@ -601,7 +605,7 @@ def _norm_leash(s):
 # operator can edit it, runs it in a real terminal, and the result returns here.
 ASK_USER_TOOL = {"type": "function", "function": {
     "name": "ask_user_to_run",
-    "description": "Hand a command to the operator to run in their own terminal; the exact command and its exit code return to you (never any password). Use when run_command can't: needs sudo/root, an interactive prompt, a typed password or secret, or your judgement before acting. Also the right fallback when run_command failed because it required one of those. They may edit the command before running. Don't use it for ordinary commands run_command can handle.",
+    "description": "Hand a command to the operator to run in their own terminal; the exact command and its exit code come back to you (never any password). Use when run_command can't: sudo/root, an interactive prompt, or a typed secret. They may edit it before running.",
     "parameters": {"type": "object",
         "properties": {"cmd": {"type": "string", "description": "The command to hand over."},
                        "reason": {"type": "string", "description": "Brief why this needs the operator (e.g. 'needs sudo')."}},
@@ -612,15 +616,10 @@ ASK_USER_TOOL = {"type": "function", "function": {
 # extracts the @#! ... @#! block from the handover turn and replaces history with it.
 UPDATE_PLAN_TOOL = {"type": "function", "function": {
     "name": "update_plan",
-    "description": ("Set/replace your PINNED plan: the GOAL plus a TODO checklist. It stays "
-                    "pinned to the system prompt, visible every turn, and SURVIVES "
-                    "compaction/handover - so it's how you keep long-horizon work on track. "
-                    "Call it whenever the plan changes: at the start to lay out the GOAL and "
-                    "tasks, and again as you finish steps (flip '- [ ]' to '- [x]') or "
-                    "re-scope. Pass the FULL plan each time - it replaces the previous one. "
-                    "Pass an empty string to clear it. Keep it short. Use it for tasks with "
-                    "3+ steps or several distinct sub-tasks; keep only ONE step in progress "
-                    "at a time. Don't use it for a single trivial task or a conversational reply."),
+    "description": ("Set/replace your PINNED plan: a GOAL plus a TODO checklist that stays "
+                    "pinned to the system prompt and survives compaction/handover. Pass the "
+                    "FULL plan each time (it replaces the previous); flip '- [ ]' to '- [x]' "
+                    "as you finish steps; empty string clears it."),
     "parameters": {"type": "object",
         "properties": {"plan": {"type": "string", "description":
             "The full plan text, e.g.\nGOAL: ship feature X\nTODO:\n- [x] done step\n- [ ] next step"}},
@@ -657,11 +656,9 @@ NOTE_TOOL = {"type": "function", "function": {
     "name": "note",
     "description": (
         "Your persistent session NOTEBOOK - episodic memory that survives compaction and "
-        "travels with the session (saved/restored on /load). Jot decisions, findings, "
-        "gotchas you couldn't re-derive from code or git. Actions: add (default; bare `text` "
-        "appends a timestamped entry) | recent (newest `n`, default 40) | grep (`pattern`) | "
-        "range (`from` alone = since then; `from`+`to` = between; timestamps 'YYYY-MM-DD "
-        "HH:MM', bare date = whole day). No args shows recent; reads are capped."),
+        "travels with the session. Jot decisions, findings, gotchas you couldn't re-derive "
+        "from code or git. Actions: add (default when `text` given) | recent | grep | range. "
+        "No args = recent; reads are capped."),
     "parameters": {"type": "object", "properties": {
         "text": {"type": "string", "description": "Note to append (add)."},
         "action": {"type": "string", "enum": ["add", "recent", "grep", "range"]},
@@ -3871,7 +3868,7 @@ class Config:
     update_track: str = "stable"     # which /update track to follow: 'stable' (the main
                                      # branch) or 'beta' (pre-release branch). Selects the
                                      # branch /update fetches VERSION + lean_coder.py from.
-    command_timeout: int = 300       # foreground run_command timeout (s); long tasks use ' &'
+    command_timeout: int = 300       # foreground run_command timeout (s); long tasks use the background tool
     bg_max_concurrent: int = 5       # max background tasks at once (0 = unlimited)
     worker_max_concurrent: int = 10   # dispatch_worker: max worker agents alive at once (0 = unlimited)
     worker_idle_timeout: int = 1800  # dispatch_worker: worker lease secs; unattended self-kill
@@ -4880,9 +4877,9 @@ def _bg_register(pid, cmd, log, kind="task", idle_timeout=None,
     THAT box; the host field lets a reader tell 'my box' (pid is authoritative)
     from a foreign record (never mine to reap) - see _proc_alive_here.
 
-    `kind` tags what the record is: "task" (a plain backgrounded run_command, the
+    `kind` tags what the record is: "task" (a plain background task, the
     default) or "worker" (a dispatched agent). Both share this lifecycle, but the
-    plain bg surface (/bg, the bg_status tool, non-agent finished-notify) FILTERS
+    plain bg surface (/bg, the background tool, non-agent finished-notify) FILTERS
     to kind="task" so a session without the worker tool never sees - or is
     confused by - a worker. Workers surface only through the worker tool's path.
 
@@ -5231,7 +5228,7 @@ def _bg_alert_msg(items):
         if it.get("kind") == "silent":
             head = (f"background task STILL RUNNING but silent: `{cmd}` (pid {pid}) has "
                     f"produced no output for ~{it.get('secs')}s. It was NOT killed. "
-                    f"Check on it (bg_status), keep waiting, or `kill {pid}`.")
+                    f"Check on it (background(pid={pid})), keep waiting, or `kill {pid}`.")
         else:
             head = (f"background task hit max_runtime: `{cmd}` (pid {pid}) ran past its "
                     f"{it.get('secs')}s ceiling and is STILL RUNNING (kill_on_max=false). "
@@ -5254,7 +5251,7 @@ def _bg_clear_alert(log, akind):
 
 def _bg_status_items(owner, kind="task"):
     """Status rows for this-box bg tasks owned by `owner` (a pid), for the
-    model-facing bg_status tool. Each row: {pid, cmd, state ('running' | 'exit N'),
+    model-facing background tool. Each row: {pid, cmd, state ('running' | 'exit N'),
     runtime (human elapsed), tail (last lines)}. Filtered to `kind` (default 'task',
     so workers stay off the plain-bg surface). Only records on THIS box - a foreign
     record's pid isn't ours to probe."""
@@ -5281,13 +5278,13 @@ def _bg_status_items(owner, kind="task"):
 
 
 def _bg_status_msg(rows, pid=None) -> str:
-    """Render _bg_status_items rows into the string the bg_status tool returns to
+    """Render _bg_status_items rows into the string the background tool returns to
     the model. pid given but no row -> a clear 'no such task'. Empty -> a plain note."""
     if pid is not None and not rows:
         return (f"no background task with pid {pid} owned by this session on this box "
                 f"(it may have been reaped, or belongs to another session).")
     if not rows:
-        return "no background tasks from this session.  (end a run_command with ' &' to start one)"
+        return "no background tasks from this session.  (start one with the `background` tool)"
     out = []
     for r in rows:
         head = f"pid {r['pid']}  {r['state']}  (ran {r['runtime']})  {r['cmd']}"
@@ -7051,9 +7048,10 @@ def _ctl_opts(ctl):
 def _scp_argv(host, ctl, local_path, remote_path):
     """scp a local file to `remote_path` on `host`. Reuses the ControlMaster socket
     when `ctl` is set (POSIX); on Windows (ctl falsy) it's a fresh key-auth transfer.
-    MEASURED on Win11 OpenSSH (192.0.2.16): a full 648KB agent.py lands byte-identical
-    in ~4s - so scp is the Windows push (the old 'scp truncates large files' claim was
-    wrong; it replaces the ~3-4min, deadlock-prone chunked base64 path)."""
+    when `ctl` is set (POSIX); on Windows (ctl falsy) it's a fresh key-auth transfer.
+    scp is the Windows push: it goes through the same sshd over its own channel and
+    lands the agent byte-identical, replacing the slow, deadlock-prone chunked base64
+    path (Windows sshd DEADLOCKS on a stdin-piped `cat > path` exec channel)."""
     return (["scp"] + _ctl_opts(ctl) + ["-o", "BatchMode=yes",
              "-o", "StrictHostKeyChecking=accept-new", "-o", "LogLevel=ERROR",
              "-p", local_path, f"{host}:{remote_path}"])
@@ -7254,7 +7252,7 @@ class RemoteWorkspace:
 
     def _reuse_executor(self, want):
         """Find an EXISTING remote executor whose source hash == `want`, so we can
-        skip the ~50KB push. Prefers a provisioned `lean_coder` on PATH, then a
+        skip the full-source push. Prefers a provisioned `lean_coder` on PATH, then a
         copy pushed earlier into the stable runtime dir. Returns (exec_cmd, dir),
         or (None, dir) when nothing matches (caller pushes). Stateless: it only
         ever runs `--version`, never leaves anything behind beyond the dir."""
@@ -7431,10 +7429,9 @@ class RemoteWorkspace:
     def _win_scp_write(self, remote_path, data):
         """Byte-exact large-file push to a Windows remote via scp. Windows sshd
         DEADLOCKS on a stdin-piped exec channel (so `cat > path` can't be used) and the
-        old command-line base64 chunking was slow (~3-4 min, 54 calls) and could hang on
-        a chunk. scp goes through the same sshd over its own channel: MEASURED on Win11
-        OpenSSH (192.0.2.16) a full 648KB agent.py lands byte-identical in ~4s. We write
-        the bytes to a local temp file, scp it across, verify sha256 (raises on
+        old command-line base64 chunking was slow and could hang on a chunk. scp goes
+        through the same sshd over its own channel and lands the agent byte-identical.
+        We write the bytes to a local temp file, scp it across, verify sha256 (raises on
         mismatch), and always clean the temp file up."""
         import tempfile
         want = hashlib.sha256(data).hexdigest()
@@ -10147,9 +10144,12 @@ def _fmt_call_args(name: str, args: dict) -> str:
 
 
 def _is_bg_call(name: str, args: dict) -> bool:
-    """True when this is a backgrounded (detached) run_command - a trailing '&' on
-    the cmd."""
-    return name == "run_command" and str(args.get("cmd", "")).rstrip().endswith("&")
+    """True when this call STARTS a detached background task (background tool, run
+    action - explicit or the cmd-implies-run default)."""
+    if name != "background":
+        return False
+    act = (str(args.get("action", "")).strip().lower() or ("run" if args.get("cmd") else "status"))
+    return act == "run"
 
 
 # name -> display glyph, populated from a lean-tool's optional TOOL["glyph"] as it
@@ -10165,7 +10165,7 @@ _NET_TOOLS = frozenset({
     "web_fetch", "web_search", "brave_search", "web_screenshot", "render_url", "ssh",
     "fetch", "curl", "http_get"})
 # Agent-internal / bookkeeping tools: no fs, no exec, no net - a distinct 'meta' icon.
-_META_TOOLS = frozenset({"update_plan", "request_handover", "note", "bg_status"})
+_META_TOOLS = frozenset({"update_plan", "request_handover", "note"})
 
 
 def _tool_category(name: str, args: dict) -> str:
@@ -11110,7 +11110,7 @@ def handle_bg_command(agent, cfg, arg):
         rows = remote.bg_list()
         if not rows:
             print(dim(f"no background tasks on {remote.host}.  "
-                      f"(end a command with ' &' to start one)"))
+                      f"(start one with the `background` tool)"))
             return
         print(bold(f"background tasks (remote {remote.host}):"))
         for r in rows:
@@ -11130,7 +11130,7 @@ def handle_bg_command(agent, cfg, arg):
     finished = [r for r in recs if not _proc_alive(r.get("pid"))
                 and _bg_exit_code(r) is not None]
     if not running and not finished:
-        print(dim("no background tasks running.  (end a command with ' &' to start one)"))
+        print(dim("no background tasks running.  (start one with the `background` tool)"))
         return
     print(bold("background tasks:"))
     for r in running:

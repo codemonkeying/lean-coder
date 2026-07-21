@@ -40,10 +40,10 @@ check("/mcp fully wired (dispatch+slash+help)",
       "/mcp" in _tbl and "/mcp" in _slash and "/mcp" in _help)
 
 # 1. Fixed overhead budget (system prompt + always-on tool schemas). README claims
-# ~2k core; ceiling gives headroom for later additions without lying in the README.
+# ~2.5k core; ceiling gives headroom for later additions without lying in the README.
 sys_msg = {"role": "system", "content": lc.SYSTEM_PROMPT + "\nWorking directory: /x"}
 overhead = lc.messages_tokens([sys_msg], lc.active_tools(lc.Config()))
-check("fixed overhead < 2500 tokens (~2k README claim + headroom)", overhead < 2500, f"~{overhead} tokens")
+check("fixed overhead < 2700 tokens (~2.5k README claim + headroom)", overhead < 2700, f"~{overhead} tokens")
 # the hot metering path must survive non-string content (int/None from a loaded or
 # synthesised history) and size a block LIST by its JSON length, not its element count
 # (a crash/skew here would feed a bad ctx meter into handover decisions).
@@ -54,8 +54,8 @@ check("_raw_messages_tokens: non-string content doesn't crash the meter",
 check("_raw_messages_tokens: block list sized by JSON, not element count",
       lc._raw_messages_tokens([{"role": "user", "content": [{"type": "text", "text": "x" * 400}]}], [])
       > lc._raw_messages_tokens([{"role": "user", "content": [{"type": "text", "text": "x"}]}], []) + 50)
-check("8 base tools (ssh moved to a lean-tool; bg_status added)", len(lc.TOOLS) == 8, f"{len(lc.TOOLS)}")
-check("bg_status is a core tool", "bg_status" in [t["function"]["name"] for t in lc.TOOLS])
+check("8 base tools (ssh moved to a lean-tool; background added)", len(lc.TOOLS) == 8, f"{len(lc.TOOLS)}")
+check("background is a core tool", "background" in [t["function"]["name"] for t in lc.TOOLS])
 check("active_tools adds ask_user_to_run by default", len(lc.active_tools(lc.Config())) == 11)
 check("active_tools drops it when disabled",
       len(lc.active_tools(lc.Config(ask_user_to_run=False))) == 10)
@@ -529,11 +529,11 @@ _fznc = (FIX / "src/fuzznest.py").read_text()
 check("apply_diff fuzzy preserves nested REPLACE indentation",
       _fznc == "def f():\n  if cond:\n      new_a()\n      new_b()\n", repr(_fznc))
 
-# 7b. tool-call line: backgrounded run_command is labelled in TEXT (not just glyph)
-check("tool line: bg run_command shows (background) tag",
-      "(background)" in lc._tool_call_line("run_command", {"cmd": "x.py &"}))
-check("tool line: blocking run_command has no bg tag",
-      "(background)" not in lc._tool_call_line("run_command", {"cmd": "ls"}))
+# 7b. tool-call line: a background(run) call is labelled in TEXT (not just glyph)
+check("tool line: background run shows (background) tag",
+      "(background)" in lc._tool_call_line("background", {"cmd": "x.py"}))
+check("tool line: background status has no bg tag",
+      "(background)" not in lc._tool_call_line("background", {"action": "status"}))
 check("tool line: non-run_command tool has no bg tag",
       "(background)" not in lc._tool_call_line("read_file", {"path": "a"}))
 
@@ -594,12 +594,12 @@ shutil.rmtree(_ext, ignore_errors=True)
 rc = tools.run_command("echo hello && exit 0")
 check("run_command returns output", "hello" in rc and "exit 0" in rc, rc.replace("\n", " "))
 
-# 10a. trailing '&' backgrounds (detached) instead of hanging on the captured pipe
+# 10a. the background tool launches detached instead of hanging on the captured pipe
 _orig_cfgdir = lc.CONFIG_DIR
 lc.CONFIG_DIR = Path(tempfile.mkdtemp(prefix="lc_bg_"))
-bgr = tools.run_command("sleep 30 &")           # would block ~30s/timeout if not detached
-check("run_command: trailing & launches in background (pid returned)",
-      "background: pid" in bgr and "kill " in bgr, bgr.replace("\n", " "))
+bgr = tools.background(cmd="sleep 30")          # would block ~30s/timeout if not detached
+check("background: run launches detached (pid returned)",
+      "background: pid" in bgr and "action='kill'" in bgr, bgr.replace("\n", " "))
 check("run_command: background writes a log path under CONFIG_DIR/bg",
       "/bg/" in bgr and (lc.CONFIG_DIR / "bg").is_dir())
 import re as _re_bg, os as _os_bg
@@ -627,12 +627,12 @@ _orig_cd2 = lc.CONFIG_DIR
 lc.CONFIG_DIR = Path(tempfile.mkdtemp(prefix="lc_bgreg_"))
 _bgcfg = lc.Config(cwd=FIX, approval="auto", bg_max_concurrent=2)
 _bgtools = lc.Tools(_bgcfg)
-_r1 = _bgtools.run_command("sleep 30 &")
+_r1 = _bgtools.background(cmd="sleep 30")
 check("bg: first task registered + running",
       "background: pid" in _r1 and len(lc._bg_running()) == 1)
-_bgtools.run_command("sleep 30 &")
+_bgtools.background(cmd="sleep 30")
 check("bg: second task under the limit", len(lc._bg_running()) == 2)
-_r3 = _bgtools.run_command("sleep 30 &")
+_r3 = _bgtools.background(cmd="sleep 30")
 check("bg: max_concurrent refuses the 3rd with a clear message",
       "background-task limit" in _r3 and len(lc._bg_running()) == 2)
 _b = _io_bgr.StringIO()
@@ -642,13 +642,13 @@ check("/bg lists running tasks", "background tasks:" in _b.getvalue())
 with _ctx_bgr.redirect_stdout(_io_bgr.StringIO()):
     lc.handle_bg_command(None, _bgcfg, "kill all")    # /bg kill all
 check("/bg kill all stops them", len(lc._bg_running()) == 0)
-_bgtools.run_command("sleep 30 &")
+_bgtools.background(cmd="sleep 30")
 check("bg: a task runs before session-kill", len(lc._bg_running()) == 1)
 lc._bg_kill_session()                                  # exit hook pegs tasks to the session
 check("bg: _bg_kill_session reaps this session's tasks", len(lc._bg_running()) == 0)
 # <log>.exit sidecar: a finished task records its exit code in a file (survives a
 # reconnect / executor death; works local + remote). /bg then reports pass/fail.
-_r_exit = _bgtools.run_command("sh -c 'exit 7' &")
+_r_exit = _bgtools.background(cmd="sh -c 'exit 7'")
 _exlog = _r_exit.split("output -> ", 1)[1].splitlines()[0].strip()
 import time as _t_bg
 for _ in range(50):
@@ -664,32 +664,38 @@ with _ctx_bgr.redirect_stdout(_bexit):
 check("/bg surfaces a finished task's exit code", "exit 7" in _bexit.getvalue())
 lc._bg_clean_sidecars(_rec7)
 check("bg: _bg_clean_sidecars removes log + .exit", not Path(_exlog + ".exit").exists())
-# bg_status tool: model-facing pid->{state,runtime,tail}, kind-filtered so workers
+# background(status): model-facing pid->{state,runtime,tail}, kind-filtered so workers
 # never leak onto the plain-bg surface.
 check("_fmt_runtime: seconds", lc._fmt_runtime(5) == "5s")
 check("_fmt_runtime: minutes", lc._fmt_runtime(192) == "3m12s")
 check("_fmt_runtime: hours", lc._fmt_runtime(3840) == "1h04m")
 check("_fmt_runtime: bad input -> ?", lc._fmt_runtime(None) == "?")
 lc._bg_save([])                                        # clean registry for the status subtests
-_bgtools.run_command("sleep 30 &")                     # a live plain task, this session
+_bgtools.background(cmd="sleep 30")                    # a live plain task, this session
 _st_rows = [r for r in lc._bg_status_items(lc.os.getpid()) if r["state"] == "running"]
-check("bg_status: lists this session's live task", len(_st_rows) == 1)
-check("bg_status: task carries a runtime", _st_rows[0]["runtime"] != "?")
-check("bg_status tool: running task via the Tools method", "running" in _bgtools.bg_status())
+check("background status: lists this session's live task", len(_st_rows) == 1)
+check("background status: task carries a runtime", _st_rows[0]["runtime"] != "?")
+check("background status: running task via the Tools method", "running" in _bgtools.background())
 # a worker record must NOT appear on the plain-bg surface (a live one: reuse the sleep pid)
 _wpid = _st_rows[0]["pid"]
 lc._bg_register(_wpid, "lean_coder --agent-run x", _exlog + ".worker", kind="worker")
-check("bg_status: worker filtered out of the plain surface",
+check("background status: worker filtered out of the plain surface",
       all(r["cmd"] != "lean_coder --agent-run x" for r in lc._bg_status_items(lc.os.getpid())))
 check("_bg_running: worker excluded from default (task) kind",
       all("agent-run" not in r.get("cmd", "") for r in lc._bg_running()))
 check("_bg_running(kind=worker): worker included when asked",
       any("agent-run" in r.get("cmd", "") for r in lc._bg_running(kind="worker")))
-check("bg_status: no such pid -> clear message", "no background task with pid" in _bgtools.bg_status(pid=123456))
+check("background status: no such pid -> clear message", "no background task with pid" in _bgtools.background(pid=123456))
+# kill verb: stop a task by pid through the tool
+_bgtools.background(cmd="sleep 30")
+_krow = [r for r in lc._bg_status_items(lc.os.getpid()) if r["state"] == "running"]
+_kmsg = _bgtools.background(action="kill", pid=_krow[0]["pid"])
+check("background kill: stops the task", "killed background task" in _kmsg)
+check("background kill: needs a pid", "needs a pid" in _bgtools.background(action="kill"))
 lc._bg_kill_session()
 lc._bg_save([])                                        # drop the fake foreign-pid worker record too
-_missmsg = _bgtools.bg_status()
-check("bg_status: empty -> plain note", "no background tasks" in _missmsg)
+_missmsg = _bgtools.background()
+check("background status: empty -> plain note", "no background tasks" in _missmsg)
 # idle-timeout / lease: a leased task self-terminates when left unattended, and its
 # lease file is bumped by _bg_bump_lease (the per-turn heartbeat).
 lc._bg_save([])
@@ -1054,7 +1060,7 @@ check("bg: _bg_alive foreign infers from sidecar (no sidecar -> alive)",
       lc._bg_alive({"host": "otherbox", "pid": 999999, "log": "/nope/x.log"}))
 # adopt: a survived same-host task owned by a DEAD prior executor is re-parented,
 # not killed. Simulate with a real detached sleep and a bogus dead owner.
-_r_ad = _bgtools.run_command("sleep 30 &")
+_r_ad = _bgtools.background(cmd="sleep 30")
 _adlog = _r_ad.split("output -> ", 1)[1].splitlines()[0].strip()
 _recs = lc._bg_load()
 for _r in _recs:
@@ -1072,7 +1078,7 @@ lc._bg_kill_session(); lc._bg_save([])                 # cleanup
 # is suppressed. _bg_log_tail returns trailing lines.
 _bgpag = lc.Agent(lc.Config(cwd=FIX, approval="auto"))
 _bgpag.tools = _bgtools                                 # share the launcher's Tools
-_r_fin = _bgtools.run_command("sh -c 'echo line-a; echo line-b; exit 5' &")
+_r_fin = _bgtools.background(cmd="sh -c 'echo line-a; echo line-b; exit 5'")
 _finlog = _r_fin.split("output -> ", 1)[1].splitlines()[0].strip()
 for _ in range(50):
     if Path(_finlog + ".exit").exists(): break
@@ -1192,10 +1198,10 @@ check("_drain_choice: default (Enter / c / junk) -> combine",
 # declared boolean/integer must be coerced back (else bool('false') is truthy -> a
 # notify_on_exit=false silently becomes ON). string params must NOT be coerced.
 _tt_schemas = {t["function"]["name"]: t["function"]["parameters"]["properties"] for t in lc.TOOLS}
-_tt_xml = ("<function=run_command><parameter=cmd>sleep 5 &</parameter>"
+_tt_xml = ("<function=background><parameter=cmd>sleep 5</parameter>"
            "<parameter=notify_on_exit>false</parameter>"
            "<parameter=heartbeat_timeout>30</parameter></function>")
-_tt_calls, _ = lc.parse_text_tool_calls(_tt_xml, known_names={"run_command"}, schemas=_tt_schemas)
+_tt_calls, _ = lc.parse_text_tool_calls(_tt_xml, known_names={"background"}, schemas=_tt_schemas)
 _tt_a = _tt_calls[0]["function"]["arguments"]
 check("text-tool-call: XML bool 'false' coerced to real False",
       _tt_a.get("notify_on_exit") is False, repr(_tt_a))
@@ -1205,7 +1211,7 @@ _tt_wf, _ = lc.parse_text_tool_calls(
     known_names={"write_file"}, schemas=_tt_schemas)
 check("text-tool-call: string param NEVER coerced (content stays 'true')",
       _tt_wf[0]["function"]["arguments"].get("content") == "true")
-_tt_np, _ = lc.parse_text_tool_calls(_tt_xml, known_names={"run_command"})  # no schemas
+_tt_np, _ = lc.parse_text_tool_calls(_tt_xml, known_names={"background"})  # no schemas
 check("text-tool-call: no-schema pass-through unchanged (back-compat)",
       _tt_np[0]["function"]["arguments"].get("notify_on_exit") == "false")
 # mid-turn slash commands are peeled out (run as commands, never sent to the model)
@@ -3147,9 +3153,9 @@ check("style_md_line **bold** wins over * (bold stripped, no stray italic)",
       lc.style_md_line("a **b** c") == "a b c")
 check("style_md_line strips *italic* and identifiers with _ untouched",
       lc.style_md_line("call foo_bar_baz here") == "call foo_bar_baz here")
-# _tool_glyph: a backgrounded run_command gets the distinct bg glyph; else the gear
-check("_tool_glyph: backgrounded run_command -> bg glyph",
-      lc._tool_glyph("run_command", {"cmd": "sleep 100 &"}) == lc.GLYPH["bg"])
+# _tool_glyph: a background(run) call gets the distinct bg glyph; else the gear
+check("_tool_glyph: background run -> bg glyph",
+      lc._tool_glyph("background", {"cmd": "sleep 100"}) == lc.GLYPH["bg"])
 check("_tool_glyph: normal run_command -> exec category glyph",
       lc._tool_glyph("run_command", {"cmd": "ls"}) == lc.GLYPH["cat_exec"])
 check("_tool_glyph: read_file -> read category glyph",
