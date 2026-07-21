@@ -2287,17 +2287,34 @@ _MD_BOLD = re.compile(r"\*\*(.+?)\*\*|__(.+?)__")
 # operands reject a marker adjacent to whitespace so "a * b" and "2 * 3" pass through.
 _MD_ITALIC = re.compile(r"(?<![\*\w])\*(?!\s)([^*\n]+?)(?<!\s)\*(?![\*\w])"
                         r"|(?<![_\w])_(?!\s)([^_\n]+?)(?<!\s)_(?![_\w])")
+# Blockquote: one or more leading '>' (nested), each optionally followed by a space.
+# The model emits these when it drafts "a message to send" - without handling, the
+# raw '> ' leaks on every line. We strip the markers and re-style as a dim, bar-led
+# quote so it reads as a set-apart block, not literal text.
+_MD_QUOTE = re.compile(r"^\s{0,3}((?:>\s?)+)(.*)$")
 
 
 def style_md_line(line: str) -> str:
     """Style one COMPLETE markdown line: strip heading hashes / ** / backticks
     (always), add bold/cyan when the terminal allows. Lists, italics, and other
     text pass through untouched."""
+    q = _MD_QUOTE.match(line)
+    if q:
+        # Strip the '>' marker(s); render the remaining text (still inline-styled) as a
+        # dim quote led by a bar glyph, so the block is visually set apart from prose.
+        inner = style_md_inline(q.group(2))
+        return dim(GLYPH["userbar"] + " ") + inner
     h = _MD_H.match(line)
     if h:
         inner = _MD_CODE.sub(lambda m: m.group(1), h.group(2))      # strip backticks
         inner = _MD_BOLD.sub(lambda m: m.group(1) or m.group(2), inner)  # strip **
         return bold(inner)
+    return style_md_inline(line)
+
+
+def style_md_inline(line: str) -> str:
+    """Inline styling only (code / bold / italic), no line-level heading or quote
+    handling. Split out so the quote branch can reuse it on the quoted text."""
     line = _MD_CODE.sub(lambda m: cyan(m.group(1)), line)
     line = _MD_BOLD.sub(lambda m: bold(m.group(1) or m.group(2)), line)
     line = _MD_ITALIC.sub(lambda m: italic(m.group(1) or m.group(2)), line)
