@@ -4923,8 +4923,9 @@ try:
     check("leash chat Agent: tool_defs empty", _mag.tool_defs == [])
     # the permissions note now rides the NEXT user turn (not the cached system prompt)
     check("leash chat: model told via pending note, NOT system prompt",
-          "chat-only" in (_mag._pending_ai_note or "")
-          and "Chat-only" not in _mag.messages[0]["content"])
+          "no tools" in (_mag._pending_ai_note or "")
+          and "<leash>" in (_mag._pending_ai_note or "")
+          and "no tools" not in _mag.messages[0]["content"].lower())
     with _ctxl.redirect_stdout(_io.StringIO()):
         lc.handle_leash_command(_mag, _mag.cfg, "rwe")         # back to full
     check("/leash rwe -> tools restored",
@@ -5257,8 +5258,9 @@ _csa.refresh_tools()
 check("chat-only model: tool surface empties even at leash rwe", _csa.tool_defs == [])
 _csres = _csa._run_tool("read_file", {"path": "x"})
 check("chat-only model: dispatch blocked at the model level", _csres.startswith("BLOCKED") and "NOT help" in _csres)
-check("chat-only model: system prompt tells the model it has no tools",
-      "does not support tool calling" in _csa._system())
+check("chat-only model: session-env tail tells the model it has no tools (not the cached system prompt)",
+      "NO tools" in _csa._session_env() and "chat-only" in _csa._session_env()
+      and "no tools" not in _csa._system().lower())
 import re as _re_cs
 _save_tty_cs = lc._TTY
 lc._TTY = True
