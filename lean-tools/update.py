@@ -186,6 +186,50 @@ def _probe(cfg, local_ver, version_tuple):
     return published, version_tuple(published) > version_tuple(local_ver), None
 
 
+def _read_installed_version(dest_root):
+    """The version string from the freshly-overlaid VERSION file on disk (the NEW build's),
+    or "" if unreadable. Used to bound the release-notes range after an update."""
+    try:
+        return (dest_root / "VERSION").read_text().strip().splitlines()[0].strip()
+    except (OSError, IndexError):
+        return ""
+
+def _notes_from_source(py_path):
+    """Extract RELEASE_NOTES (a {version: [lines]} dict literal) from a lean_coder.py on
+    disk WITHOUT importing it - the running process is still the OLD build, so we read the
+    notes out of the freshly-overlaid file via ast. Returns the dict, or {} on any trouble
+    (missing/renamed/non-literal - never raises into the update flow)."""
+    try:
+        import ast
+        tree = ast.parse(Path(py_path).read_text())
+        for node in tree.body:
+            if isinstance(node, ast.Assign) and any(
+                    isinstance(t, ast.Name) and t.id == "RELEASE_NOTES" for t in node.targets):
+                val = ast.literal_eval(node.value)
+                return val if isinstance(val, dict) else {}
+    except Exception:
+        pass
+    return {}
+
+
+def _show_update_notes(dest_root, from_ver, to_ver, version_tuple, bold, green, dim, dot):
+    """After a successful overlay, print the 'what's new' highlights for every version in
+    (from_ver, to_ver] read from the NEWLY-installed lean_coder.py. So /update shows what
+    you just got, right now - not only on the next relaunch. Best-effort."""
+    notes = _notes_from_source(dest_root / "lean_coder.py")
+    if not notes:
+        return
+    lo, hi = version_tuple(from_ver), version_tuple(to_ver)
+    picked = sorted((v for v in notes if lo < version_tuple(v) <= hi), key=version_tuple)
+    if not picked:
+        return
+    print(bold(green("what's new")) + dim(f"  ({to_ver})"))
+    for ver in picked:
+        print(dim(f"  {dot} {ver}"))
+        for line in notes[ver]:
+            print("    " + line)
+
+
 def _apply(cfg, dest_root, dim, green, yellow, red, ask=None):
     """Download the track tarball, validate, and OVERLAY the bundled files onto
     dest_root. `ask` gates the write (None = no prompt, for auto-update). Returns
@@ -321,7 +365,12 @@ def setup(lc, cfg):
         if mode != "force" and not newer:
             print(green("up to date - nothing to do.")); return
 
-        _apply(cfg, dest_root, dim, green, yellow, red, ask=ask)
+        if _apply(cfg, dest_root, dim, green, yellow, red, ask=ask):
+            # Show what you just got, now (the running process is still the old build,
+            # so read the notes out of the freshly-overlaid lean_coder.py on disk).
+            _to = _read_installed_version(dest_root) or (published or _local_ver)
+            _show_update_notes(dest_root, _local_ver, _to, _vt,
+                               lc["bold"], green, dim, lc["GLYPH"]["dot"])
 
     def _auto_update_on_launch():
         """Non-interactive launch check, gated by cfg.auto_update. Quiet on the
@@ -337,7 +386,11 @@ def setup(lc, cfg):
             return
         print(yellow(f"auto-update: newer build {published} available (have {_local_ver}, "
                      f"track '{_track(cfg)}'); updating..."))
-        _apply(cfg, Path(lc["__file__"]).resolve().parent, dim, green, yellow, red, ask=None)
+        if _apply(cfg, Path(lc["__file__"]).resolve().parent, dim, green, yellow, red, ask=None):
+            _root = Path(lc["__file__"]).resolve().parent
+            _to = _read_installed_version(_root) or (published or _local_ver)
+            _show_update_notes(_root, _local_ver, _to, _vt,
+                               lc["bold"], green, dim, lc["GLYPH"]["dot"])
 
     register_command("/update", _update,
                      "self-update lean_coder + bundled plugins to the latest build (check | force)")
