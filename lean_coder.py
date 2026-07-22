@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L866    Lean-tools (plugin tools: discovery, manager)
-  L1206   MCP client (connection, manager, OAuth, discovery)
-  L1660   Providers (backend plugin registry)
-  L1882   Interactive pickers + menus (raw-mode UI engine)
-  L2231   Terminal styling (colors, formatting helpers)
-  L2428   Streaming + markdown render (model output)
-  L2775   Composer (pinned input line, editor, stdin)
-  L3625   Token accounting (calibrated context meter)
-  L3790   Config (dataclass, field registry, load/save)
-  L6301   Tool execution + text tool-call parsing
-  L6722   Remote workspace (executor client, /connect)
-  L8287   Context meter
-  L8382   Agent (turn loop, context mgmt, tool dispatch)
-  L14055  Slash-command handlers + dispatch table
-  L14167  REPL (interactive loop, session resume)
-  L14539  Worker agent (headless --agent-run)
-  L14852  Entry (CLI arg parsing, main)
+  L901    Lean-tools (plugin tools: discovery, manager)
+  L1241   MCP client (connection, manager, OAuth, discovery)
+  L1695   Providers (backend plugin registry)
+  L1917   Interactive pickers + menus (raw-mode UI engine)
+  L2266   Terminal styling (colors, formatting helpers)
+  L2463   Streaming + markdown render (model output)
+  L2810   Composer (pinned input line, editor, stdin)
+  L3660   Token accounting (calibrated context meter)
+  L3825   Config (dataclass, field registry, load/save)
+  L6340   Tool execution + text tool-call parsing
+  L6761   Remote workspace (executor client, /connect)
+  L8326   Context meter
+  L8421   Agent (turn loop, context mgmt, tool dispatch)
+  L14094  Slash-command handlers + dispatch table
+  L14231  REPL (interactive loop, session resume)
+  L14606  Worker agent (headless --agent-run)
+  L14919  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -113,6 +113,41 @@ def _precompact_name(origin: str, existing) -> str:
 # a different axis (any byte change), so the two are intentionally separate.
 __version__ = "0.9.4"
 
+# Release notes shown once after an update (see _release_notes_since / repl startup).
+# Keyed by version string; each value is a short list of user-facing highlights. Kept
+# in-source so they ship with the build and can never drift from it. Add a NEW top entry
+# whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
+# Newest first is not required (we sort by version), but keep it tidy that way anyway.
+RELEASE_NOTES = {
+    "0.9.4": [
+        "context mgmt: /handover is now /compact (summarize + continue); the old",
+        "  /compact (stub old tool output) is now /trim.",
+        "new knob compact_keep (default 3): verbatim turns kept after a compaction.",
+        "/set compact_at <frac>: THE lever for when auto-compaction fires (the soft",
+        "  nudge zone auto-follows). Was compact_hard; old configs still work.",
+    ],
+}
+
+
+def _release_notes_since(last_seen, current=None):
+    """Highlights for every RELEASE_NOTES version strictly newer than `last_seen` and
+    <= `current` (default this build), oldest-first. Empty when up to date or when
+    last_seen is blank/unknown-future (a fresh install shows nothing - notes are for
+    UPDATES, not first run). Never raises on a junk version string."""
+    cur = version_tuple(current)
+    try:
+        lo = version_tuple(last_seen) if last_seen else None
+    except Exception:
+        lo = None
+    if lo is None:
+        return []
+    out = []
+    for ver, notes in RELEASE_NOTES.items():
+        vt = version_tuple(ver)
+        if lo < vt <= cur:
+            out.append((ver, notes))
+    out.sort(key=lambda t: version_tuple(t[0]))
+    return out
 
 def _prerelease_key(pre):
     """SemVer pre-release precedence key for the dot-separated identifiers after '-'.
@@ -4015,6 +4050,9 @@ class Config:
     update_track: str = "stable"     # which /update track to follow: 'stable' (the main
                                      # branch) or 'beta' (pre-release branch). Selects the
                                      # branch /update fetches VERSION + lean_coder.py from.
+    last_seen_version: str = ""      # highest __version__ whose release notes we've shown.
+                                     # Blank on a fresh install (first run shows nothing);
+                                     # bumped after the "what's new" panel prints on startup.
     command_timeout: int = 300       # foreground run_command timeout (s); long tasks use the background tool
     bg_max_concurrent: int = 5       # max background tasks at once (0 = unlimited)
     worker_max_concurrent: int = 10   # dispatch_worker: max worker agents alive at once (0 = unlimited)
@@ -4280,6 +4318,7 @@ _SCALAR_FIELDS = (
     ("statusline_iter",           0,                   False),
     ("auto_update",               False,               False),
     ("update_track",              "stable",            False),
+    ("last_seen_version",         "",                  False),
     ("editor",                    "",                  False),
     ("user_name",                 "operator",          False),
     ("lean_tools_dir",            "",                  False),
@@ -14163,6 +14202,31 @@ def _resume_into(agent, cfg, name):
     return n, meta
 
 
+def _show_release_notes(cfg: Config):
+    """After an update, print a compact 'what's new' panel once: the highlights for
+    every release newer than cfg.last_seen_version, then bump the marker + persist so
+    it never repeats. No-op on a fresh install (blank marker) or when up to date. On
+    the very first run after ADDING this feature, seed the marker silently so an
+    existing user isn't shown the whole backlog. Best-effort; never blocks startup."""
+    try:
+        entries = _release_notes_since(cfg.last_seen_version)
+        seed = not cfg.last_seen_version    # blank = fresh install OR pre-feature config
+        if entries and not seed:
+            print(bold(green("what's new")) + dim(f"  ({__version__})"))
+            for ver, notes in entries:
+                print(dim(f"  {GLYPH['dot']} {ver}"))
+                for line in notes:
+                    print("    " + line)
+            print(dim("  /help for commands\n"))
+        # Always advance the marker to this build (seed silently, or clear after showing).
+        if cfg.last_seen_version != __version__:
+            cfg.last_seen_version = __version__
+            cfg._defaults["last_seen_version"] = __version__
+            save_config(cfg, quiet=True)
+    except Exception:
+        pass
+
+
 # ==========================================================================
 # SECTION: REPL (interactive loop, session resume)
 # ==========================================================================
@@ -14321,6 +14385,9 @@ def repl(cfg: Config, resume=None):
         if cfg.leash != "rwe":
             print(dim(f"  leash: {cfg.leash} ({_LEASH_GRANTS[cfg.leash]})"))
         print(dim("  /help for commands, /quit to exit\n"))
+
+    # After an update, a one-time 'what's new' panel (below the banner / resume line).
+    _show_release_notes(cfg)
 
     pending_exit = False           # armed by one ^C at the prompt; a second exits
     pending_inputs = []            # lines the user typed via the composer mid-turn
