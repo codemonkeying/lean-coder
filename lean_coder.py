@@ -1991,25 +1991,36 @@ def lean_tools_menu(manager):
             return "\r" + _fit_line(content) + "\033[K"
 
         out = [row(bold("lean-tools  ")
-                   + dim("(up/down move, space toggle, a all, enter save, q cancel)")
+                   + dim("(up/down move, #=jump, space toggle, a all, enter save, q cancel)")
                    + dim(more_up + more_down))]
         for off, (kind, val) in enumerate(window):
             i = top + off
             pointer = cyan(">") if i == cur else " "
+            num = dim(f"{i + 1:>2}) ")              # 1-based row number for #-jump
             if kind == "group":
                 gs = gstate(val)
                 mark = green("x") if gs == "all" else (yellow("-") if gs == "partial" else " ")
-                out.append(row(f"{pointer} [{mark}] {bold(val or 'general')}"))
+                out.append(row(f"{pointer} {num}[{mark}] {bold(val or 'general')}"))
             else:
                 mark = green("x") if val in enabled else " "
                 ind = "  " if show_groups else ""
-                out.append(row(f"{pointer} {ind}[{mark}] {val}  {dim(manager.desc(val))}"))
+                out.append(row(f"{pointer} {num}{ind}[{mark}] {val}  {dim(manager.desc(val))}"))
         for d in detail:                           # full desc of the selected tool
             out.append(row("    " + dim(d)))
         sys.stdout.write("\n".join(out))
         return len(out) - 1
 
     def on_key(k):
+        # Number-jump: a digit moves the cursor to that 1-based row (multi-digit
+        # accumulates); space then toggles it. No filter mode here, so digits are
+        # unambiguous. Mirrors the single-select picker's #-jump.
+        if isinstance(k, str) and k.isdigit():
+            st["numjump"] = (st.get("numjump", "") + k)[-3:]
+            n = int(st["numjump"])
+            if 1 <= n <= len(rows):
+                st["cur"] = n - 1
+            return None
+        st["numjump"] = ""
         if k in (_K_UP, "k"):
             st["cur"] = (st["cur"] - 1) % len(rows)
         elif k in (_K_DOWN, "j"):
@@ -2085,17 +2096,25 @@ def mcp_servers_menu(manager):
             return "\r" + _fit_line(content) + "\033[K"
 
         out = [row(bold("MCP servers  ")
-                   + dim("(up/down move, space toggle, a all, enter save, q cancel)")
+                   + dim("(up/down move, #=jump, space toggle, a all, enter save, q cancel)")
                    + dim(more_up + more_down))]
         for off, name in enumerate(window):
             i = top + off
             pointer = cyan(">") if i == cur else " "
+            num = dim(f"{i + 1:>2}) ")              # 1-based row number for #-jump
             mark = green("x") if name in enabled else " "
-            out.append(row(f"{pointer} [{mark}] {name}  {dim(_row_desc(name))}"))
+            out.append(row(f"{pointer} {num}[{mark}] {name}  {dim(_row_desc(name))}"))
         sys.stdout.write("\n".join(out))
         return len(out) - 1
 
     def on_key(k):
+        if isinstance(k, str) and k.isdigit():       # #-jump (multi-digit accumulates)
+            st["numjump"] = (st.get("numjump", "") + k)[-3:]
+            n = int(st["numjump"])
+            if 1 <= n <= len(names):
+                st["cur"] = n - 1
+            return None
+        st["numjump"] = ""
         if k in (_K_UP, "k"):
             st["cur"] = (st["cur"] - 1) % len(names)
         elif k in (_K_DOWN, "j"):
@@ -2112,6 +2131,101 @@ def mcp_servers_menu(manager):
                 enabled.clear()
             else:
                 enabled.update(names)
+        elif k == _K_ENTER:
+            return ("done", enabled)
+        elif k in (_K_CANCEL, "q"):
+            return ("cancel", None)
+        return None
+
+    res = run_picker(render, on_key)
+    return res[1] if res[0] == "done" else None
+
+
+def multiselect_menu(title, items, is_on, desc=None, prompt=input):
+    """Generic MULTI-TOGGLE picker (the shared shape behind /tools + /mcp): up/down
+    move, #=jump (multi-digit), space toggles, a = all/none, enter saves, q cancels.
+    `items` = row values; `is_on(v)` -> bool current state; `desc(v)` -> optional dim
+    detail. Returns the new enabled SET, or None if cancelled. Numbered-input fallback
+    when there's no TTY (or a test passes its own `prompt`): 'N' toggles row N, 'a'
+    all/none, blank/'0' saves, 'q' cancels."""
+    items = list(items)
+    enabled = set(v for v in items if is_on(v))
+    _desc = desc or (lambda v: "")
+
+    if not picker_capable() or prompt is not input:
+        while True:
+            print(bold(title))
+            for i, v in enumerate(items, 1):
+                mark = green("x") if v in enabled else " "
+                d = _desc(v)
+                print(f"  {i}) [{mark}] {v}" + (dim(f"  {d}") if d else ""))
+            print(dim("  N = toggle, a = all/none, enter = save, q = cancel"))
+            try:
+                sel = prompt("toggle #: ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                return None
+            if sel in ("", "0"):
+                return enabled
+            if sel == "q":
+                return None
+            if sel == "a":
+                enabled.clear() if enabled >= set(items) else enabled.update(items)
+            elif sel.isdigit() and 1 <= int(sel) <= len(items):
+                v = items[int(sel) - 1]
+                enabled.discard(v) if v in enabled else enabled.add(v)
+
+    st = {"cur": 0, "top": 0}
+
+    def render(rows_avail):
+        cur, top = st["cur"], st["top"]
+        body = max(1, rows_avail - 1)
+        if cur < top:
+            top = cur
+        elif cur >= top + body:
+            top = cur - body + 1
+        st["top"] = top
+        window = items[top:top + body]
+        more_up = " ↑more" if top > 0 else ""      # sweep-ok
+        more_down = " ↓more" if top + body < len(items) else ""      # sweep-ok
+
+        def row(content):
+            return "\r" + _fit_line(content) + "\033[K"
+
+        out = [row(bold(title + "  ")
+                   + dim("(up/down move, #=jump, space toggle, a all, enter save, q cancel)")
+                   + dim(more_up + more_down))]
+        for off, v in enumerate(window):
+            i = top + off
+            pointer = cyan(">") if i == cur else " "
+            num = dim(f"{i + 1:>2}) ")
+            mark = green("x") if v in enabled else " "
+            d = _desc(v)
+            out.append(row(f"{pointer} {num}[{mark}] {v}" + (dim(f"  {d}") if d else "")))
+        sys.stdout.write("\n".join(out))
+        return len(out) - 1
+
+    def on_key(k):
+        if isinstance(k, str) and k.isdigit():          # #-jump (multi-digit accumulates)
+            st["numjump"] = (st.get("numjump", "") + k)[-3:]
+            n = int(st["numjump"])
+            if 1 <= n <= len(items):
+                st["cur"] = n - 1
+            return None
+        st["numjump"] = ""
+        if k in (_K_UP, "k"):
+            st["cur"] = (st["cur"] - 1) % len(items)
+        elif k in (_K_DOWN, "j"):
+            st["cur"] = (st["cur"] + 1) % len(items)
+        elif k == _K_HOME:
+            st["cur"] = 0
+        elif k == _K_END:
+            st["cur"] = len(items) - 1
+        elif k == _K_SPACE:
+            v = items[st["cur"]]
+            enabled.discard(v) if v in enabled else enabled.add(v)
+        elif k == "a":
+            enabled.clear() if enabled >= set(items) else enabled.update(items)
         elif k == _K_ENTER:
             return ("done", enabled)
         elif k in (_K_CANCEL, "q"):
@@ -11038,26 +11152,23 @@ def handle_providers_command(agent, cfg, arg):
             return
         _toggle_provider_plugin(agent, cfg, mgr, name)
         return
-    while True:
-        print(bold("provider plugins") + dim(f"  ({_providers_dir(cfg)})"))
-        names = mgr.names()
-        for i, n in enumerate(names, 1):
-            mark = green("on ") if n in cfg.providers_enabled else dim("off")
-            d = mgr.desc(n)
-            # mark the backend actually RUNNING now: [on]/[off] is the enabled set, which
-            # doesn't tell you which enabled provider is active (the /model choice does).
-            active = green("  (active)") if n == cfg.provider else ""
-            print(f"  {i}) [{mark}] {bold(cyan(n))}" + (dim(f"  {d}") if d else "") + active)
-        print("  0) done")
-        try:
-            sel = input("toggle #: ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print()
-            break
-        if sel in ("", "0"):
-            break
-        if sel.isdigit() and 1 <= int(sel) <= len(names):
-            _toggle_provider_plugin(agent, cfg, mgr, names[int(sel) - 1])
+    # MULTI-TOGGLE picker (shared with /tools + /mcp): the enabled set is what changed;
+    # apply the diff through _toggle_provider_plugin so each enable/disable still runs its
+    # setup/register or deactivate side-effects (and persists) exactly as before.
+    names = mgr.names()
+
+    def _desc(n):
+        d = mgr.desc(n)
+        active = "(active)" if n == cfg.provider else ""
+        return "  ".join(x for x in (d, active) if x)
+
+    new = multiselect_menu("provider plugins", names,
+                           is_on=lambda n: n in cfg.providers_enabled, desc=_desc)
+    if new is None:                                   # cancelled - no change
+        return
+    for n in names:
+        if (n in new) != (n in cfg.providers_enabled):
+            _toggle_provider_plugin(agent, cfg, mgr, n)
 
 
 def handle_bg_command(agent, cfg, arg):

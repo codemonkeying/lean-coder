@@ -282,7 +282,9 @@ finally:
 (FIX / ".git").mkdir()
 ig = lc.IgnoreMatcher(FIX)
 check("ignores node_modules/", ig.ignored(FIX / "node_modules"))
-check("ignores *.lock", ig.ignored(FIX / "pkg.lock"))
+# A file LISTER must not hide files by extension - a real *.lock/*.pdf/*.png is a
+# real file (mirrors ripgrep/fd: gitignore + hidden + binary-CONTENT, never a suffix).
+check("does NOT hide *.lock by extension", not ig.ignored(FIX / "pkg.lock"))
 check("ignores .git/", ig.ignored(FIX / ".git"))
 check("keeps src/app.py", not ig.ignored(FIX / "src" / "app.py"))
 (FIX / ".cache").mkdir()
@@ -5082,6 +5084,25 @@ check("pick_model_menu: styled label path returns chosen model",
                          prompt=lambda _p: "2") == "b:7b")
 check("_pick_one_tty: returns _NO_TTY when stdin/stdout not a terminal (headless)",
       lc._pick_one_tty("pick:", ["a", "b"]) is lc._NO_TTY)
+# multiselect_menu: numbered fallback (custom prompt). Toggle row 2 on, then save.
+_ms_seq = iter(["2", ""])
+_msr = lc.multiselect_menu("pick:", ["a", "b", "c"], is_on=lambda v: False,
+                           prompt=lambda _p: next(_ms_seq))
+check("multiselect_menu: toggle a row on then save returns the enabled set",
+      _msr == {"b"})
+# start with 'b' on, toggle it OFF, save -> empty set (not None)
+_ms_seq2 = iter(["2", ""])
+_msr2 = lc.multiselect_menu("pick:", ["a", "b"], is_on=lambda v: v == "b",
+                            prompt=lambda _p: next(_ms_seq2))
+check("multiselect_menu: toggling an on-row off yields empty set (not cancel)",
+      _msr2 == set())
+check("multiselect_menu: q cancels -> None",
+      lc.multiselect_menu("pick:", ["a"], is_on=lambda v: False,
+                          prompt=lambda _p: "q") is None)
+_ms_seq3 = iter(["a", ""])
+check("multiselect_menu: 'a' selects all then save",
+      lc.multiselect_menu("pick:", ["a", "b"], is_on=lambda v: False,
+                          prompt=lambda _p: next(_ms_seq3)) == {"a", "b"})
 # shared picker engine: capability gate + --plain emergency escape
 check("picker_capable: False when headless (no tty)", lc.picker_capable() is False)
 check("_wants_plain: strips --plain and flags it",
