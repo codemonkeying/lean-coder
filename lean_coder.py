@@ -2073,12 +2073,12 @@ def lean_tools_menu(manager):
 
 
 def mcp_servers_menu(manager):
-    """Interactive per-SERVER enable/disable for MCP: up/down move, space toggles,
-    enter saves, q cancels. Each row shows the server name, transport, connection
-    state (tool count or error), and enabled mark. Returns the new enabled set, or
-    None if cancelled. Falls back to a plain listing with no TTY."""
+    """Interactive per-SERVER enable/disable for MCP. Thin wrapper over the generic
+    multiselect_menu (the shared multi-toggle shape): each row shows the server name
+    plus its transport, connection state (tool count or error), and target. Returns the
+    new enabled set, or None if cancelled. (Was a near-verbatim reimplementation of
+    multiselect_menu; now it just supplies the rows + per-row detail.)"""
     names = manager.names()
-    enabled = set(n for n in names if manager._is_on(n))
 
     def _row_desc(name):
         cfg = manager.servers.get(name, {})
@@ -2091,77 +2091,9 @@ def mcp_servers_menu(manager):
         else:
             state = "not connected"
         target = cfg.get("url") or cfg.get("command") or "?"
-        return f"{tp} · {state} · {target}"
+        return f"{tp} {GLYPH['dot']} {state} {GLYPH['dot']} {target}"
 
-    if not picker_capable():
-        print(bold("MCP servers:"))
-        for n in names:
-            print(f"  [{'x' if n in enabled else ' '}] {n}  {dim(_row_desc(n))}")
-        print(dim("  (no TTY: set mcp_enabled in the config file to change)"))
-        return None
-
-    st = {"cur": 0, "top": 0}
-
-    def render(rows_avail):
-        cur, top = st["cur"], st["top"]
-        body = max(1, rows_avail - 1)
-        if cur < top:
-            top = cur
-        elif cur >= top + body:
-            top = cur - body + 1
-        st["top"] = top
-        window = names[top:top + body]
-        more_up = " ↑more" if top > 0 else ""      # sweep-ok
-        more_down = " ↓more" if top + body < len(names) else ""      # sweep-ok
-
-        def row(content):
-            return "\r" + _fit_line(content) + "\033[K"
-
-        out = [row(bold("MCP servers  ")
-                   + dim("(up/down move, #=jump, space toggle, a all, enter save, q cancel)")
-                   + dim(more_up + more_down))]
-        for off, name in enumerate(window):
-            i = top + off
-            pointer = cyan(">") if i == cur else " "
-            num = dim(f"{i + 1:>2}) ")              # 1-based row number for #-jump
-            mark = green("x") if name in enabled else " "
-            out.append(row(f"{pointer} {num}[{mark}] {name}  {dim(_row_desc(name))}"))
-        sys.stdout.write("\n".join(out))
-        return len(out) - 1
-
-    def on_key(k):
-        if isinstance(k, str) and k.isdigit():       # #-jump (multi-digit accumulates)
-            st["numjump"] = (st.get("numjump", "") + k)[-3:]
-            n = int(st["numjump"])
-            if 1 <= n <= len(names):
-                st["cur"] = n - 1
-            return None
-        st["numjump"] = ""
-        if k in (_K_UP, "k"):
-            st["cur"] = (st["cur"] - 1) % len(names)
-        elif k in (_K_DOWN, "j"):
-            st["cur"] = (st["cur"] + 1) % len(names)
-        elif k == _K_HOME:
-            st["cur"] = 0
-        elif k == _K_END:
-            st["cur"] = len(names) - 1
-        elif k == _K_SPACE:
-            name = names[st["cur"]]
-            enabled.discard(name) if name in enabled else enabled.add(name)
-        elif k == "a":                           # bulk: all on, or all off if already all on
-            if enabled >= set(names):
-                enabled.clear()
-            else:
-                enabled.update(names)
-        elif k == _K_ENTER:
-            return ("done", enabled)
-        elif k in (_K_CANCEL, "q"):
-            return ("cancel", None)
-        return None
-
-    res = run_picker(render, on_key)
-    return res[1] if res[0] == "done" else None
-
+    return multiselect_menu("MCP servers", names, is_on=manager._is_on, desc=_row_desc)
 
 def multiselect_menu(title, items, is_on, desc=None, prompt=input):
     """Generic MULTI-TOGGLE picker (the shared shape behind /tools + /mcp): up/down
