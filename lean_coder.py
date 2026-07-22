@@ -10742,7 +10742,7 @@ HELP_COMMANDS = [
     ("/ctx", "context-token estimate"),
     ("/activity [n|all]", "what the system did automatically (compaction, handover, fallback, ...)"),
     ("/expand [N]", "show a tool call's full args + captured output; bare = newest, N = the #id"),
-    ("/help", "this help"),
+    ("/help [cmd]", "this help; /help <cmd> shows one command's help"),
     ("/quit", "exit"),
 ]
 
@@ -11627,6 +11627,8 @@ def _arg_completions(agent, cfg, cmd):
         return b + c
     if cmd in ("/prompt reset", "/prompt restore"):   # only overridden built-ins can be reset
         return sorted(n for n in BUILTIN_PROMPTS if prompt_file(n).is_file())
+    if cmd in ("/help", "/h", "/?"):              # /help <cmd> -> complete command names
+        return [c for c in SLASH_COMMANDS if c != "/help"] + sorted(_lean_tool_commands)
     if cmd == "/approve":
         return list(APPROVAL_MODES)
     if cmd == "/set":                             # app-config keys (was /settings)
@@ -13793,7 +13795,21 @@ def handle_expand_command(agent, cfg, arg):
 
 
 def handle_help_command(agent, cfg, arg):
-    """/help | /h | /? - list builtin + lean-tool-registered commands."""
+    """/help | /h | /? - list builtin + lean-tool-registered commands.
+    /help <cmd> prints that command's own help (same as `/<cmd> ?`)."""
+    arg = arg.strip()
+    if arg:                                   # /help <cmd> -> per-command help
+        name = arg if arg.startswith("/") else "/" + arg
+        handler = _BUILTIN_COMMANDS_TABLE.get(name)
+        if handler is not None:
+            short = next((d for c, d in HELP_COMMANDS if c.split()[0] == name), None)
+            _command_help(name, handler, short)
+        elif name in _lean_tool_commands:
+            fn, hl = _lean_tool_commands[name]
+            _command_help(name, fn, hl)
+        else:
+            print(yellow(f"unknown command {name} - /help for the list"))
+        return
     extra = [(c, h) for c, (_, h) in sorted(_lean_tool_commands.items())]
     print(render_help(extra))
 

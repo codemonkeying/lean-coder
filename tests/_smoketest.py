@@ -2558,7 +2558,8 @@ check("render_help lists every built-in command",
 check("render_help includes descriptions + footer",
       "this help" in plain and "Tab completes" in plain)
 check("render_help styles the command (bold+cyan), not the description",
-      lc.bold(lc.cyan("/clear")) in help_txt and lc.dim("this help") in help_txt)
+      lc.bold(lc.cyan("/clear")) in help_txt
+      and lc.dim("wipe conversation, stay in this session") in help_txt)
 check("render_help shows lean-tool commands under their own header",
       "lean-tool commands:" in plain and "/whoami" in plain)
 # regression: one very long command (/provider) must NOT pad every row out to its
@@ -5019,6 +5020,12 @@ check("argcomp: /session load + /session save key to the same name list",
       lc._arg_completions(_fa, _fc, "/session load") == _sess_arg
       and lc._arg_completions(_fa, _fc, "/session save") == _sess_arg)
 check("argcomp: /autosave on/off", lc._arg_completions(_fa, _fc, "/autosave") == ["on", "off"])
+# /help <cmd>: completes command names (not itself); first-arg '?' suppressed for /help
+_help_comp = lc._arg_completions(_fa, _fc, "/help")
+check("argcomp: /help completes other command names, not itself",
+      "/model" in _help_comp and "/help" not in _help_comp)
+check("_completion_options: /help does not offer the ? help arg",
+      "?" not in lc._completion_options(_fa, _fc, "/help "))
 check("argcomp: /connect saved + open hosts",
       "dev" in lc._arg_completions(_fa, _fc, "/connect") and "box1" in lc._arg_completions(_fa, _fc, "/connect"))
 # CLI contract: a command's flags Tab-complete at ANY arg position (mirrors the handlers
