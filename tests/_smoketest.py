@@ -5634,5 +5634,21 @@ if os.path.isfile(_sweep) and shutil.which("bash"):
         check("hygiene sweep clean (no stray IP/email/key/unicode in tracked source)",
               False, "\n    " + "\n    ".join(_tail[-12:]))
 
+# FILE MAP drift gate: the '# SECTION:' banners and the docstring FILE MAP index (regen
+# by tools/gen_section_index.py) must agree - a moved/added/removed section that didn't
+# regenerate the map would silently mislead navigation. Recompute the expected index
+# from the live banners and assert every entry is present with the right line number.
+_lc_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lean_coder.py")
+_lc_src = open(_lc_path).readlines()
+_expected = [f"  L{i + 1:<6} {ln[len('# SECTION:'):].strip()}"
+             for i, ln in enumerate(_lc_src) if ln.startswith("# SECTION:")]
+_map_txt = "".join(_lc_src)
+if "=== FILE MAP" in _map_txt:
+    _map_body = _map_txt.split("=== FILE MAP", 1)[1].split("=== END FILE MAP", 1)[0]
+    _stale = [e for e in _expected if e.rstrip() not in _map_body]
+    check("FILE MAP index matches SECTION banners (run tools/gen_section_index.py)",
+          not _stale, ("\n    stale/missing: " + "; ".join(e.strip() for e in _stale[:6])) if _stale else "")
+else:
+    check("FILE MAP index present", False, "no '=== FILE MAP' block in module docstring")
 print("\n" + ("ALL PASS" if ok else "SOME FAILED"))
 sys.exit(0 if ok else 1)
