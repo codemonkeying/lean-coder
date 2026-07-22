@@ -4,6 +4,26 @@ native tool calling. Zero third-party dependencies: Python stdlib only.
 
 Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
+
+=== FILE MAP (regen: tools/gen_section_index.py) ===
+  L866    Lean-tools (plugin tools: discovery, manager)
+  L1198   MCP client (connection, manager, OAuth, discovery)
+  L1665   Providers (backend plugin registry)
+  L1887   Interactive pickers + menus (raw-mode UI engine)
+  L2236   Terminal styling (colors, formatting helpers)
+  L2433   Streaming + markdown render (model output)
+  L2780   Composer (pinned input line, editor, stdin)
+  L3630   Token accounting (calibrated context meter)
+  L3795   Config (dataclass, field registry, load/save)
+  L6293   Tool execution + text tool-call parsing
+  L6714   Remote workspace (executor client, /connect)
+  L8279   Context meter
+  L8374   Agent (turn loop, context mgmt, tool dispatch)
+  L14036  Slash-command handlers + dispatch table
+  L14148  REPL (interactive loop, session resume)
+  L14520  Worker agent (headless --agent-run)
+  L14833  Entry (CLI arg parsing, main)
+=== END FILE MAP ===
 """
 
 import argparse
@@ -842,6 +862,10 @@ def _dup_name_skip(prev: Path, f: Path, label: str, name: str) -> bool:
     return True
 
 
+# ==========================================================================
+# SECTION: Lean-tools (plugin tools: discovery, manager)
+# ==========================================================================
+
 class LeanToolManager:
     """Discovers lean-tool files and exposes their schemas/handlers. `enabled` is a
     set of lean-tool names (None = all, used by the hermetic executor which only
@@ -1169,6 +1193,10 @@ def mcp_register_client(reg_endpoint, registration_key=None, client_name="lean-c
         return resp
     return None
 
+
+# ==========================================================================
+# SECTION: MCP client (connection, manager, OAuth, discovery)
+# ==========================================================================
 
 class MCPConnection:
     """One live connection to a single MCP server. Two transports, both stdlib-only:
@@ -1633,6 +1661,10 @@ def _provider_dirs(cfg):
     return dirs
 
 
+# ==========================================================================
+# SECTION: Providers (backend plugin registry)
+# ==========================================================================
+
 class ProviderManager:
     """Discovers provider plugins in the providers/ dir - each a `.py` with a
     module-level PROVIDER dict (the spec) and an optional helpers-only
@@ -1850,6 +1882,10 @@ class _RawFdReader:
         except OSError:
             return ""
 
+
+# ==========================================================================
+# SECTION: Interactive pickers + menus (raw-mode UI engine)
+# ==========================================================================
 
 def run_picker(render, on_key, height_reserve=2):
     """The shared raw-mode render+input loop with a SCROLLING VIEWPORT. `render(top,
@@ -2196,6 +2232,10 @@ def multiselect_menu(title, items, is_on, desc=None, prompt=input):
 _TTY = sys.stdout.isatty()
 
 
+# ==========================================================================
+# SECTION: Terminal styling (colors, formatting helpers)
+# ==========================================================================
+
 def _c(code: str, s: str) -> str:
     return f"\033[{code}m{s}\033[0m" if _TTY else s
 
@@ -2388,6 +2428,10 @@ def style_md_inline(line: str) -> str:
     line = _MD_ITALIC.sub(lambda m: italic(m.group(1) or m.group(2)), line)
     return line
 
+
+# ==========================================================================
+# SECTION: Streaming + markdown render (model output)
+# ==========================================================================
 
 class StreamStall(ConnectionError):
     """A streaming model request stalled at the socket level. Subclasses
@@ -2731,6 +2775,10 @@ def flush_stdin():
 
 _active_composer = None            # set while a Composer owns the terminal
 
+
+# ==========================================================================
+# SECTION: Composer (pinned input line, editor, stdin)
+# ==========================================================================
 
 class Composer:
     """A bottom-of-screen input line (+ a status line) that stays put while the
@@ -3578,6 +3626,10 @@ _TOK_FACTOR = 1.0            # learned estimate->actual multiplier (see calibrat
 _TOK_FACTOR_MIN, _TOK_FACTOR_MAX = 0.7, 3.0
 
 
+# ==========================================================================
+# SECTION: Token accounting (calibrated context meter)
+# ==========================================================================
+
 def _tok_factor() -> float:
     return _TOK_FACTOR
 
@@ -3738,6 +3790,10 @@ def repair_tool_pairs(messages):
 # ----------------------------------------------------------------------------
 # Ignore matching (.gitignore + .leancoderignore + defaults)
 # ----------------------------------------------------------------------------
+
+# ==========================================================================
+# SECTION: Config (dataclass, field registry, load/save)
+# ==========================================================================
 
 class IgnoreMatcher:
     def __init__(self, root: Path):
@@ -6233,6 +6289,10 @@ def _print_new_file(text: str, cap: int = 40):
 # Inference control signal (shared by core and provider clients)
 # ----------------------------------------------------------------------------
 
+# ==========================================================================
+# SECTION: Tool execution + text tool-call parsing
+# ==========================================================================
+
 class _TurnAbort(Exception):
     """Raised (or signalled) to stop streaming mid-inference on SIGINT."""
 
@@ -6649,6 +6709,10 @@ def run_tool_executor(cwd, lean_tools_dir=None):
         except Exception as e:
             _emit_json(proto, {"id": rid, "ok": False, "error": f"{type(e).__name__}: {e}"})
 
+
+# ==========================================================================
+# SECTION: Remote workspace (executor client, /connect)
+# ==========================================================================
 
 class ExecutorClient:
     """Driver-side handle to a tool executor subprocess (stage 1: local; later:
@@ -8211,6 +8275,10 @@ def run_interactive_shell(cfg, remote=None) -> str:
 # Agent loop
 # ----------------------------------------------------------------------------
 
+# ==========================================================================
+# SECTION: Context meter
+# ==========================================================================
+
 class ContextMeter:
     """Read-only context-window measurement + compaction policy for an Agent. Computes
     how full the window is (used tokens), which compaction zone that puts us in, whether
@@ -8301,6 +8369,10 @@ class ContextMeter:
             line += dim(f"  {GLYPH['dot']}  /clear to start fresh")
         print(line + extra)
 
+
+# ==========================================================================
+# SECTION: Agent (turn loop, context mgmt, tool dispatch)
+# ==========================================================================
 
 class Agent:
     def __init__(self, cfg: Config):
@@ -13960,6 +14032,10 @@ def _command_help(cmd, handler, short):
             print("  " + ln)
 
 
+# ==========================================================================
+# SECTION: Slash-command handlers + dispatch table
+# ==========================================================================
+
 def dispatch_command(agent, cfg, cmd, arg):
     """The one slash-command lookup: builtin table first, then the lean-tool registry,
     else 'unknown command'. Returns True iff the repl should exit (only /quit signals
@@ -14067,6 +14143,10 @@ def _resume_into(agent, cfg, name):
     _print_session_tail(msgs)
     return n, meta
 
+
+# ==========================================================================
+# SECTION: REPL (interactive loop, session resume)
+# ==========================================================================
 
 def repl(cfg: Config, resume=None):
     global _active_agent
@@ -14436,6 +14516,10 @@ def _brief_result_path(brief_file, result_file):
     return result_file or (str(brief_file) + ".result")
 
 
+# ==========================================================================
+# SECTION: Worker agent (headless --agent-run)
+# ==========================================================================
+
 def run_agent_brief(args) -> int:
     """Headless WORKER role (`--agent-run`): read a brief file, run ONE brief to
     completion, write the model's final answer (its ===RESULT=== block, or the whole
@@ -14744,6 +14828,10 @@ def run_agent_brief(args) -> int:
     print(dim(f"agent-run: done -> {resultf}"))
     return 0
 
+
+# ==========================================================================
+# SECTION: Entry (CLI arg parsing, main)
+# ==========================================================================
 
 def main():
     ap = argparse.ArgumentParser(
