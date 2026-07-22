@@ -11087,27 +11087,23 @@ def handle_settings_command(agent, cfg, arg):
                 print(yellow(f"unknown setting '{parts[0]}' "
                              f"(try: {', '.join(_SETTINGS_BY_KEY)})"))
         return
-    sessions_item = len(_SETTINGS_FIELDS) + 1
+    # SINGLE-select picker (shared with /model, /leash, ...): choose a field to edit,
+    # loop until cancel. A trailing 'sessions' sentinel opens the recent-sessions view.
+    _SESSIONS = "\x00sessions"
     while True:
-        print(bold("settings") + dim("  (config.toml; model/host via /model, /ollama host)"))
-        for i, (k, label, kind) in enumerate(_SETTINGS_FIELDS, 1):
-            print(f"  {i}) {label}: " + cyan(str(getattr(cfg, k))))
-        print(f"  {sessions_item}) sessions" + dim("  (view recent / load)"))
-        print("  0) done")
-        try:
-            sel = input("edit #: ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print()
+        keys = [k for k, _, _ in _SETTINGS_FIELDS] + [_SESSIONS]
+        labels = [f"{label}: " + cyan(str(getattr(cfg, k)))
+                  for k, label, _ in _SETTINGS_FIELDS]
+        labels.append("sessions" + dim("  (view recent / load)"))
+        chosen = pick_one("settings" + dim("  (config.toml; model/host via /model)"),
+                          keys, labels=labels)
+        if chosen is None:
             break
-        if sel in ("", "0"):
-            break
-        if sel == str(sessions_item):
+        if chosen == _SESSIONS:
             _settings_sessions_view(agent, cfg)
             continue
-        if not (sel.isdigit() and 1 <= int(sel) <= len(_SETTINGS_FIELDS)):
-            continue
-        k, label, kind = _SETTINGS_FIELDS[int(sel) - 1]
-        _edit_one_setting(agent, cfg, k, label, kind)
+        label, kind = _SETTINGS_BY_KEY[chosen]
+        _edit_one_setting(agent, cfg, chosen, label, kind)
 
 
 def _toggle_provider_plugin(agent, cfg, mgr, name):
