@@ -58,24 +58,24 @@ AUTOSAVE_KEEP = 10               # rolling autosave sessions kept (oldest pruned
 AUTOSAVE_PREFIX = "auto-"        # autosave session names; named snapshots have none
 # Pre-handover safety snapshots: written just before a handover REPLACES history, so
 # the full pre-handover conversation stays recoverable (via /load, and the grep-my-own-
-# context recall path). Named <origin-session>-prehandover-<N> so the snapshot is tied
+# context recall path). Named <origin-session>-precompact-<N> so the snapshot is tied
 # to WHAT it snapshots. (Historically mislabelled "pre-compact-*" - it's a handover, not
 # a compact: compact() only stubs tool results in place and takes no snapshot.)
-PREHANDOVER_MARK = "-prehandover-"   # infix marking a pre-handover snapshot
-PREHANDOVER_KEEP = 3             # cap them: safety nets, not named saves - newest few suffice
+PRECOMPACT_MARK = "-precompact-"   # infix marking a pre-handover snapshot
+PRECOMPACT_KEEP = 3             # cap them: safety nets, not named saves - newest few suffice
 
 
 def _is_snapshot(name: str) -> bool:
     """True for a rolling pre-handover safety snapshot (not a user/auto session)."""
-    return PREHANDOVER_MARK in name
+    return PRECOMPACT_MARK in name
 
 
-def _prehandover_name(origin: str, existing) -> str:
-    """A pre-handover snapshot name tied to its origin session: <origin>-prehandover-<N>,
+def _precompact_name(origin: str, existing) -> str:
+    """A pre-handover snapshot name tied to its origin session: <origin>-precompact-<N>,
     N = the next free index for that origin among `existing` names. So a session's
-    snapshots read origin-prehandover-1, -2, ... and the recall path can find them by
-    globbing '<origin>-prehandover-*'."""
-    base = f"{origin}{PREHANDOVER_MARK}"
+    snapshots read origin-precompact-1, -2, ... and the recall path can find them by
+    globbing '<origin>-precompact-*'."""
+    base = f"{origin}{PRECOMPACT_MARK}"
     used = []
     for nm in existing:
         if nm.startswith(base):
@@ -91,7 +91,7 @@ def _prehandover_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.9.3"
+__version__ = "0.9.4"
 
 
 def _prerelease_key(pre):
@@ -133,7 +133,7 @@ def source_hash() -> str:
         return hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
     except OSError:
         return ""
-COMPACT_KEEP = 3               # /compact: tool results kept in full (rest stubbed)
+TRIM_KEEP = 3               # /trim: tool results kept in full (rest stubbed)
 NUDGE_EVERY = 5                # soft-zone: nudge the model to wrap up at most every N turns
 AUTO_CTX_CAP = 32768           # auto-detect never raises num_ctx above this (OOM guard)
 
@@ -150,6 +150,17 @@ SEARCH_MAX_FILE_BYTES = 5_000_000   # skip files bigger than this - never slurp 
                                     # multi-GB VM image / DB / log into RAM (swap death)
 TREE_MAX_ENTRIES = 400
 TREE_DEFAULT_DEPTH = 3
+
+# Universal ingestion-cap backstop for OPAQUE/UNTRUSTED tool results (mcp.call +
+# generic lean-tools that don't self-cap). Grounded in the tool-surface audit +
+# mid-2026 field practice (Codex 10KiB/256ln head+tail+marker; Claude Code tuned
+# to ~8k chars; run_command here caps at 6k). Reuses web_fetch's validated dials
+# rather than inventing new ones. Effective cap = clamp(free*CPT*FRAC, FLOOR, CEIL).
+# All three are Config knobs (ingest_cap_frac / _floor / _ceil); these are defaults.
+INGEST_CAP_FLOOR = 2000        # never truncate BELOW this, even on a tiny free window
+INGEST_CAP_CEIL = 6000         # hard ceiling: a runaway blob never exceeds this (matches run_command)
+INGEST_CHARS_PER_TOKEN = 3     # conservative chars/token, matches web_fetch
+INGEST_CAP_FRAC = 0.4          # share of the FREE context window one result may use
 
 DEFAULT_IGNORES = [
     ".git/", "node_modules/", "dist/", "build/", "out/", ".next/",
@@ -205,34 +216,37 @@ SYSTEM_PROMPT = (
     "</batch_reads>"
 )
 
-HANDOVER_MARK = "===HANDOVER==="    # the visible delimiter the model wraps its handover in
+COMPACT_MARK = "===COMPACT==="     # the visible delimiter the model wraps its compact summary in
+COMPACT_EMERGENCY_KEEP = 1         # hardcoded backstop: on context OVERFLOW we trim to this many
+                                   # turns. Not a preference (no /set) - it's a last-ditch rescue
+                                   # that fires AT the overflow trigger; more would risk re-overflow.
 SELFPROMPT_MARK = "===NEXT==="      # the model wraps its post-compaction self-prompt in these
 PLAN_MARK = "===PLAN==="            # the model wraps its pinned goal + TODO in these
 BRIEF_MARK = "===BRIEF==="          # a worker's task (its first user turn) - see --agent-run
 GRANT_MARK = "===GRANT==="          # a worker's grant header (leash/model/cwd/limits)
 RESULT_MARK = "===RESULT==="        # a worker wraps its final answer in these; the parent harvests it
 
-HANDOVER_INSTR = (
-    "You are wrapping up this session (/handover). Two steps, in order:\n"
+COMPACT_INSTR = (
+    "You are compacting this session (/compact). Two steps, in order:\n"
     "1. DURABLE DOCS: if there are docs/notes worth persisting (a plan, a design doc, a "
-    "README, a HANDOVER.md - whatever this project already uses), update them now with "
+    "README - whatever this project already uses), update them now with "
     "your tools, and if this is ALREADY a git repo, commit them. Do NOT initialise a new "
     "repo, and do NOT commit if there isn't one. If you have no write/command tools right "
     "now (read-only leash), skip this step.\n"
-    "2. HANDOVER: write a concise handover for your future self (memory will be wiped) - "
-    "the goal, key decisions, current state, WHERE the durable docs live, and a clear "
-    "prompt to continue from. Wrap ONLY that handover between two " + HANDOVER_MARK +
-    " markers as visible text, like:\n" + HANDOVER_MARK + "\n<your handover here>\n" +
-    HANDOVER_MARK + "\n"
+    "2. SUMMARY: write a concise summary for your future self (older context will be "
+    "replaced) - the goal, key decisions, current state, WHERE the durable docs live, and "
+    "a clear prompt to continue from. Wrap ONLY that summary between two " + COMPACT_MARK +
+    " markers as visible text, like:\n" + COMPACT_MARK + "\n<your summary here>\n" +
+    COMPACT_MARK + "\n"
     "3. OPTIONAL PLAN: you may write your goal + TODO between two " + PLAN_MARK +
     " markers; it stays pinned for whoever resumes:\n" + PLAN_MARK +
     "\nGOAL: ...\nTODO:\n- [ ] ...\n" + PLAN_MARK + "\n"
     "4. OPTIONAL SELF-PROMPT: if there's a clear next action, write it between two " +
     SELFPROMPT_MARK + " markers (your continue-from prompt):\n" + SELFPROMPT_MARK +
     "\n<what to do next>\n" + SELFPROMPT_MARK + "\n"
-    "Write these blocks as visible text and then STOP - the handover text becomes the "
-    "ENTIRE continuing context; everything else is discarded. No tool call is needed to "
-    "finish; just end your reply after the blocks."
+    "Write these blocks as visible text and then STOP - the summary text becomes the "
+    "ENTIRE continuing context for the older turns; everything summarized is discarded. No "
+    "tool call is needed to finish; just end your reply after the blocks."
 )
 
 
@@ -270,9 +284,9 @@ def _extract_marked(text: str, mark: str):
     return None
 
 
-def _extract_handover_block(text: str):
-    """The handover block (between the last HANDOVER_MARK pair)."""
-    return _extract_marked(text, HANDOVER_MARK)
+def _extract_compact_block(text: str):
+    """The handover block (between the last COMPACT_MARK pair)."""
+    return _extract_marked(text, COMPACT_MARK)
 
 
 def _extract_plan(text: str):
@@ -294,27 +308,27 @@ def _extract_selfprompt(text: str):
 # nothing and the OLD behaviour no-op'd - which on a FULL context leaves the model
 # stuck (can't compact, can't continue). The fix (per the research handover): try
 # tiers, and ACCEPT a degraded handover over a no-op. Only truly-empty output no-ops.
-_HANDOVER_MIN = 30    # a block shorter than this is treated as empty (parse failure)
-_HANDOVER_MAX_TRIES = 3   # total handover-turn attempts before accepting what we have
+_COMPACT_MIN = 30    # a block shorter than this is treated as empty (parse failure)
+_COMPACT_MAX_TRIES = 3   # total handover-turn attempts before accepting what we have
                           # (completeness retry; separate from _loop's send/429 recovery)
 
 # Escalating corrective retries for a handover the tolerant parser couldn't salvage
 # (research: accept a degraded handover over a no-op; only truly-empty output no-ops).
 # Retry 1 = terse "start with the marker"; retry 2 = the exact template to copy.
-HANDOVER_RETRY_1 = (
-    "Your handover blocks were not found. Start your reply with " + HANDOVER_MARK +
+COMPACT_RETRY_1 = (
+    "Your summary blocks were not found. Start your reply with " + COMPACT_MARK +
     " immediately - no preamble, no other tool. The parser needs the exact fence markers."
 )
-HANDOVER_RETRY_2 = (
+COMPACT_RETRY_2 = (
     "Still no usable blocks. Copy this EXACT shape, filling the brackets, nothing "
     "before the first marker:\n" +
-    HANDOVER_MARK + "\n<what you were doing, what changed, what's next, open questions>\n" + HANDOVER_MARK + "\n" +
+    COMPACT_MARK + "\n<what you were doing, what changed, what's next, open questions>\n" + COMPACT_MARK + "\n" +
     PLAN_MARK + "\nGOAL: <one line>\nTODO:\n- [ ] <item>\n" + PLAN_MARK + "\n" +
     SELFPROMPT_MARK + "\n<the single next instruction>\n" + SELFPROMPT_MARK + "\nBegin now:"
 )
 
 # fuzzy field-name aliases for the JSON/markdown tiers.
-_HANDOVER_ALIASES = ("handover", "summary", "context")
+_COMPACT_ALIASES = ("compact", "handover", "summary", "context")  # tolerant parser: accept
 _PLAN_ALIASES     = ("plan", "todo", "checklist", "goal")
 _NEXT_ALIASES     = ("next", "selfprompt", "self_prompt", "next_step", "next_prompt", "prompt")
 
@@ -361,7 +375,7 @@ def _json_field(text, names):
     return None
 
 
-def _parse_handover(text: str) -> dict:
+def _parse_compact(text: str) -> dict:
     """Tolerant multi-tier parse of a handover turn -> {handover, plan, next, tier}.
     Each field is a string or None. `tier` records the HIGHEST (most-degraded) tier
     any field needed, for observability. Tiers, tried per-field in order:
@@ -384,23 +398,23 @@ def _parse_handover(text: str) -> dict:
         if v:
             tier = max(tier, 4); return v
         return None
-    handover = _pick(HANDOVER_MARK, _HANDOVER_ALIASES, _HANDOVER_ALIASES)
+    handover = _pick(COMPACT_MARK, _COMPACT_ALIASES, _COMPACT_ALIASES)
     plan     = _pick(PLAN_MARK, _PLAN_ALIASES, _PLAN_ALIASES)
     nxt      = _pick(SELFPROMPT_MARK, _NEXT_ALIASES, _NEXT_ALIASES)
     # Tier 5 (semantic): no handover block found at all, but there IS real prose - use
     # it wholesale as the summary so a full-context session is never left stuck.
     if not handover:
         stripped = re.sub(r"(?m)^\s*(?:#{1,6}.*|=+.*=+)\s*$", "", text).strip()
-        if len(stripped) >= _HANDOVER_MIN:
+        if len(stripped) >= _COMPACT_MIN:
             handover = stripped
             tier = max(tier, 5)
     # min-content guard: a too-short block is treated as absent (empty != usable).
-    if handover and len(handover) < _HANDOVER_MIN:
+    if handover and len(handover) < _COMPACT_MIN:
         handover = None
     return {"handover": handover, "plan": plan, "next": nxt, "tier": tier}
 
 
-def _handover_missing(parsed) -> list:
+def _compact_missing(parsed) -> list:
     """Which required handover blocks are still missing (in emit order). The model
     writes all three as marked text; the turn ending is the trigger (no finalize
     tool), and any missing block is re-solicited before we accept what we have.
@@ -417,10 +431,10 @@ def _handover_missing(parsed) -> list:
     return missing
 
 
-def _handover_nudge_missing(missing) -> str:
+def _compact_nudge_missing(missing) -> str:
     """A corrective re-prompt naming exactly which block(s) to emit, and how."""
     how = {
-        "handover":  f"the SUMMARY between two {HANDOVER_MARK} markers",
+        "handover":  f"the SUMMARY between two {COMPACT_MARK} markers",
         "plan":      f"the PLAN (GOAL + TODO) between two {PLAN_MARK} markers",
         "next-step": f"the NEXT-STEP self-prompt between two {SELFPROMPT_MARK} markers",
     }
@@ -439,19 +453,19 @@ def _handover_nudge_missing(missing) -> str:
 # blocks, failed handover. The shape that holds up is blocks-FIRST, an explicit "start
 # your reply with the first marker - no preamble", and durable-doc saving demoted to an
 # AFTER option. Keep that shape if you edit this.
-AUTO_HANDOVER_INSTR = (
+AUTO_COMPACT_INSTR = (
     "Your context is full - compact it yourself now (recent turns are kept; older ones "
     "get replaced by what you write here). You are writing a note to YOURSELF in a fresh "
     "session that has NO memory of this conversation - capture everything that future-you "
     "needs to continue without losing the thread. Write these three blocks IN THIS REPLY, "
     "using the exact markers, then STOP. Start your reply with " +
-    HANDOVER_MARK + " - no preamble, no narration, no tool call.\n"
-    "1. HANDOVER: a concise summary of the older context for your future self - the goal, "
+    COMPACT_MARK + " - no preamble, no narration, no tool call.\n"
+    "1. SUMMARY: a concise summary of the older context for your future self - the goal, "
     "key decisions, current task state (done / in progress / next), WHERE things live "
     "(files, commands), and open threads. Put the summary text BETWEEN two identical " +
-    HANDOVER_MARK + " lines (repeat the marker exactly - do NOT invent an XML-style "
+    COMPACT_MARK + " lines (repeat the marker exactly - do NOT invent an XML-style "
     "closing tag):\n" +
-    HANDOVER_MARK + "\nyour summary here\n" + HANDOVER_MARK + "\n"
+    COMPACT_MARK + "\nyour summary here\n" + COMPACT_MARK + "\n"
     "2. PLAN: your current goal + TODO (mark done vs next) - this stays PINNED across the "
     "compaction, so keep it accurate. Again between two identical " + PLAN_MARK + " lines:\n" +
     PLAN_MARK + "\nGOAL: ...\nTODO:\n- [x] done\n- [ ] next\n" + PLAN_MARK + "\n"
@@ -459,7 +473,7 @@ AUTO_HANDOVER_INSTR = (
     "after compaction, phrased as a prompt you'd act on immediately. Between two identical " +
     SELFPROMPT_MARK + " lines:\n" +
     SELFPROMPT_MARK + "\nwhat to do next\n" + SELFPROMPT_MARK + "\n"
-    "Then STOP - just end your reply after the blocks (no tool call). The handover becomes "
+    "Then STOP - just end your reply after the blocks (no tool call). The summary becomes "
     "your kept context; the self-prompt runs as your next turn. If durable notes need "
     "saving, do that AFTER the blocks (and commit ONLY if this is already a git repo - "
     "never init one)."
@@ -468,19 +482,22 @@ AUTO_HANDOVER_INSTR = (
 # Soft-zone nudge: gentle, injected inline into the user turn while context is in the
 # soft zone. DELIBERATELY soft - "finish, then wrap at a clean break" - not "compact
 # now"; a harsh nudge just makes the model stop mid-thought, which is what the hard
-# auto-handover is for. {used}/{limit}/{pct} are filled in at injection time.
-HANDOVER_NUDGE = (
-    "context {used}/{limit} tokens ({pct}%). At {hard} tokens ({hard_pct}%) a handover is "
+# auto-compact is for. {used}/{limit}/{pct} are filled in at injection time.
+COMPACT_NUDGE = (
+    "context {used}/{limit} tokens ({pct}%). At {hard} tokens ({hard_pct}%) a compaction is "
     "FORCED - history gets compacted whether or not you're at a clean point. To land it "
     "tidily instead, steer toward a clean break; and IF the current task/step is fully "
     "done (nothing half-finished) and the next thing is unrelated, you may call "
-    "request_handover NOW to compact at this clean boundary. Don't interrupt work in "
+    "request_compact NOW to compact at this clean boundary. Don't interrupt work in "
     "progress for it - only at a genuine boundary."
 )
 
 # Editable prompts live as text files under the config dir. The built-in prompts
-# (system, handover, auto_handover, handover_nudge) live in a protected `system/`
+# (system, compact, auto_compact, compact_nudge) live in a protected `system/`
 # subdir so a user browsing the
+# prompts dir doesn't break them by accident; custom prompts live in the root.
+# read_prompt() returns the override file's text if present, else the baked default.
+# Reloaded on /reload (and read live by _system()/compact()).
 # prompts dir doesn't break them by accident; custom prompts live in the root.
 # read_prompt() returns the override file's text if present, else the baked default.
 # Reloaded on /reload (and read live by _system()/handover()).
@@ -488,9 +505,9 @@ PROMPTS_DIR = CONFIG_PATH.parent / "prompts"
 SYSTEM_PROMPTS_DIR = PROMPTS_DIR / "system"
 BUILTIN_PROMPTS = {
     "system":         SYSTEM_PROMPT,
-    "handover":       HANDOVER_INSTR,
-    "auto_handover":  AUTO_HANDOVER_INSTR,     # the lever-pull instruction on an auto-handover turn
-    "handover_nudge": HANDOVER_NUDGE,    # the gentle soft-zone "wrap up at a break" nudge
+    "compact":        COMPACT_INSTR,
+    "auto_compact":  AUTO_COMPACT_INSTR,     # the lever-pull instruction on an auto-compact turn
+    "compact_nudge": COMPACT_NUDGE,    # the gentle soft-zone "wrap up at a break" nudge
 }
 EDITOR_FALLBACKS = ("nano", "vi", "vim")
 
@@ -625,7 +642,7 @@ ASK_USER_TOOL = {"type": "function", "function": {
 UPDATE_PLAN_TOOL = {"type": "function", "function": {
     "name": "update_plan",
     "description": ("Set/replace your PINNED plan: a GOAL plus a TODO checklist that stays "
-                    "pinned to the system prompt and survives compaction/handover. Pass the "
+                    "pinned to the system prompt and survives compaction. Pass the "
                     "FULL plan each time (it replaces the previous); flip '- [ ]' to '- [x]' "
                     "as you finish steps; empty string clears it."),
     "parameters": {"type": "object",
@@ -634,22 +651,22 @@ UPDATE_PLAN_TOOL = {"type": "function", "function": {
         "required": ["plan"]}}}
 
 
-# Surfaced ONLY in the soft context zone (the user has, via handover_soft, opened the
+# Surfaced ONLY in the soft context zone (the user has, via compact_soft, opened the
 # spend window). Lets the model ELECT a handover at a clean semantic boundary - a
 # finished task, before switching to an unrelated one - instead of being nagged with
 # no lever, or force-wiped mid-thought when context later hits the hard threshold.
 # Cost is NOT the model's call: it can never hand over before the soft zone (the
 # user's threshold), only pick the tidiest MOMENT inside the window the user opened.
-REQUEST_HANDOVER_TOOL = {"type": "function", "function": {
-    "name": "request_handover",
-    "description": ("Electively hand over NOW, at a clean stopping point. Only call this "
+REQUEST_COMPACT_TOOL = {"type": "function", "function": {
+    "name": "request_compact",
+    "description": ("Electively compact NOW, at a clean stopping point. Only call this "
                     "when the CURRENT task/step is genuinely complete (work committed, "
                     "nothing half-done) and the next thing is a fresh, unrelated task that "
                     "won't need this history - a natural boundary to summarize + reset at. "
-                    "It runs the same handover the automatic one does: you summarize the "
+                    "It runs the same compaction the automatic one does: you summarize the "
                     "older context and write your next-step self-prompt, then history is "
                     "replaced by that summary. Do NOT call it mid-task, and do NOT call it "
-                    "just because context is large - the automatic handover covers pure "
+                    "just because context is large - the automatic compaction covers pure "
                     "size. Prefer finishing cleanly first. Takes no arguments."),
     "parameters": {"type": "object", "properties": {}, "required": []}}}
 
@@ -678,7 +695,7 @@ NOTE_TOOL = {"type": "function", "function": {
 
 
 def active_tools(cfg, remote=False, lean_tool_schemas=(), model_tools=True,
-                 offer_handover=False):
+                 offer_compact=False):
     """The tool list the model actually sees, gated by the /leash capability ceiling:
     chat -> none; r -> read tools only; rw -> + write tools; rwe -> + run_command +
     ask_user_to_run. Lean-tools are tiered by their `safe` flag: a safe (read-only)
@@ -686,8 +703,8 @@ def active_tools(cfg, remote=False, lean_tool_schemas=(), model_tools=True,
     `lean_tool_schemas` is an iterable of (schema, is_safe). `model_tools` is whether the
     ACTIVE MODEL can tool-call at all (a provider may report a chat-only model via its
     tool_support() hook); False drops the whole tool block regardless of leash - a model
-    with no tools can't be granted any by raising the ceiling. `offer_handover` adds the
-    elective request_handover tool (surfaced only in the soft context zone - the caller
+    with no tools can't be granted any by raising the ceiling. `offer_compact` adds the
+    elective request_compact tool (surfaced only in the soft context zone - the caller
     decides). (`remote` is kept for call-site symmetry; the core tools are identical
     local or remote.)"""
     leash = getattr(cfg, "leash", "rwe")
@@ -696,8 +713,8 @@ def active_tools(cfg, remote=False, lean_tool_schemas=(), model_tools=True,
     allow_write = leash in ("rw", "rwe")
     allow_exec = leash == "rwe"
     tools = [UPDATE_PLAN_TOOL, NOTE_TOOL]  # plan upkeep + session notebook: no fs/exec, every non-chat tier
-    if offer_handover:               # soft zone: let the model elect a handover at a break
-        tools.append(REQUEST_HANDOVER_TOOL)
+    if offer_compact:               # soft zone: let the model elect a handover at a break
+        tools.append(REQUEST_COMPACT_TOOL)
     for t in TOOLS:
         nm = t["function"]["name"]
         if nm in _WRITE_TIER and not allow_write:
@@ -749,8 +766,8 @@ def _leash_allows_tool(leash, name, lean_safe=None):
     tool reaches dispatch anyway - a hallucinated or injected tool_call, a replayed or
     loaded message, a tool wrongly leaked onto the surface - it is refused here unless
     `leash` truly permits it. Mirrors active_tools()'s tiering exactly. update_plan /
-    request_handover is agent-internal (no fs/exec) and allowed at any tier."""
-    if name in ("update_plan", "request_handover", "note"):
+    request_compact is agent-internal (no fs/exec) and allowed at any tier."""
+    if name in ("update_plan", "request_compact", "note"):
         return True
     if leash == "chat":
         return False                         # no tools at all
@@ -2272,7 +2289,7 @@ def _zone_color(zone):
     on, the ctx meter colours by the zone that actually drives behaviour - soft (nudge)
     -> yellow, hard/emergency (forced handover) -> red - instead of raw % of the max
     window, which is misleading when the handover threshold is well below 100% (e.g.
-    handover_hard=0.25 forces a handover while a %-of-max meter still reads calm blue)."""
+    compact_hard=0.25 forces a handover while a %-of-max meter still reads calm blue)."""
     return {"ok": blue, "soft": yellow, "hard": red, "emergency": red}.get(zone, blue)
 
 
@@ -2367,7 +2384,7 @@ GLYPH = {
     "cat_exec": g("»", "$"),       # run_command, shell_session, ask_user_to_run
     "cat_net":  g("⇅", "@"),       # web_fetch, brave_search, ssh, web_screenshot  # sweep-ok
     "cat_mcp":  g("⧉", "m"),       # any mcp__* tool
-    "cat_meta": g("◇", "-"),       # update_plan, note, request_handover
+    "cat_meta": g("◇", "-"),       # update_plan, note, request_compact
     "userbar":  g("┃", "|"),       # left accent bar down the operator's own turn
     "ok":       g("✓", "+"),
     "no":       g("✗", "x"),
@@ -3879,18 +3896,22 @@ class Config:
     gen_ttft_timeout: float = 600.0    # ollama: read deadline until the FIRST token
                                        # arrives (catches a prefill stall - server
                                        # accepts then emits nothing). 600 = old default.
-    gen_idle_timeout: "float | None" = None  # ollama: max gap BETWEEN tokens once
+    gen_idle_timeout: "float | None" = None  # ollama: max gap BETWEEN tokens during
                                        # streaming (catches a decode stall). None =
                                        # disabled (old behaviour); a slow-but-live
                                        # stream must not trip it, so set generously.
-    auto_evict: bool = False         # continuous tool-output eviction: each round, stub
-                                     # acted-on tool results (keep last auto_evict_keep in
-                                     # full). A raw-token quota lever - BUT it rewrites
-                                     # history mid-prefix, busting the cache it shrinks, so
-                                     # it only wins if cache reads are NOT discounted on the
-                                     # plan's quota. Defaults OFF until measured. See
-                                     # docs/cost-reduction-roadmap.md.
-    auto_evict_keep: int = 3         # tool results kept verbatim by auto_evict
+    # (auto_evict / auto_evict_keep removed in the context-mgmt overhaul, design
+    # decision 8: continuous per-round tool-output eviction is superseded by the
+    # universal ingestion cap - opaque/untrusted results are now born small at the
+    # source, so a mid-prefix stub pass every round just busted the cache for a small
+    # win. /trim (manual + emergency) covers the rest.)
+    ingest_cap_frac: float = INGEST_CAP_FRAC    # share of FREE window one opaque/
+                                     # untrusted tool result (mcp.call, generic lean-tool)
+                                     # may use at INGESTION. The universal hard stop that
+                                     # makes it impossible for one result to blow context.
+    ingest_cap_floor: int = INGEST_CAP_FLOOR    # min truncation size (BUDGET floor, not
+                                     # an output floor: a result < cap is shown whole)
+    ingest_cap_ceil: int = INGEST_CAP_CEIL      # absolute char ceiling on a capped result
     window_messages: int = 0         # bounded context window: send only the last N
                                      # messages (cut at a clean turn boundary) instead
                                      # of the full history. 0 = unbounded (OFF, the
@@ -3918,47 +3939,60 @@ class Config:
                                      #     otherwise overflow the server (which ollama silently
                                      #     top-clips + a hosted API 400s). So it never moves the
                                      #     cache boundary in normal use; it only trims the turn
-                                     #     that was going over anyway. auto_handover still fires
+                                     #     that was going over anyway. auto_compact still fires
                                      #     FIRST at its % (the cache-friendly path); this is the
                                      #     last line only. Loses old tail, never sys/tools/env/
                                      #     plan/recent turns - vs the server beheading the top.
                                      #   an int N: a HARD fixed cap (e.g. 4000 for a 4k model).
                                      #   0: OFF. Takes precedence over window_messages when on.
                                      # Non-destructive (shapes the send only).
-    auto_handover: bool = True       # self-managing context: when on, the model is shown a
+    auto_compact: bool = True       # self-managing context: when on, the model is shown a
                                      # ctx-budget line and may hand over at a natural break in
                                      # the soft zone; a hard threshold force-hands-over (the
                                      # model pulls the same lever /handover does, then its
                                      # self-prompt is fed back to it). See cost-reduction-roadmap.
-    handover_soft: float = 0.70       # soft zone start, as a fraction of the context window:
-                                     # nudge the model to wrap up + hand over at a clean break
-    handover_hard: float = 0.95       # hard threshold: force a handover at a clean boundary
-                                     # (respects the min-interval loop guard)
-    handover_emergency: float = 1.00  # emergency stop: compact regardless, bypassing the clean
+    compact_soft: float = 0.70       # soft zone start, as a fraction of the context window:
+                                     # nudge the model to wrap up + compact at a clean break
+    compact_hard: float = 0.90       # hard threshold: force a compact at a clean boundary
+                                     # (respects the min-interval loop guard). 0.90 (down from
+                                     # 0.95) gives the summarizing turn headroom before the
+                                     # window backstop beheads the prefix.
+    compact_emergency: float = 1.00  # emergency stop: compact regardless, bypassing the clean
                                      # boundary AND the loop guard (about to overflow the window)
-    handover_min_interval: float = 60.0  # loop guard: min seconds between compactions (~1/min),
+    compact_min_interval: float = 60.0  # loop guard: min seconds between compactions (~1/min),
                                      # bypassed only by the emergency threshold
-    autostart_after_handover: bool = True   # after a compaction, auto-run the model's
-                                     # self-prompt as the next turn so work continues (a
-                                     # 5s ^C-to-cancel beat precedes it; off = park at prompt)
-    handover_overrides: dict = field(default_factory=dict)  # per-model override of the
+    autostart_after_compact: bool = True   # after ANY compaction (auto OR manual
+                                     # /compact), auto-run the model's self-prompt as the
+                                     # next turn so work continues (a 5s ^C-to-cancel beat
+                                     # precedes it; off = park at the prompt)
+    # keep_last: verbatim recent TURNS kept after the summary, PER compaction mode.
+    # Each mode trades differently (design decision 4): emergency keeps the break as
+    # low/cheap as possible under overflow pressure; soft/manual preserve enough recent
+    # thread for a voluntary compaction; hard is the middle ground when tight. A "turn"
+    # = a user message + the assistant/tool run that answers it; the tail always starts
+    # on a clean user boundary so a tool_result is never orphaned from its tool_call.
+    compact_keep: int = 3            # verbatim TURNS kept after any compaction (soft/hard/
+                                     # manual all share this; tail-trim stubs tool payloads
+                                     # so 3 turns of conversation is plenty). Emergency
+                                     # overflow uses a hardcoded backstop (COMPACT_EMERGENCY_KEEP).
+    compact_overrides: dict = field(default_factory=dict)  # per-model override of the
                                      # handover settings (models fill context at different
                                      # rates): model_id -> {auto, soft, hard, autostart}.
                                      # Anything absent falls back to the global default above.
-    auto_compact_interval: int = 0   # NEW auto-COMPACT (distinct from auto-handover): the
-                                     # cheap programmatic strip (/compact - stub old tool
+    auto_trim_interval: int = 0   # auto-TRIM (distinct from auto-compact/handover): the
+                                     # cheap programmatic strip (/trim - stub old tool
                                      # outputs) fired automatically each time context crosses
                                      # a k*interval TOKEN boundary going up. 0 = off (default).
-                                     # A first line of defence BEFORE a full handover: e.g.
+                                     # A first line of defence BEFORE a full compact: e.g.
                                      # 100000 -> strip at 100k, 200k, ... Hysteresis (below)
                                      # stops it re-firing every turn once it strips just under
-                                     # a boundary. Keeps the last handover_compact_keep tool
+                                     # a boundary. Keeps the last auto_trim_keep tool
                                      # results in full.
-    auto_compact_hysteresis: float = 0.25  # re-arm margin as a fraction of the interval: after
+    auto_trim_hysteresis: float = 0.25  # re-arm margin as a fraction of the interval: after
                                      # firing at boundary B, don't re-arm that boundary until
                                      # context drops below B - hysteresis*interval (so a strip
                                      # to just under B can't retrigger next turn). Schmitt trigger.
-    auto_compact_keep: int = COMPACT_KEEP  # tool results kept in full by an auto-compact strip
+    auto_trim_keep: int = TRIM_KEEP  # tool results kept in full by an auto-trim strip
     wake_on_bg_finish: bool = False  # AUTONOMY: when a background task THIS session started
                                      # finishes, WAKE the agent with a synthesised turn (react
                                      # to the result with NO operator input) instead of only
@@ -4086,24 +4120,24 @@ class Config:
                 pass
         return stored
 
-    def handover_for(self, model: "str | None" = None):
+    def compact_for(self, model: "str | None" = None):
         """Resolve compaction settings for `model` (default: the active model).
         Precedence (uniform working-state layer): SESSION override > per-model
-        handover_overrides > global default. A /set of a handover_* key is a session
+        compact_overrides > global default. A /set of a handover_* key is a session
         override and must win over a per-model override; a /set --config writes the
         global default. Models fill context at different rates, so the per-model layer
         sits between. Returns {auto, soft, hard, autostart}."""
-        ov = self.handover_overrides.get(model or self.active_model(), {})
+        ov = self.compact_overrides.get(model or self.active_model(), {})
         so = self.session_overrides
         def pick(mkey, gkey, gval):
             if gkey in so:                       # session override wins outright
                 return getattr(self, gkey)
             return ov.get(mkey, gval)
         return {
-            "auto":      pick("auto",      "auto_handover",            self.auto_handover),
-            "soft":      pick("soft",      "handover_soft",            self.handover_soft),
-            "hard":      pick("hard",      "handover_hard",            self.handover_hard),
-            "autostart": pick("autostart", "autostart_after_handover", self.autostart_after_handover),
+            "auto":      pick("auto",      "auto_compact",            self.auto_compact),
+            "soft":      pick("soft",      "compact_soft",            self.compact_soft),
+            "hard":      pick("hard",      "compact_hard",            self.compact_hard),
+            "autostart": pick("autostart", "autostart_after_compact", self.autostart_after_compact),
         }
 
     def set_active_model(self, name):
@@ -4210,10 +4244,12 @@ _PERSISTED_SCALAR_KEYS = (
     "command_timeout", "bg_max_concurrent",
     "worker_max_concurrent", "worker_idle_timeout", "worker_max_iterations", "editor",
     "approval", "confirm_reads", "auto_reconnect", "statusline", "statusline_every",
-    "statusline_iter", "auto_evict", "auto_evict_keep",
-    "window_messages", "window_tokens", "auto_handover", "handover_soft", "handover_hard",
-    "handover_emergency", "handover_min_interval", "autostart_after_handover",
-    "auto_compact_interval", "auto_compact_hysteresis", "auto_compact_keep",
+    "statusline_iter",
+    "ingest_cap_frac", "ingest_cap_floor", "ingest_cap_ceil",
+    "window_messages", "window_tokens", "auto_compact", "compact_soft", "compact_hard",
+    "compact_emergency", "compact_min_interval", "autostart_after_compact",
+    "compact_keep",
+    "auto_trim_interval", "auto_trim_hysteresis", "auto_trim_keep",
     "wake_on_bg_finish", "notes_spool",
     "gen_connect_timeout", "gen_ttft_timeout", "gen_idle_timeout",
     "lean_tools_dir", "providers_dir", "user_name", "ephemeral",
@@ -4237,7 +4273,7 @@ _EPHEMERAL_KEYS = frozenset((
 _BESPOKE_KEYS = frozenset((
     "host", "hosts", "machines", "connect_hosts", "host_models", "provider",
     "provider_settings", "providers_enabled", "lean_tools_enabled", "mcp_servers",
-    "mcp_enabled", "always_expand", "show_snapshots", "handover_overrides",
+    "mcp_enabled", "always_expand", "show_snapshots", "compact_overrides",
 ))
 
 
@@ -4266,9 +4302,9 @@ def load_config(args) -> Config:
     # /handover does); "compact" now means only the programmatic /compact strip.
     # The knobs are handover_* accordingly - no compact_* back-compat aliases (they'd
     # be one more thing to track); a pre-rename config just falls back to defaults.
-    _ov = file_vals.get("handover_overrides")
+    _ov = file_vals.get("compact_overrides")
     if isinstance(_ov, dict):
-        cfg.handover_overrides = {k: dict(v) for k, v in _ov.items() if isinstance(v, dict)}
+        cfg.compact_overrides = {k: dict(v) for k, v in _ov.items() if isinstance(v, dict)}
     cfg.leash = _norm_leash(cfg.leash) or "rwe"     # validate the ceiling; junk -> full
     if cfg.approval not in APPROVAL_MODES:          # validate the cadence; junk -> ask
         cfg.approval = "ask"
@@ -4365,7 +4401,6 @@ def load_config(args) -> Config:
     # remaining CLI flags
     if args.num_ctx:        cfg.num_ctx = args.num_ctx
     if getattr(args, "keep_alive", None) is not None: cfg.keep_alive = args.keep_alive
-    if getattr(args, "auto_evict", None): cfg.auto_evict = True
     if getattr(args, "window_messages", None) is not None: cfg.window_messages = args.window_messages
     if getattr(args, "window_tokens", None) is not None:
         try:
@@ -4480,34 +4515,38 @@ def save_config(cfg: Config, quiet: bool = False):
         lines.append(f"gen_ttft_timeout = {cfg.gen_ttft_timeout}")
     if cfg.gen_idle_timeout is not None:
         lines.append(f"gen_idle_timeout = {cfg.gen_idle_timeout}")
-    if cfg.auto_evict:
-        lines.append("auto_evict = true")
-    if cfg.auto_evict_keep != 3:
-        lines.append(f"auto_evict_keep = {cfg.auto_evict_keep}")
+    if cfg.ingest_cap_frac != INGEST_CAP_FRAC:
+        lines.append(f"ingest_cap_frac = {cfg.ingest_cap_frac}")
+    if cfg.ingest_cap_floor != INGEST_CAP_FLOOR:
+        lines.append(f"ingest_cap_floor = {cfg.ingest_cap_floor}")
+    if cfg.ingest_cap_ceil != INGEST_CAP_CEIL:
+        lines.append(f"ingest_cap_ceil = {cfg.ingest_cap_ceil}")
     if cfg.max_iterations != 0:
         lines.append(f"max_iterations = {cfg.max_iterations}")
     if cfg.window_messages != 0:              # default is off (0) now
         lines.append(f"window_messages = {cfg.window_messages}")
     if cfg.window_tokens != "auto":           # default is 'auto'; persist an int cap or 0 (off)
         lines.append(f"window_tokens = {_toml_value(cfg.window_tokens)}")
-    if not cfg.auto_handover:
-        lines.append("auto_handover = false")
-    if cfg.handover_soft != 0.70:
-        lines.append(f"handover_soft = {cfg.handover_soft}")
-    if cfg.handover_hard != 0.95:
-        lines.append(f"handover_hard = {cfg.handover_hard}")
-    if cfg.handover_emergency != 1.00:
-        lines.append(f"handover_emergency = {cfg.handover_emergency}")
-    if cfg.handover_min_interval != 60.0:
-        lines.append(f"handover_min_interval = {cfg.handover_min_interval}")
-    if not cfg.autostart_after_handover:       # default is on now; persist an opt-OUT
-        lines.append("autostart_after_handover = false")
-    if cfg.auto_compact_interval != 0:         # default 0 (off); persist when opted in
-        lines.append(f"auto_compact_interval = {cfg.auto_compact_interval}")
-    if cfg.auto_compact_hysteresis != 0.25:
-        lines.append(f"auto_compact_hysteresis = {cfg.auto_compact_hysteresis}")
-    if cfg.auto_compact_keep != COMPACT_KEEP:
-        lines.append(f"auto_compact_keep = {cfg.auto_compact_keep}")
+    if not cfg.auto_compact:
+        lines.append("auto_compact = false")
+    if cfg.compact_soft != 0.70:
+        lines.append(f"compact_soft = {cfg.compact_soft}")
+    if cfg.compact_hard != 0.90:
+        lines.append(f"compact_hard = {cfg.compact_hard}")
+    if cfg.compact_emergency != 1.00:
+        lines.append(f"compact_emergency = {cfg.compact_emergency}")
+    if cfg.compact_min_interval != 60.0:
+        lines.append(f"compact_min_interval = {cfg.compact_min_interval}")
+    if not cfg.autostart_after_compact:       # default is on now; persist an opt-OUT
+        lines.append("autostart_after_compact = false")
+    if cfg.compact_keep != 3:
+        lines.append(f"compact_keep = {cfg.compact_keep}")
+    if cfg.auto_trim_interval != 0:         # default 0 (off); persist when opted in
+        lines.append(f"auto_trim_interval = {cfg.auto_trim_interval}")
+    if cfg.auto_trim_hysteresis != 0.25:
+        lines.append(f"auto_trim_hysteresis = {cfg.auto_trim_hysteresis}")
+    if cfg.auto_trim_keep != TRIM_KEEP:
+        lines.append(f"auto_trim_keep = {cfg.auto_trim_keep}")
     if cfg.wake_on_bg_finish:                  # default off; persist an opt-IN
         lines.append("wake_on_bg_finish = true")
     if cfg.notes_spool != 2000:                # default 2000 lines; persist when changed
@@ -4584,22 +4623,22 @@ def save_config(cfg: Config, quiet: bool = False):
         lines.append("")
         lines.append("[models]")
         lines += [f'"{h}" = "{m}"' for h, m in cfg.host_models.items()]
-    # Per-model handover overrides: [handover_overrides.<model>] tables. Declared a
+    # Per-model handover overrides: [compact_overrides.<model>] tables. Declared a
     # BESPOKE (own-serializer) key and READ back in load_config - but historically had
     # NO writer here, so every autosave_config() (fired by /model, /connect, and the
     # flows around a handover) rewrote config.toml WITHOUT them: the overrides silently
-    # vanished and the next load fell back to the global handover_soft/hard defaults
+    # vanished and the next load fell back to the global compact_soft/hard defaults
     # (0.70/0.95), which the status line shows as "handover 95%". Write them back.
-    if cfg.handover_overrides:
-        for _m, _ov in cfg.handover_overrides.items():
+    if cfg.compact_overrides:
+        for _m, _ov in cfg.compact_overrides.items():
             if not (isinstance(_m, str) and _m.strip() and isinstance(_ov, dict) and _ov):
                 continue
             lines.append("")
             # Quote the model segment: names carry ':' / '.' (qwen3:32b, claude-opus-4-8)
             # which are INVALID as a bare TOML key - an unquoted header would make the
             # whole config.toml unparseable, and the next load would silently fall back to
-            # ALL defaults (wiping global handover_soft/hard too -> the "95%" reset).
-            lines.append(f"[handover_overrides.{_toml_value(_m)}]")
+            # ALL defaults (wiping global compact_soft/hard too -> the "95%" reset).
+            lines.append(f"[compact_overrides.{_toml_value(_m)}]")
             lines += [f"{k} = {_toml_value(v)}" for k, v in _ov.items()]
     if cfg.provider and cfg.provider != "ollama":
         lines.insert(2, f'provider = "{cfg.provider}"')   # just after model line
@@ -4939,7 +4978,7 @@ def autosave_session(agent, cfg):
 def _prune_autosaves(keep: int = AUTOSAVE_KEEP):
     """Keep only the newest `keep` autosave sessions, and separately cap the rolling
     pre-handover safety snapshots (a handover writes one every fire) to
-    PREHANDOVER_KEEP. Both are rolling/disposable; only USER-named sessions are kept
+    PRECOMPACT_KEEP. Both are rolling/disposable; only USER-named sessions are kept
     forever. Without the snapshot cap they pile up unbounded and flood /load (a busy
     session can leave dozens)."""
     if not SESSIONS_DIR.is_dir():
@@ -4957,10 +4996,10 @@ def _prune_autosaves(keep: int = AUTOSAVE_KEEP):
             except OSError:
                 pass
 
-    # A prehandover snapshot of an auto- session starts with AUTOSAVE_PREFIX too, so
+    # A precompact snapshot of an auto- session starts with AUTOSAVE_PREFIX too, so
     # match snapshots FIRST and exclude them from the autosave cap (else a snapshot
     # would count against the autosave quota and skew both).
-    _cap(_is_snapshot, PREHANDOVER_KEEP)
+    _cap(_is_snapshot, PRECOMPACT_KEEP)
     _cap(lambda s: s.startswith(AUTOSAVE_PREFIX) and not _is_snapshot(s), keep)
 
 
@@ -8269,7 +8308,7 @@ class ContextMeter:
     back-reference to its Agent but only READS from it (last_prompt_tokens, the client's
     cache counters, messages, tool_defs, cfg) - it never mutates conversation state. The
     one writable bit, the last-compaction timestamp, stays owned by the Agent (set in
-    auto_handover) and is read here as agent._last_compact_ts. Pulling this cohesive
+    auto_compact) and is read here as agent._last_compact_ts. Pulling this cohesive
     read-mostly cluster out of the Agent god-class makes it unit-testable in isolation."""
 
     def __init__(self, agent):
@@ -8307,16 +8346,16 @@ class ContextMeter:
     def zone(self):
         """Context-budget zone for self-managing compaction. Returns (zone, used,
         limit), zone in 'ok' | 'soft' | 'hard' | 'emergency' by fraction of window:
-          >= handover_emergency -> 'emergency' (compact NOW, bypass boundary + guard)
+          >= compact_emergency -> 'emergency' (compact NOW, bypass boundary + guard)
           >= hard (per-model)   -> 'hard'      (force at a clean boundary, respect guard)
           >= soft (per-model)   -> 'soft'      (nudge the model to compact at a break)
           else                  -> 'ok'.
-        Used only when cfg.auto_handover (per-model) is on."""
+        Used only when cfg.auto_compact (per-model) is on."""
         used  = self.used()
         limit = self.cfg.ctx_window() or 1
         frac  = used / limit
-        c     = self.cfg.handover_for()        # per-model soft/hard/auto/autostart
-        if frac >= self.cfg.handover_emergency:
+        c     = self.cfg.compact_for()        # per-model soft/hard/auto/autostart
+        if frac >= self.cfg.compact_emergency:
             return ("emergency", used, limit)
         if frac >= c["hard"]:
             return ("hard", used, limit)
@@ -8326,11 +8365,11 @@ class ContextMeter:
 
     def compact_allowed(self, zone) -> bool:
         """Loop guard: emergency always proceeds; otherwise require at least
-        handover_min_interval seconds since the last compaction, so a self-driving
+        compact_min_interval seconds since the last compaction, so a self-driving
         compact->autostart->compact cycle can't burn quota in a tight loop."""
         if zone == "emergency":
             return True
-        return (time.time() - self.agent._last_compact_ts) >= self.cfg.handover_min_interval
+        return (time.time() - self.agent._last_compact_ts) >= self.cfg.compact_min_interval
 
     def print_meter(self):
         used = self.used()
@@ -8338,7 +8377,7 @@ class ContextMeter:
         pct = used / window * 100
         # Colour by the auto-handover zone (soft->yellow, hard/emergency->red) when it's
         # on, matching the status-row meter; plain %-of-max colour when handover is off.
-        if self.cfg.handover_for().get("auto"):
+        if self.cfg.compact_for().get("auto"):
             zlabel = self.zone()[0]
             col = _zone_color(zlabel)
         else:
@@ -8376,24 +8415,24 @@ class Agent:
         self.session_out = 0            # accumulated per chat() call, zeroed on /clear
         self._last_provider = None       # last active provider, for '/provider on'
         self._abort = False
-        self._handover_capture = None    # set by finalize_handover -> stops the loop
-        self.handovers = 0               # completed handovers this session (manual + auto)
-        self._handover_mark = 0          # index where the current /handover turn starts
-        self._elected_handover = False   # set by request_handover -> _maybe_handover runs it
+        self._compact_capture = None    # set by finalize_compact -> stops the loop
+        self.compactions = 0               # completed handovers this session (manual + auto)
+        self._compact_mark = 0          # index where the current /handover turn starts
+        self._elected_compact = False   # set by request_compact -> _maybe_compact runs it
         self._last_compact_ts = 0.0      # time of last auto-handover (loop guard)
         self._autostart_pending = None   # self-prompt queued to run as the next turn
         self._queued_turns = []          # user turns queued by a command (e.g. /prompt use);
                                          # the REPL drains these as full turns before prompting
         self._activity = []              # system-activity log: automatic behaviours
-                                         # (auto-evict, auto-compact, handover, 429->Haiku,
+                                         # (compact, trim, ingest-cap, 429->Haiku,
                                          # token refresh) recorded with a reason so /activity
                                          # shows "what the system did for you, and why".
         self._ac_armed_boundary = 0      # highest k*interval boundary auto-compact has FIRED
                                          # at; hysteresis re-arms it only after ctx drops back
                                          # under (boundary - hysteresis*interval). Schmitt state.
-        self._handover_boundary = 0      # message index just past the cache-STABLE prefix left
+        self._compact_boundary = 0      # message index just past the cache-STABLE prefix left
                                          # by the last handover (0 = none yet). A provider client
-                                         # may pin a cache breakpoint here. See auto_handover().
+                                         # may pin a cache breakpoint here. See auto_compact().
         # permissions note for the model, injected into the next user turn (not the cached
         # system prompt). Seeded at startup only if the leash is restricted (rwe = full = no note).
         self._pending_ai_note = _leash_note(cfg.leash) if cfg.leash != "rwe" else None
@@ -8494,7 +8533,7 @@ class Agent:
             active_tools(self.cfg, remote=bool(ws),
                          lean_tool_schemas=self._all_lean_schemas(),
                          model_tools=self._model_tool_support(),
-                         offer_handover=self._offer_handover()))
+                         offer_compact=self._offer_compact()))
         self.messages[0] = {"role": "system", "content": self._system()}
 
     def drop_remote(self, host):
@@ -8544,13 +8583,13 @@ class Agent:
         except Exception:
             return tools
 
-    def _offer_handover(self) -> bool:
-        """Whether to surface the elective request_handover tool this turn: only in the
+    def _offer_compact(self) -> bool:
+        """Whether to surface the elective request_compact tool this turn: only in the
         soft context zone (auto-handover on), i.e. once context has crossed the user's
-        handover_soft threshold - the point at which the user has decided spending on a
+        compact_soft threshold - the point at which the user has decided spending on a
         handover is acceptable. The model then picks the tidy MOMENT within that window;
         it can never elect one BELOW soft, so it never decides how much the user pays."""
-        if not self.cfg.handover_for()["auto"]:
+        if not self.cfg.compact_for()["auto"]:
             return False
         return self._ctx_zone()[0] == "soft"
 
@@ -8567,7 +8606,7 @@ class Agent:
             active_tools(self.cfg, remote=bool(self.remote),
                          lean_tool_schemas=self._all_lean_schemas(),
                          model_tools=self._model_tool_support(),
-                         offer_handover=self._offer_handover()))
+                         offer_compact=self._offer_compact()))
 
     def reload_lean_tools(self):
         """Re-scan the lean-tool dir (picks up new/edited/removed files) keeping the
@@ -8655,8 +8694,8 @@ class Agent:
         """Route a tool call: to the remote executor when connected (with a
         local confirmation first, since the executor can't prompt), else local.
         The model is unaware of any of this - identical surface either way."""
-        if name == "request_handover":       # elective soft-zone handover (agent-internal)
-            return self._request_handover()
+        if name == "request_compact":       # elective soft-zone handover (agent-internal)
+            return self._request_compact()
         if name == "update_plan":            # pinned-plan upkeep (local agent state, never remote)
             return self._update_plan(args.get("plan", ""))
         if name == "note":                   # session notebook (local agent state, never remote)
@@ -9147,7 +9186,7 @@ class Agent:
             _invalidate_msg_tokens()
         return trimmed, freed
 
-    def compact(self, keep: int = COMPACT_KEEP):
+    def trim(self, keep: int = TRIM_KEEP):
         """Trim old tool results to short stubs, keeping the last `keep` in
         full. The cheapest big context win - old file dumps/command output are
         rarely needed once acted on. Returns (trimmed_count, tokens_freed)."""
@@ -9273,6 +9312,23 @@ class Agent:
         except Exception:
             return ""
 
+    def _keep_tail_turns(self, msgs, keep_turns):
+        """Index into `msgs` where a tail of the last `keep_turns` TURNS begins (a turn
+        = a user message + the run answering it). Used by compaction to decide how much
+        recent verbatim thread to keep after the summary (per-mode keep_last, design
+        decision 4). Returns None when keep_turns<=0 (a clean [system, summary] cut) or
+        no user boundary is found. The tail always starts on a user message so a
+        tool_result is never orphaned from its tool_call."""
+        if keep_turns <= 0:
+            return None
+        head = 1 if (msgs and msgs[0].get("role") == "system") else 0
+        user_idx = [i for i, m in enumerate(msgs) if i >= head and m.get("role") == "user"]
+        if not user_idx:
+            return None
+        if len(user_idx) <= keep_turns:
+            return user_idx[0]
+        return user_idx[-keep_turns]
+
     def _keep_tail_start(self, msgs, max_msgs):
         """Index into `msgs` where the kept tail begins: the first user-message
         boundary within the last `max_msgs` (so a tool_result is never orphaned from
@@ -9289,72 +9345,62 @@ class Agent:
                 return base + i
         return None
 
-    def _auto_evict(self):
-        """Continuous tool-output eviction - the main quota lever. Each agentic
-        round, stub the bodies of tool results the model has ALREADY responded to,
-        keeping the last `auto_evict_keep` of them in full. The in-flight batch
-        (tool results AFTER the last assistant message - what the model is about to
-        read this round) is never touched, so a parallel read batch stays intact
-        until it has been acted on. Quota counts raw tokens and the full history is
-        re-sent every round, so shrinking acted-on results shrinks every later call.
-        See docs/cost-reduction-roadmap.md. Returns (trimmed_count, tokens_freed)."""
-        keep = self.cfg.auto_evict_keep
-        last_asst = max((i for i, m in enumerate(self.messages)
-                         if m["role"] == "assistant"), default=-1)
-        acted = [i for i, m in enumerate(self.messages)
-                 if m["role"] == "tool" and i < last_asst]
-        to_trim = acted[:-keep] if keep > 0 else acted
-        return self._trim_tool_indices(to_trim)
+    # (_auto_evict removed - design decision 8. The universal ingestion cap
+    # (_ingest_cap) supersedes continuous eviction; _trim_tool_indices still backs
+    # the manual/emergency /trim path.)
 
-    def _handover_turn_text(self):
+    def _compact_turn_text(self):
         """All assistant content produced since the handover instruction was injected
         (the marked block lives here, possibly alongside the finalize tool call)."""
-        return "\n".join(m.get("content") or "" for m in self.messages[self._handover_mark:]
+        return "\n".join(m.get("content") or "" for m in self.messages[self._compact_mark:]
                          if m.get("role") == "assistant")
 
-    def _solicit_handover(self, instr):
+    def _solicit_compact(self, instr):
         """Shared core of both compaction paths: inject the handover instruction `instr`,
         give the model a turn to write the marked blocks (@#! summary + plan + next-step),
         and - since there is no finalize tool, the turn ENDING is the trigger - tolerantly
-        parse it, re-soliciting any MISSING block BY NAME up to _HANDOVER_MAX_TRIES.
+        parse it, re-soliciting any MISSING block BY NAME up to _COMPACT_MAX_TRIES.
         Returns (parsed, missing, attempt, turn_text). ONE place so handover() and
-        auto_handover() can't drift (they did: one used the tolerant parse, one a strict
+        auto_compact() can't drift (they did: one used the tolerant parse, one a strict
         re-extract, silently dropping the salvaged plan/next). Callers decide what to do
         with the result (replace history now, snapshot first, autostart, etc.)."""
         self.messages.append({"role": "user", "content": instr})
         self.dirty = True
-        self._handover_capture = None
-        self._handover_mark = len(self.messages)
+        self._compact_capture = None
+        self._compact_mark = len(self.messages)
         parsed, turn_text = None, ""
         missing = ["handover"]
         attempt = 0
-        for attempt in range(_HANDOVER_MAX_TRIES):
+        for attempt in range(_COMPACT_MAX_TRIES):
             if attempt > 0:
-                nudge = (_handover_nudge_missing(missing) if attempt == 1
-                         else HANDOVER_RETRY_2)   # last try: the exact full template
+                nudge = (_compact_nudge_missing(missing) if attempt == 1
+                         else COMPACT_RETRY_2)   # last try: the exact full template
                 self.messages.append({"role": "user", "content": nudge})
             with self._sigint_guard():
                 self._loop()
-            turn_text = self._handover_turn_text()
-            parsed = _parse_handover(turn_text)
-            missing = _handover_missing(parsed)
+            turn_text = self._compact_turn_text()
+            parsed = _parse_compact(turn_text)
+            missing = _compact_missing(parsed)
             if not missing:
                 break
         return parsed, missing, attempt, turn_text
 
-    def _finish_handover(self, parsed, *, summary_prefix, tail=None,
+    def _finish_compact(self, parsed, *, summary_prefix, tail=None,
                          autostart=False, stamp_clock=False):
-        """Shared epilogue for handover() + auto_handover(): once the marked blocks
+        """Shared epilogue for compact() + auto_compact(): once the marked blocks
         are parsed, install the pinned plan, rebuild history as [system, summary(+tail)],
         set the stable cache boundary, and reset the per-turn counters. The two callers
-        differ only in the four knobs:
+        differ only in the knobs:
           - summary_prefix: how the compacted summary is introduced;
-          - tail: recent verbatim messages kept AFTER the summary (auto only; None = a
-            clean [system, summary] cut for an operator-driven /handover);
-          - autostart: queue the model's next-step self-prompt (auto only - nobody's
-            watching to type it);
-          - stamp_clock: bump the anti-thrash loop guard (auto only).
-        Returns the handover text block."""
+          - tail: recent verbatim messages kept AFTER the summary (both callers pass a
+            per-mode keep_last tail now; None = a clean [system, summary] cut);
+          - autostart: queue the model's next-step self-prompt. Both callers pass True
+            now, gated by cfg.autostart_after_compact - a manual /compact continues too
+            (a 5s ^C-to-cancel beat precedes it), so the config governs both paths
+            uniformly. Off = park at the prompt after compaction.
+          - stamp_clock: bump the anti-thrash loop guard (auto only - a manual /compact
+            is deliberate, so it shouldn't arm the min-interval guard).
+        Returns the summary text block."""
         block = parsed["handover"]
         if parsed["plan"]:
             self.pinned_plan = parsed["plan"]   # survives handover (uncached send-time reminder)
@@ -9362,38 +9408,54 @@ class Agent:
             {"role": "system", "content": self._system()},
             {"role": "user", "content": summary_prefix + block, "cache_boundary": True},
         ] + (tail or [])
+        # Tail-trim: the kept tail preserves recent CONVERSATION, but a tool-heavy turn's
+        # weight is dominated by giant tool payloads (file dumps, command output) that the
+        # summary has already distilled. Stub those bodies in place so a manual /compact
+        # lands near the old clean-cut size instead of dragging 10s of k of stale output
+        # forward. Messages/reasoning stay; only tool-result bodies shrink to placeholders.
+        # (indices >= 2 = everything after [system, summary].)
+        if tail:
+            tool_idx = [i for i in range(2, len(self.messages))
+                        if self.messages[i].get("role") == "tool"]
+            if tool_idx:
+                self._trim_tool_indices(tool_idx)
         # Cache-boundary signal: after a handover the prefix [system][summary] is STABLE,
         # so a client with a spare breakpoint can pin it and re-read the prefix at ~0.1x.
         # 2 = system + the one compacted-summary user message.
-        self._handover_boundary = 2
+        self._compact_boundary = 2
         self.last_prompt_tokens = None
         self.tools.changed_files.clear()
         if stamp_clock:
             self._last_compact_ts = time.time()
-        if autostart and parsed["next"] and self.cfg.handover_for()["autostart"]:
+        if autostart and parsed["next"] and self.cfg.compact_for()["autostart"]:
             self._autostart_pending = parsed["next"]
-        self.handovers += 1
+        self.compactions += 1
         return block
 
-    def handover(self):
-        """Agentic /handover: the model gets a real (tool-capable) turn to update +
-        commit any durable docs, then write its future-self handover as marked text
-        (@#! block + plan + next-step). No finalize tool - the turn ending is the
-        trigger; we parse the marked blocks, re-solicit any missing one, then replace
-        history with the summary - a "smart /clear" that keeps the thread. A bad/absent
-        block does NOT nuke history (returns None). Returns the handover text, or None."""
+    def compact(self):
+        """Agentic /compact: the model gets a real (tool-capable) turn to update +
+        commit any durable docs, then write its summary as marked text (summary block +
+        plan + next-step). No finalize tool - the turn ending is the trigger; we parse
+        the marked blocks, re-solicit any missing one, then replace history with the
+        summary, keeping the last compact_keep TURNS verbatim (design decision 4:
+        manual keeps a tail, no longer a clean cut). A bad/absent block does NOT nuke
+        history (returns None). Returns the summary text, or None."""
         if len([m for m in self.messages if m["role"] != "system"]) == 0:
             return None
-        instr = read_prompt("handover") or HANDOVER_INSTR
-        parsed, missing, attempt, _turn_text = self._solicit_handover(instr)
-        if not parsed["handover"]:   # no usable handover (truly empty) -> leave history untouched
+        pre = list(self.messages)
+        keep_from = self._keep_tail_turns(pre, self.cfg.compact_keep)
+        tail = pre[keep_from:] if keep_from is not None else []
+        instr = read_prompt("compact") or COMPACT_INSTR
+        parsed, missing, attempt, _turn_text = self._solicit_compact(instr)
+        if not parsed["handover"]:   # no usable summary (truly empty) -> leave history untouched
             return None
         if parsed["tier"] >= 3 or missing:
-            self._log_activity("handover",
+            self._log_activity("compact",
                                f"degraded parse (tier {parsed['tier']}, missing {missing})",
                                "model dropped marker discipline; salvaged via tolerant parser")
-        return self._finish_handover(
-            parsed, summary_prefix="Session handover (prior context summarized):\n")
+        return self._finish_compact(
+            parsed, summary_prefix="Earlier context (compacted summary):\n", tail=tail,
+            autostart=True)
 
     def _update_plan(self, plan: str):
         """The update_plan tool body: replace the pinned GOAL + TODO and refresh the
@@ -9501,28 +9563,28 @@ class Agent:
             return self._note_cap(sel, f"in {lo} .. {hi}")
         return f"error: unknown note action {action!r} (add|recent|grep|range)."
 
-    def _request_handover(self):
-        """The request_handover tool body: the model elects a handover at a clean break.
+    def _request_compact(self):
+        """The request_compact tool body: the model elects a handover at a clean break.
         We don't compact here (mid-turn, inside a tool batch) - we set a flag that
-        _maybe_handover honours AFTER the turn, running the same auto_handover machinery.
+        _maybe_compact honours AFTER the turn, running the same auto_compact machinery.
         Guard: only honour it in the soft-or-higher zone. The tool is only offered in the
         soft zone, but a stale/replayed/hallucinated call could arrive below it - refuse
         those so an elected handover can never happen before the user's threshold (the
         model never gets to spend on a handover the user hasn't opened the window for)."""
-        if not self.cfg.handover_for()["auto"]:
-            return "handover is off (auto_handover disabled) - not handing over."
+        if not self.cfg.compact_for()["auto"]:
+            return "compaction is off (auto_compact disabled) - not compacting."
         if self._ctx_zone()[0] == "ok":
-            return ("not yet: context is still light (below the handover threshold), so a "
-                    "handover would just discard fidelity for no gain. Keep going - the "
+            return ("not yet: context is still light (below the compaction threshold), so a "
+                    "compaction would just discard fidelity for no gain. Keep going - the "
                     "option reappears once context is heavier.")
-        self._elected_handover = True
-        return ("handover queued - finish this turn cleanly (no half-done work); the "
-                "handover runs right after, and you'll write the summary + next-step then.")
+        self._elected_compact = True
+        return ("compaction queued - finish this turn cleanly (no half-done work); the "
+                "compaction runs right after, and you'll write the summary + next-step then.")
 
-    def auto_handover(self, zone: str = "hard"):
+    def auto_compact(self, zone: str = "hard"):
         """Self-managing compaction. Snapshot the full history (recoverable), then an
         agentic turn where the model summarizes the OLDER context (between
-        HANDOVER_MARK markers) and writes its next-step self-prompt (between
+        COMPACT_MARK markers) and writes its next-step self-prompt (between
         SELFPROMPT_MARK markers), then ends the turn (no finalize tool). We keep the recent tail
         verbatim, replace the older part with the summary, queue the self-prompt for
         autostart, and stamp the loop-guard clock. A bad/absent summary leaves history
@@ -9531,16 +9593,22 @@ class Agent:
             return None
         pre       = list(self.messages)       # capture BEFORE the compaction turn
         pre_plan  = getattr(self, "pinned_plan", "")   # for the recovery snapshot below
-        keep_from = self._keep_tail_start(pre, self.cfg.window_messages)
+        # One knob for how many recent TURNS to keep verbatim after the summary
+        # (soft/hard/manual all share cfg.compact_keep; tail-trim stubs the tool payloads
+        # so a few conversation turns is cheap). Emergency is not a preference - it's the
+        # overflow backstop, hardcoded minimal so the rescue can't itself re-overflow.
+        keep_turns = (COMPACT_EMERGENCY_KEEP if zone == "emergency"
+                      else self.cfg.compact_keep)
+        keep_from = self._keep_tail_turns(pre, keep_turns)
         tail      = pre[keep_from:] if keep_from is not None else []
 
         saved = self.tool_defs
-        # Shared retry-parse core (see _solicit_handover): give the model a turn to write
+        # Shared retry-parse core (see _solicit_compact): give the model a turn to write
         # the marked blocks, tolerantly parse, re-solicit any missing one. The completeness
         # retry (an incomplete-but-successful ANSWER) is a DIFFERENT layer from the send-
         # level overload/429 recovery inside _loop (a failed SEND): separate budgets.
-        instr = read_prompt("auto_handover") or AUTO_HANDOVER_INSTR
-        parsed, missing, attempt, _turn_text = self._solicit_handover(instr)
+        instr = read_prompt("auto_compact") or AUTO_COMPACT_INSTR
+        parsed, missing, attempt, _turn_text = self._solicit_compact(instr)
         block = parsed["handover"]
         self.tool_defs = saved
         if not block:                         # no usable summary -> don't nuke history
@@ -9551,38 +9619,88 @@ class Agent:
             return None
         if parsed["tier"] >= 3 or attempt > 0:
             self._log_activity(
-                "handover",
+                "compact",
                 f"degraded parse (tier {parsed['tier']}, {attempt} retr{'y' if attempt == 1 else 'ies'})",
                 "model dropped marker discipline; salvaged via tolerant parser + retry")
         # Snapshot the PRE-HANDOVER history ONLY now that we have a usable summary and are
         # about to replace it - so it stays recoverable via /load (and greppable by the
         # recall path). Doing it here (not at the top) means a FAILED/futile handover
         # writes no snapshot: that unbounded per-turn snapshotting by a model that never
-        # summarized is what flooded /load. Named <origin>-prehandover-<N> so the snapshot
+        # summarized is what flooded /load. Named <origin>-precompact-<N> so the snapshot
         # is tied to the session it came from.
         try:
             rhost = self.remote.host if self.remote else None
             origin = getattr(self, "autosave_name", "") or "session"
             existing = [nm for nm, _ in list_sessions()]
-            save_session(pre, self.cfg, _prehandover_name(origin, existing),
+            save_session(pre, self.cfg, _precompact_name(origin, existing),
                          remote=rhost, pinned_plan=pre_plan)
         except Exception:
             pass
         # Consume the already-computed tolerant parse (from the retry loop above), NOT a
-        # second strict fence-only re-extract: _parse_handover salvages plan/next from a
-        # degraded tier (## Plan header, JSON field) too, and _handover_missing already
+        # second strict fence-only re-extract: _parse_compact salvages plan/next from a
+        # degraded tier (## Plan header, JSON field) too, and _compact_missing already
         # accepted that tier - so a strict _extract_* here would silently throw away the
         # salvage for exactly the models the tolerant parser exists to rescue, dropping
         # both the pinned plan and the autostart self-prompt. Same source as handover().
         # Auto differs from /handover only in the four knobs below: keep the recent
         # verbatim tail, queue the next-step self-prompt, and stamp the loop guard.
-        return self._finish_handover(
+        return self._finish_compact(
             parsed, summary_prefix="Earlier context (compacted summary):\n",
             tail=tail, autostart=True, stamp_clock=True)
 
+    def _ingest_cap(self, text: str, label: str):
+        """Universal ingestion hard stop for OPAQUE/UNTRUSTED tool output (mcp.call +
+        generic lean-tools that don't self-cap). This is lever A from the context
+        design: EVERY such result passes through here so no single tool can blow the
+        window - external/third-party code we can't trust to self-cap. Can only SHRINK.
+
+        Cap = clamp(free_tokens * CHARS_PER_TOKEN * frac, floor, ceil), window-relative
+        (small model / nearly-full big one -> small cap) with a static ceiling (lever B).
+        Shape = head + tail + a middle marker (errors cluster at the tail, so keeping
+        both ends preserves start context AND error text in one rule). Silent truncation
+        is the industrial failure mode, so on a cut we emit a LOUD dual-channel notice:
+        an inline structured line the model sees (re-fetch narrower / /compact / /trim)
+        and an ORANGE status line for the user. Returns the (possibly capped) text."""
+        if not isinstance(text, str):
+            return text
+        free = max(0, self.cfg.ctx_window() - self._ctx_used())
+        budget = int(free * INGEST_CHARS_PER_TOKEN * self.cfg.ingest_cap_frac)
+        cap = max(self.cfg.ingest_cap_floor, min(budget, self.cfg.ingest_cap_ceil))
+        if len(text) <= cap:
+            return text
+        head = cap * 2 // 3
+        tail = cap - head
+        dropped = len(text) - head - tail
+        # Which term bound the cap decides the advice. If the window term (budget) was
+        # below the ceiling, context is TIGHT - freeing room (/compact | /trim) would
+        # actually raise the cap, so suggest it. If we hit the fixed ceiling instead, the
+        # result is just inherently big; compacting frees nothing, so only "re-fetch
+        # narrower" helps - don't mislead with /compact | /trim.
+        tight = budget < self.cfg.ingest_cap_ceil
+        advice = (" or /compact | /trim if context is tight" if tight
+                  else " (result is inherently large - compacting won't raise this cap)")
+        notice = (f"\n…[{label}: tool result truncated at ingestion - showing "
+                  f"{head + tail:,} of {len(text):,} chars, {dropped:,} dropped. "
+                  f"Re-fetch narrower (offset/grep) to see more{advice}.]…\n")
+        # User-facing print: only LOUD (orange) when context is tight, since that's the
+        # only case where the user can/should act (/compact | /trim). A ceiling hit on a
+        # roomy window is routine - a runaway blob got clamped, nothing's wrong - so keep
+        # it to a quiet dim one-liner (no scary numbers, no misleading action hint).
+        if tight:
+            print(yellow(f"  {GLYPH['warn']} {label} output truncated "
+                         f"({head + tail:,}/{len(text):,} chars) - consider /compact or /trim"))
+        else:
+            print(dim(f"  {label} output truncated to {head + tail:,} chars"))
+        self._log_activity("ingest-cap",
+                           f"{label} result capped {len(text):,}->{head + tail:,} chars",
+                           f"opaque/untrusted output exceeded cap {cap:,} ("
+                           f"{'window-tight' if tight else 'ceiling'}; frac "
+                           f"{self.cfg.ingest_cap_frac}, free {free:,} tok)")
+        return text[:head] + notice + text[-tail:]
+
     def _dispatch(self, name: str, args: dict) -> str:
         if name.startswith(MCP_NS):
-            return self.mcp.call(name, args)
+            return self._ingest_cap(self.mcp.call(name, args), name)
         plug = self.lean_tools.get(name)
         if plug:
             # Publish the live context budget so a lean-tool can size its output to
@@ -9599,10 +9717,13 @@ class Agent:
                 # {text, image_path?} instead of a str. Preserve it here; the
                 # append sites split it into content(+image_path). Anything else
                 # is stringified (unchanged behaviour for the thousands of
-                # str-returning tools).
+                # str-returning tools). The ingestion backstop caps the STRING
+                # result: a self-capping tool (web_fetch) stays under it; a tool
+                # that ignores CTX_* can't blow the window anyway.
                 if isinstance(out, dict) and "text" in out:
+                    out["text"] = self._ingest_cap(out.get("text", ""), name)
                     return out
-                return str(out)
+                return self._ingest_cap(str(out), name)
             except Exception as e:
                 return f"error in lean-tool {name}: {e}"
         fn = getattr(self.tools, name, None)
@@ -9619,7 +9740,7 @@ class Agent:
         """A throttled one-line context nudge while in the soft zone, injected into the
         user turn (uncached). Tells the model context is filling so it wraps up toward a
         clean stopping point before the hard auto-compaction. "" when not due."""
-        if not self.cfg.handover_for()["auto"]:
+        if not self.cfg.compact_for()["auto"]:
             return ""
         zone, used, limit = self._ctx_zone()
         if zone != "soft":
@@ -9628,10 +9749,10 @@ class Agent:
             return ""
         self._last_nudge_turn = self._turn_count
         pct = int(used / limit * 100) if limit else 0
-        hard_frac = self.cfg.handover_for()["hard"]
+        hard_frac = self.cfg.compact_for()["hard"]
         hard = int(limit * hard_frac) if limit else 0
         hard_pct = int(hard_frac * 100)
-        tmpl = read_prompt("handover_nudge") or HANDOVER_NUDGE
+        tmpl = read_prompt("compact_nudge") or COMPACT_NUDGE
         try:
             return tmpl.format(used=f"{used:,}", limit=f"{limit:,}", pct=pct,
                                hard=f"{hard:,}", hard_pct=hard_pct)
@@ -9641,8 +9762,8 @@ class Agent:
 
     def run_turn(self, user_input: str):
         self._turn_count += 1
-        # Rebuild the surface so the elective request_handover tool appears/disappears
-        # as context crosses the soft threshold (offer_handover tracks the zone). Cheap;
+        # Rebuild the surface so the elective request_compact tool appears/disappears
+        # as context crosses the soft threshold (offer_compact tracks the zone). Cheap;
         # keeps the offered tools honest to the current zone without a separate trigger.
         self.refresh_tools()
         notes = []
@@ -9660,16 +9781,16 @@ class Agent:
             user_input = user_input + "\n\n[" + bg_note + "]"
         self.messages.append({"role": "user", "content": user_input})
         self.tools.changed_files.clear()
-        self._handover_capture = None    # clear any prior /handover trigger (loop guard)
-        self._elected_handover = False   # clear any prior elective request (fires once)
+        self._compact_capture = None    # clear any prior /handover trigger (loop guard)
+        self._elected_compact = False   # clear any prior elective request (fires once)
         self.dirty = True                # conversation now has unsaved changes
         with self._sigint_guard():
             self._loop()
         # An interrupted tool batch (^C, crash) can leave a dangling tool_use; heal
         # it in place so the autosave + next turn aren't poisoned (see repair_tool_pairs).
         self.messages = repair_tool_pairs(self.messages)
-        self._maybe_auto_compact()        # cheap programmatic strip at token intervals (first)
-        self._maybe_handover()            # then the agentic handover (hard/emergency)
+        self._maybe_auto_trim()        # cheap programmatic strip at token intervals (first)
+        self._maybe_compact()            # then the agentic handover (hard/emergency)
 
     def record_tool_call(self, name, args):
         """Store a tool call's FULL args in the ring and return its monotonic id.
@@ -9740,49 +9861,49 @@ class Agent:
         if len(self._activity) > 200:
             del self._activity[:-200]
 
-    def _maybe_auto_compact(self):
-        """Auto-COMPACT: the cheap, instant, programmatic strip (like /compact - stub old
+    def _maybe_auto_trim(self):
+        """Auto-TRIM: the cheap, instant, programmatic strip (like /trim - stub old
         tool outputs) fired when context crosses a k*interval TOKEN boundary going UP. A
-        first line of defence before a full agentic handover: no model turn, no summary,
+        first line of defence before a full agentic compact: no model turn, no summary,
         just drops stale tool dumps. Hysteresis (a Schmitt trigger) stops it re-firing
         every turn once a strip lands just under a boundary: after firing at boundary B it
         won't re-arm until context falls below B - hysteresis*interval. Off when
-        auto_compact_interval is 0."""
-        interval = getattr(self.cfg, "auto_compact_interval", 0)
+        auto_trim_interval is 0."""
+        interval = getattr(self.cfg, "auto_trim_interval", 0)
         if interval <= 0:
             return
         used = self._ctx_used()
-        hyst = interval * getattr(self.cfg, "auto_compact_hysteresis", 0.25)
+        hyst = interval * getattr(self.cfg, "auto_trim_hysteresis", 0.25)
         # re-arm: if we've dropped a full margin below the last-fired boundary, clear it
         if self._ac_armed_boundary and used < self._ac_armed_boundary - hyst:
             self._ac_armed_boundary = 0
         boundary = (used // interval) * interval        # highest boundary at/below `used`
         if boundary <= 0 or boundary <= self._ac_armed_boundary:
             return                                       # not past a NEW boundary yet
-        keep = getattr(self.cfg, "auto_compact_keep", COMPACT_KEEP)
-        trimmed, freed = self.compact(keep)
+        keep = getattr(self.cfg, "auto_trim_keep", TRIM_KEEP)
+        trimmed, freed = self.trim(keep)
         self._ac_armed_boundary = boundary               # arm this boundary (don't refire)
         if trimmed:
-            print(yellow(f"  {GLYPH['warn']} auto-compact at {used:,} tokens: stripped "
+            print(yellow(f"  {GLYPH['warn']} auto-trim at {used:,} tokens: stripped "
                          f"{trimmed} old tool result(s), ~{freed:,} tokens freed")
-                  + dim(f"  (every {interval:,} tokens; change: /set auto_compact_interval)"))
+                  + dim(f"  (every {interval:,} tokens; change: /set auto_trim_interval)"))
             self._log_activity(
-                "auto-compact",
+                "auto-trim",
                 f"stripped {trimmed} old tool result(s), ~{freed:,} tokens freed",
                 f"context crossed {boundary:,} (at {used:,}); fires every {interval:,} tokens")
 
-    def _maybe_handover(self):
+    def _maybe_compact(self):
         """After a turn, run a handover when either (a) context is in the hard/emergency
         zone - forced, threshold-driven; or (b) the model ELECTED one this turn via
-        request_handover (soft zone, a clean semantic boundary). Then optionally AUTOSTART
-        the model's queued self-prompt. The loop guard (handover_min_interval) caps a
+        request_compact (soft zone, a clean semantic boundary). Then optionally AUTOSTART
+        the model's queued self-prompt. The loop guard (compact_min_interval) caps a
         FORCED compaction to ~1/min so the autostart->turn->compact cycle can't spin; we
         also refuse to autostart if compaction didn't actually drop below hard."""
-        if not self.cfg.handover_for()["auto"]:
+        if not self.cfg.compact_for()["auto"]:
             return
         zone, used, limit = self._ctx_zone()
-        elected = getattr(self, "_elected_handover", False)
-        self._elected_handover = False        # consume it (fires at most once)
+        elected = getattr(self, "_elected_compact", False)
+        self._elected_compact = False        # consume it (fires at most once)
         forced = zone in ("hard", "emergency")
         if not (forced or elected):
             return
@@ -9799,44 +9920,53 @@ class Agent:
                 self._compact_unsupported_warned = True
             return
         pct = int(used / limit * 100) if limit else 0
-        kind = "elective handover (clean break)" if elected and not forced else "auto-handover"
+        kind = "elective compaction (clean break)" if elected and not forced else "auto-compact"
         print(yellow(f"  {GLYPH['warn']} context {used:,}/{limit:,} ({pct}%, {zone}) - "
                      f"{kind} (summarizing + resetting the cache prefix)…")
-              + dim("  (change: /set handover_hard)"))
-        if self.auto_handover(zone) is None:
-            # The agentic summary failed (model couldn't produce a usable handover -
+              + dim("  (change: /set compact_hard)"))
+        if self.auto_compact(zone) is None:
+            # The agentic summary failed (model couldn't produce a usable summary -
             # common when history already overflows the window so the summarizing turn
-            # itself is truncated). For a FORCED handover, leaving history intact would
+            # itself is truncated). For a FORCED compaction, leaving history intact would
             # re-fire emergency every turn forever (see the 232% loop) - so fall back to a
             # programmatic strip. For an ELECTED one, context isn't full: just report and
             # carry on (no strip needed). The loop guard is already stamped on failure.
             if not forced:
-                print(yellow(f"  {GLYPH['warn']} elective handover produced no summary - "
+                print(yellow(f"  {GLYPH['warn']} elective compaction produced no summary - "
                              f"nothing changed, carrying on."))
                 return
-            trimmed, freed = self.compact(self.cfg.auto_evict_keep)
+            trimmed, freed = self.trim(COMPACT_EMERGENCY_KEEP)
             if trimmed:
-                print(yellow(f"  {GLYPH['warn']} agentic handover failed; stripped {trimmed} old "
+                print(yellow(f"  {GLYPH['warn']} agentic compaction failed; stripped {trimmed} old "
                              f"tool result(s) instead, ~{freed:,} tokens freed  ")
                       + dim("(/compact or /clear if still full)"))
                 self._log_activity(
-                    "handover-failed",
+                    "compact-failed",
                     f"summary call failed; fell back to stripping {trimmed} tool result(s), ~{freed:,} tokens freed",
                     "usually a backend overload/429 during the summarizing turn; history kept, raw tool output dropped")
             else:
-                print(yellow(f"  {GLYPH['warn']} agentic handover failed and nothing to strip - "
+                print(yellow(f"  {GLYPH['warn']} agentic compaction failed and nothing to strip - "
                              f"/clear or switch to a larger-window model."))
                 self._log_activity(
-                    "handover-failed",
+                    "compact-failed",
                     "summary call failed and nothing left to strip",
                     "/clear or switch to a larger-window model")
             return
-        print(yellow(f"  {GLYPH['warn']} handover done -> ~{self._ctx_used():,} tokens kept; "
+        print(yellow(f"  {GLYPH['warn']} compaction done -> ~{self._ctx_used():,} tokens kept; "
                      f"new cache boundary set on the summary"))
         self._log_activity(
-            "handover",
+            "compact",
             f"summarized the session -> ~{self._ctx_used():,} tokens kept",
             f"{kind}; new cache boundary set on the summary")
+        self._consume_autostart()
+
+    def _consume_autostart(self):
+        """Run the self-prompt a compaction queued (_autostart_pending), if any: a 5s
+        ^C-to-cancel countdown then run_turn(sp). Shared by the auto path (_maybe_compact)
+        and the manual /compact command, so both continue the same way (gated upstream by
+        cfg.autostart_after_compact, which decides whether the prompt was queued at all).
+        Skips + surfaces the step instead of running when context is still hard/emergency
+        (autostarting would immediately re-compact)."""
         sp = self._autostart_pending
         self._autostart_pending = None
         if not sp:
@@ -10020,13 +10150,11 @@ class Agent:
                     and getattr(self.cfg, "statusline", True) and _TTY):
                 for _row in _status_rows(self, self.cfg):
                     print(_row)
-            if self.cfg.auto_evict:
-                _ev_trimmed, _ev_freed = self._auto_evict()
-                if _ev_trimmed:
-                    self._log_activity(
-                        "auto-evict",
-                        f"stubbed {_ev_trimmed} acted-on tool result(s), ~{_ev_freed:,} tokens freed",
-                        f"continuous eviction; keeps last {self.cfg.auto_evict_keep} in full")
+            # (Continuous auto_evict removed per context-mgmt design decision 8: the
+            # universal ingestion cap now caps opaque/untrusted tool output at the source,
+            # so a per-round stub pass is redundant. /trim (manual + emergency) + compact
+            # cover the rest. auto_evict busted the cache mid-prefix every round for a
+            # small win now that bodies are born-small.)
             try:
                 assistant, prompt_eval, aborted = self._chat_with_model_fallback()
             except (ConnectionError, RuntimeError) as e:
@@ -10138,7 +10266,7 @@ class Agent:
     # The context measurement / compaction-policy methods live on self.ctx
     # (ContextMeter) now; these stay as thin delegators so the ~14 internal + external
     # call sites - and the suite's monkeypatch seam (tests override self._ctx_zone to
-    # drive auto_handover) - keep working unchanged.
+    # drive auto_compact) - keep working unchanged.
     def _ctx_used(self) -> int:
         return self.ctx.used()
 
@@ -10293,7 +10421,7 @@ _NET_TOOLS = frozenset({
     "web_fetch", "web_search", "brave_search", "web_screenshot", "render_url", "ssh",
     "fetch", "curl", "http_get"})
 # Agent-internal / bookkeeping tools: no fs, no exec, no net - a distinct 'meta' icon.
-_META_TOOLS = frozenset({"update_plan", "request_handover", "note"})
+_META_TOOLS = frozenset({"update_plan", "request_compact", "note"})
 
 
 def _tool_category(name: str, args: dict) -> str:
@@ -10533,7 +10661,7 @@ def _render_tool_call(entry: dict, cap: int = EXPAND_MAX_CHARS) -> str:
 # REPL
 # ----------------------------------------------------------------------------
 
-SLASH_COMMANDS = ["/clear", "/new", "/compact", "/handover", "/session", "/save", "/load",
+SLASH_COMMANDS = ["/clear", "/new", "/trim", "/compact", "/session", "/save", "/load",
                   "/prompt", "/sh", "/connect", "/machines", "/local", "/disconnect", "/tools", "/reload",
                   "/model", "/provider", "/think", "/effort",
                   "/set", "/usage", "/approve", "/leash", "/autosave", "/incognito",
@@ -10723,8 +10851,8 @@ def register_command(cmd, handler, help_line="", completer=None):
 HELP_COMMANDS = [
     ("/clear", "wipe conversation, stay in this session"),
     ("/new [name]", "start a separate session"),
-    ("/compact [keep]", "programmatic: stub old tool outputs, keep newest [keep]"),
-    ("/handover", "agentic: summarize + commit docs, replace history (the lever auto-handover pulls)"),
+    ("/trim [keep]", "programmatic: stub old tool outputs, keep newest [keep] (no LLM)"),
+    ("/compact", "agentic: summarize + commit docs, replace history (the lever auto-compact pulls)"),
     ("/save [name]", "name the current session"),
     ("/load [name]", "resume a session (no arg = picker)"),
     ("/session", "list | delete <name>"),
@@ -10752,7 +10880,7 @@ HELP_COMMANDS = [
     ("/plan [set|goal|add|done|clear]", "view/steer the pinned GOAL+TODO; no arg = show"),
     ("/info", "live session read-out"),
     ("/ctx", "context-token estimate"),
-    ("/activity [n|all]", "what the system did automatically (compaction, handover, fallback, ...)"),
+    ("/activity [n|all]", "what the system did automatically (compaction, trim, fallback, ...)"),
     ("/expand [N]", "show a tool call's full args + captured output; bare = newest, N = the #id"),
     ("/help [cmd]", "this help; /help <cmd> shows one command's help"),
     ("/quit", "exit"),
@@ -10762,8 +10890,8 @@ HELP_FOOTER = ("Tab completes commands and their inline arguments. `/<cmd> ?` sh
                "command's own help (args, behaviour). ^C stops a running turn; "
                "at the prompt it cancels the line, and ^C twice in a row exits. "
                "Anything else goes to the model.\n"
-               "App-config knobs (context/handover gates, sampling, etc.) live in /set - "
-               "e.g. handover_soft/hard/emergency, auto_handover, auto_evict_keep; "
+               "App-config knobs (context/compact gates, sampling, etc.) live in /set - "
+               "e.g. compact_soft/hard/emergency, auto_compact, ingest_cap_frac; "
                "backend-specific knobs live in /provider set.")
 
 
@@ -10919,22 +11047,25 @@ _SETTINGS_FIELDS = [
     # --- context management (send-window + auto-handover) ---
     ("window_messages", "send-window size in messages (0 = off, full history)", "int"),
     ("window_tokens", "send-window token cap: 'auto' (=ctx-reserve, default), an int (hard cap), or 0 (off)", "int_or_auto"),
-    ("auto_handover", "auto-handover (self-managing context)", "bool"),
-    ("handover_soft", "handover soft-zone start (fraction of ctx)", "float"),
-    ("handover_hard", "handover hard threshold (fraction of ctx)", "float"),
+    ("auto_compact", "auto-compact (self-managing context)", "bool"),
+    ("compact_soft", "compact soft-zone start (fraction of ctx)", "float"),
+    ("compact_hard", "compact hard threshold (fraction of ctx)", "float"),
+    ("compact_emergency", "compact emergency threshold (fraction of ctx)", "float"),
     ("auto_num_ctx", "ollama: detect num_ctx at startup", "bool"),
     ("gen_connect_timeout", "ollama: TCP connect deadline (s)", "float"),
     ("gen_ttft_timeout", "ollama: read deadline until first token (s)", "float"),
     ("gen_idle_timeout", "ollama: max gap between tokens (s; blank = off)", "float"),
-    ("handover_min_interval", "min seconds between handovers", "float"),
-    ("autostart_after_handover", "auto-continue the turn after a handover (on by default; 5s ^C to cancel)", "bool"),
+    ("compact_min_interval", "min seconds between compactions", "float"),
+    ("autostart_after_compact", "auto-continue the turn after a compaction (on by default; 5s ^C to cancel)", "bool"),
+    ("compact_keep", "verbatim turns kept after a compaction (soft/hard/manual)", "int"),
     ("wake_on_bg_finish", "wake + react autonomously when a background task finishes (off by default)", "bool"),
-    ("auto_compact_interval", "auto-compact: strip old tool outputs every N tokens (0 = off)", "int"),
-    ("auto_compact_hysteresis", "auto-compact re-arm margin (fraction of interval)", "float"),
-    ("auto_compact_keep", "tool results kept in full by an auto-compact strip", "int"),
+    ("auto_trim_interval", "auto-trim: stub old tool outputs every N tokens (0 = off)", "int"),
+    ("auto_trim_hysteresis", "auto-trim re-arm margin (fraction of interval)", "float"),
+    ("auto_trim_keep", "tool results kept in full by an auto-trim strip", "int"),
     ("notes_spool", "note memory: keep the newest N lines (spooling log; default 2000)", "int"),
-    ("auto_evict", "continuous tool-output eviction", "bool"),
-    ("auto_evict_keep", "tool results kept verbatim by auto_evict", "int"),
+    ("ingest_cap_frac", "opaque tool result: max share of free window (0-1)", "float"),
+    ("ingest_cap_floor", "opaque tool result: min truncation size (chars)", "int"),
+    ("ingest_cap_ceil", "opaque tool result: hard char ceiling", "int"),
     ("keep_alive", "ollama: model keep-alive (e.g. 10m, -1, 0)", "str"),
     ("auto_num_ctx", "ollama: detect num_ctx at startup", "bool"),
 ]
@@ -11438,8 +11569,8 @@ def _status_rows(agent, cfg):
         p.append(f"window {_wt}tok")
     elif cfg.window_messages > 0:             # only show when on - don't nag with 'window off'
         p.append(f"window {cfg.window_messages}")
-    c = cfg.handover_for()
-    p.append(f"handover {c['hard'] * 100:.0f}%" if c.get("auto") else "handover off")
+    c = cfg.compact_for()
+    p.append(f"compact {c['hard'] * 100:.0f}%" if c.get("auto") else "compact off")
     p.append(f"{len(agent.tool_defs)} tools")
     rows.append("  " + d.join(p))
 
@@ -11463,7 +11594,7 @@ def _status_rows(agent, cfg):
     ctx = col(f"ctx {est}{_fmt_tokens(used)}/{_fmt_tokens(window)} ({pct:.0f}%{zlabel})")
     quota = _provider_usage_str(agent, cfg)     # leading separator already, or "" if none
     # handovers is a live counter (row 3 reprints every turn); shown once any happened.
-    hov = (d + f"{agent.handovers} handovers") if agent.handovers else ""
+    hov = (d + f"{agent.compactions} compactions") if agent.compactions else ""
     # ctx -> handover count -> the backend quota meters (5h / wk) -> think / effort
     rows.append("  " + ctx + hov + quota + d + d.join([f"think {think}", f"effort {effort}"]))
     return rows
@@ -11502,19 +11633,19 @@ def handle_info_command(agent, cfg, arg=""):
     print(f"  version:  {__version__}{dot}track: {getattr(cfg, 'update_track', 'stable')}")
     print(f"  model:    {cfg.active_model()}")
     print(f"  provider: {backend}  ({where})")
-    hov = f", {agent.handovers} handovers" if agent.handovers else ""
+    hov = f", {agent.compactions} compactions" if agent.compactions else ""
     print(f"  context:  ~{_fmt_tokens(used)}/{_fmt_tokens(window)} "
           f"({used / window * 100:.0f}%, {zone}){dot}{len(agent.messages)} msgs, {turns} turns{hov}")
     # how context is managed - the two things that surprised people
     wm = cfg.window_messages
     print(f"  window:   {'off (full history sent)' if wm <= 0 else f'last {wm} messages sent'}")
-    c = cfg.handover_for()
+    c = cfg.compact_for()
     if c.get("auto"):
         comp = (f"auto on{dot}soft {c['soft']:.0%}  hard {c['hard']:.0%}"
                 + (f"{dot}autostart" if c.get("autostart") else ""))
     else:
         comp = "off"
-    print(f"  handover: {comp}")
+    print(f"  compact: {comp}")
     # session + which instance owns the write-lock (so a fork is never a surprise)
     if cfg.incognito:
         sess = magenta(f"{GLYPH['ghost']} incognito") + dim(" (not saved locally; provider may still log)")
@@ -13597,7 +13728,7 @@ def handle_reload_command(agent, cfg, arg):
             msg += f"; re-pushed code + lean-tools to {agent.remote.host} (ssh kept)"
         except (ConnectionError, OSError) as e:
             print(red(f"remote reload failed: {e}"))
-    print(dim(msg + ". (local core changes still need a restart; /handover first)"))
+    print(dim(msg + ". (local core changes still need a restart; /compact first)"))
 
 
 def handle_local_command(agent, cfg, arg):
@@ -13621,48 +13752,54 @@ def handle_local_command(agent, cfg, arg):
         print(dim("already local."))
 
 
-def handle_compact_command(agent, cfg, arg):
-    """/compact [keep] - summarize/drop old tool results, keeping the last `keep` in full
-    (default COMPACT_KEEP)."""
-    keep = COMPACT_KEEP
+def handle_trim_command(agent, cfg, arg):
+    """/trim [keep] - stub old tool-result bodies in place, keeping the last `keep`
+    in full (default TRIM_KEEP). No LLM: the cheap emergency/deliberate lever for when
+    earlier tool outputs are no longer needed in ongoing context."""
+    keep = TRIM_KEEP
     if arg.isdigit():
         keep = int(arg)
-    n, freed = agent.compact(keep)
-    print(dim(f"compacted {n} tool result(s), ~{freed:,} tokens freed "
+    n, freed = agent.trim(keep)
+    print(dim(f"trimmed {n} tool result(s), ~{freed:,} tokens freed "
               f"(kept last {keep} in full)."))
     agent._print_ctx()
 
 
-def handle_handover_command(agent, cfg, arg):
-    """/handover - agentic handover: the model updates+commits durable docs, writes the
-    handover between the markers, and calls the transiently surfaced finalize tool;
-    history is then replaced with the handover."""
-    print(dim("handover: update + commit durable docs, then write the "
-              f"handover between {HANDOVER_MARK} markers and finalize…"))
-    # Snapshot the full pre-handover conversation as a <name>-prehandover-N sidecar
+def handle_compact_command(agent, cfg, arg):
+    """/compact - agentic compaction: the model updates+commits durable docs, writes
+    the summary between the markers, and history is then replaced with that summary
+    (keeping the last keep_last turns). The manual lever the auto-compact zone pulls."""
+    print(dim("compact: update + commit durable docs, then write the "
+              f"summary between {COMPACT_MARK} markers and finalize…"))
+    # Snapshot the full pre-compact conversation as a <name>-precompact-N sidecar
     # (NOT under the live name) so it stays loadable AND the live session keeps its
-    # name. Mirrors auto_handover: an explicit /handover must not fork a named session
+    # name. Mirrors auto_compact: an explicit /compact must not fork a named session
     # into a fresh auto- one (the "it's auto again" bug) - you continue IN the session
-    # you handed over, now carrying the compacted summary.
+    # you compacted, now carrying the compacted summary.
     try:
         rhost = agent.remote.host if agent.remote else None
         origin = getattr(agent, "autosave_name", "") or "session"
         existing = [nm for nm, _ in list_sessions()]
-        save_session(list(agent.messages), cfg, _prehandover_name(origin, existing),
+        save_session(list(agent.messages), cfg, _precompact_name(origin, existing),
                      remote=rhost, pinned_plan=getattr(agent, "pinned_plan", ""),
                      notes=getattr(agent, "notes", None))
     except Exception:
         pass
-    summary = agent.handover()
+    summary = agent.compact()
     if summary is None:
-        print(yellow("\nno handover captured - history left intact. (Write it "
-                     f"between {HANDOVER_MARK} markers as visible text.)"))
+        print(yellow("\nno summary captured - history left intact. (Write it "
+                     f"between {COMPACT_MARK} markers as visible text.)"))
     else:
         # Keep the live autosave_name: the next autosave writes the compacted history
         # back into the SAME session, so a named session stays named.
-        print(dim("\nhistory replaced with the handover above; "
+        print(dim("\nhistory replaced with the summary above; "
                   "new cache boundary set on the summary."))
         agent._print_ctx()
+        # Continue the thread if the model queued a next-step (gated by
+        # autostart_after_compact inside compact() -> _finish_compact): same 5s ^C beat
+        # + run_turn as the auto path. Without this the manual /compact set the pending
+        # self-prompt into a void (nothing consumed it) - the "no autostart" bug.
+        agent._consume_autostart()
 
 
 def handle_autosave_command(agent, cfg, arg):
@@ -13732,7 +13869,7 @@ def handle_ctx_command(agent, cfg, arg):
 
 def handle_activity_command(agent, cfg, arg):
     """/activity [n] - show the system-activity log: the automatic behaviours the
-    system ran on your behalf (auto-compact, handover, auto-evict, 429->Haiku
+    system ran on your behalf (compact, trim, auto-trim, ingest-cap, 429->Haiku
     fallback, token refresh), newest last, each with a reason. `n` limits to the
     last n entries (default 20; `all` for everything)."""
     log = getattr(agent, "_activity", [])
@@ -13855,8 +13992,8 @@ _BUILTIN_COMMANDS_TABLE = {
     "/mcp": handle_mcp_command,
     "/reload": handle_reload_command,
     "/local": handle_local_command, "/disconnect": handle_local_command,
+    "/trim": handle_trim_command,
     "/compact": handle_compact_command,
-    "/handover": handle_handover_command,
     "/session": handle_session_command,
     "/save": handle_save_command,
     "/load": handle_load_command,
@@ -14422,7 +14559,7 @@ def run_agent_brief(args) -> int:
     cfg.approval = "auto"                 # headless: no operator to confirm
     cfg.composer = False
     cfg.autosave = False                  # a worker doesn't autosave/auto-load sessions
-    cfg.auto_handover = False             # one brief, no self-compaction handover
+    cfg.auto_compact = False             # one brief, no self-compaction handover
     # Mark this process a headless worker: no human is watching, so a provider that
     # would fast-fail an interactive turn on a transient throttle should instead wait
     # it out (see anthropic_plan _send_with_retry - it backs off 429 in worker mode).
@@ -14706,8 +14843,6 @@ def main():
                     help="context window (default 32768)")
     ap.add_argument("--keep-alive", dest="keep_alive",
                     help="ollama model resident time, e.g. 10m, 30m, -1 (default 10m)")
-    ap.add_argument("--auto-evict", dest="auto_evict", action="store_true", default=None,
-                    help="continuously stub acted-on tool results to cut tokens sent (see docs)")
     ap.add_argument("--window-messages", type=int, dest="window_messages",
                     help="send only the last N messages per request (default 30; 0 = unbounded)")
     ap.add_argument("--window-tokens", dest="window_tokens",
