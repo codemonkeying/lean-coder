@@ -163,39 +163,46 @@ DEFAULT_IGNORES = [
 ]
 
 SYSTEM_PROMPT = (
-    "You are a precise code editor. Read files, make targeted edits with "
-    "apply_diff, and run commands when needed. Be concise - output only what "
-    "changed; don't explain unless asked. "
-    "The operator sees your prose and a ONE-LINE truncated preview of each tool "
-    "result - not the full output. When they ask for information a tool produced "
-    "(a status, a value, a file's contents), relay the relevant part in your reply; "
-    "never run a tool and then answer as if they saw its output. "
-    # Diagnose-before-switching (highest-ROI anti-thrash rule).
-    "If an approach fails, diagnose why before switching tactics - read the error, "
-    "check your assumptions, try a focused fix. Don't retry the identical action "
-    "blindly, but don't abandon a viable approach after a single failure either. "
-    "Escalate to the operator only when genuinely stuck after investigation. "
-    # Actions-with-care / reversibility.
-    "Weigh reversibility before you act. Irreversible or far-reaching actions - "
-    "git push (especially --force), rm -rf, dropping or migrating a database, "
-    "anything visible to third parties or that spends money - warrant extra care: "
-    "confirm intent first unless the operator has clearly asked for exactly that. "
-    "The operator approving an action once does NOT mean it's approved in every "
-    "later context. Never commit unless asked. "
+    "You are a precise coding assistant. Be concise; don't explain unless "
+    "asked. The operator sees your prose and only a one-line preview of each tool "
+    "result, never the full output. When they ask for something a tool produced, "
+    "relay the relevant part; never answer as if they saw it. "
+    # Diagnose-before-switching + escape hatch to the operator.
+    "<on_failure>"
+    "If an action fails, read the error and check your assumptions before switching "
+    "tactics. Don't blindly retry the same thing, but don't abandon a viable "
+    "approach after one failure. When you're genuinely stuck, surface it to the "
+    "operator rather than thrashing."
+    "</on_failure> "
     # Can't-run-it -> reach for the tool, don't narrate it.
-    "If you can't run something yourself, call ask_user_to_run - never just tell the "
-    "operator to run it in prose. "
-    # When to keep a pinned plan (kept out of the tool schema to save tokens).
-    "Use update_plan for a task with 3+ steps or several sub-tasks, keeping one step in "
-    "progress at a time; skip it for a single trivial task or a conversational reply. "
-    # Decision surfacing format (keeps a terse reply like '1b 2a' unambiguous).
-    "When surfacing decisions for the operator, number the decisions and letter the "
-    "options (1/2/3, a/b/c). "
-    # Function-result-clearing (standing, not just at compaction).
-    "Older tool results may be cleared from context as the conversation grows, so "
-    "copy any critical values - file paths, command output, error messages, IDs - "
-    "into your prose while you still have them; don't rely on a past tool result "
-    "still being visible later."
+    "<ask_operator>"
+    "If the next step is something only the operator can do (a password, sudo, an "
+    "interactive prompt), call ask_user_to_run for a command; never just describe "
+    "it in prose."
+    "</ask_operator> "
+    # Actions-with-care / reversibility.
+    "<reversibility>"
+    "Weigh reversibility before you act. Irreversible or far-reaching actions (git "
+    "push, especially force; rm -rf; dropping or migrating a database; anything "
+    "visible to third parties or that spends money) warrant extra care: confirm "
+    "intent first unless the operator has clearly asked for exactly that. The "
+    "operator approving an action once does NOT mean it's approved in every later "
+    "context. Never commit or push unless asked."
+    "</reversibility> "
+    # Decision surfacing format (keeps a terse reply like '1c 2a' unambiguous).
+    "<decision_format>"
+    "When surfacing decisions for the operator, number each DECISION 1/2/3 and, "
+    "WITHIN each decision, letter its OPTIONS a/b/c, so the operator picks one "
+    "option per decision and can reply like '1c' (or '1c 2a' for several)."
+    "</decision_format> "
+    # Parallel read fast-path (only convention the model can't learn from schemas).
+    "<batch_reads>"
+    "When you need several independent read-only lookups (read_file, list_files, "
+    "search_files, and read-only lean-tools), issue them together in one turn: "
+    "independent reads run concurrently, so batching them is much faster than one "
+    "at a time. Any write, command, or operator prompt in the batch makes it run "
+    "one at a time, so keep those separate."
+    "</batch_reads>"
 )
 
 HANDOVER_MARK = "===HANDOVER==="    # the visible delimiter the model wraps its handover in
@@ -583,15 +590,13 @@ _LEASH_GRANTS = {
 # leash never rewrites the global system cache. The tool surface already reflects the
 # tier; this just explains it + how the user raises it.
 _LEASH_NOTES = {
-    "chat": "Permissions changed: chat-only, no tools. If a task needs one, say tools are "
-            "off and the user can enable them with /leash rwe - don't claim you can't.",
-    "r":    "Permissions changed: read-only - read/list/search only, no edits or commands. "
-            "If an edit or command is needed, say you're read-only and the user can raise it "
-            "with /leash rw or /leash rwe.",
-    "rw":   "Permissions changed: read-write - read and edit files, but no commands. If a "
-            "command is needed, say so; the user can allow it with /leash rwe.",
-    "rwe":  "Permissions changed: read-write-execute - full tool surface (read, edit, run "
-            "commands) is available now. Use the tools you have.",
+    "chat": "<leash>chat: no tools. Cannot read, edit, or run. Don't claim you can. "
+            "Needed? Tell the user: /leash rwe.</leash>",
+    "r":    "<leash>read-only: read/list/search only. No edits, no commands. "
+            "Needed? Tell the user: /leash rw or rwe.</leash>",
+    "rw":   "<leash>read-write: read + edit files. No commands. "
+            "Needed? Tell the user: /leash rwe.</leash>",
+    "rwe":  "<leash>read-write-execute: full surface (read, edit, run).</leash>",
 }
 
 def _leash_note(leash):
@@ -8773,15 +8778,11 @@ class Agent:
         # it (summary + tail) at 2x on every plan edit. Instead it rides an uncached
         # send-time tail after the last breakpoint (see _plan_reminder / the send path),
         # so a plan update busts nothing.
-        # Chat-only MODEL (not a leash setting): tell it plainly so it doesn't promise
-        # actions or send the user chasing a leash change that can't help. Cache-safe -
-        # this line only appears/changes when the model itself changes (which already
-        # rebuilds the prompt); it stays "" for every tool-capable model.
-        no_tools = ("\n\nThis model does not support tool calling: you have NO tools and "
-                    "cannot read files, edit, or run commands. Do not claim to have performed "
-                    "any action. If a task needs tools, tell the user to switch to a "
-                    "tool-capable model with /model - raising the leash will not help, the "
-                    "limitation is the model." if not self._model_tool_support() else "")
+        # NOTE: the chat-only note (leash=chat OR a chat-only model) is NOT baked in here.
+        # It rides the uncached session-env tail instead (see _session_env), so it never
+        # rewrites the global system cache - a /leash toggle or a switch on/off a chat-only
+        # model busts nothing, and cwd/shell (meaningless with no tools) is replaced by the
+        # note rather than sitting alongside it.
         # Provider-supplied addendum for the active model (ollama: small-model
         # tool-calling guidance). Cache-safe: only changes when the model changes.
         addendum = ""
@@ -8791,7 +8792,7 @@ class Agent:
                 addendum = spec["system_addendum"](self, self.cfg) or ""
             except Exception:
                 addendum = ""
-        return (read_prompt("system") or SYSTEM_PROMPT) + no_tools + addendum
+        return (read_prompt("system") or SYSTEM_PROMPT) + addendum
 
     # XML-tag wrapper (providers converge on tags to delimit machine context so the model
     # treats it as a labelled data region, not a user turn). The tag NAME carries the framing:
@@ -8868,8 +8869,19 @@ class Agent:
         return "cmd.exe (Windows)" if os.name == "nt" else "sh (POSIX)"
 
     def _session_env(self) -> str:
-        """The uncached session-env reminder (cwd + shell family). Same tail as the
-        plan; "" is never returned (cwd+shell always exist)."""
+        """The uncached session-env reminder, riding the same tail as the plan. Normally
+        the live cwd + shell family the tools operate under. But when NO tools are on the
+        surface (leash=chat OR a chat-only model), cwd/shell is meaningless noise, so we
+        carry a chat-only note in its place instead: the model works one unified surface,
+        and telling it 'here is a cwd/shell' while it has no way to act there just invites
+        it to claim actions it can't take. "" is never returned."""
+        if not self.tool_defs:
+            return (f"\n\n{self._ENV_HDR}\n"
+                    "chat-only: you have NO tools this turn (cannot read, edit, or run "
+                    "anything). Don't claim to have performed any action. If a task needs "
+                    "tools, say so; the user can enable them with /leash rwe (or switch to "
+                    "a tool-capable model with /model).\n"
+                    f"{self._ENV_FTR}")
         cwd = (self.remote.remote_cwd or self.remote.cwd) if self.remote else self.cfg.cwd
         return (f"\n\n{self._ENV_HDR}\ncwd: {cwd}\nshell: {self._shell_family()}\n"
                 f"{self._ENV_FTR}")
