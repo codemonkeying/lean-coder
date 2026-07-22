@@ -63,25 +63,25 @@ check("update_plan is on the surface at every non-chat tier",
       all("update_plan" in [t["function"]["name"] for t in lc.active_tools(lc.Config(leash=l))]
           for l in ("r", "rw", "rwe")))
 check("ssh is not a core tool", "ssh" not in [t["function"]["name"] for t in lc.TOOLS])
-# elective handover: request_handover is surfaced ONLY when offer_handover (soft zone)
+# elective handover: request_compact is surfaced ONLY when offer_compact (soft zone)
 _no_ho = [t["function"]["name"] for t in lc.active_tools(lc.Config())]
-_yes_ho = [t["function"]["name"] for t in lc.active_tools(lc.Config(), offer_handover=True)]
-check("request_handover absent below the soft zone", "request_handover" not in _no_ho)
-check("request_handover offered when in the soft zone", "request_handover" in _yes_ho)
-check("request_handover allowed at any tier (agent-internal)",
-      lc._leash_allows_tool("r", "request_handover") and lc._leash_allows_tool("chat", "request_handover"))
-# _request_handover guards: below soft (zone 'ok') it refuses; soft+ it queues
+_yes_ho = [t["function"]["name"] for t in lc.active_tools(lc.Config(), offer_compact=True)]
+check("request_compact absent below the soft zone", "request_compact" not in _no_ho)
+check("request_compact offered when in the soft zone", "request_compact" in _yes_ho)
+check("request_compact allowed at any tier (agent-internal)",
+      lc._leash_allows_tool("r", "request_compact") and lc._leash_allows_tool("chat", "request_compact"))
+# _request_compact guards: below soft (zone 'ok') it refuses; soft+ it queues
 _rh = lc.Agent.__new__(lc.Agent)
-_rh.cfg = lc.Config(handover_soft=0.70, handover_hard=0.95,
+_rh.cfg = lc.Config(compact_soft=0.70, compact_hard=0.95,
                     provider_settings={"ollama": {"num_ctx": 1000}}, provider="ollama")
 _rh.messages = []; _rh.tool_defs = []; _rh.last_prompt_tokens = 100  # 10% -> 'ok'
-_rh.ctx = lc.ContextMeter(_rh); _rh._elected_handover = False
-_msg = _rh._request_handover()
-check("request_handover refuses below soft (no elect)",
-      _rh._elected_handover is False and "not yet" in _msg.lower())
+_rh.ctx = lc.ContextMeter(_rh); _rh._elected_compact = False
+_msg = _rh._request_compact()
+check("request_compact refuses below soft (no elect)",
+      _rh._elected_compact is False and "not yet" in _msg.lower())
 _rh.last_prompt_tokens = 800   # 80% -> 'soft'
-_msg2 = _rh._request_handover()
-check("request_handover queues in the soft zone", _rh._elected_handover is True and "queued" in _msg2.lower())
+_msg2 = _rh._request_compact()
+check("request_compact queues in the soft zone", _rh._elected_compact is True and "queued" in _msg2.lower())
 check("operator_note shows command + exit",
       lc.operator_note("ls", 0, proposed="ls") == "[operator ran a command directly]\n$ ls\nexit 0")
 check("operator_note flags an edit",
@@ -91,7 +91,7 @@ check("operator_note: not run -> (not run)", "(not run)" in lc.operator_note("x"
 # --- tool-schema SHAPE contract: every model-facing schema (core builtins + the
 # always-on agent tools) must be a well-formed OpenAI function tool. A malformed
 # schema 400s the API, so this is a hard shape gate covering NOTE_TOOL too.
-_all_schemas = list(lc.TOOLS) + [lc.UPDATE_PLAN_TOOL, lc.REQUEST_HANDOVER_TOOL, lc.NOTE_TOOL]
+_all_schemas = list(lc.TOOLS) + [lc.UPDATE_PLAN_TOOL, lc.REQUEST_COMPACT_TOOL, lc.NOTE_TOOL]
 def _schema_wellformed(t):
     if t.get("type") != "function":
         return False
@@ -282,7 +282,9 @@ finally:
 (FIX / ".git").mkdir()
 ig = lc.IgnoreMatcher(FIX)
 check("ignores node_modules/", ig.ignored(FIX / "node_modules"))
-check("ignores *.lock", ig.ignored(FIX / "pkg.lock"))
+# A file LISTER must not hide files by extension - a real *.lock/*.pdf/*.png is a
+# real file (mirrors ripgrep/fd: gitignore + hidden + binary-CONTENT, never a suffix).
+check("does NOT hide *.lock by extension", not ig.ignored(FIX / "pkg.lock"))
 check("ignores .git/", ig.ignored(FIX / ".git"))
 check("keeps src/app.py", not ig.ignored(FIX / "src" / "app.py"))
 (FIX / ".cache").mkdir()
@@ -403,11 +405,17 @@ check("command table: help aliases share one handler",
 check("command table: /local and /disconnect share one handler",
       _tbl["/local"] is _tbl["/disconnect"] is lc.handle_local_command)
 check("command table: all expected commands present",
-      {"/clear", "/new", "/connect", "/tools", "/reload", "/compact", "/handover",
+      {"/clear", "/new", "/connect", "/tools", "/reload", "/compact", "/trim",
        "/session", "/save", "/load", "/bg", "/autosave", "/incognito", "/leash",
        "/askread", "/think", "/effort", "/provider", "/usage",
        "/info", "/set", "/model", "/approve", "/ctx", "/prompt",
        "/sh"}.issubset(_tbl))
+check("command table: /handover dropped (word reserved for future session-transfer)",
+      "/handover" not in _tbl)
+check("command table: /compact is the agentic summary lever",
+      _tbl["/compact"] is lc.handle_compact_command)
+check("command table: /trim is the programmatic stub lever",
+      _tbl["/trim"] is lc.handle_trim_command)
 check("command table: /settings renamed to /set (no /settings)", "/settings" not in _tbl)
 check("command table: removed rot-prone aliases are gone",
       not any(c in _tbl for c in ("/chat", "/yolo", "/nothink")))
@@ -844,25 +852,25 @@ check("agent-run: no RESULT block -> None (caller falls back to full text)",
 # _extract_marked XML-close fallback: a model that opens with the fence but closes
 # with an XML-style </tag> (a common small-model slip) must NOT lose its block.
 check("_extract_marked: strict fence pair still wins",
-      lc._extract_marked(f"{lc.HANDOVER_MARK}\nsummary\n{lc.HANDOVER_MARK}", lc.HANDOVER_MARK) == "summary")
+      lc._extract_marked(f"{lc.COMPACT_MARK}\nsummary\n{lc.COMPACT_MARK}", lc.COMPACT_MARK) == "summary")
 check("_extract_marked: fence + <tag>..</tag> XML-close rescued",
-      lc._extract_marked(f"{lc.HANDOVER_MARK}\n<handover>\nsummary text\n</handover>", lc.HANDOVER_MARK) == "summary text")
+      lc._extract_marked(f"{lc.COMPACT_MARK}\n<compact>\nsummary text\n</compact>", lc.COMPACT_MARK) == "summary text")
 check("_extract_marked: fence + bare </tag> close rescued",
-      lc._extract_marked(f"{lc.HANDOVER_MARK}\nbody only\n</HANDOVER>", lc.HANDOVER_MARK) == "body only")
+      lc._extract_marked(f"{lc.COMPACT_MARK}\nbody only\n</COMPACT>", lc.COMPACT_MARK) == "body only")
 check("_extract_marked: lone fence, no close -> None (safe, no session nuke)",
-      lc._extract_marked(f"{lc.HANDOVER_MARK}\ndangling text", lc.HANDOVER_MARK) is None)
-# _parse_handover: tolerant multi-tier parse (canonical -> md -> json -> prose).
-_ph1 = lc._parse_handover(f"{lc.HANDOVER_MARK}\nfixed add() in calc.py, verified\n{lc.HANDOVER_MARK}\n"
+      lc._extract_marked(f"{lc.COMPACT_MARK}\ndangling text", lc.COMPACT_MARK) is None)
+# _parse_compact: tolerant multi-tier parse (canonical -> md -> json -> prose).
+_ph1 = lc._parse_compact(f"{lc.COMPACT_MARK}\nfixed add() in calc.py, verified\n{lc.COMPACT_MARK}\n"
                           f"{lc.PLAN_MARK}\nGOAL: x\nTODO:\n- [ ] test\n{lc.PLAN_MARK}\n"
                           f"{lc.SELFPROMPT_MARK}\nwrite the test\n{lc.SELFPROMPT_MARK}")
-check("_parse_handover: tier1 canonical fences", _ph1["tier"] == 1 and _ph1["handover"] and _ph1["plan"] and _ph1["next"])
-_ph3 = lc._parse_handover("## Handover\nfixed add() in calc.py and verified it prints 5\n## Plan\nGOAL: t\n## Next\nwrite unit test")
-check("_parse_handover: tier3 markdown headers", _ph3["tier"] == 3 and "calc.py" in _ph3["handover"] and _ph3["next"] == "write unit test")
-_ph4 = lc._parse_handover('{"summary": "fixed the add bug in calc.py and verified output", "todo": ["write test"], "next": "add the unit test"}')
-check("_parse_handover: tier4 json fuzzy fields", _ph4["tier"] == 4 and "calc.py" in _ph4["handover"] and _ph4["next"] == "add the unit test")
-_ph5 = lc._parse_handover("I fixed the subtraction bug in calc.py by changing minus to plus, ran it, got 5. Next add a test.")
-check("_parse_handover: tier5 prose salvage", _ph5["tier"] == 5 and _ph5["handover"])
-check("_parse_handover: empty content -> no handover (safe no-op)", lc._parse_handover("ok")["handover"] is None)
+check("_parse_compact: tier1 canonical fences", _ph1["tier"] == 1 and _ph1["handover"] and _ph1["plan"] and _ph1["next"])
+_ph3 = lc._parse_compact("## Handover\nfixed add() in calc.py and verified it prints 5\n## Plan\nGOAL: t\n## Next\nwrite unit test")
+check("_parse_compact: tier3 markdown headers", _ph3["tier"] == 3 and "calc.py" in _ph3["handover"] and _ph3["next"] == "write unit test")
+_ph4 = lc._parse_compact('{"summary": "fixed the add bug in calc.py and verified output", "todo": ["write test"], "next": "add the unit test"}')
+check("_parse_compact: tier4 json fuzzy fields", _ph4["tier"] == 4 and "calc.py" in _ph4["handover"] and _ph4["next"] == "add the unit test")
+_ph5 = lc._parse_compact("I fixed the subtraction bug in calc.py by changing minus to plus, ran it, got 5. Next add a test.")
+check("_parse_compact: tier5 prose salvage", _ph5["tier"] == 5 and _ph5["handover"])
+check("_parse_compact: empty content -> no handover (safe no-op)", lc._parse_compact("ok")["handover"] is None)
 
 # --- bg hooks for lean-tools (bg_launch/bg_status/bg_list on the lc dict) ------
 check("bg hooks: bg_launch is exposed", callable(lc.bg_launch))
@@ -1115,12 +1123,12 @@ check("save_config: command_timeout round-trip", _rtc.get("command_timeout") == 
 check("save_config: bg_max_concurrent round-trip", _rtc.get("bg_max_concurrent") == 3)
 # non-default context knobs must round-trip (a guard referencing a stale default
 # silently drops the user's value - bit us when window default went 30 -> 0)
-lc.save_config(lc.Config(model="m", window_messages=50, handover_soft=0.4, handover_hard=0.6),
+lc.save_config(lc.Config(model="m", window_messages=50, compact_soft=0.4, compact_hard=0.6),
                quiet=True)
 _rtw = _tt_bg.loads(_tcf.read_text())
 check("save_config: window_messages round-trip", _rtw.get("window_messages") == 50)
-check("save_config: handover_soft/hard round-trip",
-      _rtw.get("handover_soft") == 0.4 and _rtw.get("handover_hard") == 0.6)
+check("save_config: compact_soft/hard round-trip",
+      _rtw.get("compact_soft") == 0.4 and _rtw.get("compact_hard") == 0.6)
 # the default value is NOT written (stays default on reload)
 lc.save_config(lc.Config(model="m"), quiet=True)
 check("save_config: default window_messages omitted",
@@ -1162,14 +1170,16 @@ _nondefault = {
     "bg_max_concurrent": 2, "worker_max_concurrent": 4, "worker_idle_timeout": 900,
     "worker_max_iterations": 15, "editor": "vim", "approval": "auto", "confirm_reads": True,
     "auto_reconnect": True, "statusline": False, "statusline_every": 3, "statusline_iter": 20,
-    "auto_evict": True, "auto_evict_keep": 5, "window_messages": 12, "window_tokens": 4000,
-    "auto_handover": False,
-    "handover_soft": 0.42, "handover_hard": 0.61, "handover_emergency": 0.99,
-    "handover_min_interval": 33.0, "autostart_after_handover": False,
-    "auto_compact_interval": 8, "auto_compact_hysteresis": 0.4, "auto_compact_keep": 6,
+    "window_messages": 12, "window_tokens": 4000,
+    "auto_compact": False,
+    "compact_soft": 0.42, "compact_hard": 0.61, "compact_emergency": 0.99,
+    "compact_min_interval": 33.0, "autostart_after_compact": False,
+    "compact_keep": 5,
+    "auto_trim_interval": 8, "auto_trim_hysteresis": 0.4, "auto_trim_keep": 6,
     "wake_on_bg_finish": True, "notes_spool": 500, "lean_tools_dir": "/tmp/lt", "providers_dir": "/tmp/pv",
     "user_name": "dide", "model": "some-model:1b", "ephemeral": True,
     "gen_connect_timeout": 7.0, "gen_ttft_timeout": 120.0, "gen_idle_timeout": 30.0,
+    "ingest_cap_frac": 0.3, "ingest_cap_floor": 1500, "ingest_cap_ceil": 12000,
 }
 # every persisted scalar must have a probe value here (so nothing is left untested)
 _missing_probe = [k for k in lc._PERSISTED_SCALAR_KEYS if k not in _nondefault]
@@ -1270,20 +1280,20 @@ try:
 finally:
     lc.CONFIG_PATH = _orig_cpA
 
-# handover_overrides load from the [handover_overrides.<model>] table
+# compact_overrides load from the [compact_overrides.<model>] table
 _hop = _plA.Path(_tfA.mkdtemp()) / "ho.toml"
-_hop.write_text("[handover_overrides.alpha-1]\nsoft = 0.6\nhard = 0.85\n")
+_hop.write_text("[compact_overrides.alpha-1]\nsoft = 0.6\nhard = 0.85\n")
 _orig_cpB = lc.CONFIG_PATH
 lc.CONFIG_PATH = _hop
 try:
     _lc = lc.load_config(A())
-    check("handover_overrides load per-model", _lc.handover_overrides.get("alpha-1", {}) ==
+    check("compact_overrides load per-model", _lc.compact_overrides.get("alpha-1", {}) ==
           {"soft": 0.6, "hard": 0.85})
 finally:
     lc.CONFIG_PATH = _orig_cpB
 
-# handover_overrides + non-default global thresholds SURVIVE a save_config round-trip.
-# Regression: save_config had no serializer for handover_overrides (a BESPOKE key), so
+# compact_overrides + non-default global thresholds SURVIVE a save_config round-trip.
+# Regression: save_config had no serializer for compact_overrides (a BESPOKE key), so
 # every autosave_config() rewrote config.toml WITHOUT them - they vanished and the next
 # load fell back to the global defaults (0.70/0.95 -> the "handover 95%" reset). Model
 # names carry ':'/'.' so the table header MUST be quoted or the whole file won't parse.
@@ -1292,19 +1302,19 @@ _orig_cpC = lc.CONFIG_PATH
 lc.CONFIG_PATH = _hop2
 try:
     _cfg = lc.Config()
-    _cfg.handover_soft = 0.2
-    _cfg.handover_hard = 0.25
-    _cfg.handover_overrides = {"qwen3:32b": {"soft": 0.6, "hard": 0.85},
+    _cfg.compact_soft = 0.2
+    _cfg.compact_hard = 0.25
+    _cfg.compact_overrides = {"qwen3:32b": {"soft": 0.6, "hard": 0.85},
                                "claude-opus-4-8": {"auto": False}}
     lc.save_config(_cfg, quiet=True)
     _rl = lc.load_config(A())
     check("save_config preserves non-default global thresholds",
-          (_rl.handover_soft, _rl.handover_hard) == (0.2, 0.25),
-          (_rl.handover_soft, _rl.handover_hard))
-    check("save_config preserves handover_overrides (colon/dot model names)",
-          _rl.handover_overrides == {"qwen3:32b": {"soft": 0.6, "hard": 0.85},
+          (_rl.compact_soft, _rl.compact_hard) == (0.2, 0.25),
+          (_rl.compact_soft, _rl.compact_hard))
+    check("save_config preserves compact_overrides (colon/dot model names)",
+          _rl.compact_overrides == {"qwen3:32b": {"soft": 0.6, "hard": 0.85},
                                      "claude-opus-4-8": {"auto": False}},
-          _rl.handover_overrides)
+          _rl.compact_overrides)
 finally:
     lc.CONFIG_PATH = _orig_cpC
 
@@ -1318,15 +1328,15 @@ for i in range(4):
     ag.messages.append({"role": "tool", "tool_name": "read_file",
                         "content": "\n".join(["data"] * 100)})
 before = lc.messages_tokens(ag.messages, lc.TOOLS)
-n, freed = ag.compact(keep=1)
+n, freed = ag.trim(keep=1)
 after = lc.messages_tokens(ag.messages, lc.TOOLS)
 tmsgs = [m for m in ag.messages if m["role"] == "tool"]
-check("compact trims all but last N", n == 3, f"trimmed={n}")
+check("trim strips all but last N", n == 3, f"trimmed={n}")
 check("compact stubs old tool results", tmsgs[0]["content"].startswith("[trimmed"))
 check("compact keeps last N in full", not tmsgs[-1]["content"].startswith("[trimmed")
       and len(tmsgs[-1]["content"].splitlines()) == 100)
 check("compact frees tokens", freed > 0 and after < before, f"freed~{freed}")
-check("compact is idempotent (re-run trims 0)", ag.compact(keep=1)[0] == 0)
+check("trim is idempotent (re-run trims 0)", ag.trim(keep=1)[0] == 0)
 # compact must survive a tool message with non-string content (an older/hand-edited
 # session, or an image-only result) - it auto-fires under handover, so a crash here
 # would take down the whole turn.
@@ -1338,13 +1348,13 @@ _ncx.messages = [{"role": "system", "content": "s"},
                  {"role": "assistant", "content": "", "tool_calls": [{}]},
                  {"role": "tool", "tool_name": "x", "content": "a\nb\nc"}]
 _ncx.last_prompt_tokens = None
-_nc_tr, _ = _ncx.compact(keep=1)
+_nc_tr, _ = _ncx.trim(keep=1)
 check("compact survives non-string tool content (no crash, coerced)",
       _nc_tr == 1 and _ncx.messages[3]["content"].startswith("[trimmed"))
 
-# 12b. auto_compact (NEW): programmatic strip fired at token intervals, w/ hysteresis
+# 12b. auto_trim (NEW): programmatic strip fired at token intervals, w/ hysteresis
 acx = lc.Agent.__new__(lc.Agent)
-acx.cfg = lc.Config(auto_compact_interval=100000, auto_compact_hysteresis=0.25, auto_compact_keep=1)
+acx.cfg = lc.Config(auto_trim_interval=100000, auto_trim_hysteresis=0.25, auto_trim_keep=1)
 acx._ac_armed_boundary = 0
 _acu = {"used": 0}
 acx._ctx_used = lambda: _acu["used"]
@@ -1352,29 +1362,29 @@ _stripped = {"n": 0}
 def _fake_strip(keep):
     _stripped["n"] += 1
     return (2, 5000)
-acx.compact = _fake_strip
+acx.trim = _fake_strip
 import io as _io_ac, contextlib as _ctx_ac
 def _run_ac():
     with _ctx_ac.redirect_stdout(_io_ac.StringIO()):
-        acx._maybe_auto_compact()
+        acx._maybe_auto_trim()
 _acu["used"] = 50000; _run_ac()
-check("auto_compact: does not fire below the first boundary", _stripped["n"] == 0)
+check("auto_trim: does not fire below the first boundary", _stripped["n"] == 0)
 _acu["used"] = 100500; _run_ac()
-check("auto_compact: fires when crossing a boundary", _stripped["n"] == 1
+check("auto_trim: fires when crossing a boundary", _stripped["n"] == 1
       and acx._ac_armed_boundary == 100000)
 _acu["used"] = 99000; _run_ac()   # strip landed just under 100k - must NOT refire
-check("auto_compact: hysteresis blocks refire just under the boundary", _stripped["n"] == 1)
+check("auto_trim: hysteresis blocks refire just under the boundary", _stripped["n"] == 1)
 _acu["used"] = 70000; _run_ac()   # dropped below 100k - 0.25*100k=75k -> re-arms, but no new boundary
-check("auto_compact: re-arms below the margin but no new boundary -> no fire", _stripped["n"] == 1
+check("auto_trim: re-arms below the margin but no new boundary -> no fire", _stripped["n"] == 1
       and acx._ac_armed_boundary == 0)
 _acu["used"] = 205000; _run_ac()  # crossed 200k
-check("auto_compact: fires again at the next boundary", _stripped["n"] == 2
+check("auto_trim: fires again at the next boundary", _stripped["n"] == 2
       and acx._ac_armed_boundary == 200000)
 # off by default
-acx.cfg.auto_compact_interval = 0
+acx.cfg.auto_trim_interval = 0
 _acu["used"] = 999999; _stripped["n"] = 0; _run_ac()
-check("auto_compact: off when interval is 0", _stripped["n"] == 0)
-check("Config default auto_compact_interval is 0 (off)", lc.Config().auto_compact_interval == 0)
+check("auto_trim: off when interval is 0", _stripped["n"] == 0)
+check("Config default auto_trim_interval is 0 (off)", lc.Config().auto_trim_interval == 0)
 
 # 12b2. handover marks the stable-prefix summary message with a cache_boundary signal
 _cb = lc.Agent.__new__(lc.Agent)
@@ -1386,27 +1396,29 @@ _cb.messages = [{"role": "system", "content": "s"},
 check("handover summary message carries cache_boundary + boundary index makes sense",
       _cb.messages[1].get("cache_boundary") is True)
 
-# 12c. _auto_evict: stub acted-on tool results, NEVER the in-flight batch
-ae = lc.Agent.__new__(lc.Agent)
-ae.cfg = lc.Config(auto_evict_keep=1)
-ae.last_prompt_tokens = None
-ae.messages = [
-    {"role": "user", "content": "go"},
-    {"role": "assistant", "content": "", "tool_calls": [{"id": "1"}]},
-    {"role": "tool", "tool_name": "read_file", "content": "A\n" * 50},   # acted-on
-    {"role": "assistant", "content": "", "tool_calls": [{"id": "2"}]},
-    {"role": "tool", "tool_name": "read_file", "content": "B\n" * 50},   # acted-on (last kept)
-    {"role": "assistant", "content": "", "tool_calls": [{"id": "3"}, {"id": "4"}]},
-    {"role": "tool", "tool_name": "read_file", "content": "C\n" * 50},   # in-flight - protect
-    {"role": "tool", "tool_name": "read_file", "content": "D\n" * 50},   # in-flight - protect
-]
-n_ev, _ = ae._auto_evict()
-check("_auto_evict stubs acted-on beyond keep", n_ev == 1, f"evicted={n_ev}")
-check("_auto_evict stubbed the OLDEST acted-on", ae.messages[2]["content"].startswith("[trimmed"))
-check("_auto_evict keeps last N acted-on full", ae.messages[4]["content"].startswith("B"))
-check("_auto_evict NEVER touches the in-flight batch",
-      ae.messages[6]["content"].startswith("C") and ae.messages[7]["content"].startswith("D"))
-check("auto_evict defaults off", lc.Config().auto_evict is False)
+# 12c. (auto_evict removed - design decision 8; superseded by the ingestion cap)
+check("auto_evict removed from Config", not hasattr(lc.Config(), "auto_evict"))
+check("_auto_evict method removed", not hasattr(lc.Agent, "_auto_evict"))
+
+# 12d. _ingest_cap: universal ingestion hard stop for opaque/untrusted tool output
+ic = lc.Agent.__new__(lc.Agent)
+ic.cfg = lc.Config(ingest_cap_frac=0.4, ingest_cap_floor=2000, ingest_cap_ceil=8000)
+ic.cfg.ctx_window = lambda: 100_000        # big window
+ic._ctx_used = lambda: 0                    # all free -> budget = 100k*3*0.4 = 120k, clamped to ceil 8000
+ic._log_activity = lambda *a, **k: None
+_small = "x" * 500
+check("_ingest_cap leaves a small result untouched", ic._ingest_cap(_small, "mcp__s__t") == _small)
+_big = "y" * 50_000
+_capped = ic._ingest_cap(_big, "mcp__s__t")
+check("_ingest_cap truncates a runaway to the ceiling", len(_capped) < 9000 and len(_capped) > 7000)
+check("_ingest_cap keeps head AND tail", _capped.startswith("y") and _capped.endswith("y"))
+check("_ingest_cap emits a truncation notice the model sees", "truncated at ingestion" in _capped)
+# floor: a tiny free window must not clip below the floor
+ic._ctx_used = lambda: 99_000               # free 1000 tok -> budget 1200, but floor 2000 wins
+_capped2 = ic._ingest_cap("z" * 5000, "mcp__s__t")
+check("_ingest_cap floor caps the BUDGET not below floor", len(_capped2) >= 2000)
+# non-str (image dict text already handled upstream) passes through untouched
+check("_ingest_cap passes non-str through", ic._ingest_cap(None, "x") is None)
 
 # 12d. _window_messages: bounded send, clean turn-boundary cut, non-destructive
 wm = lc.Agent.__new__(lc.Agent)
@@ -1494,22 +1506,22 @@ check("window_tokens 'auto': no-op when the history fits the window",
 
 # 12d-bis. _auto_resume_pick: most-recent session wins, NOT cwd-scoped, snapshots skipped
 _ar_rows = [
-    ("lcdev-prehandover-1", {"cwd": "/x"}, 300),   # newest, but a snapshot
+    ("lcdev-precompact-1", {"cwd": "/x"}, 300),   # newest, but a snapshot
     ("lcdev",                          {"cwd": "/elsewhere"}, 200),  # genuinely-most-recent thread
     ("auto-0628-120000-1",             {"cwd": "/home/user"}, 100),  # stale, same-cwd
 ]
-check("_auto_resume_pick skips pre-handover snapshots",
+check("_auto_resume_pick skips pre-compact snapshots",
       lc._auto_resume_pick(_ar_rows)[0] == "lcdev")
 check("_auto_resume_pick is NOT cwd-scoped (most-recent thread wins regardless of cwd)",
       lc._auto_resume_pick(_ar_rows)[1]["cwd"] == "/elsewhere")
 check("_auto_resume_pick None when only snapshots exist",
-      lc._auto_resume_pick([("lcdev-prehandover-1", {}, 9)]) is None)
+      lc._auto_resume_pick([("lcdev-precompact-1", {}, 9)]) is None)
 
 # 12e. ContextMeter.zone: context-budget zones for self-managing compaction. The
 # measurement/policy cluster lives on a focused ContextMeter (B1 extraction) - test it
 # directly against a bare agent stub; Agent._ctx_zone/_ctx_used/etc. delegate to it.
 cz = lc.Agent.__new__(lc.Agent)
-cz.cfg = lc.Config(handover_soft=0.40, handover_hard=0.60,
+cz.cfg = lc.Config(compact_soft=0.40, compact_hard=0.60,
                    provider_settings={"ollama": {"num_ctx": 1000}})
 cz.last_prompt_tokens = None
 cz.messages = []; cz.tool_defs = []
@@ -1562,12 +1574,12 @@ pn._pending_ai_note = "Permissions changed: read-only"
 pn.tools = type("T", (), {"changed_files": set()})()
 pn._handover_capture = None; pn.dirty = False
 pn._turn_count = 0
-pn._elected_handover = False
+pn._elected_compact = False
 pn._soft_nudge = lambda: ""       # isolate this test to the pending-note path
 pn.refresh_tools = lambda: None   # surface rebuild is out of scope for this test
 pn._sigint_guard = lambda: __import__("contextlib").nullcontext()
 pn._loop = lambda: None
-pn._maybe_handover = lambda: None
+pn._maybe_compact = lambda: None
 pn.run_turn("do the thing")
 _last = pn.messages[-1]["content"]
 check("run_turn prepends pending note to the user turn",
@@ -1578,7 +1590,7 @@ check("run_turn clears the pending note after injecting", pn._pending_ai_note is
 # cancel, drop it into history un-run). Interactive countdown stubbed; logic isolated.
 import io as _io_mc, contextlib as _ctx_mc
 mc = lc.Agent.__new__(lc.Agent)
-mc.cfg = lc.Config()                       # auto_handover on by default
+mc.cfg = lc.Config()                       # auto_compact on by default
 _st = {"compacted": False}
 mc._ctx_used = lambda: 0
 mc._ctx_zone = lambda: ("ok", 0, 1000) if _st["compacted"] else ("hard", 600, 1000)
@@ -1587,20 +1599,20 @@ def _fake_compact(zone):
     _st["compacted"] = True
     mc._autostart_pending = "do step 2"
     return "BLOCK"
-mc.auto_handover = _fake_compact
+mc.auto_compact = _fake_compact
 mc._autostart_pending = None
 mc._autostart_countdown = lambda sp, secs=5: True
 _ran = []
 mc.run_turn = lambda ui: _ran.append(ui)
 mc.messages = []
 with _ctx_mc.redirect_stdout(_io_mc.StringIO()):
-    mc._maybe_handover()
+    mc._maybe_compact()
 check("autostart runs the self-prompt when countdown proceeds", _ran == ["do step 2"])
 # cancel branch: drop into history, do NOT run
 _st["compacted"] = False; mc._autostart_pending = None; _ran.clear(); mc.messages = []
 mc._autostart_countdown = lambda sp, secs=5: False
 with _ctx_mc.redirect_stdout(_io_mc.StringIO()):
-    mc._maybe_handover()
+    mc._maybe_compact()
 check("autostart cancel: self-prompt dropped into history, not run",
       _ran == [] and any("autostart cancelled" in (m.get("content") or "") for m in mc.messages))
 # guard: if compaction didn't drop below hard, don't autostart (would loop)
@@ -1608,33 +1620,34 @@ _st["compacted"] = False; mc._autostart_pending = None; _ran.clear(); mc.message
 mc._ctx_zone = lambda: ("hard", 600, 1000)      # stays hard even after compact
 mc._autostart_countdown = lambda sp, secs=5: True
 with _ctx_mc.redirect_stdout(_io_mc.StringIO()):
-    mc._maybe_handover()
+    mc._maybe_compact()
 check("autostart skipped when still full after compaction",
       _ran == [] and any("still full" in (m.get("content") or "") for m in mc.messages))
-check("auto_handover defaults on", lc.Config().auto_handover is True)
-check("compact thresholds default 0.7/0.95 + emergency 1.0",
-      lc.Config().handover_soft == 0.70 and lc.Config().handover_hard == 0.95
-      and lc.Config().handover_emergency == 1.00)
-check("autostart_after_handover defaults ON", lc.Config().autostart_after_handover is True)
+check("auto_compact defaults on", lc.Config().auto_compact is True)
+check("compact thresholds default 0.7/0.90 + emergency 1.0 (D3: hard down from 0.95)",
+      lc.Config().compact_soft == 0.70 and lc.Config().compact_hard == 0.90
+      and lc.Config().compact_emergency == 1.00)
+check("compact_keep single knob defaults to 3; emergency backstop hardcoded 1",
+      lc.Config().compact_keep == 3 and lc.COMPACT_EMERGENCY_KEEP == 1)
 
 # 12e2. per-model compaction overrides (models fill context differently)
-cmc = lc.Config(provider="testprov", handover_soft=0.40, handover_hard=0.60,
-                autostart_after_handover=True,    # opt in, to test fallback to the global
+cmc = lc.Config(provider="testprov", compact_soft=0.40, compact_hard=0.60,
+                autostart_after_compact=True,    # opt in, to test fallback to the global
                 provider_settings={"testprov": {"model": "alpha-1"}},
-                handover_overrides={"alpha-1": {"soft": 0.5, "hard": 0.75}})
-_cf = cmc.handover_for()
-check("handover_for applies per-model override", _cf["soft"] == 0.5 and _cf["hard"] == 0.75)
-check("handover_for falls back to global for absent keys",
+                compact_overrides={"alpha-1": {"soft": 0.5, "hard": 0.75}})
+_cf = cmc.compact_for()
+check("compact_for applies per-model override", _cf["soft"] == 0.5 and _cf["hard"] == 0.75)
+check("compact_for falls back to global for absent keys",
       _cf["auto"] is True and _cf["autostart"] is True)
-check("handover_for uses global when no override for model",
-      cmc.handover_for("beta-2")["hard"] == 0.60)
+check("compact_for uses global when no override for model",
+      cmc.compact_for("beta-2")["hard"] == 0.60)
 
 # 12f. self-prompt extractor (post-compaction autostart) + shared marker extractor
 check("_extract_selfprompt pulls last NEXT pair",
       lc._extract_selfprompt("noise ===NEXT===\ndo the next thing\n===NEXT=== tail") == "do the next thing")
 check("_extract_selfprompt None when no pair", lc._extract_selfprompt("no markers here") is None)
-check("_extract_handover_block still works via shared helper",
-      lc._extract_handover_block("x ===HANDOVER===\nHANDOVER\n===HANDOVER=== y") == "HANDOVER")
+check("_extract_compact_block still works via shared helper",
+      lc._extract_compact_block("x ===COMPACT===\nSUMMARY\n===COMPACT=== y") == "SUMMARY")
 check("_extract_marked None on empty", lc._extract_marked("", "===NEXT===") is None)
 check("_extract_plan pulls the ===PLAN=== block",
       lc._extract_plan("x ===PLAN===\nGOAL: ship\nTODO:\n- [ ] a\n===PLAN=== y") == "GOAL: ship\nTODO:\n- [ ] a")
@@ -1690,21 +1703,23 @@ _snout = sn._soft_nudge()
 check("_soft_nudge fires again after NUDGE_EVERY turns", "context" in _snout and "%" in _snout)
 sn._ctx_zone = lambda: ("ok", 100, 1000); sn._turn_count = 999
 check("_soft_nudge silent outside the soft zone", sn._soft_nudge() == "")
-# the auto-handover instruction + soft nudge are editable builtin prompts
-check("auto_handover is a builtin prompt", "auto_handover" in lc.BUILTIN_PROMPTS)
-check("handover_nudge is a builtin prompt", "handover_nudge" in lc.BUILTIN_PROMPTS)
-check("read_prompt('auto_handover') returns the compaction instruction",
-      lc.read_prompt("auto_handover") == lc.AUTO_HANDOVER_INSTR)
-check("read_prompt('handover_nudge') returns the nudge template",
-      lc.read_prompt("handover_nudge") == lc.HANDOVER_NUDGE)
+# the auto-compact instruction + soft nudge are editable builtin prompts
+check("auto_compact is a builtin prompt", "auto_compact" in lc.BUILTIN_PROMPTS)
+check("compact_nudge is a builtin prompt", "compact_nudge" in lc.BUILTIN_PROMPTS)
+check("read_prompt('auto_compact') returns the compaction instruction",
+      lc.read_prompt("auto_compact") == lc.AUTO_COMPACT_INSTR)
+check("read_prompt('compact_nudge') returns the nudge template",
+      lc.read_prompt("compact_nudge") == lc.COMPACT_NUDGE)
+check("read_prompt('compact') returns the compact instruction",
+      lc.read_prompt("compact") == lc.COMPACT_INSTR)
 check("handover_nudge template has ctx placeholders",
-      "{used}" in lc.HANDOVER_NUDGE and "{pct}" in lc.HANDOVER_NUDGE)
+      "{used}" in lc.COMPACT_NUDGE and "{pct}" in lc.COMPACT_NUDGE)
 import tomllib as _tae
 _aef = Path(tempfile.mktemp(suffix=".toml"))
 _orig_aecp = lc.CONFIG_PATH; lc.CONFIG_PATH = _aef
-lc.save_config(lc.Config(model="m", auto_evict=True, auto_evict_keep=5), quiet=True)
+lc.save_config(lc.Config(model="m", compact_keep=2, ingest_cap_ceil=9000), quiet=True)
 _aev = _tae.loads(_aef.read_text())
-check("save_config persists auto_evict on + keep", _aev.get("auto_evict") is True and _aev.get("auto_evict_keep") == 5)
+check("save_config persists compact_keep + ingest_cap", _aev.get("compact_keep") == 2 and _aev.get("ingest_cap_ceil") == 9000)
 lc.CONFIG_PATH = _orig_aecp; _aef.unlink(missing_ok=True)
 
 # 12b. compact clears the stale actual prompt_eval count (the "looked broken" bug)
@@ -1713,12 +1728,12 @@ for i in range(3):
     ag2.messages.append({"role": "tool", "tool_name": "read_file",
                          "content": "\n".join(["x"] * 50)})
 ag2.last_prompt_tokens = 9999
-ag2.compact(keep=1)
-check("compact clears stale last_prompt_tokens when it trims",
+ag2.trim(keep=1)
+check("trim clears stale last_prompt_tokens when it strips",
       ag2.last_prompt_tokens is None)
 ag2.last_prompt_tokens = 1234
-check("compact leaves token count alone when nothing trims",
-      ag2.compact(keep=1)[0] == 0 and ag2.last_prompt_tokens == 1234)
+check("trim leaves token count alone when nothing strips",
+      ag2.trim(keep=1)[0] == 0 and ag2.last_prompt_tokens == 1234)
 
 # 12c. Spinner is a safe no-op when stdout isn't a TTY (tests/pipes)
 sp = lc.Spinner("x").start()
@@ -2092,11 +2107,12 @@ lc.save_config(lc.Config(model="m", keep_alive="-1"))
 check("save_config writes a non-default keep_alive",
       _t.loads(nf.read_text()).get("keep_alive") == "-1")
 _kaf = pathlib.Path(tempfile.mktemp(suffix=".toml"))
-_kaf.write_text('model = "m"\nkeep_alive = "30m"\nauto_evict = true\nauto_evict_keep = 5\n')
+_kaf.write_text('model = "m"\nkeep_alive = "30m"\nauto_evict = true\nauto_evict_keep = 5\nhandover_soft = 0.5\ncompact_keep_hard = 99\ncompact_keep = 4\n')
 _orig_ka = lc.CONFIG_PATH; lc.CONFIG_PATH = _kaf
 _kac = lc.load_config(HArgs())
 check("load_config reads keep_alive", _kac.keep_alive == "30m")
-check("load_config reads auto_evict + keep", _kac.auto_evict is True and _kac.auto_evict_keep == 5)
+check("load_config: removed/renamed keys (auto_evict, handover_soft, compact_keep_hard) ignored, not crash (D2)",
+      _kac.model == "m" and not hasattr(_kac, "auto_evict") and not hasattr(_kac, "compact_keep_hard") and _kac.compact_keep == 4)
 lc.CONFIG_PATH = _orig_ka; _kaf.unlink(missing_ok=True)
 
 # round-trip the toggle off
@@ -2556,7 +2572,8 @@ check("render_help lists every built-in command",
 check("render_help includes descriptions + footer",
       "this help" in plain and "Tab completes" in plain)
 check("render_help styles the command (bold+cyan), not the description",
-      lc.bold(lc.cyan("/clear")) in help_txt and lc.dim("this help") in help_txt)
+      lc.bold(lc.cyan("/clear")) in help_txt
+      and lc.dim("wipe conversation, stay in this session") in help_txt)
 check("render_help shows lean-tool commands under their own header",
       "lean-tool commands:" in plain and "/whoami" in plain)
 # regression: one very long command (/provider) must NOT pad every row out to its
@@ -2594,12 +2611,25 @@ check("list_prompts: default hides un-overridden system prompts, lists custom",
       "system" not in _pb and "handover" not in _pb and "research" in _pc)
 _pba, _pca = lc.list_prompts(all_builtins=True)
 check("list_prompts(all_builtins=True): every system prompt listed",
-      "system" in _pba and "handover" in _pba and "research" in _pca)
-lc.seed_prompt_file("handover")   # override one -> it surfaces in the default list
+      "system" in _pba and "compact" in _pba and "research" in _pca)
+lc.seed_prompt_file("compact")   # override one -> it surfaces in the default list
 _pb2, _ = lc.list_prompts()
 check("list_prompts: an overridden system prompt IS surfaced",
-      "handover" in _pb2 and "system" not in _pb2)
-lc.restore_prompt("handover")
+      "compact" in _pb2 and "system" not in _pb2)
+lc.restore_prompt("compact")
+# /prompt completion: name-complete after the use/edit verbs; reset only offers
+# overridden built-ins (research is custom, so it's usable+editable but not resettable).
+check("argcomp: /prompt use completes prompt names",
+      "research" in lc._arg_completions(None, None, "/prompt use")
+      and "system" in lc._arg_completions(None, None, "/prompt use"))
+check("argcomp: /prompt edit completes prompt names",
+      "research" in lc._arg_completions(None, None, "/prompt edit"))
+lc.seed_prompt_file("compact")   # override -> now resettable
+check("argcomp: /prompt reset offers only overridden built-ins",
+      "compact" in lc._arg_completions(None, None, "/prompt reset")
+      and "research" not in lc._arg_completions(None, None, "/prompt reset")
+      and "system" not in lc._arg_completions(None, None, "/prompt reset"))
+lc.restore_prompt("compact")
 check("open_in_editor: no editor/TTY -> False (graceful)", lc.open_in_editor(_pf) is False)
 lc.PROMPTS_DIR, lc.SYSTEM_PROMPTS_DIR = _orig_pd, _orig_spd
 
@@ -3462,24 +3492,24 @@ check("_prune_autosaves: keeps the newest, drops the oldest",
       and not (lc.SESSIONS_DIR / "auto-bulk-00.json").is_file())
 check("_prune_autosaves: never prunes a named snapshot",
       (lc.SESSIONS_DIR / "named-snapshot.json").is_file())
-# pre-handover safety snapshots are rolling too: capped to PREHANDOVER_KEEP, not kept
+# pre-handover safety snapshots are rolling too: capped to PRECOMPACT_KEEP, not kept
 # forever (else a busy session floods /load with dozens). Newest kept, oldest dropped.
 # Named <origin>-prehandover-<N>; the origin here is a user session ("sess").
 for _i in range(12):
     _pp, _ = lc.save_session([{"role": "user", "content": f"pc{_i}"}], _aag.cfg,
-                             f"sess{lc.PREHANDOVER_MARK}{_i}")
+                             f"sess{lc.PRECOMPACT_MARK}{_i}")
     os.utime(_pp, (3000 + _i, 3000 + _i))
 lc._prune_autosaves(keep=10)
-_pc_left = sorted(p.name for p in lc.SESSIONS_DIR.glob(f"*{lc.PREHANDOVER_MARK}*.json"))
-check("_prune_autosaves: caps pre-handover snapshots to PREHANDOVER_KEEP",
-      len(_pc_left) == lc.PREHANDOVER_KEEP, _pc_left)
+_pc_left = sorted(p.name for p in lc.SESSIONS_DIR.glob(f"*{lc.PRECOMPACT_MARK}*.json"))
+check("_prune_autosaves: caps pre-handover snapshots to PRECOMPACT_KEEP",
+      len(_pc_left) == lc.PRECOMPACT_KEEP, _pc_left)
 check("_prune_autosaves: keeps the NEWEST pre-handover snapshots, drops the oldest",
-      (lc.SESSIONS_DIR / f"sess{lc.PREHANDOVER_MARK}11.json").is_file()
-      and not (lc.SESSIONS_DIR / f"sess{lc.PREHANDOVER_MARK}0.json").is_file())
+      (lc.SESSIONS_DIR / f"sess{lc.PRECOMPACT_MARK}11.json").is_file()
+      and not (lc.SESSIONS_DIR / f"sess{lc.PRECOMPACT_MARK}0.json").is_file())
 check("_prune_autosaves: snapshot cap leaves named sessions + auto- count intact",
       (lc.SESSIONS_DIR / "named-snapshot.json").is_file()
       and len([p for p in lc.SESSIONS_DIR.glob(f"{lc.AUTOSAVE_PREFIX}*.json")
-               if lc.PREHANDOVER_MARK not in p.stem]) == 10)
+               if lc.PRECOMPACT_MARK not in p.stem]) == 10)
 
 # handle_save_command / handle_load_command round-trip (session verbs)
 shutil.rmtree(lc.SESSIONS_DIR, ignore_errors=True)
@@ -3604,16 +3634,16 @@ _srag.autosave_name = "sess-x"
 _srows = lc._status_rows(_srag, _srag.cfg)
 _plain = "\n".join(_re.sub(r"\x1b\[[0-9;]*m", "", r) for r in _srows)
 check("_status_rows returns 3 rows", len(_srows) == 3)
-check("_status_rows shows leash + approve: + handover + tools",
+check("_status_rows shows leash + approve: + compact + tools",
       "rw" in _plain and "approve: auto" in _plain
-      and "handover" in _plain and "tools" in _plain)
+      and "compact" in _plain and "tools" in _plain)
 check("_status_rows hides 'window off' when window is off (default)",
       "window off" not in _plain)
 check("_status_rows shows live turn counter", "1 turns" in _plain)
-check("_status_rows handover shows only the hard pct", "handover 95%" in _plain)
+check("_status_rows compact shows only the hard pct (D3: 90%)", "compact 90%" in _plain)
 check("_status_rows drops the 'ok' zone label from ctx", "ok)" not in _plain)
-check("_status_rows hides handovers count when none have happened",
-      "handovers" not in _plain)
+check("_status_rows hides compactions count when none have happened",
+      "compactions" not in _plain)
 check("_status_rows shows the round-cap only in auto mode", "max 25 rounds" in _plain)
 check("_status_rows row1 shows the session name with a colon", "session: sess-x" in _plain)
 # window ON -> the size is shown; handovers count appears once any have happened.
@@ -3621,17 +3651,17 @@ check("_status_rows row1 shows the session name with a colon", "session: sess-x"
 # the message-count display.
 _srag.cfg.window_tokens = 0
 _srag.cfg.window_messages = 40
-_srag.handovers = 2
+_srag.compactions = 2
 _plain_w = "\n".join(_re.sub(r"\x1b\[[0-9;]*m", "", r) for r in lc._status_rows(_srag, _srag.cfg))
 check("_status_rows shows 'window N' when window is on", "window 40" in _plain_w)
-check("_status_rows shows handovers count once any happened", "2 handovers" in _plain_w)
+check("_status_rows shows compactions count once any happened", "2 compactions" in _plain_w)
 # window_tokens 'auto' renders as 'window auto' and wins over a message-count window
 _srag.cfg.window_tokens = "auto"
 _plain_a = "\n".join(_re.sub(r"\x1b\[[0-9;]*m", "", r) for r in lc._status_rows(_srag, _srag.cfg))
 check("_status_rows shows 'window auto' when window_tokens is auto", "window auto" in _plain_a)
 _srag.cfg.window_tokens = 0
 _srag.cfg.window_messages = 0
-_srag.handovers = 0
+_srag.compactions = 0
 _srag.cfg.statusline = False
 check("_status_rows is empty when statusline is off", lc._status_rows(_srag, _srag.cfg) == [])
 lc._TTY = _tty_save
@@ -4867,15 +4897,15 @@ try:
     check("_parse_toggle: invalid -> None", lc._parse_toggle("maybe", False) is None)
 
     # /handover block parser (the @#! delimiters) - must never grab the wrong text
-    _M = lc.HANDOVER_MARK
+    _M = lc.COMPACT_MARK
     check("handover block: extracts between markers",
-          lc._extract_handover_block(f"prose\n{_M}\nthe handover\n{_M}\ntrailing") == "the handover")
+          lc._extract_compact_block(f"prose\n{_M}\nthe handover\n{_M}\ntrailing") == "the handover")
     check("handover block: LAST pair wins (ignores an echoed example)",
-          lc._extract_handover_block(f"{_M}example{_M} then real {_M}real one{_M}") == "real one")
+          lc._extract_compact_block(f"{_M}example{_M} then real {_M}real one{_M}") == "real one")
     check("handover block: no markers -> None (history NOT nuked)",
-          lc._extract_handover_block("just a summary, no markers") is None)
-    check("handover block: single marker -> None", lc._extract_handover_block(f"{_M} only one") is None)
-    check("handover block: empty between -> None", lc._extract_handover_block(f"{_M}{_M}") is None)
+          lc._extract_compact_block("just a summary, no markers") is None)
+    check("handover block: single marker -> None", lc._extract_compact_block(f"{_M} only one") is None)
+    check("handover block: empty between -> None", lc._extract_compact_block(f"{_M}{_M}") is None)
 
     # /leash capability ceiling: bounds the tool surface by level
     check("_norm_leash: aliases", lc._norm_leash("READ") == "r" and lc._norm_leash("exec") == "rwe"
@@ -4907,8 +4937,9 @@ try:
     check("leash chat Agent: tool_defs empty", _mag.tool_defs == [])
     # the permissions note now rides the NEXT user turn (not the cached system prompt)
     check("leash chat: model told via pending note, NOT system prompt",
-          "chat-only" in (_mag._pending_ai_note or "")
-          and "Chat-only" not in _mag.messages[0]["content"])
+          "no tools" in (_mag._pending_ai_note or "")
+          and "<leash>" in (_mag._pending_ai_note or "")
+          and "no tools" not in _mag.messages[0]["content"].lower())
     with _ctxl.redirect_stdout(_io.StringIO()):
         lc.handle_leash_command(_mag, _mag.cfg, "rwe")         # back to full
     check("/leash rwe -> tools restored",
@@ -5004,6 +5035,12 @@ check("argcomp: /session load + /session save key to the same name list",
       lc._arg_completions(_fa, _fc, "/session load") == _sess_arg
       and lc._arg_completions(_fa, _fc, "/session save") == _sess_arg)
 check("argcomp: /autosave on/off", lc._arg_completions(_fa, _fc, "/autosave") == ["on", "off"])
+# /help <cmd>: completes command names (not itself); first-arg '?' suppressed for /help
+_help_comp = lc._arg_completions(_fa, _fc, "/help")
+check("argcomp: /help completes other command names, not itself",
+      "/model" in _help_comp and "/help" not in _help_comp)
+check("_completion_options: /help does not offer the ? help arg",
+      "?" not in lc._completion_options(_fa, _fc, "/help "))
 check("argcomp: /connect saved + open hosts",
       "dev" in lc._arg_completions(_fa, _fc, "/connect") and "box1" in lc._arg_completions(_fa, _fc, "/connect"))
 # CLI contract: a command's flags Tab-complete at ANY arg position (mirrors the handlers
@@ -5069,6 +5106,25 @@ check("pick_model_menu: styled label path returns chosen model",
                          prompt=lambda _p: "2") == "b:7b")
 check("_pick_one_tty: returns _NO_TTY when stdin/stdout not a terminal (headless)",
       lc._pick_one_tty("pick:", ["a", "b"]) is lc._NO_TTY)
+# multiselect_menu: numbered fallback (custom prompt). Toggle row 2 on, then save.
+_ms_seq = iter(["2", ""])
+_msr = lc.multiselect_menu("pick:", ["a", "b", "c"], is_on=lambda v: False,
+                           prompt=lambda _p: next(_ms_seq))
+check("multiselect_menu: toggle a row on then save returns the enabled set",
+      _msr == {"b"})
+# start with 'b' on, toggle it OFF, save -> empty set (not None)
+_ms_seq2 = iter(["2", ""])
+_msr2 = lc.multiselect_menu("pick:", ["a", "b"], is_on=lambda v: v == "b",
+                            prompt=lambda _p: next(_ms_seq2))
+check("multiselect_menu: toggling an on-row off yields empty set (not cancel)",
+      _msr2 == set())
+check("multiselect_menu: q cancels -> None",
+      lc.multiselect_menu("pick:", ["a"], is_on=lambda v: False,
+                          prompt=lambda _p: "q") is None)
+_ms_seq3 = iter(["a", ""])
+check("multiselect_menu: 'a' selects all then save",
+      lc.multiselect_menu("pick:", ["a", "b"], is_on=lambda v: False,
+                          prompt=lambda _p: next(_ms_seq3)) == {"a", "b"})
 # shared picker engine: capability gate + --plain emergency escape
 check("picker_capable: False when headless (no tty)", lc.picker_capable() is False)
 check("_wants_plain: strips --plain and flags it",
@@ -5163,15 +5219,15 @@ check("goal C: session load applies the override to live cfg", _load_cfg.approva
 check("goal C: session load leaves _defaults (config) unchanged",
       _load_cfg._defaults.get("approval") == "ask")
 check("goal C: session load did NOT rewrite config.toml", _ocf.read_text() == _before)
-# (e) handover_for: session override > per-model handover_overrides > global.
-_hc = lc.Config(model="m", handover_soft=0.70,
-                handover_overrides={"m": {"soft": 0.50}})
+# (e) compact_for: session override > per-model compact_overrides > global.
+_hc = lc.Config(model="m", compact_soft=0.70,
+                compact_overrides={"m": {"soft": 0.50}})
 _hc.set_active_model("m")
-check("goal C: handover_for uses per-model override when no session override",
-      _hc.handover_for("m")["soft"] == 0.50)
-_hc.session_overrides["handover_soft"] = 0.33; _hc.handover_soft = 0.33
-check("goal C: handover_for session override beats per-model",
-      _hc.handover_for("m")["soft"] == 0.33)
+check("goal C: compact_for uses per-model override when no session override",
+      _hc.compact_for("m")["soft"] == 0.50)
+_hc.session_overrides["compact_soft"] = 0.33; _hc.compact_soft = 0.33
+check("goal C: compact_for session override beats per-model",
+      _hc.compact_for("m")["soft"] == 0.33)
 lc.CONFIG_PATH = _ocp; _ocf.unlink(missing_ok=True)
 
 # --- leash HARD dispatch lock (defense in depth behind the surface filter) ---
@@ -5216,8 +5272,9 @@ _csa.refresh_tools()
 check("chat-only model: tool surface empties even at leash rwe", _csa.tool_defs == [])
 _csres = _csa._run_tool("read_file", {"path": "x"})
 check("chat-only model: dispatch blocked at the model level", _csres.startswith("BLOCKED") and "NOT help" in _csres)
-check("chat-only model: system prompt tells the model it has no tools",
-      "does not support tool calling" in _csa._system())
+check("chat-only model: session-env tail tells the model it has no tools (not the cached system prompt)",
+      "NO tools" in _csa._session_env() and "chat-only" in _csa._session_env()
+      and "no tools" not in _csa._system().lower())
 import re as _re_cs
 _save_tty_cs = lc._TTY
 lc._TTY = True
@@ -5249,15 +5306,15 @@ _cc = lc.Agent(lc.Config(cwd=FIX, approval="auto"))
 _cc._ctx_zone = lambda: ("hard", 9000, 10000)
 _cc._compact_allowed = lambda z: True
 _cc_called = []
-_cc.auto_handover = lambda z="hard": _cc_called.append(z)
+_cc.auto_compact = lambda z="hard": _cc_called.append(z)
 _cc._model_tool_support = lambda: False
 with _ctx_cc.redirect_stdout(_io_cc.StringIO()):
-    _cc._maybe_handover()
-check("_maybe_handover skips compaction when the model can't tool-call", _cc_called == [])
+    _cc._maybe_compact()
+check("_maybe_compact skips compaction when the model can't tool-call", _cc_called == [])
 _cc._model_tool_support = lambda: True
 with _ctx_cc.redirect_stdout(_io_cc.StringIO()):
-    _cc._maybe_handover()
-check("_maybe_handover proceeds once the model can tool-call", _cc_called == ["hard"])
+    _cc._maybe_compact()
+check("_maybe_compact proceeds once the model can tool-call", _cc_called == ["hard"])
 
 # REGRESSION: a FAILED compaction (no summary block) writes NO pre-compact snapshot and
 # stamps the loop guard - so a model that never summarizes can't snapshot every turn.
@@ -5269,11 +5326,11 @@ _nca.messages = [{"role": "system", "content": "S"},
 _nca._loop = lambda: None              # summary turn yields nothing -> no handover block
 _nca._last_compact_ts = 0.0
 with _ctx_cc.redirect_stdout(_io_cc.StringIO()):
-    _ncr = _nca.auto_handover("hard")
+    _ncr = _nca.auto_compact("hard")
 check("failed compaction returns None, history untouched",
       _ncr is None and [m["content"] for m in _nca.messages if m["role"] != "system"] == ["hi", "yo"])
 check("failed compaction writes NO pre-handover snapshot (kills the /load flood)",
-      list(lc.SESSIONS_DIR.glob(f"*{lc.PREHANDOVER_MARK}*.json")) == [])
+      list(lc.SESSIONS_DIR.glob(f"*{lc.PRECOMPACT_MARK}*.json")) == [])
 check("failed compaction stamps the loop guard (no retry every turn)", _nca._last_compact_ts > 0)
 lc.SESSIONS_DIR = _sd_save; shutil.rmtree(_ncd, ignore_errors=True)
 
@@ -5577,5 +5634,21 @@ if os.path.isfile(_sweep) and shutil.which("bash"):
         check("hygiene sweep clean (no stray IP/email/key/unicode in tracked source)",
               False, "\n    " + "\n    ".join(_tail[-12:]))
 
+# FILE MAP drift gate: the '# SECTION:' banners and the docstring FILE MAP index (regen
+# by tools/gen_section_index.py) must agree - a moved/added/removed section that didn't
+# regenerate the map would silently mislead navigation. Recompute the expected index
+# from the live banners and assert every entry is present with the right line number.
+_lc_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lean_coder.py")
+_lc_src = open(_lc_path).readlines()
+_expected = [f"  L{i + 1:<6} {ln[len('# SECTION:'):].strip()}"
+             for i, ln in enumerate(_lc_src) if ln.startswith("# SECTION:")]
+_map_txt = "".join(_lc_src)
+if "=== FILE MAP" in _map_txt:
+    _map_body = _map_txt.split("=== FILE MAP", 1)[1].split("=== END FILE MAP", 1)[0]
+    _stale = [e for e in _expected if e.rstrip() not in _map_body]
+    check("FILE MAP index matches SECTION banners (run tools/gen_section_index.py)",
+          not _stale, ("\n    stale/missing: " + "; ".join(e.strip() for e in _stale[:6])) if _stale else "")
+else:
+    check("FILE MAP index present", False, "no '=== FILE MAP' block in module docstring")
 print("\n" + ("ALL PASS" if ok else "SOME FAILED"))
 sys.exit(0 if ok else 1)
