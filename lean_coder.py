@@ -9439,6 +9439,91 @@ class Agent:
             parsed, summary_prefix="Earlier context (compacted summary):\n", tail=tail,
             autostart=True)
 
+    def _request_compact(self):
+        """The request_compact tool body: the model elects a handover at a clean break.
+        We don't compact here (mid-turn, inside a tool batch) - we set a flag that
+        _maybe_compact honours AFTER the turn, running the same auto_compact machinery.
+        Guard: only honour it in the soft-or-higher zone. The tool is only offered in the
+        soft zone, but a stale/replayed/hallucinated call could arrive below it - refuse
+        those so an elected handover can never happen before the user's threshold (the
+        model never gets to spend on a handover the user hasn't opened the window for)."""
+        if not self.cfg.compact_for()["auto"]:
+            return "compaction is off (auto_compact disabled) - not compacting."
+        if self._ctx_zone()[0] == "ok":
+            return ("not yet: context is still light (below the compaction threshold), so a "
+                    "compaction would just discard fidelity for no gain. Keep going - the "
+                    "option reappears once context is heavier.")
+        self._elected_compact = True
+        return ("compaction queued - finish this turn cleanly (no half-done work); the "
+                "compaction runs right after, and you'll write the summary + next-step then.")
+
+    def auto_compact(self, zone: str = "hard"):
+        """Self-managing compaction. Snapshot the full history (recoverable), then an
+        agentic turn where the model summarizes the OLDER context (between
+        COMPACT_MARK markers) and writes its next-step self-prompt (between
+        SELFPROMPT_MARK markers), then ends the turn (no finalize tool). We keep the recent tail
+        verbatim, replace the older part with the summary, queue the self-prompt for
+        autostart, and stamp the loop-guard clock. A bad/absent summary leaves history
+        untouched (returns None). Returns the summary block, or None."""
+        if not [m for m in self.messages if m["role"] != "system"]:
+            return None
+        pre       = list(self.messages)       # capture BEFORE the compaction turn
+        pre_plan  = getattr(self, "pinned_plan", "")   # for the recovery snapshot below
+        # One knob for how many recent TURNS to keep verbatim after the summary
+        # (soft/hard/manual all share cfg.compact_keep; tail-trim stubs the tool payloads
+        # so a few conversation turns is cheap). Emergency is not a preference - it's the
+        # overflow backstop, hardcoded minimal so the rescue can't itself re-overflow.
+        keep_turns = (COMPACT_EMERGENCY_KEEP if zone == "emergency"
+                      else self.cfg.compact_keep)
+        keep_from = self._keep_tail_turns(pre, keep_turns)
+        tail      = pre[keep_from:] if keep_from is not None else []
+
+        saved = self.tool_defs
+        # Shared retry-parse core (see _solicit_compact): give the model a turn to write
+        # the marked blocks, tolerantly parse, re-solicit any missing one. The completeness
+        # retry (an incomplete-but-successful ANSWER) is a DIFFERENT layer from the send-
+        # level overload/429 recovery inside _loop (a failed SEND): separate budgets.
+        instr = read_prompt("auto_compact") or AUTO_COMPACT_INSTR
+        parsed, missing, attempt, _turn_text = self._solicit_compact(instr)
+        block = parsed["handover"]
+        self.tool_defs = saved
+        if not block:                         # no usable summary -> don't nuke history
+            self.messages = pre
+            # Stamp the loop guard even on failure so a model that can't produce a
+            # summary doesn't re-attempt (and re-snapshot) compaction every single turn.
+            self._last_compact_ts = time.time()
+            return None
+        if parsed["tier"] >= 3 or attempt > 0:
+            self._log_activity(
+                "compact",
+                f"degraded parse (tier {parsed['tier']}, {attempt} retr{'y' if attempt == 1 else 'ies'})",
+                "model dropped marker discipline; salvaged via tolerant parser + retry")
+        # Snapshot the PRE-HANDOVER history ONLY now that we have a usable summary and are
+        # about to replace it - so it stays recoverable via /load (and greppable by the
+        # recall path). Doing it here (not at the top) means a FAILED/futile handover
+        # writes no snapshot: that unbounded per-turn snapshotting by a model that never
+        # summarized is what flooded /load. Named <origin>-precompact-<N> so the snapshot
+        # is tied to the session it came from.
+        try:
+            rhost = self.remote.host if self.remote else None
+            origin = getattr(self, "autosave_name", "") or "session"
+            existing = [nm for nm, _ in list_sessions()]
+            save_session(pre, self.cfg, _precompact_name(origin, existing),
+                         remote=rhost, pinned_plan=pre_plan)
+        except Exception:
+            pass
+        # Consume the already-computed tolerant parse (from the retry loop above), NOT a
+        # second strict fence-only re-extract: _parse_compact salvages plan/next from a
+        # degraded tier (## Plan header, JSON field) too, and _compact_missing already
+        # accepted that tier - so a strict _extract_* here would silently throw away the
+        # salvage for exactly the models the tolerant parser exists to rescue, dropping
+        # both the pinned plan and the autostart self-prompt. Same source as handover().
+        # Auto differs from /handover only in the four knobs below: keep the recent
+        # verbatim tail, queue the next-step self-prompt, and stamp the loop guard.
+        return self._finish_compact(
+            parsed, summary_prefix="Earlier context (compacted summary):\n",
+            tail=tail, autostart=True, stamp_clock=True)
+
     def _update_plan(self, plan: str):
         """The update_plan tool body: replace the pinned GOAL + TODO and refresh the
         live system prompt so the change is visible from the very next turn (and rides
@@ -9544,91 +9629,6 @@ class Agent:
                 return f"no notes in range {lo} .. {hi}."
             return self._note_cap(sel, f"in {lo} .. {hi}")
         return f"error: unknown note action {action!r} (add|recent|grep|range)."
-
-    def _request_compact(self):
-        """The request_compact tool body: the model elects a handover at a clean break.
-        We don't compact here (mid-turn, inside a tool batch) - we set a flag that
-        _maybe_compact honours AFTER the turn, running the same auto_compact machinery.
-        Guard: only honour it in the soft-or-higher zone. The tool is only offered in the
-        soft zone, but a stale/replayed/hallucinated call could arrive below it - refuse
-        those so an elected handover can never happen before the user's threshold (the
-        model never gets to spend on a handover the user hasn't opened the window for)."""
-        if not self.cfg.compact_for()["auto"]:
-            return "compaction is off (auto_compact disabled) - not compacting."
-        if self._ctx_zone()[0] == "ok":
-            return ("not yet: context is still light (below the compaction threshold), so a "
-                    "compaction would just discard fidelity for no gain. Keep going - the "
-                    "option reappears once context is heavier.")
-        self._elected_compact = True
-        return ("compaction queued - finish this turn cleanly (no half-done work); the "
-                "compaction runs right after, and you'll write the summary + next-step then.")
-
-    def auto_compact(self, zone: str = "hard"):
-        """Self-managing compaction. Snapshot the full history (recoverable), then an
-        agentic turn where the model summarizes the OLDER context (between
-        COMPACT_MARK markers) and writes its next-step self-prompt (between
-        SELFPROMPT_MARK markers), then ends the turn (no finalize tool). We keep the recent tail
-        verbatim, replace the older part with the summary, queue the self-prompt for
-        autostart, and stamp the loop-guard clock. A bad/absent summary leaves history
-        untouched (returns None). Returns the summary block, or None."""
-        if not [m for m in self.messages if m["role"] != "system"]:
-            return None
-        pre       = list(self.messages)       # capture BEFORE the compaction turn
-        pre_plan  = getattr(self, "pinned_plan", "")   # for the recovery snapshot below
-        # One knob for how many recent TURNS to keep verbatim after the summary
-        # (soft/hard/manual all share cfg.compact_keep; tail-trim stubs the tool payloads
-        # so a few conversation turns is cheap). Emergency is not a preference - it's the
-        # overflow backstop, hardcoded minimal so the rescue can't itself re-overflow.
-        keep_turns = (COMPACT_EMERGENCY_KEEP if zone == "emergency"
-                      else self.cfg.compact_keep)
-        keep_from = self._keep_tail_turns(pre, keep_turns)
-        tail      = pre[keep_from:] if keep_from is not None else []
-
-        saved = self.tool_defs
-        # Shared retry-parse core (see _solicit_compact): give the model a turn to write
-        # the marked blocks, tolerantly parse, re-solicit any missing one. The completeness
-        # retry (an incomplete-but-successful ANSWER) is a DIFFERENT layer from the send-
-        # level overload/429 recovery inside _loop (a failed SEND): separate budgets.
-        instr = read_prompt("auto_compact") or AUTO_COMPACT_INSTR
-        parsed, missing, attempt, _turn_text = self._solicit_compact(instr)
-        block = parsed["handover"]
-        self.tool_defs = saved
-        if not block:                         # no usable summary -> don't nuke history
-            self.messages = pre
-            # Stamp the loop guard even on failure so a model that can't produce a
-            # summary doesn't re-attempt (and re-snapshot) compaction every single turn.
-            self._last_compact_ts = time.time()
-            return None
-        if parsed["tier"] >= 3 or attempt > 0:
-            self._log_activity(
-                "compact",
-                f"degraded parse (tier {parsed['tier']}, {attempt} retr{'y' if attempt == 1 else 'ies'})",
-                "model dropped marker discipline; salvaged via tolerant parser + retry")
-        # Snapshot the PRE-HANDOVER history ONLY now that we have a usable summary and are
-        # about to replace it - so it stays recoverable via /load (and greppable by the
-        # recall path). Doing it here (not at the top) means a FAILED/futile handover
-        # writes no snapshot: that unbounded per-turn snapshotting by a model that never
-        # summarized is what flooded /load. Named <origin>-precompact-<N> so the snapshot
-        # is tied to the session it came from.
-        try:
-            rhost = self.remote.host if self.remote else None
-            origin = getattr(self, "autosave_name", "") or "session"
-            existing = [nm for nm, _ in list_sessions()]
-            save_session(pre, self.cfg, _precompact_name(origin, existing),
-                         remote=rhost, pinned_plan=pre_plan)
-        except Exception:
-            pass
-        # Consume the already-computed tolerant parse (from the retry loop above), NOT a
-        # second strict fence-only re-extract: _parse_compact salvages plan/next from a
-        # degraded tier (## Plan header, JSON field) too, and _compact_missing already
-        # accepted that tier - so a strict _extract_* here would silently throw away the
-        # salvage for exactly the models the tolerant parser exists to rescue, dropping
-        # both the pinned plan and the autostart self-prompt. Same source as handover().
-        # Auto differs from /handover only in the four knobs below: keep the recent
-        # verbatim tail, queue the next-step self-prompt, and stamp the loop guard.
-        return self._finish_compact(
-            parsed, summary_prefix="Earlier context (compacted summary):\n",
-            tail=tail, autostart=True, stamp_clock=True)
 
     def _ingest_cap(self, text: str, label: str):
         """Universal ingestion hard stop for OPAQUE/UNTRUSTED tool output (mcp.call +
