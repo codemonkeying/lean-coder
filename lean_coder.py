@@ -4231,29 +4231,88 @@ def host_label(url: str, machines: dict) -> str:
     return url
 
 
-# The scalar Config fields that round-trip through the TOML config file: load reads
-# each (if present) into cfg; save writes each back (default-valued ones are omitted
-# for a clean file, but the value still round-trips). This is the ONE source of truth
-# for "is field X persisted?" - the load loop and the round-trip test both read it, so
-# a new persisted knob is added in exactly one place. (Collections - machines, hosts,
-# provider_settings, mcp_*, etc - have bespoke table serialisers and are handled
-# separately in load/save; they are intentionally NOT here.)
-_PERSISTED_SCALAR_KEYS = (
-    "model", "num_ctx", "max_iterations", "keep_alive", "temperature", "top_p", "top_k",
-    "repeat_penalty", "ask_user_to_run", "autosave", "auto_update", "update_track",
-    "command_timeout", "bg_max_concurrent",
-    "worker_max_concurrent", "worker_idle_timeout", "worker_max_iterations", "editor",
-    "approval", "confirm_reads", "auto_reconnect", "statusline", "statusline_every",
-    "statusline_iter",
-    "ingest_cap_frac", "ingest_cap_floor", "ingest_cap_ceil",
-    "window_messages", "window_tokens", "auto_compact", "compact_soft", "compact_hard",
-    "compact_emergency", "compact_min_interval", "autostart_after_compact",
-    "compact_keep",
-    "auto_trim_interval", "auto_trim_hysteresis", "auto_trim_keep",
-    "wake_on_bg_finish", "notes_spool",
-    "gen_connect_timeout", "gen_ttft_timeout", "gen_idle_timeout",
-    "lean_tools_dir", "providers_dir", "user_name", "ephemeral",
+# The scalar Config fields that round-trip through the TOML config file, as ONE
+# declarative registry: (name, default, always). This is the single source of truth -
+# load reads each (if present) into cfg; save writes each back via _emit_scalars() using
+# the SAME defaults, so a knob is added in exactly one place and it is impossible to
+# change a default without the save-comparator following (the class of bug where a new
+# default shipped but save still compared against the old literal). `always` = emit even
+# at default (a few core knobs we like to see written verbatim); everything else is
+# omitted at its default for a clean file but still round-trips. `default` may reference
+# a module constant so the registry and the dataclass share one literal. (Collections -
+# machines, hosts, provider_settings, mcp_*, always_expand, etc - have bespoke table
+# serialisers and are handled separately in load/save; they are intentionally NOT here.)
+_SCALAR_FIELDS = (
+    # name                        default              always
+    ("model",                     None,                True),   # bespoke top line, but persisted
+    ("num_ctx",                   None,                False),  # bespoke (only if pinned)
+    ("keep_alive",                "10m",               False),
+    ("gen_connect_timeout",       10.0,                False),
+    ("gen_ttft_timeout",          600.0,               False),
+    ("gen_idle_timeout",          None,                False),
+    ("ingest_cap_frac",           INGEST_CAP_FRAC,     False),
+    ("ingest_cap_floor",          INGEST_CAP_FLOOR,    False),
+    ("ingest_cap_ceil",           INGEST_CAP_CEIL,     False),
+    ("max_iterations",            0,                   False),
+    ("window_messages",           0,                   False),
+    ("window_tokens",             "auto",              False),
+    ("auto_compact",              True,                False),
+    ("compact_soft",              0.70,                False),
+    ("compact_hard",              0.90,                False),
+    ("compact_emergency",         1.00,                False),
+    ("compact_min_interval",      60.0,                False),
+    ("autostart_after_compact",   True,                False),
+    ("compact_keep",              3,                   False),
+    ("auto_trim_interval",        0,                   False),
+    ("auto_trim_hysteresis",      0.25,                False),
+    ("auto_trim_keep",            TRIM_KEEP,           False),
+    ("wake_on_bg_finish",         False,               False),
+    ("notes_spool",               2000,                False),
+    ("temperature",               0.7,                 True),
+    ("top_p",                     0.8,                 True),
+    ("top_k",                     20,                  True),
+    ("repeat_penalty",            1.05,                True),
+    ("ask_user_to_run",           True,                True),
+    ("autosave",                  True,                True),
+    ("command_timeout",           300,                 True),
+    ("bg_max_concurrent",         5,                   True),
+    ("worker_max_concurrent",     10,                  True),
+    ("worker_idle_timeout",       1800,                True),
+    ("worker_max_iterations",     30,                  True),
+    ("approval",                  "ask",               False),
+    ("confirm_reads",             False,               False),
+    ("auto_reconnect",            False,               False),
+    ("ephemeral",                 False,               False),
+    ("statusline",                True,                False),
+    ("statusline_every",          1,                   False),
+    ("statusline_iter",           0,                   False),
+    ("auto_update",               False,               False),
+    ("update_track",              "stable",            False),
+    ("editor",                    "",                  False),
+    ("user_name",                 "operator",          False),
+    ("lean_tools_dir",            "",                  False),
+    ("providers_dir",             "",                  False),
 )
+_PERSISTED_SCALAR_KEYS = tuple(name for name, _d, _a in _SCALAR_FIELDS)
+# model/num_ctx are persisted but emitted by BESPOKE code (top host/model lines +
+# num_ctx-only-if-pinned), so the generic _emit_scalars() loop skips them.
+_SCALAR_EMIT_SKIP = frozenset(("model", "num_ctx"))
+
+
+def _emit_scalars(cfg) -> list:
+    """Emit `key = value` lines for every registry scalar whose value should persist:
+    an `always` field emits even at default; any other emits only when it differs from
+    its registry default (and isn't an unset ''/None). ONE loop replaces ~40 hand-written
+    `if cfg.x != <literal>` guards - so a default change can never desync from its
+    save-comparator. model/num_ctx are emitted by bespoke code and skipped here."""
+    out = []
+    for name, default, always in _SCALAR_FIELDS:
+        if name in _SCALAR_EMIT_SKIP:
+            continue
+        val = getattr(cfg, name)
+        if always or (val != default and val not in ("", None)):
+            out.append(f"{name} = {_toml_value(val)}")
+    return out
 # EPHEMERAL: deliberately NEVER persisted. These are per-launch state - saving them
 # would let one session silently narrow/alter the NEXT launch's default. `composer` is
 # read from the file on load (a user CAN pin composer=false by hand) but is never
@@ -4503,106 +4562,25 @@ def save_config(cfg: Config, quiet: bool = False):
     # Only persist num_ctx if it was explicitly pinned (--num-ctx/env/file). When
     # it came from auto-detect, omit it so detection stays active per-host on the
     # next launch - otherwise saving after a session on a 16k host would bake that
-    # in and silently cap a 32k host.
+    # in and silently cap a 32k host. (num_ctx is in the registry but bespoke-emitted.)
     if not cfg.auto_num_ctx:
         lines.append(f"num_ctx = {cfg.num_ctx}")
-    if cfg.keep_alive and cfg.keep_alive != "10m":
-        lines.append(f'keep_alive = "{cfg.keep_alive}"')
-    # ollama streaming timeouts: persist only a non-default (prod defaults stay implicit).
-    if cfg.gen_connect_timeout != 10.0:
-        lines.append(f"gen_connect_timeout = {cfg.gen_connect_timeout}")
-    if cfg.gen_ttft_timeout != 600.0:
-        lines.append(f"gen_ttft_timeout = {cfg.gen_ttft_timeout}")
-    if cfg.gen_idle_timeout is not None:
-        lines.append(f"gen_idle_timeout = {cfg.gen_idle_timeout}")
-    if cfg.ingest_cap_frac != INGEST_CAP_FRAC:
-        lines.append(f"ingest_cap_frac = {cfg.ingest_cap_frac}")
-    if cfg.ingest_cap_floor != INGEST_CAP_FLOOR:
-        lines.append(f"ingest_cap_floor = {cfg.ingest_cap_floor}")
-    if cfg.ingest_cap_ceil != INGEST_CAP_CEIL:
-        lines.append(f"ingest_cap_ceil = {cfg.ingest_cap_ceil}")
-    if cfg.max_iterations != 0:
-        lines.append(f"max_iterations = {cfg.max_iterations}")
-    if cfg.window_messages != 0:              # default is off (0) now
-        lines.append(f"window_messages = {cfg.window_messages}")
-    if cfg.window_tokens != "auto":           # default is 'auto'; persist an int cap or 0 (off)
-        lines.append(f"window_tokens = {_toml_value(cfg.window_tokens)}")
-    if not cfg.auto_compact:
-        lines.append("auto_compact = false")
-    if cfg.compact_soft != 0.70:
-        lines.append(f"compact_soft = {cfg.compact_soft}")
-    if cfg.compact_hard != 0.90:
-        lines.append(f"compact_hard = {cfg.compact_hard}")
-    if cfg.compact_emergency != 1.00:
-        lines.append(f"compact_emergency = {cfg.compact_emergency}")
-    if cfg.compact_min_interval != 60.0:
-        lines.append(f"compact_min_interval = {cfg.compact_min_interval}")
-    if not cfg.autostart_after_compact:       # default is on now; persist an opt-OUT
-        lines.append("autostart_after_compact = false")
-    if cfg.compact_keep != 3:
-        lines.append(f"compact_keep = {cfg.compact_keep}")
-    if cfg.auto_trim_interval != 0:         # default 0 (off); persist when opted in
-        lines.append(f"auto_trim_interval = {cfg.auto_trim_interval}")
-    if cfg.auto_trim_hysteresis != 0.25:
-        lines.append(f"auto_trim_hysteresis = {cfg.auto_trim_hysteresis}")
-    if cfg.auto_trim_keep != TRIM_KEEP:
-        lines.append(f"auto_trim_keep = {cfg.auto_trim_keep}")
-    if cfg.wake_on_bg_finish:                  # default off; persist an opt-IN
-        lines.append("wake_on_bg_finish = true")
-    if cfg.notes_spool != 2000:                # default 2000 lines; persist when changed
-        lines.append(f"notes_spool = {cfg.notes_spool}")
-    if cfg.always_expand:                       # default = [] (diffs stay collapsed)
-        lines.append("always_expand = [" + ", ".join(_toml_value(x) for x in cfg.always_expand) + "]")
-    if cfg.show_snapshots:                      # default off (snapshots hidden in /load)
-        lines.append("show_snapshots = true")
-    lines += [
-        f"temperature = {cfg.temperature}",
-        f"top_p = {cfg.top_p}",
-        f"top_k = {cfg.top_k}",
-        f"repeat_penalty = {cfg.repeat_penalty}",
-        f"ask_user_to_run = {str(cfg.ask_user_to_run).lower()}",
-        f"autosave = {str(cfg.autosave).lower()}",
-        f"command_timeout = {cfg.command_timeout}",
-        f"bg_max_concurrent = {cfg.bg_max_concurrent}",
-        f"worker_max_concurrent = {cfg.worker_max_concurrent}",
-        f"worker_idle_timeout = {cfg.worker_idle_timeout}",
-        f"worker_max_iterations = {cfg.worker_max_iterations}",
-    ]
+    # Every other registry scalar in one pass (always-fields + changed-from-default).
+    lines += _emit_scalars(cfg)
     # leash is deliberately EPHEMERAL - it is NOT persisted. /leash is a runtime-only
     # ceiling (see the load path, which also treats it as runtime-only): a fresh launch
     # must default to the full surface (rwe), never silently boot chat-only/read-only
     # because some earlier session narrowed the leash and then any unrelated setting
     # change snapshotted it to disk. Pass --leash / --chat-only to start narrowed.
     # incognito is ephemeral too (persisting it would be a local trace).
-    if cfg.approval != "ask":              # default is ask; persist a non-default cadence
-        lines.append(f'approval = "{cfg.approval}"')
-    if cfg.confirm_reads:
-        lines.append("confirm_reads = true")
-    if cfg.auto_reconnect:
-        lines.append("auto_reconnect = true")
-    if cfg.ephemeral:                         # default off; persist an opt-IN (always-wipe)
-        lines.append("ephemeral = true")
-    if not cfg.statusline:                    # default on; persist only when turned off
-        lines.append("statusline = false")
-    if cfg.statusline_every != 1:             # default 1 (every prompt); persist if changed
-        lines.append(f"statusline_every = {cfg.statusline_every}")
-    if cfg.statusline_iter != 0:              # default 0 (off); persist if changed
-        lines.append(f"statusline_iter = {cfg.statusline_iter}")
-    if cfg.auto_update:                       # default off; persist an opt-IN
-        lines.append("auto_update = true")
-    if cfg.update_track != "stable":          # default stable; persist a non-default track
-        lines.append(f'update_track = "{cfg.update_track}"')
-    if cfg.editor:
-        lines.append(f'editor = "{cfg.editor}"')
-    if cfg.user_name and cfg.user_name != "operator":
-        lines.append(f'user_name = "{cfg.user_name}"')
-    if cfg.lean_tools_dir:
-        lines.append(f'lean_tools_dir = "{cfg.lean_tools_dir}"')
+    # Bespoke COLLECTIONS (not scalars, so not in _emit_scalars):
+    if cfg.always_expand:                       # default = [] (diffs stay collapsed)
+        lines.append("always_expand = [" + ", ".join(_toml_value(x) for x in cfg.always_expand) + "]")
+    if cfg.show_snapshots:                      # default off (snapshots hidden in /load)
+        lines.append("show_snapshots = true")
     if cfg.lean_tools_enabled:
         lines.append("lean_tools_enabled = ["
                      + ", ".join(f'"{p}"' for p in cfg.lean_tools_enabled) + "]")
-    if cfg.providers_dir:
-        lines.append(f'providers_dir = "{cfg.providers_dir}"')
     if cfg.mcp_enabled:
         lines.append("mcp_enabled = ["
                      + ", ".join(f'"{p}"' for p in cfg.mcp_enabled) + "]")
