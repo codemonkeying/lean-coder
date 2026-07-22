@@ -15,14 +15,14 @@ schemas, truncated tool results. See README.md.
   L2775   Composer (pinned input line, editor, stdin)
   L3625   Token accounting (calibrated context meter)
   L3790   Config (dataclass, field registry, load/save)
-  L6288   Tool execution + text tool-call parsing
-  L6709   Remote workspace (executor client, /connect)
-  L8274   Context meter
-  L8369   Agent (turn loop, context mgmt, tool dispatch)
-  L14031  Slash-command handlers + dispatch table
-  L14143  REPL (interactive loop, session resume)
-  L14515  Worker agent (headless --agent-run)
-  L14828  Entry (CLI arg parsing, main)
+  L6296   Tool execution + text tool-call parsing
+  L6717   Remote workspace (executor client, /connect)
+  L8282   Context meter
+  L8377   Agent (turn loop, context mgmt, tool dispatch)
+  L14050  Slash-command handlers + dispatch table
+  L14162  REPL (interactive loop, session resume)
+  L14534  Worker agent (headless --agent-run)
+  L14847  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -3935,11 +3935,18 @@ class Config:
                                      # model pulls the same lever /handover does, then its
                                      # self-prompt is fed back to it). See cost-reduction-roadmap.
     compact_soft: float = 0.70       # soft zone start, as a fraction of the context window:
-                                     # nudge the model to wrap up + compact at a clean break
+                                     # nudge the model to wrap up + compact at a clean break.
+                                     # DERIVED, don't set directly: a /set of compact_hard (or
+                                     # compact_gap) recomputes soft = hard - compact_gap. Set it
+                                     # explicitly only to decouple the two.
     compact_hard: float = 0.90       # hard threshold: force a compact at a clean boundary
                                      # (respects the min-interval loop guard). 0.90 (down from
                                      # 0.95) gives the summarizing turn headroom before the
-                                     # window backstop beheads the prefix.
+                                     # window backstop beheads the prefix. This is the ONE knob
+                                     # to move both zones: /set compact_hard slides soft with it.
+    compact_gap: float = 0.20        # spread below compact_hard where the soft zone opens
+                                     # (soft = hard - gap). One lever moves the pair together;
+                                     # widen/narrow this to change how early the soft nudge fires.
     compact_emergency: float = 1.00  # emergency stop: compact regardless, bypassing the clean
                                      # boundary AND the loop guard (about to overflow the window)
     compact_min_interval: float = 60.0  # loop guard: min seconds between compactions (~1/min),
@@ -4242,6 +4249,7 @@ _SCALAR_FIELDS = (
     ("auto_compact",              True,                False),
     ("compact_soft",              0.70,                False),
     ("compact_hard",              0.90,                False),
+    ("compact_gap",               0.20,                False),
     ("compact_emergency",         1.00,                False),
     ("compact_min_interval",      60.0,                False),
     ("autostart_after_compact",   True,                False),
@@ -11025,8 +11033,9 @@ _SETTINGS_FIELDS = [
     ("window_messages", "send-window size in messages (0 = off, full history)", "int"),
     ("window_tokens", "send-window token cap: 'auto' (=ctx-reserve, default), an int (hard cap), or 0 (off)", "int_or_auto"),
     ("auto_compact", "auto-compact (self-managing context)", "bool"),
-    ("compact_soft", "compact soft-zone start (fraction of ctx)", "float"),
-    ("compact_hard", "compact hard threshold (fraction of ctx)", "float"),
+    ("compact_soft", "compact soft-zone start (fraction of ctx; derived from hard-gap unless set)", "float"),
+    ("compact_hard", "compact hard threshold (fraction of ctx; slides soft with it, one lever)", "float"),
+    ("compact_gap", "spread below hard where the soft zone opens (soft = hard - gap)", "float"),
     ("compact_emergency", "compact emergency threshold (fraction of ctx)", "float"),
     ("auto_num_ctx", "ollama: detect num_ctx at startup", "bool"),
     ("gen_connect_timeout", "ollama: TCP connect deadline (s)", "float"),
@@ -11103,12 +11112,22 @@ def _set_setting_field(agent, cfg, key, raw, scope="session"):
         # ask_user_to_run adds/removes a tool, so the live surface must rebuild too.
         if key == "ask_user_to_run" and agent is not None:
             agent.refresh_tools()
-    # Record where the value belongs in the DEFAULTS/OVERRIDE layer.
-    if scope == "config":
-        cfg._defaults[key] = getattr(cfg, key)   # the new config.toml default
-        cfg.session_overrides.pop(key, None)      # let the new default show through
-    else:
-        cfg.session_overrides[key] = getattr(cfg, key)  # per-session override
+    # Record where a key's value belongs in the DEFAULTS/OVERRIDE layer.
+    def _record(k):
+        if scope == "config":
+            cfg._defaults[k] = getattr(cfg, k)    # the new config.toml default
+            cfg.session_overrides.pop(k, None)     # let the new default show through
+        else:
+            cfg.session_overrides[k] = getattr(cfg, k)  # per-session override
+    _record(key)
+    # One lever for the pair: setting the hard threshold (or the gap) slides the soft
+    # zone with it (soft = hard - gap), recorded in the SAME scope so it persists/overrides
+    # together. A direct /set compact_soft still wins - it just runs _record(key) above and
+    # skips this, decoupling the two until the next hard/gap set.
+    if key in ("compact_hard", "compact_gap"):
+        soft = round(max(0.0, cfg.compact_hard - cfg.compact_gap), 4)
+        cfg.compact_soft = soft
+        _record("compact_soft")
     return True
 
 

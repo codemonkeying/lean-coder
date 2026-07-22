@@ -1172,7 +1172,7 @@ _nondefault = {
     "auto_reconnect": True, "statusline": False, "statusline_every": 3, "statusline_iter": 20,
     "window_messages": 12, "window_tokens": 4000,
     "auto_compact": False,
-    "compact_soft": 0.42, "compact_hard": 0.61, "compact_emergency": 0.99,
+    "compact_soft": 0.42, "compact_hard": 0.61, "compact_gap": 0.15, "compact_emergency": 0.99,
     "compact_min_interval": 33.0, "autostart_after_compact": False,
     "compact_keep": 5,
     "auto_trim_interval": 8, "auto_trim_hysteresis": 0.4, "auto_trim_keep": 6,
@@ -1195,6 +1195,21 @@ _rt_bad = [k for k in lc._PERSISTED_SCALAR_KEYS
            if k != "model" and getattr(_loaded, k) != _nondefault[k]]
 check("config: every persisted scalar round-trips save -> load", not _rt_bad,
       f"dropped/changed: {_rt_bad}")
+
+# 10c-bis. compact_hard/compact_gap drive compact_soft (one lever moves the pair;
+# a direct compact_soft set decouples). Uses _set_setting_field, session scope.
+_cg = lc.Config()
+lc._set_setting_field(None, _cg, "compact_hard", "0.80", scope="session")
+check("compact: /set compact_hard slides soft (soft = hard - gap)",
+      abs(_cg.compact_soft - 0.60) < 1e-9 and "compact_soft" in _cg.session_overrides,
+      f"soft={_cg.compact_soft}, overrides={sorted(_cg.session_overrides)}")
+lc._set_setting_field(None, _cg, "compact_gap", "0.30", scope="session")
+check("compact: /set compact_gap re-derives soft from hard",
+      abs(_cg.compact_soft - 0.50) < 1e-9, f"soft={_cg.compact_soft}")
+lc._set_setting_field(None, _cg, "compact_soft", "0.42", scope="session")
+check("compact: direct /set compact_soft decouples (hard unchanged)",
+      abs(_cg.compact_soft - 0.42) < 1e-9 and abs(_cg.compact_hard - 0.80) < 1e-9,
+      f"soft={_cg.compact_soft} hard={_cg.compact_hard}")
 
 # 10d. queue-drain 3-way choice (default combine)
 check("_drain_choice: s -> separate", lc._drain_choice("s") == "separate"
