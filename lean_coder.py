@@ -7,22 +7,22 @@ schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
   L866    Lean-tools (plugin tools: discovery, manager)
-  L1198   MCP client (connection, manager, OAuth, discovery)
-  L1665   Providers (backend plugin registry)
-  L1887   Interactive pickers + menus (raw-mode UI engine)
-  L2236   Terminal styling (colors, formatting helpers)
-  L2433   Streaming + markdown render (model output)
-  L2780   Composer (pinned input line, editor, stdin)
-  L3630   Token accounting (calibrated context meter)
-  L3795   Config (dataclass, field registry, load/save)
-  L6293   Tool execution + text tool-call parsing
-  L6714   Remote workspace (executor client, /connect)
-  L8279   Context meter
-  L8374   Agent (turn loop, context mgmt, tool dispatch)
-  L14036  Slash-command handlers + dispatch table
-  L14148  REPL (interactive loop, session resume)
-  L14520  Worker agent (headless --agent-run)
-  L14833  Entry (CLI arg parsing, main)
+  L1206   MCP client (connection, manager, OAuth, discovery)
+  L1660   Providers (backend plugin registry)
+  L1882   Interactive pickers + menus (raw-mode UI engine)
+  L2231   Terminal styling (colors, formatting helpers)
+  L2428   Streaming + markdown render (model output)
+  L2775   Composer (pinned input line, editor, stdin)
+  L3625   Token accounting (calibrated context meter)
+  L3790   Config (dataclass, field registry, load/save)
+  L6288   Tool execution + text tool-call parsing
+  L6709   Remote workspace (executor client, /connect)
+  L8274   Context meter
+  L8369   Agent (turn loop, context mgmt, tool dispatch)
+  L14031  Slash-command handlers + dispatch table
+  L14143  REPL (interactive loop, session resume)
+  L14515  Worker agent (headless --agent-run)
+  L14828  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -995,33 +995,41 @@ class LeanToolManager:
         return self.lean_tools.get(name)
 
 
-def _lean_tools_dir(cfg):
-    return cfg.lean_tools_dir or str(CONFIG_PATH.parent / "lean-tools")
-
-
-def _bundled_lean_tools_dir():
-    """The code-relative lean-tools dir (bundled with the code, like providers/).
-    Holds bundled BUILTIN tools - e.g. read_file..run_command. None when absent
-    (e.g. a bare checkout without it)."""
-    d = Path(__file__).resolve().parent / "lean-tools"
+def _bundled_dir(name):
+    """The code-relative plugin dir bundled with the code (e.g. 'lean-tools',
+    'providers'). Holds the shipped builtins; None when absent (a bare checkout)."""
+    d = Path(__file__).resolve().parent / name
     return d if d.is_dir() else None
 
 
-def _lean_tools_dirs(cfg):
-    """Lean-tool search path, in order: the bundled dir first, then the user dir.
-    First file to claim a tool name wins, so a user drop-in can't shadow a bundled tool.
-    Mirrors _provider_dirs EXACTLY - tools and providers now discover the same way: the
-    driver scans both the code-relative bundled dir (lean-tools/, bundled with the code)
-    and cfg.lean_tools_dir. (builtins.py is the one exception - it's loaded directly by
-    _load_builtins() and skipped by the manager scan; see LeanToolManager._load_dir.)"""
+def _plugin_dirs(bundled_name, user_dir):
+    """Plugin search path for a bundled+user pair, in order: the bundled dir first,
+    then the user dir. First file to claim a name wins, so a user drop-in can't
+    silently shadow a bundled plugin. Shared by lean-tools and providers - they
+    discover identically."""
     dirs = []
-    bundled = _bundled_lean_tools_dir()
+    bundled = _bundled_dir(bundled_name)
     if bundled:
         dirs.append(bundled)
-    user = Path(_lean_tools_dir(cfg))
+    user = Path(user_dir)
     if user not in dirs:
         dirs.append(user)
     return dirs
+
+
+def _lean_tools_dir(cfg):
+    return cfg.lean_tools_dir or str(CONFIG_DIR / "lean-tools")
+
+
+def _bundled_lean_tools_dir():
+    """Code-relative lean-tools dir (bundled BUILTIN tools, e.g. read_file..run_command).
+    builtins.py is loaded directly by _load_builtins() and skipped by the manager scan;
+    see LeanToolManager._load_dir."""
+    return _bundled_dir("lean-tools")
+
+
+def _lean_tools_dirs(cfg):
+    return _plugin_dirs("lean-tools", _lean_tools_dir(cfg))
 
 
 # ----------------------------------------------------------------------------
@@ -1640,25 +1648,12 @@ def _providers_dir(cfg):
 
 
 def _bundled_providers_dir():
-    """The code-relative providers dir (bundled with the code, like lean-tools).
-    Holds bundled providers - e.g. ollama, the default backend. None when absent
-    (e.g. a bare checkout without it)."""
-    d = Path(__file__).resolve().parent / "providers"
-    return d if d.is_dir() else None
+    """Code-relative providers dir (bundled providers, e.g. ollama, the default backend)."""
+    return _bundled_dir("providers")
 
 
 def _provider_dirs(cfg):
-    """Provider-plugin search path, in order: the bundled canon dir first, then the
-    user dir. First file to claim a name wins, so a user drop-in can't silently shadow
-    a bundled provider (e.g. ollama)."""
-    dirs = []
-    bundled = _bundled_providers_dir()
-    if bundled:
-        dirs.append(bundled)
-    user = Path(_providers_dir(cfg))
-    if user not in dirs:
-        dirs.append(user)
-    return dirs
+    return _plugin_dirs("providers", _providers_dir(cfg))
 
 
 # ==========================================================================
