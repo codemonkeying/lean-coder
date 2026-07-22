@@ -15,14 +15,14 @@ schemas, truncated tool results. See README.md.
   L2775   Composer (pinned input line, editor, stdin)
   L3625   Token accounting (calibrated context meter)
   L3790   Config (dataclass, field registry, load/save)
-  L6296   Tool execution + text tool-call parsing
-  L6717   Remote workspace (executor client, /connect)
-  L8282   Context meter
-  L8377   Agent (turn loop, context mgmt, tool dispatch)
-  L14050  Slash-command handlers + dispatch table
-  L14162  REPL (interactive loop, session resume)
-  L14534  Worker agent (headless --agent-run)
-  L14847  Entry (CLI arg parsing, main)
+  L6301   Tool execution + text tool-call parsing
+  L6722   Remote workspace (executor client, /connect)
+  L8287   Context meter
+  L8382   Agent (turn loop, context mgmt, tool dispatch)
+  L14055  Slash-command handlers + dispatch table
+  L14167  REPL (interactive loop, session resume)
+  L14539  Worker agent (headless --agent-run)
+  L14852  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -2252,11 +2252,11 @@ def _pct_color(pct):
 
 
 def _zone_color(zone):
-    """Colour for a context-budget zone (see ContextMeter.zone). When auto-handover is
+    """Colour for a context-budget zone (see ContextMeter.zone). When auto-compaction is
     on, the ctx meter colours by the zone that actually drives behaviour - soft (nudge)
-    -> yellow, hard/emergency (forced handover) -> red - instead of raw % of the max
-    window, which is misleading when the handover threshold is well below 100% (e.g.
-    compact_hard=0.25 forces a handover while a %-of-max meter still reads calm blue)."""
+    -> yellow, hard/emergency (forced compaction) -> red - instead of raw % of the max
+    window, which is misleading when the compaction threshold is well below 100% (e.g.
+    compact_at=0.25 forces a compaction while a %-of-max meter still reads calm blue)."""
     return {"ok": blue, "soft": yellow, "hard": red, "emergency": red}.get(zone, blue)
 
 
@@ -3936,16 +3936,17 @@ class Config:
                                      # self-prompt is fed back to it). See cost-reduction-roadmap.
     compact_soft: float = 0.70       # soft zone start, as a fraction of the context window:
                                      # nudge the model to wrap up + compact at a clean break.
-                                     # DERIVED, don't set directly: a /set of compact_hard (or
-                                     # compact_gap) recomputes soft = hard - compact_gap. Set it
-                                     # explicitly only to decouple the two.
-    compact_hard: float = 0.90       # hard threshold: force a compact at a clean boundary
-                                     # (respects the min-interval loop guard). 0.90 (down from
-                                     # 0.95) gives the summarizing turn headroom before the
-                                     # window backstop beheads the prefix. This is the ONE knob
-                                     # to move both zones: /set compact_hard slides soft with it.
-    compact_gap: float = 0.20        # spread below compact_hard where the soft zone opens
-                                     # (soft = hard - gap). One lever moves the pair together;
+                                     # DERIVED, don't set directly: a /set of compact_at (or
+                                     # compact_gap) recomputes soft = compact_at - compact_gap.
+                                     # Set it explicitly only to decouple the two (advanced).
+    compact_at: float = 0.90         # THE user lever: fill fraction at which a compaction is
+                                     # forced at a clean boundary (respects the min-interval loop
+                                     # guard). 0.90 gives the summarizing turn headroom before the
+                                     # window backstop beheads the prefix. Moving this slides the
+                                     # soft zone with it (soft = compact_at - compact_gap). Was
+                                     # compact_hard <=0.9.4 (aliased on load for back-compat).
+    compact_gap: float = 0.20        # advanced: spread below compact_at where the soft zone opens
+                                     # (soft = compact_at - gap). One lever moves the pair together;
                                      # widen/narrow this to change how early the soft nudge fires.
     compact_emergency: float = 1.00  # emergency stop: compact regardless, bypassing the clean
                                      # boundary AND the loop guard (about to overflow the window)
@@ -4126,7 +4127,7 @@ class Config:
         return {
             "auto":      pick("auto",      "auto_compact",            self.auto_compact),
             "soft":      pick("soft",      "compact_soft",            self.compact_soft),
-            "hard":      pick("hard",      "compact_hard",            self.compact_hard),
+            "hard":      pick("hard",      "compact_at",              self.compact_at),
             "autostart": pick("autostart", "autostart_after_compact", self.autostart_after_compact),
         }
 
@@ -4248,7 +4249,7 @@ _SCALAR_FIELDS = (
     ("window_tokens",             "auto",              False),
     ("auto_compact",              True,                False),
     ("compact_soft",              0.70,                False),
-    ("compact_hard",              0.90,                False),
+    ("compact_at",                0.90,                False),
     ("compact_gap",               0.20,                False),
     ("compact_emergency",         1.00,                False),
     ("compact_min_interval",      60.0,                False),
@@ -4337,6 +4338,10 @@ def load_config(args) -> Config:
             file_vals = tomllib.loads(CONFIG_PATH.read_text())
         except Exception as e:
             print(yellow(f"warning: could not parse {CONFIG_PATH}: {e}"))
+    # Back-compat: compact_hard was renamed to compact_at (>0.9.4). A config still
+    # carrying the old key maps onto the new field, unless the new key is also present.
+    if "compact_hard" in file_vals and "compact_at" not in file_vals:
+        file_vals["compact_at"] = file_vals["compact_hard"]
     for key in _PERSISTED_SCALAR_KEYS + ("composer",):  # composer: read-only (see _EPHEMERAL_KEYS)
         if key in file_vals:
             setattr(cfg, key, file_vals[key])
@@ -9908,7 +9913,7 @@ class Agent:
         kind = "elective compaction (clean break)" if elected and not forced else "auto-compact"
         print(yellow(f"  {GLYPH['warn']} context {used:,}/{limit:,} ({pct}%, {zone}) - "
                      f"{kind} (summarizing + resetting the cache prefix)…")
-              + dim("  (change: /set compact_hard)"))
+              + dim("  (change: /set compact_at)"))
         if self.auto_compact(zone) is None:
             # The agentic summary failed (model couldn't produce a usable summary -
             # common when history already overflows the window so the summarizing turn
@@ -11033,9 +11038,9 @@ _SETTINGS_FIELDS = [
     ("window_messages", "send-window size in messages (0 = off, full history)", "int"),
     ("window_tokens", "send-window token cap: 'auto' (=ctx-reserve, default), an int (hard cap), or 0 (off)", "int_or_auto"),
     ("auto_compact", "auto-compact (self-managing context)", "bool"),
-    ("compact_soft", "compact soft-zone start (fraction of ctx; derived from hard-gap unless set)", "float"),
-    ("compact_hard", "compact hard threshold (fraction of ctx; slides soft with it, one lever)", "float"),
-    ("compact_gap", "spread below hard where the soft zone opens (soft = hard - gap)", "float"),
+    ("compact_at", "compact at this fill fraction of ctx (THE lever; soft auto-follows)", "float"),
+    ("compact_soft", "advanced: soft-zone start (derived from compact_at - gap unless set)", "float"),
+    ("compact_gap", "advanced: spread below compact_at where the soft zone opens (soft = at - gap)", "float"),
     ("compact_emergency", "compact emergency threshold (fraction of ctx)", "float"),
     ("auto_num_ctx", "ollama: detect num_ctx at startup", "bool"),
     ("gen_connect_timeout", "ollama: TCP connect deadline (s)", "float"),
@@ -11120,12 +11125,12 @@ def _set_setting_field(agent, cfg, key, raw, scope="session"):
         else:
             cfg.session_overrides[k] = getattr(cfg, k)  # per-session override
     _record(key)
-    # One lever for the pair: setting the hard threshold (or the gap) slides the soft
-    # zone with it (soft = hard - gap), recorded in the SAME scope so it persists/overrides
+    # One lever for the pair: setting compact_at (or the gap) slides the soft zone with it
+    # (soft = compact_at - gap), recorded in the SAME scope so it persists/overrides
     # together. A direct /set compact_soft still wins - it just runs _record(key) above and
-    # skips this, decoupling the two until the next hard/gap set.
-    if key in ("compact_hard", "compact_gap"):
-        soft = round(max(0.0, cfg.compact_hard - cfg.compact_gap), 4)
+    # skips this, decoupling the two until the next compact_at/gap set.
+    if key in ("compact_at", "compact_gap"):
+        soft = round(max(0.0, cfg.compact_at - cfg.compact_gap), 4)
         cfg.compact_soft = soft
         _record("compact_soft")
     return True
