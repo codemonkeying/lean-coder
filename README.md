@@ -537,8 +537,10 @@ rotting.
   turns are kept verbatim (`compact_keep`, default 3; tool payloads in that tail are
   stubbed so it stays cheap); the emergency overflow path uses a hardcoded minimal
   backstop. All thresholds are tunable per model via `/set` (`compact_soft`,
-  `compact_hard`, `compact_emergency`, `compact_keep`, `auto_compact`,
-  `autostart_after_compact`), and the prompts themselves are editable.
+  `compact_hard`, `compact_gap`, `compact_emergency`, `compact_keep`, `auto_compact`,
+  `autostart_after_compact`), and the prompts themselves are editable. `compact_hard`
+  is the single lever: setting it (or `compact_gap`, the spread below it) slides the
+  soft zone with it (`soft = hard - gap`); set `compact_soft` directly to decouple them.
 - **Autonomous wake on background finish (off by default).** With
   `wake_on_bg_finish = true` (via `/set`), a finished background task or worker
   wakes the agent with a synthesised turn so it reacts to the result with no operator
