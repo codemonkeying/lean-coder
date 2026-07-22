@@ -14112,6 +14112,30 @@ def _input_or_wake(prompt, wake_check=None, tick=0.25):
             return woke
 
 
+def _resume_into(agent, cfg, name):
+    """Load session `name` into `agent` and make it the live, autosaving session:
+    restore backend/model/perms + messages, claim the name + its lock, reconnect any
+    remote, and echo the tail. Returns (turns_restored, meta). Raised errors
+    (FileNotFoundError / OSError / json.JSONDecodeError) propagate to the caller, which
+    decides how to report a miss. This is the shared core of BOTH resume paths (explicit
+    --resume and auto-load-last) so the two can't drift - only the pre-checks and the
+    'resumed ...' wording differ, and those stay at each call site."""
+    data = load_session(name)
+    meta = data.get("meta", {})
+    _restore_session_state(agent, cfg, meta)      # backend/model/perms
+    msgs = data.get("messages", [])
+    n = agent.restore(msgs)
+    # Continue IN the resumed session (named or auto-): further work autosaves back into
+    # it, so it stays current instead of forking to a new auto- name. Claim its lock now
+    # so the first autosave owns it (incognito leaves no on-disk trace, so never locks).
+    agent.autosave_name = _session_name_ok(name)
+    if not cfg.incognito:
+        _write_lock(agent.autosave_name)
+    _maybe_reconnect(agent, cfg, meta)
+    _print_session_tail(msgs)
+    return n, meta
+
+
 def repl(cfg: Config, resume=None):
     global _active_agent
     agent = Agent(cfg)
@@ -14210,18 +14234,7 @@ def repl(cfg: Config, resume=None):
         try:
             if not _take_over_or_fork(resume):
                 raise FileNotFoundError  # decline -> fall through to a clean start
-            data = load_session(resume)
-            meta = data.get("meta", {})
-            _restore_session_state(agent, cfg, meta)  # backend/model/perms
-            msgs = data.get("messages", [])
-            n = agent.restore(msgs)
-            # Continue IN the resumed session (named or auto-): further work autosaves
-            # back into it, so it stays current instead of forking to a new auto- name.
-            agent.autosave_name = _session_name_ok(resume)
-            if not cfg.incognito:
-                _write_lock(agent.autosave_name)   # claim it now (take-over is real)
-            _maybe_reconnect(agent, cfg, meta)
-            _print_session_tail(msgs)
+            n, _meta = _resume_into(agent, cfg, resume)
             print(yellow(f"  resumed '{_session_name_ok(resume)}' ({n} turns) - "
                          f"/clear for a fresh one, /load to switch.") + "\n")
             resumed = True
@@ -14256,17 +14269,7 @@ def repl(cfg: Config, resume=None):
         elif cand:
             last = cand[0]
             try:
-                data = load_session(last)
-                meta = data.get("meta", {})
-                _restore_session_state(agent, cfg, meta)
-                msgs = data.get("messages", [])
-                n = agent.restore(msgs)
-                # Continue IN the resumed session (named or auto-) so it stays current;
-                # claim its lock now so the first autosave owns it.
-                agent.autosave_name = _session_name_ok(last)
-                _write_lock(agent.autosave_name)
-                _maybe_reconnect(agent, cfg, meta)
-                _print_session_tail(msgs)
+                n, meta = _resume_into(agent, cfg, last)
                 other = meta.get("cwd")
                 cwd_note = f"  (last used in {other})" if other and other != here else ""
                 print(yellow(f"  resumed last session '{last}' ({n} turns) - "
