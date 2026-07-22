@@ -9,7 +9,7 @@
 ![Core dependencies: none](https://img.shields.io/badge/core%20dependencies-none%20(stdlib%20only)-brightgreen.svg)
 ![Baseline overhead: ~2.5k tokens](https://img.shields.io/badge/baseline%20overhead-~2.5k%20tokens-orange.svg)
 
-[Install](#install) &middot; [Quick start](#quick-start) &middot; [Why it exists](#why-it-exists) &middot; [Providers](#providers-pick-a-model-backend) &middot; [Safety](#safety-two-axes) &middot; [Tools](#tools) &middot; [Handover](#handover-the-agent-documents-its-work-before-a-memory-wipe)
+[Install](#install) &middot; [Quick start](#quick-start) &middot; [Why it exists](#why-it-exists) &middot; [Providers](#providers-pick-a-model-backend) &middot; [Safety](#safety-two-axes) &middot; [Tools](#tools) &middot; [Compact](#compact-the-agent-documents-its-work-before-a-memory-wipe)
 
 ![lean-coder auditing and fixing a real bug on a local model](demos/demo.gif)
 
@@ -194,9 +194,9 @@ actual code. lean-coder treats context as the scarce resource it is:
   lean-coder is a generic MCP client too (see below). The difference is you pay that
   cost only for what you deliberately add.
 - **Truncated results** - a single big file read or noisy command can't blow the budget.
-- **Layered context management** - documented handover (automatic, on by default)
-  plus opt-in continuous eviction and periodic compaction, reclaiming space mid-task
-  without losing the thread (`/compact` and `/handover` are the manual levers). More below.
+- **Layered context management** - documented compaction (automatic, on by default)
+  plus ingestion-time output caps, reclaiming space mid-task
+  without losing the thread (`/compact` and `/trim` are the manual levers). More below.
 
 The payoff: it stays usable on **small local models**, not just frontier hosted
 ones. The tools are deliberately small and few, because that is what a 7B-30B model
@@ -218,15 +218,15 @@ can drive reliably.
   just works against `localhost:11434`); drop your own file in to talk to any other
   backend, and `/model` lists models across every enabled provider and switches in
   one step.
-- **Self-managing context via handover (on by default).** The standout feature and a
+- **Self-managing context via compaction (on by default).** The standout feature and a
   main reason this exists: rather than blindly truncating, the agent *documents its
   own work before a memory wipe*. As context fills (a **soft ~70%** nudge, a **hard
-  ~95%** force, an **emergency ~100%** stop) it commits durable docs to disk, writes a
-  handover to its future self, **pins a goal + TODO that survive the wipe**, and leaves
-  a self-prompt, then wipes and, by default, **auto-continues the same task from a
+  ~90%** force, an **emergency ~100%** stop) it commits durable docs to disk, writes a
+  summary for its future self, **pins a goal + TODO that survive the wipe**, and leaves
+  a self-prompt, then compacts and, by default, **auto-continues the same task from a
   clean slate** via that self-prompt. So a long-running job keeps going far past the
   window, with documentation that never goes stale and a plan that never gets lost.
-  `/compact` complements it for lighter trimming. (More below.)
+  `/trim` complements it for lighter, no-LLM stubbing. (More below.)
 - **Two independent safety axes:** a capability ceiling (`/leash`) and a confirm
   cadence (`/approve`) that compose from supervised editing to full autonomy. See
   [Safety](#safety-two-axes) below.
@@ -250,7 +250,7 @@ can drive reliably.
   without starting over: drive a local Ollama for the cheap steps, jump to a
   frontier model for the hard one, and back.
 - **Nothing happens off-screen.** `/activity` replays what the system did on its own -
-  compaction, handover, model fallback, eviction), so the automatic context
+  compaction, trim, model fallback, ingestion caps, so the automatic context
   management is auditable, not magic.
 - **Updates and spreads itself.** `/update` self-updates the script to the latest
   published build (`stable` or `beta` track; `auto_update` checks at launch), and
@@ -492,50 +492,56 @@ conflict marker in the file.
 - **Budget meter:** after each turn a context-token figure (the real count from the
   provider when available, else an estimate) prints against the window, colored as it
   climbs. `/ctx` and `/usage` report it on demand.
-- **`/compact [keep]`:** trims old tool results (file dumps, command output) to
-  one-line stubs, keeping the newest `keep` in full. The lighter tool, reclaiming the
-  biggest context consumer without touching the conversation or any edits.
+- **`/trim [keep]`:** stubs old tool results (file dumps, command output) to
+  one-line placeholders, keeping the newest `keep` in full. No LLM call. The lighter
+  lever, reclaiming the biggest context consumer without touching the conversation or
+  any edits. Fires manually or, in an emergency, automatically.
 
-### Handover: the agent documents its work before a memory wipe
+### Compact: the agent documents its work before a memory wipe
 
-Handover is separate from compaction and is the feature that keeps a long-running
-task alive. The insight: **the agent knows what's in its own head**, so the sensible
-moment to update documentation is *right before* that memory is wiped, not after
-it's already gone stale.
+Compaction is the feature that keeps a long-running task alive. The insight: **the
+agent knows what's in its own head**, so the sensible moment to update documentation
+is *right before* that memory is compacted, not after it's already gone stale.
 
-On `/handover` (or automatically, see below) the model gets a full tool-capable
-turn to:
+On `/compact` (or automatically, see below) the model gets a full tool-capable turn
+to:
 
 1. **Persist durable docs.** Update whatever the project already uses (a design doc,
-   README, `HANDOVER.md`, notes) with its current understanding, and commit them if
-   the project is already a git repo.
-2. **Write a handover to its future self.** The goal, key decisions, current state
+   README, notes) with its current understanding, and commit them if the project is
+   already a git repo.
+2. **Write a summary for its future self.** The goal, key decisions, current state
    (done / in progress / next), *where* the durable docs live, and a prompt to
    continue from.
 3. **Pin a goal + TODO** that survives the wipe.
 4. **Write a self-prompt.** The single next instruction.
 
-The conversation is then replaced with just that handover block, a "smart `/clear`"
-that keeps the thread; and, unless disabled, the self-prompt is **fed straight back
-in as the next turn**, so the agent continues the same task from a clean slate (a
-5-second `^C`-to-cancel beat precedes it). Durable state lives on disk and in the
-pinned plan; the context window resets. That's how a task outruns the window while
-its documentation stays current instead of rotting.
+The older conversation is then replaced with just that summary block (the most recent
+turns are kept verbatim), a "smart `/clear`" that keeps the thread; and, unless
+disabled, the self-prompt is **fed straight back in as the next turn**, so the agent
+continues the same task from a clean slate (a 5-second `^C`-to-cancel beat precedes
+it). Durable state lives on disk and in the pinned plan; the context window resets.
+That's how a task outruns the window while its documentation stays current instead of
+rotting.
 
-- **Continuous eviction (`auto_evict`).** The lightest, always-quietest lever: each
-  agentic round, the bodies of tool results the model has *already acted on* are
-  stubbed out, keeping the last few (`auto_evict_keep`, default 3) verbatim. The
-  in-flight batch is never touched. Since the whole history is re-sent every round,
-  shrinking spent results shrinks every later call, so a long tool-heavy turn stops
-  paying for stale output. `auto_compact` does the same on a token interval as a
-  one-shot strip; `/compact` is the manual version.
+(Note: "handover" is reserved for a future feature that transfers a live session to
+another model or human; today's self-shrinking behaviour is `/compact`.)
+
+- **Ingestion-time output caps.** Every tool result passes through one cap on the way
+  in: a runaway `mcp.call` or lean-tool result is sized to a share of the free window
+  (head + tail kept, middle marked) so no single result can blow the context, with a
+  loud notice to both you and the model when it truncates. Results are born small
+  rather than clawed back later.
 - **Self-managing (on by default).** As context fills, the agent manages it in tiers:
   a **soft zone** (~70% of the window) where it's nudged to wrap up at a *clean break*
-  and hand over tidily; a **hard threshold** (~95%) that forces a handover at a
+  and compact tidily; a **hard threshold** (~90%) that forces a compaction at a
   boundary; and an **emergency** stop (~100%) that compacts immediately. A loop guard
-  (~1/min) stops a compact->continue->compact spin. All thresholds are tunable per
-  model via `/set` (`handover_soft`, `handover_hard`, `handover_emergency`,
-  `auto_handover`, `autostart_after_handover`), and the prompts themselves are editable.
+  boundary; and an **emergency** stop (~100%) that compacts immediately. A loop guard
+  (~1/min) stops a compact->continue->compact spin. After a compaction the last few
+  turns are kept verbatim (`compact_keep`, default 3; tool payloads in that tail are
+  stubbed so it stays cheap); the emergency overflow path uses a hardcoded minimal
+  backstop. All thresholds are tunable per model via `/set` (`compact_soft`,
+  `compact_hard`, `compact_emergency`, `compact_keep`, `auto_compact`,
+  `autostart_after_compact`), and the prompts themselves are editable.
 - **Autonomous wake on background finish (off by default).** With
   `wake_on_bg_finish = true` (via `/set`), a finished background task or worker
   wakes the agent with a synthesised turn so it reacts to the result with no operator
@@ -544,11 +550,11 @@ its documentation stays current instead of rotting.
   / `max_runtime` args, which wake the agent for *that* job even when the global
   setting is off. See LEAN_TOOLS.md for details.
 - **Bounded send-window (off by default).** For a very small local model, even the
-  handover flow can be too much history to hold. `window_messages = N` (via `/set`)
+  compaction flow can be too much history to hold. `window_messages = N` (via `/set`)
   caps each request to the last N messages, cut at a *whole-turn boundary* so the
   current task is never truncated, giving a hard token bound every turn, at the cost of the
   model seeing only recent turns. Most models are better served leaving this off and
-  letting handover manage size; reach for it on tight local windows.
+  letting compaction manage size; reach for it on tight local windows.
 
 ## Configuration
 
@@ -579,8 +585,8 @@ can't exhaust memory; pass `--num-ctx` to go higher explicitly.
 ```
 /clear             wipe conversation, stay in this session
 /new [name]        start a separate session
-/compact [keep]    stub old tool outputs, keep newest [keep] in full
-/handover          agent commits durable docs, writes a future-self handover, replaces history
+/trim [keep]       stub old tool outputs, keep newest [keep] in full (no LLM)
+/compact           agent commits durable docs, writes a future-self summary, replaces history
 /save [name]       name the current session
 /load [name]       resume a session (no arg = picker)
 /session           list | delete <name>
@@ -607,7 +613,7 @@ can't exhaust memory; pass `--num-ctx` to go higher explicitly.
 /bg [kill <pid>]   list/kill background tasks
 /ctx               context-token estimate
 /info              live session read-out
-/activity [n|all]  what the system did automatically (compaction, handover, fallback, …)
+/activity [n|all]  what the system did automatically (compaction, trim, fallback, …)
 /expand [N]        show a tool call's full (untruncated) args
 /help              list commands
 /quit              exit
@@ -623,7 +629,7 @@ numbered prompt when headless.
 ### Editable prompts
 
 `/prompt` opens the prompt files in your editor. The built-ins (`system` (the system
-prompt), `handover`, `auto_handover`, `handover_nudge`) can be tuned to taste and take
+prompt), `compact`, `auto_compact`, `compact_nudge`) can be tuned to taste and take
 effect live (`/prompt reset <name>` reverts to the baked default). Overrides live in
 `~/.config/leancoder/prompts/`.
 
