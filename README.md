@@ -523,9 +523,6 @@ it). Durable state lives on disk and in the pinned plan; the context window rese
 That's how a task outruns the window while its documentation stays current instead of
 rotting.
 
-(Note: "handover" is reserved for a future feature that transfers a live session to
-another model or human; today's self-shrinking behaviour is `/compact`.)
-
 - **Ingestion-time output caps.** Every tool result passes through one cap on the way
   in: a runaway `mcp.call` or lean-tool result is sized to a share of the free window
   (head + tail kept, middle marked) so no single result can blow the context, with a
