@@ -357,8 +357,19 @@ How it works (it piggybacks the background-task machinery, no new transport):
 
 - The model calls `dispatch_worker(task=..., [model=...], [provider=...], [cwd=...],
   [leash=...], [host=...])` to launch one. The same tool also manages workers via
-  `action`: `action='status'` reports dispatched workers, `action='cancel'` (with
-  `pid=...`) kills one; the default `action='dispatch'` launches from `task`.
+  `action`: `action='models'` lists the models you can dispatch on (per provider, so
+  you can pick a cheap leaf model without guessing an id), `action='status'` reports
+  dispatched workers, `action='cancel'` (with `pid=...`) kills one; the default
+  `action='dispatch'` launches from `task`.
+- **A worker does not self-compact.** Its context is deliberately *not* auto-managed
+  (`run_agent_brief` forces `auto_compact` off): a worker runs one scoped brief, so
+  the compaction/handover machinery - built for a long, evolving *driver* session -
+  does not apply. A worker that runs long simply hits its iteration cap and, rather
+  than lie, writes an `INCOMPLETE` result (or, with `worker_checkpoint` on, leaves a
+  transcript the driver can `action='resume'` with fresh budget). Checkpoint + resume
+  *is* the worker's equivalent of compaction: the driver, not the worker, decides to
+  extend it. So keep a worker's task scoped; hand a genuinely large job out as a DAG
+  of smaller tasks on a `board` instead of one worker that outgrows its window.
 - The tool writes a **brief file** (the task + a grant header) and launches
   `lean_coder --agent-run` as a detached background task tagged `kind="worker"`,
   with a **lease** (it self-terminates if this session stops attending it, so a
@@ -457,14 +468,21 @@ around the wrong database before anyone confirmed it). The driver is the schedul
   a worker is gated by the recursion governor (`worker_max_depth` x
   `worker_max_children`, both off by default); acting on files is gated by the leash
   (`r`/`rw`/`rwe`). So a `leash: r` scout can coordinate on the board yet neither
-  edit files nor spawn anyone. In the tool, `create`/`add`/`assign`/`block` are
+  edit files nor spawn anyone. In the tool, `create`/`add`/`assign` are
   **driver-only** (`worker_depth == 0`); a worker may only `done`/`fail` its own task
-  and `list`/`find`.
-- **Auto-enabled per worker.** Dispatch with `taskboard=<name>` and the worker
-  automatically gets the (`safe`) board tool plus a one-line contract to report its
-  task `done` there - you do not also have to list it in `tools=`. Granting a worker
-  a board *is* the intent to let it coordinate; a worker with no `taskboard` grant
-  gets nothing extra.
+  and `list`/`reconcile`.
+- **Collect the results in order (`reconcile`).** Once the DAG has run, `reconcile`
+  returns every `done` task's `result_ref` in dependency order (dep before dependent)
+  - what the driver concatenates to assemble the swarm's finished work. It is a read
+  action, open to workers too; a task that finished without a `result_ref` is skipped
+  and counted, and unfinished/failed tasks are reported so nothing is silently missed.
+- **Disabled by default; auto-enabled per worker.** `board` ships off like every
+  bundled lean-tool (it costs schema tokens only once you `/tools` it on) - keeping
+  the baseline overhead honest. Enable it on the driver when you want to run a swarm.
+  Dispatching a worker with `taskboard=<name>` auto-enables it for that worker (plus a
+  one-line contract to report its task `done` there) - you do not have to list it in
+  `tools=`. Granting a worker a board *is* the intent to let it coordinate; no
+  `taskboard` grant, no board.
 
 ## Context discipline
 
