@@ -18,6 +18,8 @@ NOTES.md
 /lean-cli/
 
 # Internal-only: plugin/dev scaffolding, MCP reference scratch, dev scripts.
+# (NB: /tools/ is intentionally NOT ignored - it ships gen_section_index.py, which the
+# smoketest's FILE MAP drift gate depends on. Keep dev-only scratch in /scripts/.)
 /plugin-dev/
 /.mcp-ref/
 /scripts/
@@ -49,7 +51,6 @@ NOTES.md
 !/lean-tools/brave_search.py
 !/lean-tools/diagnostics.py
 !/lean-tools/git_summary.py
-!/lean-tools/note.py
 !/lean-tools/notify.py
 !/lean-tools/provision.py
 !/lean-tools/shell_session.py

@@ -110,7 +110,7 @@ Same duck type as `OllamaClient` - the contract the agent loop already speaks:
   reads them off the client; all optional, treated as 0 if absent):
   - `last_out_tokens` - output tokens for the call; feeds `agent.session_out`.
   - `last_cache_read` / `last_cache_write` - prompt-cache read/write tokens. **A
-    caching backend MUST set these.** Core's context meter (and the auto-handover
+    caching backend MUST set these.** Core's context meter (and the auto-compaction
     zones, and the status row) compute the true fill as
     `prompt_eval + last_cache_read + last_cache_write` - with caching, `prompt_eval`
     is just the *uncached* input and alone under-reports real context size by ~10x,

@@ -491,7 +491,7 @@ conflict marker in the file.
   `…[truncated N …]…` notice.
 - **Budget meter:** after each turn a context-token figure (the real count from the
   provider when available, else an estimate) prints against the window, colored as it
-  climbs. `/ctx` and `/usage` report it on demand.
+  climbs. `/usage` reports it on demand.
 - **`/trim [keep]`:** stubs old tool results (file dumps, command output) to
   one-line placeholders, keeping the newest `keep` in full. No LLM call. The lighter
   lever, reclaiming the biggest context consumer without touching the conversation or
@@ -523,9 +523,6 @@ it). Durable state lives on disk and in the pinned plan; the context window rese
 That's how a task outruns the window while its documentation stays current instead of
 rotting.
 
-(Note: "handover" is reserved for a future feature that transfers a live session to
-another model or human; today's self-shrinking behaviour is `/compact`.)
-
 - **Ingestion-time output caps.** Every tool result passes through one cap on the way
   in: a runaway `mcp.call` or lean-tool result is sized to a share of the free window
   (head + tail kept, middle marked) so no single result can blow the context, with a
@@ -539,9 +536,12 @@ another model or human; today's self-shrinking behaviour is `/compact`.)
   (~1/min) stops a compact->continue->compact spin. After a compaction the last few
   turns are kept verbatim (`compact_keep`, default 3; tool payloads in that tail are
   stubbed so it stays cheap); the emergency overflow path uses a hardcoded minimal
-  backstop. All thresholds are tunable per model via `/set` (`compact_soft`,
-  `compact_hard`, `compact_emergency`, `compact_keep`, `auto_compact`,
-  `autostart_after_compact`), and the prompts themselves are editable.
+  backstop. The single lever is **`compact_at`** (via `/set`) - the fill fraction at
+  which it compacts; the soft-nudge zone auto-follows below it. Also tunable per model:
+  `compact_emergency`, `compact_keep`, `auto_compact`, `autostart_after_compact`, and
+  the prompts themselves. Advanced: `compact_soft_ratio` (where the soft zone opens as a
+  fraction of the hard cap, `soft = compact_at * ratio`, default 0.8) and `compact_soft`
+  (set it directly to decouple the pair) exist but are rarely needed.
 - **Autonomous wake on background finish (off by default).** With
   `wake_on_bg_finish = true` (via `/set`), a finished background task or worker
   wakes the agent with a synthesised turn so it reacts to the result with no operator
@@ -611,7 +611,6 @@ can't exhaust memory; pass `--num-ctx` to go higher explicitly.
 /incognito [on|off]don't save the session locally
 /askread [on|off]  confirm read tools too
 /bg [kill <pid>]   list/kill background tasks
-/ctx               context-token estimate
 /info              live session read-out
 /activity [n|all]  what the system did automatically (compaction, trim, fallback, …)
 /expand [N]        show a tool call's full (untruncated) args
