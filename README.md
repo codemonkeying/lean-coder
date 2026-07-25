@@ -176,11 +176,12 @@ actual code. lean-coder treats context as the scarce resource it is:
 
   | lean-tool | ~tokens | | lean-tool | ~tokens |
   |---|---|---|---|---|
-  | dispatch_worker | ~860 | | web_fetch | ~180 |
-  | web_screenshot | ~525 | | brave_search | ~165 |
-  | shell_session | ~360 | | ssh | ~145 |
-  | symbols | ~335 | | diagnostics | ~65 |
-  | git_summary | ~65 | | word_count | ~55 |
+  | dispatch_worker | ~860 | | board | ~585 |
+  | web_screenshot | ~525 | | web_fetch | ~180 |
+  | shell_session | ~360 | | brave_search | ~165 |
+  | symbols | ~335 | | ssh | ~145 |
+  | diagnostics | ~65 | | git_summary | ~65 |
+  | word_count | ~55 | | | |
 
   Turn on **every** one and the total is still **under ~5.5k tokens**. The meter always
   shows the real current figure.
@@ -388,7 +389,8 @@ on with `/tools` and it costs context only from that point. These ship bundled i
 
 | Lean-tool         | Adds |
 |-------------------|------|
-| `dispatch_worker` | Hand a scoped sub-task to a background worker agent; collect its result. Steer a running worker (inject / set its plan / add notes), grant it a narrowed toolset, seed it with context/plan/notes, and (with `worker_checkpoint` on) **resume** a worker that died without finishing from its saved transcript. Adds `/worker` (list / `<pid>` = full result / cancel / inject / set_plan / add_note / resume / board). |
+| `dispatch_worker` | Hand a scoped sub-task to a background worker agent; collect its result. Steer a running worker (inject / set its plan / add notes), grant it a narrowed toolset, seed it with context/plan/notes, dispatch it against a named task `board`, and (with `worker_checkpoint` on) **resume** a worker that died without finishing from its saved transcript. Adds `/worker` (list / `<pid>` = full result / cancel / inject / set_plan / add_note / resume). |
+| `board`           | A driver-orchestrated **task board**: a named dependency DAG of tasks the driver lays out, assigns workers to, and marks progress on (workers report their own task `done` and read the board, but only the driver creates/assigns). Tasks with unmet deps stay blocked, so a worker never starts on the wrong assumption; `done` reports what it unblocked. Named + on disk, so it survives a crash and can be handed to another session. `safe`; auto-enabled for a worker dispatched with `taskboard=`. |
 | `web_fetch`       | Read a URL as clean text. |
 | `web_screenshot`  | Screenshot a URL with a headless browser + return the page text (and, on a vision model, the image itself). **Needs [Playwright](https://playwright.dev/python/) + a browser** (`pip install playwright && playwright install firefox`); says so if absent. Disabled by default. |
 | `brave_search`    | Web search (Brave API). |
