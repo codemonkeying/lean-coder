@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L901    Lean-tools (plugin tools: discovery, manager)
-  L1241   MCP client (connection, manager, OAuth, discovery)
-  L1695   Providers (backend plugin registry)
-  L1917   Interactive pickers + menus (raw-mode UI engine)
-  L2266   Terminal styling (colors, formatting helpers)
-  L2463   Streaming + markdown render (model output)
-  L2810   Composer (pinned input line, editor, stdin)
-  L3660   Token accounting (calibrated context meter)
-  L3825   Config (dataclass, field registry, load/save)
-  L6340   Tool execution + text tool-call parsing
-  L6761   Remote workspace (executor client, /connect)
-  L8326   Context meter
-  L8421   Agent (turn loop, context mgmt, tool dispatch)
-  L14094  Slash-command handlers + dispatch table
-  L14231  REPL (interactive loop, session resume)
-  L14606  Worker agent (headless --agent-run)
-  L14919  Entry (CLI arg parsing, main)
+  L883    Lean-tools (plugin tools: discovery, manager)
+  L1223   MCP client (connection, manager, OAuth, discovery)
+  L1677   Providers (backend plugin registry)
+  L1899   Interactive pickers + menus (raw-mode UI engine)
+  L2248   Terminal styling (colors, formatting helpers)
+  L2445   Streaming + markdown render (model output)
+  L2792   Composer (pinned input line, editor, stdin)
+  L3642   Token accounting (calibrated context meter)
+  L3807   Config (dataclass, field registry, load/save)
+  L6331   Tool execution + text tool-call parsing
+  L6752   Remote workspace (executor client, /connect)
+  L8317   Context meter
+  L8412   Agent (turn loop, context mgmt, tool dispatch)
+  L14053  Slash-command handlers + dispatch table
+  L14190  REPL (interactive loop, session resume)
+  L14565  Worker agent (headless --agent-run)
+  L14878  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -124,7 +124,9 @@ RELEASE_NOTES = {
         "  /compact (stub old tool output) is now /trim.",
         "new knob compact_keep (default 3): verbatim turns kept after a compaction.",
         "/set compact_at <frac>: THE lever for when auto-compaction fires (the soft",
-        "  nudge zone auto-follows). Was compact_hard; old configs still work.",
+        "  nudge zone auto-follows at compact_soft_ratio, default 0.8 = 80% of the cap).",
+        "  Was compact_hard; old configs still work.",
+        "/ctx removed: its context% line is already in /usage and /info.",
     ],
 }
 
@@ -282,26 +284,32 @@ GRANT_MARK = "===GRANT==="          # a worker's grant header (leash/model/cwd/l
 RESULT_MARK = "===RESULT==="        # a worker wraps its final answer in these; the parent harvests it
 
 COMPACT_INSTR = (
-    "You are compacting this session (/compact). Two steps, in order:\n"
-    "1. DURABLE DOCS: if there are docs/notes worth persisting (a plan, a design doc, a "
-    "README - whatever this project already uses), update them now with "
-    "your tools, and if this is ALREADY a git repo, commit them. Do NOT initialise a new "
-    "repo, and do NOT commit if there isn't one. If you have no write/command tools right "
-    "now (read-only leash), skip this step.\n"
-    "2. SUMMARY: write a concise summary for your future self (older context will be "
-    "replaced) - the goal, key decisions, current state, WHERE the durable docs live, and "
-    "a clear prompt to continue from. Wrap ONLY that summary between two " + COMPACT_MARK +
-    " markers as visible text, like:\n" + COMPACT_MARK + "\n<your summary here>\n" +
-    COMPACT_MARK + "\n"
-    "3. OPTIONAL PLAN: you may write your goal + TODO between two " + PLAN_MARK +
-    " markers; it stays pinned for whoever resumes:\n" + PLAN_MARK +
-    "\nGOAL: ...\nTODO:\n- [ ] ...\n" + PLAN_MARK + "\n"
-    "4. OPTIONAL SELF-PROMPT: if there's a clear next action, write it between two " +
-    SELFPROMPT_MARK + " markers (your continue-from prompt):\n" + SELFPROMPT_MARK +
-    "\n<what to do next>\n" + SELFPROMPT_MARK + "\n"
-    "Write these blocks as visible text and then STOP - the summary text becomes the "
-    "ENTIRE continuing context for the older turns; everything summarized is discarded. No "
-    "tool call is needed to finish; just end your reply after the blocks."
+    "You are compacting this session now: the older turns get replaced by what you write "
+    "here, so you are writing a note to YOURSELF in a fresh session that has NO memory of "
+    "this conversation - capture everything future-you needs to continue without losing "
+    "the thread.\n"
+    "FIRST, if any durable fact needs to outlive this session (a decision, a design note, a "
+    "gotcha your future self can't re-derive from code/git), save it now with your tools to "
+    "wherever this project keeps such notes - and commit ONLY if this is already a git repo "
+    "and nothing tells you to hold (never init one). Skip this if there's nothing durable to "
+    "save or you have no write tools.\n"
+    "THEN write these blocks IN THIS REPLY, using the exact markers, and STOP. The blocks "
+    "must START with " + COMPACT_MARK + " - no narration or preamble before them (a durable-"
+    "save tool call above is fine; just don't write prose first).\n"
+    "1. SUMMARY: a concise summary of the older context for your future self - the goal, key "
+    "decisions, current task state (done / in progress / next), WHERE things live (files, "
+    "commands, durable docs), and open threads. Put the summary text BETWEEN two identical " +
+    COMPACT_MARK + " lines (repeat the marker exactly - do NOT invent an XML-style closing "
+    "tag):\n" + COMPACT_MARK + "\nyour summary here\n" + COMPACT_MARK + "\n"
+    "2. PLAN: your current goal + TODO (mark done vs next) - this stays PINNED across the "
+    "compaction, so keep it accurate. Again between two identical " + PLAN_MARK + " lines:\n" +
+    PLAN_MARK + "\nGOAL: ...\nTODO:\n- [x] done\n- [ ] next\n" + PLAN_MARK + "\n"
+    "3. SELF-PROMPT: the single next instruction to yourself - the very next thing to do "
+    "after compaction, phrased as a prompt you'd act on immediately. Between two identical " +
+    SELFPROMPT_MARK + " lines:\n" +
+    SELFPROMPT_MARK + "\nwhat to do next\n" + SELFPROMPT_MARK + "\n"
+    "Then STOP - end your reply after the blocks (no further tool call needed). The summary "
+    "becomes your kept context; the self-prompt runs as your next turn."
 )
 
 
@@ -499,40 +507,12 @@ def _compact_nudge_missing(missing) -> str:
             "the marker, no preamble, no other tool.")
 
 
-# Auto-compaction instruction: the model gets a full tool-capable turn to wrap up,
-# then writes BOTH a handover block (@#!, kept as continuing context) and a
-# self-prompt (%%^^, autostarted as the next turn). Recent turns are kept verbatim.
-# Forced (hard/emergency) handover. IMPORTANT ordering lesson: the OLD version opened
-# with an optional "update docs with your tools" step, which invited a chatty preamble
-# ("I'll compact the context...") that smaller models emitted and then STOPPED - no
-# blocks, failed handover. The shape that holds up is blocks-FIRST, an explicit "start
-# your reply with the first marker - no preamble", and durable-doc saving demoted to an
-# AFTER option. Keep that shape if you edit this.
-AUTO_COMPACT_INSTR = (
-    "Your context is full - compact it yourself now (recent turns are kept; older ones "
-    "get replaced by what you write here). You are writing a note to YOURSELF in a fresh "
-    "session that has NO memory of this conversation - capture everything that future-you "
-    "needs to continue without losing the thread. Write these three blocks IN THIS REPLY, "
-    "using the exact markers, then STOP. Start your reply with " +
-    COMPACT_MARK + " - no preamble, no narration, no tool call.\n"
-    "1. SUMMARY: a concise summary of the older context for your future self - the goal, "
-    "key decisions, current task state (done / in progress / next), WHERE things live "
-    "(files, commands), and open threads. Put the summary text BETWEEN two identical " +
-    COMPACT_MARK + " lines (repeat the marker exactly - do NOT invent an XML-style "
-    "closing tag):\n" +
-    COMPACT_MARK + "\nyour summary here\n" + COMPACT_MARK + "\n"
-    "2. PLAN: your current goal + TODO (mark done vs next) - this stays PINNED across the "
-    "compaction, so keep it accurate. Again between two identical " + PLAN_MARK + " lines:\n" +
-    PLAN_MARK + "\nGOAL: ...\nTODO:\n- [x] done\n- [ ] next\n" + PLAN_MARK + "\n"
-    "3. SELF-PROMPT: the single next instruction to yourself - the very next thing to do "
-    "after compaction, phrased as a prompt you'd act on immediately. Between two identical " +
-    SELFPROMPT_MARK + " lines:\n" +
-    SELFPROMPT_MARK + "\nwhat to do next\n" + SELFPROMPT_MARK + "\n"
-    "Then STOP - just end your reply after the blocks (no tool call). The summary becomes "
-    "your kept context; the self-prompt runs as your next turn. If durable notes need "
-    "saving, do that AFTER the blocks (and commit ONLY if this is already a git repo - "
-    "never init one)."
-)
+# Auto-compaction uses the SAME instruction as manual /compact - there is one compaction
+# path (see _compact()), so there is one prompt. Kept as a named alias for the prompt
+# registry + any code/prompt-override that referenced it. Do NOT re-fork this into a
+# separate string: the two drifted into a self-contradiction once ("no tool call" vs
+# "save durable notes after the blocks") before they were merged.
+AUTO_COMPACT_INSTR = COMPACT_INSTR
 
 # Soft-zone nudge: gentle, injected inline into the user turn while context is in the
 # soft zone. DELIBERATELY soft - "finish, then wrap at a clean break" - not "compact
@@ -560,10 +540,12 @@ PROMPTS_DIR = CONFIG_PATH.parent / "prompts"
 SYSTEM_PROMPTS_DIR = PROMPTS_DIR / "system"
 BUILTIN_PROMPTS = {
     "system":         SYSTEM_PROMPT,
-    "compact":        COMPACT_INSTR,
-    "auto_compact":  AUTO_COMPACT_INSTR,     # the lever-pull instruction on an auto-compact turn
+    "compact":        COMPACT_INSTR,     # the ONE compaction prompt (manual + auto + elected)
     "compact_nudge": COMPACT_NUDGE,    # the gentle soft-zone "wrap up at a break" nudge
 }
+# Back-compat: 'auto_compact' used to be a separate editable prompt; there is now one
+# compaction path reading only 'compact', so a stale prompts/system/auto_compact.txt
+# override is simply ignored (harmless). AUTO_COMPACT_INSTR stays as a code alias.
 EDITOR_FALLBACKS = ("nano", "vi", "vim")
 
 
@@ -3969,20 +3951,23 @@ class Config:
                                      # the soft zone; a hard threshold force-hands-over (the
                                      # model pulls the same lever /handover does, then its
                                      # self-prompt is fed back to it). See cost-reduction-roadmap.
-    compact_soft: float = 0.70       # soft zone start, as a fraction of the context window:
+    compact_soft: float = 0.72       # soft zone start, as a fraction of the context window:
                                      # nudge the model to wrap up + compact at a clean break.
                                      # DERIVED, don't set directly: a /set of compact_at (or
-                                     # compact_gap) recomputes soft = compact_at - compact_gap.
+                                     # compact_soft_ratio) recomputes soft = compact_at * ratio.
                                      # Set it explicitly only to decouple the two (advanced).
     compact_at: float = 0.90         # THE user lever: fill fraction at which a compaction is
                                      # forced at a clean boundary (respects the min-interval loop
                                      # guard). 0.90 gives the summarizing turn headroom before the
                                      # window backstop beheads the prefix. Moving this slides the
-                                     # soft zone with it (soft = compact_at - compact_gap). Was
-                                     # compact_hard <=0.9.4 (aliased on load for back-compat).
-    compact_gap: float = 0.20        # advanced: spread below compact_at where the soft zone opens
-                                     # (soft = compact_at - gap). One lever moves the pair together;
-                                     # widen/narrow this to change how early the soft nudge fires.
+                                     # soft zone with it (soft = compact_at * compact_soft_ratio).
+                                     # Was compact_hard <=0.9.4 (aliased on load for back-compat).
+    compact_soft_ratio: float = 0.8  # advanced: where the soft zone opens as a FRACTION of the
+                                     # hard cap (soft = compact_at * ratio). Proportional so it
+                                     # stays sane at any compact_at (0.8 => soft is 80% of the way
+                                     # to the cap: at 0.9 -> 0.72, at 0.2 -> 0.16). Was compact_gap
+                                     # (an ABSOLUTE spread, soft = at - gap) up to <=0.9.4; cut over
+                                     # to a ratio (no migration - a stale compact_gap is ignored).
     compact_emergency: float = 1.00  # emergency stop: compact regardless, bypassing the clean
                                      # boundary AND the loop guard (about to overflow the window)
     compact_min_interval: float = 60.0  # loop guard: min seconds between compactions (~1/min),
@@ -4286,9 +4271,9 @@ _SCALAR_FIELDS = (
     ("window_messages",           0,                   False),
     ("window_tokens",             "auto",              False),
     ("auto_compact",              True,                False),
-    ("compact_soft",              0.70,                False),
+    ("compact_soft",              0.72,                False),
     ("compact_at",                0.90,                False),
-    ("compact_gap",               0.20,                False),
+    ("compact_soft_ratio",        0.8,                 False),
     ("compact_emergency",         1.00,                False),
     ("compact_min_interval",      60.0,                False),
     ("autostart_after_compact",   True,                False),
@@ -4384,6 +4369,12 @@ def load_config(args) -> Config:
     for key in _PERSISTED_SCALAR_KEYS + ("composer",):  # composer: read-only (see _EPHEMERAL_KEYS)
         if key in file_vals:
             setattr(cfg, key, file_vals[key])
+    # Derive compact_soft from the pair UNLESS the file pins it explicitly (a manual
+    # override decouples, same rule as a live /set). Without this, a config that sets
+    # only compact_at leaves compact_soft at its dataclass default - which can sit ABOVE
+    # the hard cap (e.g. at=0.2, default soft=0.72), an incoherent "soft after hard".
+    if "compact_soft" not in file_vals:
+        cfg.compact_soft = round(max(0.0, min(1.0, cfg.compact_at * cfg.compact_soft_ratio)), 4)
     # Snapshot the config.toml DEFAULTS layer: for each persisted scalar, the value as
     # configured (file value if present, else the dataclass default). save_config writes
     # scalar lines FROM this, so a per-session OVERRIDE later applied onto the live cfg
@@ -9461,30 +9452,76 @@ class Agent:
         self.compactions += 1
         return block
 
-    def compact(self):
-        """Agentic /compact: the model gets a real (tool-capable) turn to update +
-        commit any durable docs, then write its summary as marked text (summary block +
-        plan + next-step). No finalize tool - the turn ending is the trigger; we parse
-        the marked blocks, re-solicit any missing one, then replace history with the
-        summary, keeping the last compact_keep TURNS verbatim (design decision 4:
-        manual keeps a tail, no longer a clean cut). A bad/absent block does NOT nuke
-        history (returns None). Returns the summary text, or None."""
-        if len([m for m in self.messages if m["role"] != "system"]) == 0:
+    def _compact(self, zone: str = "hard", deliberate: bool = False):
+        """The ONE compaction implementation behind manual /compact, auto-compaction, and
+        an elected request_compact - there is a single path and a single prompt so they
+        can't drift (they did, twice). The model gets a tool-capable turn to save any
+        durable docs and write the marked blocks (summary + plan + next-step); no finalize
+        tool, the turn ENDING is the trigger. We tolerantly parse, re-solicit any missing
+        block, then replace the older history with the summary, keeping the last
+        compact_keep TURNS verbatim (emergency: a hardcoded minimal tail so the overflow
+        rescue can't itself re-overflow).
+
+        A bad/absent summary leaves history UNTOUCHED (returns None). The pre-compact
+        history is snapshotted (recoverable via /load, greppable by recall) ONLY once a
+        usable summary is confirmed - a failed/futile compaction writes no snapshot (that
+        unbounded per-turn snapshotting is what once flooded /load).
+
+        Knobs: `zone` ("hard"/"emergency"/soft-elected) picks the verbatim keep; `deliberate`
+        (a manual /compact) skips arming the anti-thrash loop guard - the user asked for it,
+        so it shouldn't throttle the next auto-compaction. Returns the summary block, or None."""
+        if not [m for m in self.messages if m["role"] != "system"]:
             return None
-        pre = list(self.messages)
-        keep_from = self._keep_tail_turns(pre, self.cfg.compact_keep)
-        tail = pre[keep_from:] if keep_from is not None else []
+        pre       = list(self.messages)                # capture BEFORE the compaction turn
+        pre_plan  = getattr(self, "pinned_plan", "")   # for the recovery snapshot below
+        keep_turns = (COMPACT_EMERGENCY_KEEP if zone == "emergency"
+                      else self.cfg.compact_keep)
+        keep_from = self._keep_tail_turns(pre, keep_turns)
+        tail      = pre[keep_from:] if keep_from is not None else []
+
+        saved = self.tool_defs
+        # Shared retry-parse core: a turn to write the marked blocks, tolerant parse,
+        # re-solicit any missing one. This completeness retry (an incomplete ANSWER) is a
+        # DIFFERENT layer from the send-level overload/429 recovery inside _loop.
         instr = read_prompt("compact") or COMPACT_INSTR
         parsed, missing, attempt, _turn_text = self._solicit_compact(instr)
-        if not parsed["handover"]:   # no usable summary (truly empty) -> leave history untouched
+        block = parsed["handover"]
+        self.tool_defs = saved
+        if not block:                         # no usable summary -> don't nuke history
+            self.messages = pre
+            # Arm the loop guard on failure (auto only) so a model that can't produce a
+            # summary doesn't re-attempt + re-snapshot every turn. A deliberate /compact
+            # failure just returns - nothing auto-loops on it.
+            if not deliberate:
+                self._last_compact_ts = time.time()
             return None
-        if parsed["tier"] >= 3 or missing:
-            self._log_activity("compact",
-                               f"degraded parse (tier {parsed['tier']}, missing {missing})",
-                               "model dropped marker discipline; salvaged via tolerant parser")
+        if parsed["tier"] >= 3 or attempt > 0 or missing:
+            self._log_activity(
+                "compact",
+                f"degraded parse (tier {parsed['tier']}, {attempt} retr{'y' if attempt == 1 else 'ies'})",
+                "model dropped marker discipline; salvaged via tolerant parser + retry")
+        # Snapshot the pre-compact history now that we have a usable summary and are about
+        # to replace it. Named <origin>-precompact-<N> so it's tied to its source session;
+        # carries the pinned plan + notes so a /load restores the full working state.
+        try:
+            rhost = self.remote.host if self.remote else None
+            origin = getattr(self, "autosave_name", "") or "session"
+            existing = [nm for nm, _ in list_sessions()]
+            save_session(pre, self.cfg, _precompact_name(origin, existing),
+                         remote=rhost, pinned_plan=pre_plan, notes=getattr(self, "notes", None))
+        except Exception:
+            pass
+        # Consume the tolerant parse from the retry loop (NOT a second strict re-extract:
+        # that would throw away plan/next salvaged from a degraded tier for exactly the
+        # models the tolerant parser exists to rescue).
         return self._finish_compact(
-            parsed, summary_prefix="Earlier context (compacted summary):\n", tail=tail,
-            autostart=True)
+            parsed, summary_prefix="Earlier context (compacted summary):\n",
+            tail=tail, autostart=True, stamp_clock=not deliberate)
+
+    def compact(self):
+        """Manual /compact - a deliberate compaction (doesn't arm the anti-thrash guard).
+        Thin wrapper over the single _compact() implementation."""
+        return self._compact(zone="hard", deliberate=True)
 
     def _request_compact(self):
         """The request_compact tool body: the model elects a handover at a clean break.
@@ -9505,71 +9542,10 @@ class Agent:
                 "compaction runs right after, and you'll write the summary + next-step then.")
 
     def auto_compact(self, zone: str = "hard"):
-        """Self-managing compaction. Snapshot the full history (recoverable), then an
-        agentic turn where the model summarizes the OLDER context (between
-        COMPACT_MARK markers) and writes its next-step self-prompt (between
-        SELFPROMPT_MARK markers), then ends the turn (no finalize tool). We keep the recent tail
-        verbatim, replace the older part with the summary, queue the self-prompt for
-        autostart, and stamp the loop-guard clock. A bad/absent summary leaves history
-        untouched (returns None). Returns the summary block, or None."""
-        if not [m for m in self.messages if m["role"] != "system"]:
-            return None
-        pre       = list(self.messages)       # capture BEFORE the compaction turn
-        pre_plan  = getattr(self, "pinned_plan", "")   # for the recovery snapshot below
-        # One knob for how many recent TURNS to keep verbatim after the summary
-        # (soft/hard/manual all share cfg.compact_keep; tail-trim stubs the tool payloads
-        # so a few conversation turns is cheap). Emergency is not a preference - it's the
-        # overflow backstop, hardcoded minimal so the rescue can't itself re-overflow.
-        keep_turns = (COMPACT_EMERGENCY_KEEP if zone == "emergency"
-                      else self.cfg.compact_keep)
-        keep_from = self._keep_tail_turns(pre, keep_turns)
-        tail      = pre[keep_from:] if keep_from is not None else []
-
-        saved = self.tool_defs
-        # Shared retry-parse core (see _solicit_compact): give the model a turn to write
-        # the marked blocks, tolerantly parse, re-solicit any missing one. The completeness
-        # retry (an incomplete-but-successful ANSWER) is a DIFFERENT layer from the send-
-        # level overload/429 recovery inside _loop (a failed SEND): separate budgets.
-        instr = read_prompt("auto_compact") or AUTO_COMPACT_INSTR
-        parsed, missing, attempt, _turn_text = self._solicit_compact(instr)
-        block = parsed["handover"]
-        self.tool_defs = saved
-        if not block:                         # no usable summary -> don't nuke history
-            self.messages = pre
-            # Stamp the loop guard even on failure so a model that can't produce a
-            # summary doesn't re-attempt (and re-snapshot) compaction every single turn.
-            self._last_compact_ts = time.time()
-            return None
-        if parsed["tier"] >= 3 or attempt > 0:
-            self._log_activity(
-                "compact",
-                f"degraded parse (tier {parsed['tier']}, {attempt} retr{'y' if attempt == 1 else 'ies'})",
-                "model dropped marker discipline; salvaged via tolerant parser + retry")
-        # Snapshot the PRE-HANDOVER history ONLY now that we have a usable summary and are
-        # about to replace it - so it stays recoverable via /load (and greppable by the
-        # recall path). Doing it here (not at the top) means a FAILED/futile handover
-        # writes no snapshot: that unbounded per-turn snapshotting by a model that never
-        # summarized is what flooded /load. Named <origin>-precompact-<N> so the snapshot
-        # is tied to the session it came from.
-        try:
-            rhost = self.remote.host if self.remote else None
-            origin = getattr(self, "autosave_name", "") or "session"
-            existing = [nm for nm, _ in list_sessions()]
-            save_session(pre, self.cfg, _precompact_name(origin, existing),
-                         remote=rhost, pinned_plan=pre_plan)
-        except Exception:
-            pass
-        # Consume the already-computed tolerant parse (from the retry loop above), NOT a
-        # second strict fence-only re-extract: _parse_compact salvages plan/next from a
-        # degraded tier (## Plan header, JSON field) too, and _compact_missing already
-        # accepted that tier - so a strict _extract_* here would silently throw away the
-        # salvage for exactly the models the tolerant parser exists to rescue, dropping
-        # both the pinned plan and the autostart self-prompt. Same source as handover().
-        # Auto differs from /handover only in the four knobs below: keep the recent
-        # verbatim tail, queue the next-step self-prompt, and stamp the loop guard.
-        return self._finish_compact(
-            parsed, summary_prefix="Earlier context (compacted summary):\n",
-            tail=tail, autostart=True, stamp_clock=True)
+        """Self-managing / elected compaction - arms the anti-thrash loop guard. Thin
+        wrapper over the single _compact() implementation (zone picks the verbatim keep:
+        'emergency' = minimal overflow backstop, else compact_keep). Returns block or None."""
+        return self._compact(zone=zone, deliberate=False)
 
     def _update_plan(self, plan: str):
         """The update_plan tool body: replace the pinned GOAL + TODO and refresh the
@@ -10694,7 +10670,7 @@ SLASH_COMMANDS = ["/clear", "/new", "/trim", "/compact", "/session", "/save", "/
                   "/prompt", "/sh", "/connect", "/machines", "/local", "/disconnect", "/tools", "/reload",
                   "/model", "/provider", "/think", "/effort",
                   "/set", "/usage", "/approve", "/leash", "/autosave", "/incognito",
-                  "/askread", "/bg", "/note", "/plan", "/mcp", "/info", "/ctx", "/activity", "/expand", "/help", "/quit"]
+                  "/askread", "/bg", "/note", "/plan", "/mcp", "/info", "/activity", "/expand", "/help", "/quit"]
 
 # Built-in command names are the shadow-protection set: lean-tool commands can't claim
 # any of them. It is DERIVED from _BUILTIN_COMMANDS_TABLE (every builtin command + alias)
@@ -10908,7 +10884,6 @@ HELP_COMMANDS = [
     ("/note [grep|range|add|clear]", "the session notebook (episodic memory); no arg = recent"),
     ("/plan [set|goal|add|done|clear]", "view/steer the pinned GOAL+TODO; no arg = show"),
     ("/info", "live session read-out"),
-    ("/ctx", "context-token estimate"),
     ("/activity [n|all]", "what the system did automatically (compaction, trim, fallback, ...)"),
     ("/expand [N]", "show a tool call's full args + captured output; bare = newest, N = the #id"),
     ("/help [cmd]", "this help; /help <cmd> shows one command's help"),
@@ -11078,8 +11053,8 @@ _SETTINGS_FIELDS = [
     ("window_tokens", "send-window token cap: 'auto' (=ctx-reserve, default), an int (hard cap), or 0 (off)", "int_or_auto"),
     ("auto_compact", "auto-compact (self-managing context)", "bool"),
     ("compact_at", "compact at this fill fraction of ctx (THE lever; soft auto-follows)", "float"),
-    ("compact_soft", "advanced: soft-zone start (derived from compact_at - gap unless set)", "float"),
-    ("compact_gap", "advanced: spread below compact_at where the soft zone opens (soft = at - gap)", "float"),
+    ("compact_soft", "soft-zone start; auto-follows compact_at, or set it here to MANUALLY OVERRIDE (decouples until you set compact_at/soft_ratio again)", "float"),
+    ("compact_soft_ratio", "where the soft zone opens as a fraction of the hard cap (soft = compact_at * ratio; 0.8 => 80% of the way to the cap)", "float"),
     ("compact_emergency", "compact emergency threshold (fraction of ctx)", "float"),
     ("auto_num_ctx", "ollama: detect num_ctx at startup", "bool"),
     ("gen_connect_timeout", "ollama: TCP connect deadline (s)", "float"),
@@ -11164,12 +11139,13 @@ def _set_setting_field(agent, cfg, key, raw, scope="session"):
         else:
             cfg.session_overrides[k] = getattr(cfg, k)  # per-session override
     _record(key)
-    # One lever for the pair: setting compact_at (or the gap) slides the soft zone with it
-    # (soft = compact_at - gap), recorded in the SAME scope so it persists/overrides
-    # together. A direct /set compact_soft still wins - it just runs _record(key) above and
-    # skips this, decoupling the two until the next compact_at/gap set.
-    if key in ("compact_at", "compact_gap"):
-        soft = round(max(0.0, cfg.compact_at - cfg.compact_gap), 4)
+    # One lever for the pair: setting compact_at (or the ratio) slides the soft zone with it
+    # (soft = compact_at * compact_soft_ratio), recorded in the SAME scope so it persists/
+    # overrides together. Proportional so it stays sane at any compact_at. A direct /set
+    # compact_soft still wins - it just runs _record(key) above and skips this, decoupling
+    # the two until the next compact_at/compact_soft_ratio set.
+    if key in ("compact_at", "compact_soft_ratio"):
+        soft = round(max(0.0, min(1.0, cfg.compact_at * cfg.compact_soft_ratio)), 4)
         cfg.compact_soft = soft
         _record("compact_soft")
     return True
@@ -13806,25 +13782,14 @@ def handle_trim_command(agent, cfg, arg):
 
 
 def handle_compact_command(agent, cfg, arg):
-    """/compact - agentic compaction: the model updates+commits durable docs, writes
+    """/compact - agentic compaction: the model saves+commits durable docs, writes
     the summary between the markers, and history is then replaced with that summary
-    (keeping the last keep_last turns). The manual lever the auto-compact zone pulls."""
-    print(dim("compact: update + commit durable docs, then write the "
+    (keeping the last compact_keep turns). The manual lever the auto-compact zone pulls.
+    The pre-compact snapshot (a <name>-precompact-N sidecar, so the live session keeps its
+    name) is taken inside _compact() once a usable summary exists - so a failed /compact
+    leaves history AND the snapshot dir untouched (same rule as the auto path)."""
+    print(dim("compact: save + commit durable docs, then write the "
               f"summary between {COMPACT_MARK} markers and finalize…"))
-    # Snapshot the full pre-compact conversation as a <name>-precompact-N sidecar
-    # (NOT under the live name) so it stays loadable AND the live session keeps its
-    # name. Mirrors auto_compact: an explicit /compact must not fork a named session
-    # into a fresh auto- one (the "it's auto again" bug) - you continue IN the session
-    # you compacted, now carrying the compacted summary.
-    try:
-        rhost = agent.remote.host if agent.remote else None
-        origin = getattr(agent, "autosave_name", "") or "session"
-        existing = [nm for nm, _ in list_sessions()]
-        save_session(list(agent.messages), cfg, _precompact_name(origin, existing),
-                     remote=rhost, pinned_plan=getattr(agent, "pinned_plan", ""),
-                     notes=getattr(agent, "notes", None))
-    except Exception:
-        pass
     summary = agent.compact()
     if summary is None:
         print(yellow("\nno summary captured - history left intact. (Write it "
@@ -13900,11 +13865,6 @@ def handle_approve_command(agent, cfg, arg):
         print(dim(f"approval -> {cfg.approval}"))
     elif mode:
         print(dim(f"approval modes: {', '.join(APPROVAL_MODES)}"))
-
-
-def handle_ctx_command(agent, cfg, arg):
-    """/ctx - print the context-window meter."""
-    agent._print_ctx()
 
 
 def handle_activity_command(agent, cfg, arg):
@@ -14054,7 +14014,6 @@ _BUILTIN_COMMANDS_TABLE = {
     "/model": handle_model_command,
     "/models": handle_model_command,
     "/approve": handle_approve_command,
-    "/ctx": handle_ctx_command,
     "/activity": handle_activity_command,
     "/expand": handle_expand_command,
     "/help": handle_help_command, "/h": handle_help_command, "/?": handle_help_command,
@@ -14412,7 +14371,7 @@ def repl(cfg: Config, resume=None):
         # Status block above the prompt. statusline_every controls the cadence: 1 (default)
         # = every prompt, N = every N prompts, 0 = only when it changes. A real state change
         # (settings/model/tools/plan - the ctx row's per-turn token drift is excluded from
-        # the signature) ALWAYS reprints regardless of cadence. /info and /ctx show it too.
+        # the signature) ALWAYS reprints regardless of cadence. /info and /usage show it too.
         prompt_no += 1
         _rows = _status_rows(agent, cfg)
         _key = _status_key(_rows)
