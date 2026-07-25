@@ -441,6 +441,13 @@ class OllamaClient:
         saw_done = False                  # did a done:true frame ever arrive?
         done_reason = None                # 'load' = cold-load ack, not a real turn
         self.last_out_tokens = None       # set on `done`; cleared so a failed call can't restack
+        # Per-call generation telemetry (ns), also set on `done`. Cleared here so a failed
+        # call never restacks a prior turn's timing. The Agent rolls these up into
+        # session decode throughput; other providers simply never set them (Agent reads
+        # them with a getattr default, so this stays optional + provider-agnostic).
+        self.last_eval_ns = None          # decode wall time (eval_duration): pairs with last_out_tokens
+        self.last_prompt_eval_tokens = None  # prefill tokens (prompt_eval_count)
+        self.last_prompt_eval_ns = None   # prefill wall time (prompt_eval_duration)
         spin = Spinner("thinking", THINK_FRAMES).start()  # until first token
         # 3-tier timeout (shared core helper): open with the connect deadline, then
         # stream_tiered re-arms the socket to the TTFT deadline until the first line
@@ -505,6 +512,11 @@ class OllamaClient:
                         prompt_eval = obj.get("prompt_eval_count")
                         # report output tokens for the core session counter
                         self.last_out_tokens = obj.get("eval_count")
+                        # generation telemetry (ns) for honest decode throughput: decode
+                        # tokens/time and prefill tokens/time, straight off the done frame.
+                        self.last_eval_ns = obj.get("eval_duration")
+                        self.last_prompt_eval_tokens = obj.get("prompt_eval_count")
+                        self.last_prompt_eval_ns = obj.get("prompt_eval_duration")
         except _TurnAbort:
             aborted = True
         except urllib.error.HTTPError as e:
