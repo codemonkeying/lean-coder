@@ -44,13 +44,12 @@ from pathlib import Path
 
 # Built-in ceiling defaults (last resort: env var > live cfg > this - see docstring).
 _DEFAULTS = {"max_concurrent": 10, "idle_timeout": 1800, "max_iterations": 30,
-             "max_depth": 1, "max_children": 0, "token_budget": 0}
+             "max_depth": 1, "max_children": 0}
 _ENV = {"max_concurrent": "LEANCODER_WORKER_MAX_CONCURRENT",
         "idle_timeout": "LEANCODER_WORKER_IDLE_TIMEOUT",
         "max_iterations": "LEANCODER_WORKER_MAX_ITER",
         "max_depth": "LEANCODER_WORKER_MAX_DEPTH",
-        "max_children": "LEANCODER_WORKER_MAX_CHILDREN",
-        "token_budget": "LEANCODER_WORKER_TOKEN_BUDGET"}
+        "max_children": "LEANCODER_WORKER_MAX_CHILDREN"}
 
 TOOL = {
     "name": "dispatch_worker",
@@ -334,24 +333,6 @@ def run(args, cwd):
                 f"finish (its result reaches you automatically) or raise "
                 f"LEANCODER_WORKER_MAX_CONCURRENT.")
 
-    # Operator ceiling: shared TOKEN budget (the boss's slow-bleed guard). Count caps stop
-    # a fork-bomb; this stops a long swarm quietly draining quota one worker at a time. We
-    # meter FINISHED workers' spend (their .usage sidecars); refresh it first WITHOUT
-    # touching the finish-notice dedup (don't steal a notice owed to the model), then
-    # refuse once the cumulative total crosses the ceiling. A still-running worker's spend
-    # isn't counted until it exits (concurrency bounds in-flight burn); this deliberately
-    # gates on realized, not projected, cost.
-    tok_budget = _ceiling("token_budget")
-    if tok_budget:
-        for _m in _H["workers"].values():
-            if not _m.get("usage_counted") and _read_result(_m["result"]) is not None:
-                _accrue_usage(_m)        # count a finished worker's tokens (idempotent)
-        spent = _worker_tokens_spent()
-        if spent >= tok_budget:
-            return (f"error: the shared worker token budget is spent ({spent:,} of "
-                    f"{tok_budget:,} tokens used by workers this session). Not dispatching "
-                    f"another. Raise worker_token_budget / LEANCODER_WORKER_TOKEN_BUDGET, or "
-                    f"set it to 0 for unlimited.")
     # Model + provider. Default: inherit the driver's current model+provider (both
     # blank -> the worker keeps whatever it activates). A `model` may be ANY model on
     # ANY enabled provider; we infer its provider from the enabled-provider->models
@@ -568,7 +549,7 @@ def _read_result(path):
 def _read_usage(result_path):
     """A finished worker's token spend from its '<brief>.usage' sidecar (written on exit
     by run_agent_brief). Returns (in_tokens, out_tokens); (0, 0) if absent/unreadable.
-    Used to meter the shared token budget across workers."""
+    Observability: summed for /worker status, nothing gates on it."""
     try:
         txt = Path(_brief_from_result(result_path) + ".usage").read_text()
     except OSError:
@@ -600,11 +581,9 @@ def _accrue_usage(meta):
 
 
 def _worker_tokens_spent():
-    """Cumulative tokens (in+out) spent by all FINISHED workers this session, plus a
-    best-effort estimate for still-running ones (their .usage isn't written until exit,
-    so running workers count 0 - the budget meters completed spend, the concurrency cap
-    bounds in-flight burn). This is the shared budget the boss meters against
-    worker_token_budget."""
+    """Cumulative tokens (in+out) spent by all FINISHED workers this session (their .usage
+    sidecars, accrued once each in _accrue_usage). Still-running workers count 0 until they
+    exit. Pure observability - surfaced in /worker status; nothing gates on it."""
     return _H.get("tokens_in", 0) + _H.get("tokens_out", 0)
 
 def _worker_stderr_tail(result_path, n=15):
@@ -783,10 +762,8 @@ def _worker_status(pid=None):
             line += f"\n  injects delivered: {n_inj} (last: {last_inj[:80]})"
         out.append(line)
     spent = _worker_tokens_spent()
-    budget = _ceiling("token_budget")
     if spent:
-        cap = f" of {budget:,}" if budget else ""
-        out.append(f"shared worker spend: {spent:,}{cap} tokens (finished workers)")
+        out.append(f"total worker spend: {spent:,} tokens (finished workers)")
     return "\n".join(out)
 
 
@@ -1102,8 +1079,8 @@ def setup(lc, cfg):
     _H["__file__"] = lc.get("__file__")     # the CORE module file, for the worker argv
     _H["cfg"] = cfg
     _H["workers"] = {}                       # pid -> {result, task, started, model, announced}
-    _H.setdefault("tokens_in", 0)            # shared token budget: cumulative worker spend
-    _H.setdefault("tokens_out", 0)           # (metered as each worker finishes; see _accrue_usage)
+    _H.setdefault("tokens_in", 0)            # observability: cumulative finished-worker spend
+    _H.setdefault("tokens_out", 0)           # (accrued as each worker finishes; see _accrue_usage)
 
     # Desktop ping on a worker finish, IF the notify lean-tool is also enabled (its
     # _ping is exposed on lc when it runs). Optional - absent => notices are text-only.

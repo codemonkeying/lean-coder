@@ -15,14 +15,14 @@ schemas, truncated tool results. See README.md.
   L2817   Composer (pinned input line, editor, stdin)
   L3667   Token accounting (calibrated context meter)
   L3832   Config (dataclass, field registry, load/save)
-  L6460   Tool execution + text tool-call parsing
-  L6881   Remote workspace (executor client, /connect)
-  L8446   Context meter
-  L8541   Agent (turn loop, context mgmt, tool dispatch)
-  L14226  Slash-command handlers + dispatch table
-  L14363  REPL (interactive loop, session resume)
-  L14738  Worker agent (headless --agent-run)
-  L15193  Entry (CLI arg parsing, main)
+  L6455   Tool execution + text tool-call parsing
+  L6876   Remote workspace (executor client, /connect)
+  L8441   Context meter
+  L8536   Agent (turn loop, context mgmt, tool dispatch)
+  L14220  Slash-command handlers + dispatch table
+  L14357  REPL (interactive loop, session resume)
+  L14732  Worker agent (headless --agent-run)
+  L15187  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -4074,10 +4074,6 @@ class Config:
                                      # default 1 = fan-out only, a worker can't spawn (today's limit)
     worker_max_children: int = 0     # dispatch_worker: max children ANY single worker may spawn
                                      # (0 = none). Only bites once max_depth > 1 permits recursion.
-    worker_token_budget: int = 0     # dispatch_worker: cumulative token ceiling (in+out) across
-                                     # ALL workers this session; a new dispatch is refused once
-                                     # finished-worker spend crosses it. 0 = unlimited (default).
-                                     # Slow-bleed guard: count caps stop fork-bombs, this stops drift.
     worker_depth: int = 0            # INTERNAL: this process's depth in the tree (driver=0,
                                      # its workers=1, ...). Set from the grant in run_agent_brief;
                                      # NOT a user knob (not in _ROUNDTRIP / /settings).
@@ -4341,7 +4337,6 @@ _SCALAR_FIELDS = (
     ("worker_max_iterations",     30,                  True),
     ("worker_max_depth",          1,                   True),
     ("worker_max_children",       0,                   True),
-    ("worker_token_budget",       0,                   True),
     ("approval",                  "ask",               False),
     ("confirm_reads",             False,               False),
     ("auto_reconnect",            False,               False),
@@ -11192,7 +11187,6 @@ _SETTINGS_FIELDS = [
     ("worker_max_iterations", "max tool-call rounds per worker", "int"),
     ("worker_max_depth", "max worker tree depth (1 = fan-out only, no recursion)", "int"),
     ("worker_max_children", "max children any one worker may spawn (0 = none)", "int"),
-    ("worker_token_budget", "shared worker token ceiling in+out (0 = unlimited)", "int"),
     ("editor", "editor (for /prompt)", "str"),
     ("user_name", "your name on your own turn in scrollback", "str"),
     ("approval", "approval mode", tuple(APPROVAL_MODES)),
@@ -15176,9 +15170,9 @@ def run_agent_brief(args) -> int:
         Path(resultf).write_text(f"{RESULT_MARK}\n{block}\n{RESULT_MARK}\n")
     except OSError as e:
         return _fail(f"cannot write result file: {e}")
-    # Report this worker's token spend so the parent can meter a shared budget across
-    # workers (the boss's slow-bleed guard - see dispatch_worker _worker_tokens_spent).
-    # A tiny '<brief>.usage' sidecar with in/out totals; best-effort, never fatal.
+    # Report this worker's token spend (observability): the parent sums finished workers'
+    # spend for /worker status (see dispatch_worker _worker_tokens_spent). A tiny
+    # '<brief>.usage' sidecar with in/out totals; best-effort, never fatal.
     try:
         Path(str(brief_file) + ".usage").write_text(
             f"in={int(getattr(agent, 'session_in', 0) or 0)} "
