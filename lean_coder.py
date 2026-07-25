@@ -15,14 +15,14 @@ schemas, truncated tool results. See README.md.
   L2818   Composer (pinned input line, editor, stdin)
   L3668   Token accounting (calibrated context meter)
   L3833   Config (dataclass, field registry, load/save)
-  L6518   Tool execution + text tool-call parsing
-  L6939   Remote workspace (executor client, /connect)
-  L8504   Context meter
-  L8599   Agent (turn loop, context mgmt, tool dispatch)
-  L14284  Slash-command handlers + dispatch table
-  L14421  REPL (interactive loop, session resume)
-  L14796  Worker agent (headless --agent-run)
-  L15322  Entry (CLI arg parsing, main)
+  L6668   Tool execution + text tool-call parsing
+  L7089   Remote workspace (executor client, /connect)
+  L8654   Context meter
+  L8749   Agent (turn loop, context mgmt, tool dispatch)
+  L14434  Slash-command handlers + dispatch table
+  L14571  REPL (interactive loop, session resume)
+  L14946  Worker agent (headless --agent-run)
+  L15479  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -4084,6 +4084,9 @@ class Config:
                                      # NOT a user knob (not in _ROUNDTRIP / /settings).
     worker_child_budget: int = 0     # INTERNAL: how many children THIS worker was granted (from
                                      # the grant). Driver is ungated by this (uses max_concurrent).
+    worker_board_session: int = 0    # INTERNAL: the shared-board session id (the driver's pid) a
+                                     # worker uses to reach the swarm claim board. Set from the
+                                     # grant ('board: N'); 0 = no board (a lone worker). Not a knob.
     tool_allowlist: tuple = None     # None = no restriction (all leash-permitted tools).
                                      # Else a set/tuple of tool NAMES the surface is
                                      # narrowed to (still leash-capped). Runtime-only,
@@ -4388,8 +4391,9 @@ _EPHEMERAL_KEYS = frozenset((
     "composer", "leash", "incognito", "think", "cwd", "model_explicit", "auto_num_ctx",
     "tool_allowlist",     # runtime-only per-worker tool grant; never persisted (a fresh
                           # launch must default to the full surface, like leash)
-    "worker_depth", "worker_child_budget",  # runtime-only tree position + granted child
-                          # budget, set from the grant per worker; never a saved knob
+    "worker_depth", "worker_child_budget", "worker_board_session",  # runtime-only tree
+                          # position + granted child budget + shared-board session id, set
+                          # from the grant per worker; never a saved knob
     # Not config.toml scalars: `_defaults` is the DEFAULTS snapshot save_config writes
     # FROM; `session_overrides` is the per-key override map persisted in the SESSION
     # meta (not config.toml) and re-applied at load runtime-only. Classified here so
@@ -6002,6 +6006,152 @@ def _worker_dir_sweep(grace=3600):
                     f.unlink()
             except OSError:
                 pass
+
+
+# ==========================================================================
+# Shared worker BOARD (swarm coordination - Phase 2). A session-level directory of
+# append-only files that peer workers on ONE repo read/write to avoid stepping on
+# each other. NOT a service: a claims file + a small claim-with-TTL helper, mirroring
+# the sidecar-file pattern (no server, no DB, no new transport). Driver-side only,
+# under CONFIG_DIR/workers/board/<session>, so it is purely a LOCAL concern and is
+# torn down at session exit + aged-out on startup, same two-trigger zero-trace scheme
+# as the worker sidecars (Constraint A). Only meaningful when >1 worker runs on one
+# repo; a lone worker never touches it.
+#
+# CLAIM POLICY (resolves the design open-Q): FIRST-CLAIM-WINS + TTL. A worker claims a
+# path (a file it is about to edit); the claim carries an owner + an expiry. A second
+# worker's claim on the same live path is REFUSED (it must pick other work or wait).
+# The TTL doubles as a liveness signal: a dead worker's claim expires and the path frees
+# itself, so a crash can't deadlock the board. No central arbiter - the append-only log
+# + last-write-wins-per-path reconciliation IS the arbitration (lean over an orchestrator
+# round-trip; an orchestrator can still layer on top by reading the same file).
+_BOARD_CLAIM_TTL = 900          # seconds a claim holds before it is considered stale/expired
+
+def _board_dir(session_id):
+    """The board directory for a session (created lazily by the claim writer). Keyed by
+    session so concurrent sessions on one box never share a board."""
+    return CONFIG_DIR / "workers" / "board" / str(session_id)
+
+
+def _board_claims_path(session_id):
+    return _board_dir(session_id) / "claims.jsonl"
+
+
+def _board_read_claims(session_id, now=None):
+    """Reduce the append-only claims.jsonl to the LIVE claim per path. Each line is a
+    JSON record {path, owner, ts, ttl, action:'claim'|'release'}. Last write wins per
+    path; a 'release' or an expired claim (ts+ttl <= now) drops the path. Returns
+    {path: {owner, ts, ttl}} of currently-held claims. Corrupt lines are skipped
+    (best-effort: a partial append must never crash a reader)."""
+    now = time.time() if now is None else now
+    p = _board_claims_path(session_id)
+    live = {}
+    try:
+        raw = p.read_text()
+    except OSError:
+        return live
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except (ValueError, TypeError):
+            continue
+        path = rec.get("path")
+        if not path:
+            continue
+        if rec.get("action") == "release":
+            live.pop(path, None)
+            continue
+        ttl = rec.get("ttl", _BOARD_CLAIM_TTL)
+        if rec.get("ts", 0) + ttl <= now:
+            live.pop(path, None)          # expired -> not held
+            continue
+        live[path] = {"owner": rec.get("owner"), "ts": rec.get("ts", 0), "ttl": ttl}
+    return live
+
+
+def _board_claim(session_id, path, owner, ttl=_BOARD_CLAIM_TTL, now=None):
+    """Try to claim `path` for `owner` (first-claim-wins). Appends a claim record IFF the
+    path is free (no live claim, or the live claim is already this owner's = refresh).
+    Returns (ok, holder): ok True + holder=owner on success; ok False + holder=<other
+    owner> when another live claim blocks it. Append-only + atomic single write, so two
+    racing claimers are resolved by read-back (the loser sees the winner's record)."""
+    now = time.time() if now is None else now
+    live = _board_read_claims(session_id, now=now)
+    held = live.get(path)
+    if held and held.get("owner") != owner:
+        return False, held.get("owner")
+    d = _board_dir(session_id)
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+        rec = {"path": path, "owner": owner, "ts": now, "ttl": ttl, "action": "claim"}
+        with _board_claims_path(session_id).open("a") as f:
+            f.write(json.dumps(rec) + "\n")
+    except OSError:
+        return False, None
+    return True, owner
+
+
+def _board_release(session_id, path, owner, now=None):
+    """Release `owner`'s claim on `path` (append a 'release' record). Best-effort; a
+    release for a path this owner doesn't hold is a harmless no-op on read-back."""
+    now = time.time() if now is None else now
+    d = _board_dir(session_id)
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+        rec = {"path": path, "owner": owner, "ts": now, "action": "release"}
+        with _board_claims_path(session_id).open("a") as f:
+            f.write(json.dumps(rec) + "\n")
+    except OSError:
+        return False
+    return True
+
+
+def _board_teardown(session_id):
+    """Session exit: remove this session's board dir entirely (zero trace). Best-effort."""
+    d = _board_dir(session_id)
+    try:
+        for f in d.glob("*"):
+            try:
+                f.unlink()
+            except OSError:
+                pass
+        d.rmdir()
+    except OSError:
+        pass
+
+
+def _board_sweep(grace=3600):
+    """Startup backstop: remove aged-out board dirs left by a crashed session (where
+    _board_teardown never ran). A board whose claims.jsonl mtime is older than `grace`
+    (default 1h) is nuked. Empty/parentless dirs are pruned. Driver-side only; mirrors
+    _worker_dir_sweep's aged-out guard so a concurrent session's live board is never
+    touched. Best-effort."""
+    root = CONFIG_DIR / "workers" / "board"
+    if not root.is_dir():
+        return
+    now = time.time()
+    for d in root.glob("*"):
+        if not d.is_dir():
+            continue
+        claims = d / "claims.jsonl"
+        try:
+            mtime = claims.stat().st_mtime if claims.exists() else d.stat().st_mtime
+            if now - mtime < grace:
+                continue
+        except OSError:
+            continue
+        for f in d.glob("*"):
+            try:
+                f.unlink()
+            except OSError:
+                pass
+        try:
+            d.rmdir()
+        except OSError:
+            pass
 
 
 def _bg_reap_orphans():
@@ -14877,6 +15027,13 @@ def run_agent_brief(args) -> int:
             cfg.worker_child_budget = int(grant["child_budget"])
         except ValueError:
             pass
+    # Shared swarm board: the driver's session id, so this worker's board claims land on
+    # the SAME claims file its peers use. Absent -> 0 -> a lone worker with no board.
+    if grant.get("board"):
+        try:
+            cfg.worker_board_session = int(grant["board"])
+        except ValueError:
+            pass
     # The worker attaches its TOOLS to the parent's remote when one is passed. In that
     # case the grant 'cwd' is a path on the REMOTE (not the driver), so it must NOT
     # constrain the driver-local cfg.cwd - leave cfg.cwd at the driver default and hand
@@ -15435,7 +15592,9 @@ def main():
     _register_dir_providers(cfg)          # register enabled providers/ plugins (bundled ollama + user)
     _bg_reap_orphans()                    # kill background tasks left by a crashed session
     _worker_dir_sweep()                   # nuke orphaned worker sidecars (reboot/SIGKILL residue)
+    _board_sweep()                        # nuke aged-out swarm board dirs from a crashed session
     atexit.register(_bg_kill_session)     # peg this session's bg tasks to it: kill on exit
+    atexit.register(lambda: _board_teardown(os.getpid()))  # tear down this session's swarm board
     atexit.register(_close_worker_masters)  # tear down masters opened just to carry workers
     try:
         repl(cfg, resume=args.resume)
