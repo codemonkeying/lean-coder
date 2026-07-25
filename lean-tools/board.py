@@ -35,19 +35,22 @@ TOOL = {
         "finish first), 'assign' a worker pid to a ready task, 'list' to see every task "
         "with a computed ready/blocked flag (assign only READY ones - a blocked task's "
         "deps aren't done yet), 'done'/'fail' to record an outcome, 'block' to park a "
-        "running task, 'find' to search. Workers report their OWN task done/fail and can "
-        "list/find; only the driver creates/adds/assigns/blocks. The board is the map: "
-        "hand out work whose deps are done, mark each finish, re-check what is ready."),
+        "running task, 'find' to search, 'reconcile' to collect every finished task's "
+        "result in dependency order (dep before dependent) once the DAG is done. Workers "
+        "report their OWN task done/fail and can list/find/reconcile; only the driver "
+        "creates/adds/assigns/blocks. The board is the map: hand out work whose deps are "
+        "done, mark each finish, re-check what is ready, reconcile the results at the end."),
     "parameters": {
         "type": "object",
         "properties": {
             "action": {"type": "string",
                        "enum": ["create", "add", "assign", "block", "done", "fail",
-                                "list", "find"],
+                                "list", "find", "reconcile"],
                        "description": "create=new board; add=append a task; assign=put a "
                                       "worker on a ready task (driver); block=park a task; "
                                       "done/fail=record an outcome; list=all tasks + ready/"
-                                      "blocked; find=search tasks by text."},
+                                      "blocked; find=search tasks by text; reconcile=finished "
+                                      "results in dependency order."},
             "board": {"type": "string",
                       "description": "The board name (like a session name). Required by every "
                                      "action."},
@@ -191,6 +194,36 @@ def run(args, cwd):
             return f"board '{name}': no task matches '{q}'."
         return "\n".join([_H["bold"](f"board '{name}' matches for '{q}':")]
                          + [_fmt_task(t, ready_ids) for t in hits])
+
+    if action == "reconcile":
+        # Read action, open to anyone: the result_refs of every DONE task in dependency
+        # (topological) order, dep-before-dependent - what the driver concatenates to
+        # collect the swarm's finished work once the DAG has run.
+        pairs = _H["_taskboard_reconcile"](board)
+        tasks = board.get("tasks", [])
+        done_no_ref = [t for t in tasks
+                       if t.get("status") == "done" and not t.get("result_ref")]
+        pending = [t for t in tasks if t.get("status") not in ("done", "failed")]
+        failed = [t for t in tasks if t.get("status") == "failed"]
+        if not pairs:
+            base = f"board '{name}': nothing to reconcile - no done task has a result_ref yet."
+            if pending:
+                base += f" ({len(pending)} task(s) still unfinished.)"
+            return base
+        lines = [_H["bold"](f"board '{name}' reconcile (dependency order):")]
+        for i, (t, rr) in enumerate(pairs, 1):
+            lines.append(f"  {i}. {t.get('id','?')} {t.get('name','')}"
+                         + _H["cyan"](f"  -> {rr}"))
+        tail = []
+        if done_no_ref:
+            tail.append(f"{len(done_no_ref)} done task(s) had no result_ref (skipped)")
+        if pending:
+            tail.append(f"{len(pending)} still unfinished")
+        if failed:
+            tail.append(f"{len(failed)} failed")
+        if tail:
+            lines.append(_H["dim"]("note: " + "; ".join(tail) + "."))
+        return "\n".join(lines)
 
     if action == "add":
         if not _is_driver():

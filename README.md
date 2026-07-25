@@ -383,14 +383,15 @@ one turn runs **concurrently**.
 ### Opt-in lean-tools
 
 Anything beyond local edit + shell is a **lean-tool**: a single `.py` file with a
-`TOOL` schema and a `run` function, discovered but **disabled by default**. Turn one
-on with `/tools` and it costs context only from that point. These ship bundled in
+`TOOL` schema and a `run` function, discovered but **disabled by default** (the lone
+exception is `board`, which is on out of the box). Turn one on with `/tools` and it
+costs context only from that point. These ship bundled in
 [`lean-tools/`](lean-tools/), ready to enable:
 
 | Lean-tool         | Adds |
 |-------------------|------|
 | `dispatch_worker` | Hand a scoped sub-task to a background worker agent; collect its result. Steer a running worker (inject / set its plan / add notes), grant it a narrowed toolset, seed it with context/plan/notes, dispatch it against a named task `board`, and (with `worker_checkpoint` on) **resume** a worker that died without finishing from its saved transcript. Adds `/worker` (list / `<pid>` = full result / cancel / inject / set_plan / add_note / resume). |
-| `board`           | A driver-orchestrated **task board**: a named dependency DAG of tasks the driver lays out, assigns workers to, and marks progress on (workers report their own task `done` and read the board, but only the driver creates/assigns). Tasks with unmet deps stay blocked, so a worker never starts on the wrong assumption; `done` reports what it unblocked. Named + on disk, so it survives a crash and can be handed to another session. `safe`; auto-enabled for a worker dispatched with `taskboard=`. |
+| `board`           | A driver-orchestrated **task board**: a named dependency DAG of tasks the driver lays out, assigns workers to, and marks progress on (workers report their own task `done` and read the board, but only the driver creates/assigns). Tasks with unmet deps stay blocked, so a worker never starts on the wrong assumption; `done` reports what it unblocked. Named + on disk, so it survives a crash and can be handed to another session. `safe`; **on by default** (the one lean-tool that is), and also auto-enabled for a worker dispatched with `taskboard=`. |
 | `web_fetch`       | Read a URL as clean text. |
 | `web_screenshot`  | Screenshot a URL with a headless browser + return the page text (and, on a vision model, the image itself). **Needs [Playwright](https://playwright.dev/python/) + a browser** (`pip install playwright && playwright install firefox`); says so if absent. Disabled by default. |
 | `brave_search`    | Web search (Brave API). |
