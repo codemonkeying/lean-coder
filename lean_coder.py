@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L883    Lean-tools (plugin tools: discovery, manager)
-  L1223   MCP client (connection, manager, OAuth, discovery)
-  L1677   Providers (backend plugin registry)
-  L1899   Interactive pickers + menus (raw-mode UI engine)
-  L2248   Terminal styling (colors, formatting helpers)
-  L2445   Streaming + markdown render (model output)
-  L2792   Composer (pinned input line, editor, stdin)
-  L3642   Token accounting (calibrated context meter)
-  L3807   Config (dataclass, field registry, load/save)
-  L6331   Tool execution + text tool-call parsing
-  L6752   Remote workspace (executor client, /connect)
-  L8317   Context meter
-  L8412   Agent (turn loop, context mgmt, tool dispatch)
-  L14053  Slash-command handlers + dispatch table
-  L14190  REPL (interactive loop, session resume)
-  L14565  Worker agent (headless --agent-run)
-  L14878  Entry (CLI arg parsing, main)
+  L890    Lean-tools (plugin tools: discovery, manager)
+  L1230   MCP client (connection, manager, OAuth, discovery)
+  L1684   Providers (backend plugin registry)
+  L1906   Interactive pickers + menus (raw-mode UI engine)
+  L2255   Terminal styling (colors, formatting helpers)
+  L2452   Streaming + markdown render (model output)
+  L2799   Composer (pinned input line, editor, stdin)
+  L3649   Token accounting (calibrated context meter)
+  L3814   Config (dataclass, field registry, load/save)
+  L6338   Tool execution + text tool-call parsing
+  L6759   Remote workspace (executor client, /connect)
+  L8324   Context meter
+  L8419   Agent (turn loop, context mgmt, tool dispatch)
+  L14060  Slash-command handlers + dispatch table
+  L14197  REPL (interactive loop, session resume)
+  L14572  Worker agent (headless --agent-run)
+  L14885  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -111,7 +111,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.9.4"
+__version__ = "0.9.5"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -119,14 +119,21 @@ __version__ = "0.9.4"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.9.5": [
+        "compaction is now one lever end to end: a single prompt, one pre-compact",
+        "  snapshot (taken only once a usable summary exists), one code path.",
+        "the soft-nudge zone knob is now compact_soft_ratio (soft = compact_at * ratio,",
+        "  default 0.8); replaces compact_gap. A stale compact_gap in config is ignored.",
+        "/ctx removed: its context% line is already in /usage and /info.",
+        "anthropic: a mid-stream overload (SSE error frame, not HTTP 529) now retries",
+        "  with backoff instead of failing the turn.",
+    ],
     "0.9.4": [
         "context mgmt: /handover is now /compact (summarize + continue); the old",
         "  /compact (stub old tool output) is now /trim.",
         "new knob compact_keep (default 3): verbatim turns kept after a compaction.",
-        "/set compact_at <frac>: THE lever for when auto-compaction fires (the soft",
-        "  nudge zone auto-follows at compact_soft_ratio, default 0.8 = 80% of the cap).",
-        "  Was compact_hard; old configs still work.",
-        "/ctx removed: its context% line is already in /usage and /info.",
+        "/set compact_at <frac>: THE lever for when auto-compaction fires. Was",
+        "  compact_hard; old configs still work.",
     ],
 }
 
