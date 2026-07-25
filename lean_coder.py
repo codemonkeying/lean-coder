@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L909    Lean-tools (plugin tools: discovery, manager)
-  L1249   MCP client (connection, manager, OAuth, discovery)
-  L1703   Providers (backend plugin registry)
-  L1925   Interactive pickers + menus (raw-mode UI engine)
-  L2274   Terminal styling (colors, formatting helpers)
-  L2471   Streaming + markdown render (model output)
-  L2818   Composer (pinned input line, editor, stdin)
-  L3668   Token accounting (calibrated context meter)
-  L3833   Config (dataclass, field registry, load/save)
-  L6668   Tool execution + text tool-call parsing
-  L7089   Remote workspace (executor client, /connect)
-  L8654   Context meter
-  L8749   Agent (turn loop, context mgmt, tool dispatch)
-  L14438  Slash-command handlers + dispatch table
-  L14575  REPL (interactive loop, session resume)
-  L14950  Worker agent (headless --agent-run)
-  L15508  Entry (CLI arg parsing, main)
+  L925    Lean-tools (plugin tools: discovery, manager)
+  L1265   MCP client (connection, manager, OAuth, discovery)
+  L1719   Providers (backend plugin registry)
+  L1941   Interactive pickers + menus (raw-mode UI engine)
+  L2290   Terminal styling (colors, formatting helpers)
+  L2487   Streaming + markdown render (model output)
+  L2834   Composer (pinned input line, editor, stdin)
+  L3684   Token accounting (calibrated context meter)
+  L3849   Config (dataclass, field registry, load/save)
+  L6684   Tool execution + text tool-call parsing
+  L7105   Remote workspace (executor client, /connect)
+  L8670   Context meter
+  L8765   Agent (turn loop, context mgmt, tool dispatch)
+  L14454  Slash-command handlers + dispatch table
+  L14591  REPL (interactive loop, session resume)
+  L14966  Worker agent (headless --agent-run)
+  L15524  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -111,7 +111,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.9.5"
+__version__ = "0.9.6"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -119,6 +119,22 @@ __version__ = "0.9.5"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.9.6": [
+        "workers grew up: dispatch a background sub-agent with a scoped tool allowlist",
+        "  and seeded state (curated context / a starting plan / notebook lines), then",
+        "  steer it live with /worker set_plan and add_note while it runs.",
+        "dead-worker recovery: a worker that times out, is killed, or hits its iteration",
+        "  cap can be resumed from a transcript checkpoint (opt in with worker_checkpoint)",
+        "  instead of restarting cold - optionally with a fresh, larger iteration budget.",
+        "the driver can now set a per-worker iteration cap at dispatch, capped at your",
+        "  operator ceiling (an env lockdown still wins).",
+        "swarm coordination: peers share a claims board (first-claim-wins with a TTL) so",
+        "  two workers on one repo don't stomp the same file.",
+        "safe-recursion governor bounds any worker subtree (depth x child-budget), and a",
+        "  worker's leash/tools can never exceed the grantor's.",
+        "config: a duplicate-key or partly-corrupt config.toml no longer wipes your",
+        "  settings - the good scalars are salvaged.",
+    ],
     "0.9.5": [
         "compaction is now one lever end to end: a single prompt, one pre-compact",
         "  snapshot (taken only once a usable summary exists), one code path.",
