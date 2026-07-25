@@ -433,6 +433,39 @@ session is connected to a remote.
 > provisioned, authed lean-coder there); for now the worker's tools reach a remote via
 > the executor while inference stays local.
 
+## Swarm coordination (`board`)
+
+For more than one worker on one job, the bundled `board` lean-tool is the
+coordination surface: a **driver-orchestrated task DAG**. The driver lays out a
+graph of tasks (each with `deps` that must finish first), assigns a worker to each
+ready task, and marks progress; workers report their *own* task `done` and read the
+board, but never self-select work. This is deliberately **push, not pull** - a weak
+worker picking its own next task is how a swarm goes wrong (e.g. building the UI
+around the wrong database before anyone confirmed it). The driver is the scheduler.
+
+- **On disk, named, session-shaped.** A board is `CONFIG_DIR/workers/taskboards/
+  <name>.json` (`{meta, tasks[]}`), written atomically like a saved session - so it
+  survives a crash and can be handed to a different lean-coder session to keep
+  driving. Distinct from a worker's file *claim* (`dispatch_worker` `board_claim`),
+  which is the "don't both edit auth.py" mutex; the board is the "task C waits for
+  task D" dependency graph.
+- **`ready`/`blocked` is derived, not stored.** A task is *ready* when every dep is
+  `done`; the driver assigns only ready tasks (assigning a blocked one is refused),
+  and marking a task `done` reports what it just unblocked - so the driver always
+  knows what to hand out next without hand-tracking the graph.
+- **Three orthogonal capabilities.** The board grants *coordination* only. Spawning
+  a worker is gated by the recursion governor (`worker_max_depth` x
+  `worker_max_children`, both off by default); acting on files is gated by the leash
+  (`r`/`rw`/`rwe`). So a `leash: r` scout can coordinate on the board yet neither
+  edit files nor spawn anyone. In the tool, `create`/`add`/`assign`/`block` are
+  **driver-only** (`worker_depth == 0`); a worker may only `done`/`fail` its own task
+  and `list`/`find`.
+- **Auto-enabled per worker.** Dispatch with `taskboard=<name>` and the worker
+  automatically gets the (`safe`) board tool plus a one-line contract to report its
+  task `done` there - you do not also have to list it in `tools=`. Granting a worker
+  a board *is* the intent to let it coordinate; a worker with no `taskboard` grant
+  gets nothing extra.
+
 ## Context discipline
 
 Every enabled lean-tool's schema is in every request. Make `description` earn

@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L925    Lean-tools (plugin tools: discovery, manager)
-  L1265   MCP client (connection, manager, OAuth, discovery)
-  L1719   Providers (backend plugin registry)
-  L1941   Interactive pickers + menus (raw-mode UI engine)
-  L2290   Terminal styling (colors, formatting helpers)
-  L2487   Streaming + markdown render (model output)
-  L2834   Composer (pinned input line, editor, stdin)
-  L3684   Token accounting (calibrated context meter)
-  L3849   Config (dataclass, field registry, load/save)
-  L6962   Tool execution + text tool-call parsing
-  L7383   Remote workspace (executor client, /connect)
-  L8948   Context meter
-  L9043   Agent (turn loop, context mgmt, tool dispatch)
-  L14732  Slash-command handlers + dispatch table
-  L14869  REPL (interactive loop, session resume)
-  L15244  Worker agent (headless --agent-run)
-  L15839  Entry (CLI arg parsing, main)
+  L939    Lean-tools (plugin tools: discovery, manager)
+  L1279   MCP client (connection, manager, OAuth, discovery)
+  L1733   Providers (backend plugin registry)
+  L1955   Interactive pickers + menus (raw-mode UI engine)
+  L2304   Terminal styling (colors, formatting helpers)
+  L2501   Streaming + markdown render (model output)
+  L2848   Composer (pinned input line, editor, stdin)
+  L3698   Token accounting (calibrated context meter)
+  L3863   Config (dataclass, field registry, load/save)
+  L6976   Tool execution + text tool-call parsing
+  L7397   Remote workspace (executor client, /connect)
+  L8962   Context meter
+  L9057   Agent (turn loop, context mgmt, tool dispatch)
+  L14746  Slash-command handlers + dispatch table
+  L14883  REPL (interactive loop, session resume)
+  L15258  Worker agent (headless --agent-run)
+  L15853  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -111,7 +111,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.9.6"
+__version__ = "0.9.7"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -119,6 +119,20 @@ __version__ = "0.9.6"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.9.7": [
+        "new `board` lean-tool: a driver-orchestrated task board (a named dependency",
+        "  DAG). The driver lays out tasks with deps, assigns a worker to each ready one,",
+        "  and marks progress; workers report their own task done and read the board but",
+        "  never self-select. Tasks with unmet deps stay blocked, so a worker never starts",
+        "  on a wrong assumption. Enable it with /tools.",
+        "dispatch a worker against a board with taskboard=<name>: it auto-gets the board",
+        "  tool and reports its task done there when finished. Pair a strong driver model",
+        "  with cheaper leaf-worker models - the scheduling judgment stays in one seat.",
+        "a board is a named JSON file on disk, so a swarm survives a crash and can be",
+        "  handed to another session to keep driving.",
+        "fix: the swarm file-claim board now resolves a true concurrent race to exactly",
+        "  one winner (it used to tell every racer it won).",
+    ],
     "0.9.6": [
         "workers grew up: dispatch a background sub-agent with a scoped tool allowlist",
         "  and seeded state (curated context / a starting plan / notebook lines), then",
