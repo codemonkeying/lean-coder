@@ -766,12 +766,17 @@ def _worker_cancel(pid):
     row = rows.get(pid)
     if row and row["state"] != "running":
         return f"worker {pid} is not running ({row['state']}); nothing to cancel."
-    kill = _H.get("_bg_kill")
+    # Kill the worker AND every descendant it spawned. A worker-spawned grandchild is
+    # setsid'd into its own process group, so a single killpg would orphan it; _bg_kill_tree
+    # walks the registry's owner graph to reach every level. Fall back to the flat kill if
+    # core predates the tree helper.
+    kill = _H.get("_bg_kill_tree") or _H.get("_bg_kill")
     if not kill:
         return "error: no kill hook available (core too old)."
     kill(pid)
     meta["announced"] = True    # suppress a finish notice for a worker we deliberately killed
-    return f"cancelled worker {pid} (SIGTERM to its process group). task: {meta['task'][:80]}"
+    return (f"cancelled worker {pid} (SIGTERM to it and any workers it spawned). "
+            f"task: {meta['task'][:80]}")
 
 
 def _brief_from_result(result_path):
@@ -1012,7 +1017,7 @@ def setup(lc, cfg):
     # Capture the core hooks + helpers run()/the command need (a tool's run() gets
     # no lc). setup() is driver-only = exactly where a worker is launched, so these
     # are always present when run() fires.
-    for k in ("bg_launch", "bg_list", "bg_status", "_bg_kill", "_bg_log_tail", "_extract_marked", "CONFIG_DIR",
+    for k in ("bg_launch", "bg_list", "bg_status", "_bg_kill", "_bg_kill_tree", "_bg_log_tail", "_extract_marked", "CONFIG_DIR",
               "BRIEF_MARK", "GRANT_MARK", "RESULT_MARK", "LEASH_LEVELS", "_norm_leash",
               "SEED_CONTEXT_MARK", "SEED_PLAN_MARK", "SEED_NOTES_MARK",
               "active_remote", "_ssh_master_alive", "ensure_worker_master",
