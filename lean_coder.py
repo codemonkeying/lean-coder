@@ -15,14 +15,14 @@ schemas, truncated tool results. See README.md.
   L2834   Composer (pinned input line, editor, stdin)
   L3684   Token accounting (calibrated context meter)
   L3849   Config (dataclass, field registry, load/save)
-  L6956   Tool execution + text tool-call parsing
-  L7377   Remote workspace (executor client, /connect)
-  L8942   Context meter
-  L9037   Agent (turn loop, context mgmt, tool dispatch)
-  L14726  Slash-command handlers + dispatch table
-  L14863  REPL (interactive loop, session resume)
-  L15238  Worker agent (headless --agent-run)
-  L15796  Entry (CLI arg parsing, main)
+  L6962   Tool execution + text tool-call parsing
+  L7383   Remote workspace (executor client, /connect)
+  L8948   Context meter
+  L9043   Agent (turn loop, context mgmt, tool dispatch)
+  L14732  Slash-command handlers + dispatch table
+  L14869  REPL (interactive loop, session resume)
+  L15244  Worker agent (headless --agent-run)
+  L15839  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -4103,6 +4103,11 @@ class Config:
     worker_board_session: int = 0    # INTERNAL: the shared-board session id (the driver's pid) a
                                      # worker uses to reach the swarm claim board. Set from the
                                      # grant ('board: N'); 0 = no board (a lone worker). Not a knob.
+    worker_taskboard: str = ""       # INTERNAL: the NAMED task DAG board (Phase 2b) this worker was
+                                     # assigned to. Set from the grant ('taskboard: <name>'); when
+                                     # set, run_agent_brief auto-loads the `board` lean-tool so the
+                                     # worker can report done/list. Distinct from worker_board_session
+                                     # (the int file-claim mutex). "" = no task board. Not a knob.
     tool_allowlist: tuple = None     # None = no restriction (all leash-permitted tools).
                                      # Else a set/tuple of tool NAMES the surface is
                                      # narrowed to (still leash-capped). Runtime-only,
@@ -4407,9 +4412,10 @@ _EPHEMERAL_KEYS = frozenset((
     "composer", "leash", "incognito", "think", "cwd", "model_explicit", "auto_num_ctx",
     "tool_allowlist",     # runtime-only per-worker tool grant; never persisted (a fresh
                           # launch must default to the full surface, like leash)
-    "worker_depth", "worker_child_budget", "worker_board_session",  # runtime-only tree
-                          # position + granted child budget + shared-board session id, set
-                          # from the grant per worker; never a saved knob
+    "worker_depth", "worker_child_budget", "worker_board_session", "worker_taskboard",
+                          # runtime-only tree position + granted child budget + shared-board
+                          # session id + assigned task-board name, set from the grant per
+                          # worker; never a saved knob
     # Not config.toml scalars: `_defaults` is the DEFAULTS snapshot save_config writes
     # FROM; `session_overrides` is the per-key override map persisted in the SESSION
     # meta (not config.toml) and re-applied at load runtime-only. Classified here so
@@ -15326,6 +15332,23 @@ def run_agent_brief(args) -> int:
             cfg.worker_board_session = int(grant["board"])
         except ValueError:
             pass
+    # Named task DAG board (Phase 2b): the driver assigned this worker to a board by NAME.
+    # Auto-load the `board` lean-tool so the worker can report its task done + read the
+    # board - granting a worker a board IS the intent to let it coordinate, so requiring the
+    # driver to also list 'board' in tools= would be a silent-failure footgun (worker can't
+    # report -> board stalls -> driver waits forever). The board tool is safe (touches only
+    # board JSON under the config dir, never the user tree), so this never widens the leash;
+    # and it's scoped - a worker with no taskboard grant gets nothing extra. If the grant
+    # ALSO carries a tools= allowlist, keep 'board' in it (the worker still needs it).
+    tb_name = (grant.get("taskboard") or "").strip()
+    if tb_name:
+        cfg.worker_taskboard = tb_name
+        enabled = list(cfg.lean_tools_enabled or [])
+        if "board" not in enabled:
+            enabled.append("board")
+        cfg.lean_tools_enabled = enabled
+        if cfg.tool_allowlist is not None and "board" not in cfg.tool_allowlist:
+            cfg.tool_allowlist = tuple(cfg.tool_allowlist) + ("board",)
     # The worker attaches its TOOLS to the parent's remote when one is passed. In that
     # case the grant 'cwd' is a path on the REMOTE (not the driver), so it must NOT
     # constrain the driver-local cfg.cwd - leave cfg.cwd at the driver default and hand
@@ -15347,6 +15370,15 @@ def run_agent_brief(args) -> int:
         agent = Agent(cfg)
     except Exception as e:
         return _fail(f"worker failed to initialise (Agent build): {e}")
+    # A worker is a full agent, so its enabled lean-tools need their setup() run too - the
+    # REPL does this at startup, but the headless worker path skipped it, so a tool that
+    # depends on setup() (e.g. `board` capturing its core hooks into _H) loaded but ran
+    # uninitialised. Run it here now that cfg + the enabled set are final. Not the
+    # --tool-exec executor (that path never builds an Agent); a real worker agent.
+    try:
+        _run_lean_tool_setup(cfg, agent.lean_tools)
+    except Exception as e:
+        print(yellow(f"agent-run: lean-tool setup warning: {e}"))
     # Apply the parent's seed STATE onto the fresh worker (before its first turn). A plan
     # goes straight to pinned_plan (rides the worker's own compaction); notes seed the
     # notebook one entry per non-blank line, tagged so the worker reads them as given, not
@@ -15448,6 +15480,17 @@ def run_agent_brief(args) -> int:
         # know", distinct from the task itself. Only when present.
         + (f"\nCONTEXT FROM THE AGENT THAT DISPATCHED YOU (background you need; not the task "
            f"itself):\n{seed_context.strip()}\n" if seed_context.strip() else "")
+        # Task-board contract (Phase 2b): when the driver assigned this worker to a named
+        # board, tell it - once, structurally - to report its own task done there. The
+        # `board` tool was auto-loaded above; the worker marks its task done (and may read
+        # the board with list/find), but cannot assign/create - that's the driver's job.
+        + (f"\nTASK BOARD: you are working task board '{cfg.worker_taskboard}'. Use the "
+           f"`board` tool: when your task is complete, call action='done' board="
+           f"'{cfg.worker_taskboard}' task=<your task id> result_ref=<path to your work "
+           f"product>, so the driver knows to schedule what your task unblocks. You may "
+           f"also action='list'/'find' to see the board, but you cannot create/add/assign "
+           f"(that is the driver's role). Your task id is stated in the task below.\n"
+           if getattr(cfg, "worker_taskboard", "") else "")
         + "\nTASK:\n"
         + brief)
 
