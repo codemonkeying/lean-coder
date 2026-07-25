@@ -15,14 +15,14 @@ schemas, truncated tool results. See README.md.
   L2817   Composer (pinned input line, editor, stdin)
   L3667   Token accounting (calibrated context meter)
   L3832   Config (dataclass, field registry, load/save)
-  L6455   Tool execution + text tool-call parsing
-  L6876   Remote workspace (executor client, /connect)
-  L8441   Context meter
-  L8536   Agent (turn loop, context mgmt, tool dispatch)
-  L14220  Slash-command handlers + dispatch table
-  L14357  REPL (interactive loop, session resume)
-  L14732  Worker agent (headless --agent-run)
-  L15187  Entry (CLI arg parsing, main)
+  L6512   Tool execution + text tool-call parsing
+  L6933   Remote workspace (executor client, /connect)
+  L8498   Context meter
+  L8593   Agent (turn loop, context mgmt, tool dispatch)
+  L14277  Slash-command handlers + dispatch table
+  L14414  REPL (interactive loop, session resume)
+  L14789  Worker agent (headless --agent-run)
+  L15249  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -4399,16 +4399,73 @@ _BESPOKE_KEYS = frozenset((
 ))
 
 
+def _salvage_config_scalars(raw: str) -> dict:
+    """Lenient recovery parser for a config.toml that tomllib REJECTED (e.g. a duplicate
+    top-level key written by a stale session). Reads only the top-level 'key = value'
+    scalars BEFORE the first '[table]' header (tables are bespoke - hosts/providers - and
+    are safely re-derived from defaults if lost), coercing TOML-ish scalars (int, float,
+    bool, quoted string). LAST value wins per key (mirrors what a save intends and what a
+    lenient TOML reader would keep). Never raises; returns {} on total garbage. This
+    turns a hard 'drop everything to defaults' into 'keep what's readable'."""
+    out = {}
+    for line in (raw or "").splitlines():
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        if s.startswith("["):        # first table header -> stop; the rest is bespoke
+            break
+        if "=" not in s:
+            continue
+        k, _, v = s.partition("=")
+        k, v = k.strip(), v.strip()
+        if not k or not v or v.startswith(("[", "{")):   # skip inline arrays/tables
+            continue
+        # strip an inline comment on unquoted values (a '#' inside quotes is data)
+        if not v.startswith(("'", '"')) and "#" in v:
+            v = v.split("#", 1)[0].strip()
+        val = None
+        if v.lower() in ("true", "false"):
+            val = (v.lower() == "true")
+        elif len(v) >= 2 and v[0] in "'\"" and v[-1] == v[0]:
+            val = v[1:-1]
+        else:
+            try:
+                val = int(v)
+            except ValueError:
+                try:
+                    val = float(v)
+                except ValueError:
+                    val = None
+        if val is not None:
+            out[k] = val            # last write wins on a duplicate key
+    return out
+
 def load_config(args) -> Config:
     cfg = Config()
     # config file (lowest, above defaults)
     file_vals = {}
     if CONFIG_PATH.is_file():
+        raw = ""
         try:
             import tomllib  # lazy: the hermetic --tool-exec role never needs it
-            file_vals = tomllib.loads(CONFIG_PATH.read_text())
+            raw = CONFIG_PATH.read_text()
+            file_vals = tomllib.loads(raw)
         except Exception as e:
-            print(yellow(f"warning: could not parse {CONFIG_PATH}: {e}"))
+            # Don't nuke the whole config to defaults over ONE bad line (e.g. a stale
+            # session that serialised a duplicate key from its own in-memory field list -
+            # a duplicate key makes tomllib reject the ENTIRE file, which would silently
+            # drop the user's model pin, host, provider, etc). Recover the top-level
+            # scalars with a lenient parse (last value wins per key). Tables (hosts/
+            # providers) can't be salvaged safely here, so they fall back to defaults; the
+            # file self-heals on the next normal save (any /set or clean exit rewrites it).
+            salvaged = _salvage_config_scalars(raw) if raw else {}
+            if salvaged:
+                file_vals = salvaged
+                print(yellow(f"warning: {CONFIG_PATH} was malformed ({e}); "
+                             f"recovered {len(salvaged)} top-level setting(s). It will be "
+                             f"rewritten clean on the next settings change or clean exit."))
+            else:
+                print(yellow(f"warning: could not parse {CONFIG_PATH} ({e}); using defaults."))
     # Back-compat: compact_hard was renamed to compact_at (>0.9.4). A config still
     # carrying the old key maps onto the new field, unless the new key is also present.
     if "compact_hard" in file_vals and "compact_at" not in file_vals:
@@ -14783,6 +14840,13 @@ def run_agent_brief(args) -> int:
         cfg.leash = _norm_leash(grant["leash"]) or cfg.leash
     # Per-worker tool allowlist: the parent may grant a NARROWED toolset (a comma list
     # of tool names in the grant). Absent -> None -> the full leash-permitted surface
+    # (today's behaviour). The meta tools are always kept regardless (enforced in
+    # active_tools / _gate_tool), so a scout granted just "read_file,web_fetch" still
+    # has its plan/notebook. The leash cap still applies on top.
+    if grant.get("tools"):
+        names = tuple(t.strip() for t in grant["tools"].split(",") if t.strip())
+        if names:
+            cfg.tool_allowlist = names
     if grant.get("max_iterations"):
         try:
             cfg.max_iterations = int(grant["max_iterations"])
@@ -14802,8 +14866,6 @@ def run_agent_brief(args) -> int:
             cfg.worker_child_budget = int(grant["child_budget"])
         except ValueError:
             pass
-        if names:
-            cfg.tool_allowlist = names
     # The worker attaches its TOOLS to the parent's remote when one is passed. In that
     # case the grant 'cwd' is a path on the REMOTE (not the driver), so it must NOT
     # constrain the driver-local cfg.cwd - leave cfg.cwd at the driver default and hand
