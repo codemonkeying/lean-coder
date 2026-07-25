@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L902    Lean-tools (plugin tools: discovery, manager)
-  L1242   MCP client (connection, manager, OAuth, discovery)
-  L1696   Providers (backend plugin registry)
-  L1918   Interactive pickers + menus (raw-mode UI engine)
-  L2267   Terminal styling (colors, formatting helpers)
-  L2464   Streaming + markdown render (model output)
-  L2811   Composer (pinned input line, editor, stdin)
-  L3661   Token accounting (calibrated context meter)
-  L3826   Config (dataclass, field registry, load/save)
-  L6387   Tool execution + text tool-call parsing
-  L6808   Remote workspace (executor client, /connect)
-  L8373   Context meter
-  L8468   Agent (turn loop, context mgmt, tool dispatch)
-  L14150  Slash-command handlers + dispatch table
-  L14287  REPL (interactive loop, session resume)
-  L14662  Worker agent (headless --agent-run)
-  L14984  Entry (CLI arg parsing, main)
+  L908    Lean-tools (plugin tools: discovery, manager)
+  L1248   MCP client (connection, manager, OAuth, discovery)
+  L1702   Providers (backend plugin registry)
+  L1924   Interactive pickers + menus (raw-mode UI engine)
+  L2273   Terminal styling (colors, formatting helpers)
+  L2470   Streaming + markdown render (model output)
+  L2817   Composer (pinned input line, editor, stdin)
+  L3667   Token accounting (calibrated context meter)
+  L3832   Config (dataclass, field registry, load/save)
+  L6393   Tool execution + text tool-call parsing
+  L6814   Remote workspace (executor client, /connect)
+  L8379   Context meter
+  L8474   Agent (turn loop, context mgmt, tool dispatch)
+  L14156  Slash-command handlers + dispatch table
+  L14293  REPL (interactive loop, session resume)
+  L14668  Worker agent (headless --agent-run)
+  L15012  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -289,6 +289,12 @@ PLAN_MARK = "===PLAN==="            # the model wraps its pinned goal + TODO in 
 BRIEF_MARK = "===BRIEF==="          # a worker's task (its first user turn) - see --agent-run
 GRANT_MARK = "===GRANT==="          # a worker's grant header (leash/model/cwd/limits)
 RESULT_MARK = "===RESULT==="        # a worker wraps its final answer in these; the parent harvests it
+# Optional seed blocks a parent may include in a worker's brief to hand it curated
+# STATE (not whole context): starting plan, episodic notes, shared-context blob. All
+# bounded by the dispatch tool so "share state, not context" holds. See run_agent_brief.
+SEED_PLAN_MARK = "===PLAN==="       # seeds the worker's pinned_plan (GOAL + TODO)
+SEED_NOTES_MARK = "===NOTES==="     # seeds the worker's notebook (one note per line)
+SEED_CONTEXT_MARK = "===CONTEXT===" # a short shared-context blob prepended to the task
 
 COMPACT_INSTR = (
     "You are compacting this session now: the older turns get replaced by what you write "
@@ -14692,6 +14698,12 @@ def run_agent_brief(args) -> int:
     if not brief:
         return _fail(f"brief file has no {BRIEF_MARK} block")
     grant = _parse_grant(_extract_marked(raw, GRANT_MARK) or "")
+    # Optional seed STATE the parent curated for this worker (all bounded at dispatch):
+    # a starting plan, notebook entries, and a shared-context blob. Parsed here, applied
+    # onto the agent below once it's built. Absent -> the worker starts clean (default).
+    seed_plan = _extract_marked(raw, SEED_PLAN_MARK) or ""
+    seed_notes = _extract_marked(raw, SEED_NOTES_MARK) or ""
+    seed_context = _extract_marked(raw, SEED_CONTEXT_MARK) or ""
 
     # Build the worker's config from CLI + grant (grant wins - it's the parent's grant).
     cfg = load_config(args)
@@ -14735,6 +14747,17 @@ def run_agent_brief(args) -> int:
         agent = Agent(cfg)
     except Exception as e:
         return _fail(f"worker failed to initialise (Agent build): {e}")
+    # Apply the parent's seed STATE onto the fresh worker (before its first turn). A plan
+    # goes straight to pinned_plan (rides the worker's own compaction); notes seed the
+    # notebook one entry per non-blank line, tagged so the worker reads them as given, not
+    # self-recorded. The shared-context blob is folded into the task preamble below.
+    if seed_plan.strip():
+        agent.pinned_plan = seed_plan.strip()
+    if seed_notes.strip():
+        _dtg = time.strftime("%Y-%m-%d %H:%M")
+        for _ln in seed_notes.splitlines():
+            if _ln.strip():
+                agent.notes.append({"dtg": _dtg, "text": "parent: " + _ln.strip()})
     prov = _maybe_autostart_provider(agent, cfg)
     if prov is None or agent.client is None:
         why = getattr(agent, "_provider_fail_reason", "") or (
@@ -14820,7 +14843,12 @@ def run_agent_brief(args) -> int:
         "FIRST, before your first tool call, state your understanding of the task in about one "
         "sentence (what you're going to do). This stated intent lets whoever dispatched you "
         "catch a misread early and stop or redirect you. Keep it short, but don't truncate a "
-        "thought to hit a length.\n\nTASK:\n"
+        "thought to hit a length.\n"
+        # Seed context the parent curated (bounded at dispatch) - "here's what you need to
+        # know", distinct from the task itself. Only when present.
+        + (f"\nCONTEXT FROM THE AGENT THAT DISPATCHED YOU (background you need; not the task "
+           f"itself):\n{seed_context.strip()}\n" if seed_context.strip() else "")
+        + "\nTASK:\n"
         + brief)
 
     # Wire the inject poller: at each between-iteration boundary the worker drains any

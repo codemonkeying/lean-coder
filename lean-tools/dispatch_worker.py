@@ -44,6 +44,10 @@ from pathlib import Path
 
 # Built-in ceiling defaults (last resort: env var > live cfg > this - see docstring).
 _DEFAULTS = {"max_concurrent": 10, "idle_timeout": 1800, "max_iterations": 30}
+# Size cap (chars) per seed block (context/plan/notes). The point is to share curated
+# STATE, not smuggle the parent's whole context into a worker - an oversized seed is
+# truncated (with a marker) rather than passed whole. Generous but bounded.
+_SEED_CAP = 4000
 _ENV = {"max_concurrent": "LEANCODER_WORKER_MAX_CONCURRENT",
         "idle_timeout": "LEANCODER_WORKER_IDLE_TIMEOUT",
         "max_iterations": "LEANCODER_WORKER_MAX_ITER"}
@@ -119,6 +123,19 @@ TOOL = {
                                      "privilege: a worker never gets a tool you didn't grant, and "
                                      "the grant is still leash-capped. Its plan/note/compaction "
                                      "meta tools are always kept."},
+            "context": {"type": "string",
+                        "description": "Optional CURATED background the worker needs but that "
+                                       "isn't the task itself (e.g. 'the auth module was just "
+                                       "refactored; tokens now live in x'). Share STATE, not your "
+                                       "whole context - keep it short; it is size-capped."},
+            "plan": {"type": "string",
+                     "description": "Optional starting plan for the worker (GOAL + a '- [ ]' TODO "
+                                    "list) - seeds its pinned plan so it begins with your goal "
+                                    "decomposition instead of cold. Size-capped."},
+            "notes": {"type": "string",
+                      "description": "Optional seed notes for the worker's notebook, one per line "
+                                     "(your relevant findings). They are tagged as coming from you. "
+                                     "Size-capped."},
         },
         "required": [],
     },
@@ -183,13 +200,16 @@ def _workers_dir():
 
 
 def _compose_brief(task, model, cwd, max_iter, leash="r", provider="", brain_host="",
-                   tools=""):
+                   tools="", context="", plan="", notes=""):
     """Build the brief file text: the task wrapped in BRIEF markers + a GRANT header.
     `leash` is the already-capped grant (see _capped_leash). `provider` (optional) is
     the backend the worker must activate for `model`; absent = inherit the driver's.
     `brain_host` (optional) is an ollama inference endpoint for the worker's BRAIN,
     distinct from where its tools run; absent = the driver's own host. `tools`
-    (optional) is a comma-separated allowlist of tool names; absent = full toolset."""
+    (optional) is a comma-separated allowlist of tool names; absent = full toolset.
+    `context`/`plan`/`notes` (optional, size-bounded by the caller) seed the worker
+    with curated STATE - a background blob, a starting plan, notebook entries - each
+    emitted as its own marker block the worker parses in run_agent_brief."""
     B, G = _H["BRIEF_MARK"], _H["GRANT_MARK"]
     grant = [f"leash: {leash}", f"cwd: {cwd}", f"max_iterations: {max_iter}"]
     if model:
@@ -200,7 +220,13 @@ def _compose_brief(task, model, cwd, max_iter, leash="r", provider="", brain_hos
         grant.append(f"brain_host: {brain_host}")
     if tools:
         grant.append(f"tools: {tools}")
-    return (f"{B}\n{task.strip()}\n{B}\n{G}\n" + "\n".join(grant) + f"\n{G}\n")
+    out = [f"{B}\n{task.strip()}\n{B}", f"{G}\n" + "\n".join(grant) + f"\n{G}"]
+    for text, mark_key in ((context, "SEED_CONTEXT_MARK"), (plan, "SEED_PLAN_MARK"),
+                           (notes, "SEED_NOTES_MARK")):
+        if text and text.strip():
+            m = _H[mark_key]
+            out.append(f"{m}\n{text.strip()}\n{m}")
+    return "\n".join(out) + "\n"
 
 
 def _self_argv():
@@ -357,6 +383,17 @@ def run(args, cwd):
                             f"{', '.join(sorted(parent_tools))}.")
             tools_csv = ",".join(want_tools)
 
+    # Optional seed STATE (curated background, starting plan, notebook lines). Each is
+    # size-capped so a worker gets shared STATE, not the parent's whole context. An
+    # oversized block is truncated with a visible marker rather than rejected.
+    def _bounded(key):
+        v = (args.get(key) or "").strip()
+        if len(v) > _SEED_CAP:
+            v = v[:_SEED_CAP] + "\n...[truncated at seed cap]"
+        return v
+    seed_context = _bounded("context")
+    seed_plan = _bounded("plan")
+    seed_notes = _bounded("notes")
     max_iter = _ceiling("max_iterations")
     idle_timeout = _ceiling("idle_timeout")
     # Progress-staleness watchdog: bark (alert the parent), never bite. The worker bumps
@@ -383,7 +420,8 @@ def run(args, cwd):
     try:
         brief_file.write_text(_compose_brief(task, model, wcwd, max_iter, leash=leash,
                                              provider=provider, brain_host=brain_host,
-                                             tools=tools_csv))
+                                             tools=tools_csv, context=seed_context,
+                                             plan=seed_plan, notes=seed_notes))
     except OSError as e:
         return f"error: cannot write brief file: {e}"
 
@@ -419,8 +457,11 @@ def run(args, cwd):
     _H["workers"][launched["pid"]]["leash"] = leash
     wnote = f"on {remote['host']}" if remote else "local (driver)"
     tnote = f", tools limited to [{tools_csv}]" if tools_csv else ""
+    seeds = [n for n, v in (("context", seed_context), ("plan", seed_plan),
+                            ("notes", seed_notes)) if v]
+    snote = f", seeded {'+'.join(seeds)}" if seeds else ""
     return (f"dispatched worker pid {launched['pid']} ({mstr}, {lstr}, tools {wnote}"
-            f"{tnote}, cwd {wcwd}){cap_note}.\n"
+            f"{tnote}{snote}, cwd {wcwd}){cap_note}.\n"
             f"It runs in the BACKGROUND. You do NOT need to poll for it: when it "
             f"finishes, its result is delivered to you automatically on a later turn. "
             f"Do NOT call bg_status (workers are hidden from it by design) and do NOT "
@@ -802,6 +843,7 @@ def setup(lc, cfg):
     # are always present when run() fires.
     for k in ("bg_launch", "bg_list", "bg_status", "_bg_kill", "_bg_log_tail", "_extract_marked", "CONFIG_DIR",
               "BRIEF_MARK", "GRANT_MARK", "RESULT_MARK", "LEASH_LEVELS", "_norm_leash",
+              "SEED_CONTEXT_MARK", "SEED_PLAN_MARK", "SEED_NOTES_MARK",
               "active_remote", "_ssh_master_alive", "ensure_worker_master",
               "active_tool_names", "resolve_host", "_norm_host",
               "dim", "bold", "green", "cyan"):
