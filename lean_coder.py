@@ -19,10 +19,10 @@ schemas, truncated tool results. See README.md.
   L6808   Remote workspace (executor client, /connect)
   L8373   Context meter
   L8468   Agent (turn loop, context mgmt, tool dispatch)
-  L14119  Slash-command handlers + dispatch table
-  L14256  REPL (interactive loop, session resume)
-  L14631  Worker agent (headless --agent-run)
-  L14953  Entry (CLI arg parsing, main)
+  L14150  Slash-command handlers + dispatch table
+  L14287  REPL (interactive loop, session resume)
+  L14662  Worker agent (headless --agent-run)
+  L14984  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -8489,6 +8489,13 @@ class Agent:
         self.last_prompt_tokens = None
         self.session_in = 0              # tokens sent/received this session (any backend);
         self.session_out = 0            # accumulated per chat() call, zeroed on /clear
+        # Generation telemetry for honest DECODE throughput (tok/s). Only providers that
+        # expose per-call gen timing (ollama's eval_count/eval_duration) contribute; the
+        # rest never set the client attrs so these stay 0 (Agent reads with a getattr
+        # default). Excludes prefill + tool round-trips by construction, so tok/s here is
+        # real decode speed, not tokens/wall-clock. Zeroed on /clear.
+        self.session_eval_tokens = 0     # decode tokens (ollama eval_count) summed
+        self.session_eval_ns = 0         # decode wall time (ollama eval_duration) summed
         self._last_provider = None       # last active provider, for '/provider on'
         self._abort = False
         self._compact_capture = None    # set by finalize_compact -> stops the loop
@@ -9197,10 +9204,20 @@ class Agent:
                 "input. React to the result now: inspect it, decide the next step, and "
                 "either act or hand back.]\n\n" + "\n\n".join(parts))
 
+    def decode_tok_s(self):
+        """Honest session decode throughput (tokens/sec), or None when no provider
+        reported per-call gen timing this session (e.g. an API-only session - see
+        session_eval_*). Decode-only: excludes prefill + tool round-trips by
+        construction, so it's real generation speed, not tokens/wall-clock."""
+        if self.session_eval_tokens and self.session_eval_ns:
+            return self.session_eval_tokens / (self.session_eval_ns / 1e9)
+        return None
+
     def reset(self):
         self.messages = [{"role": "system", "content": self._system()}]
         self.last_prompt_tokens = None
         self.session_in = self.session_out = 0
+        self.session_eval_tokens = self.session_eval_ns = 0
         self.tools.changed_files.clear()
         self.dirty = False
         # A fresh session starts with no goal. The pinned plan is separate agent
@@ -10263,6 +10280,14 @@ class Agent:
             # output_tokens) on an optional attribute, so any backend contributes
             # to the session count without a chat() signature change.
             self.session_out += getattr(self.client, "last_out_tokens", 0) or 0
+            # Decode-throughput telemetry: accumulate only when BOTH the token count and
+            # the gen-time are present for this call (ollama), so tok/s = tokens/time stays
+            # honest. A provider that reports neither contributes nothing (getattr -> 0).
+            _ev_tok = getattr(self.client, "last_out_tokens", 0) or 0
+            _ev_ns = getattr(self.client, "last_eval_ns", 0) or 0
+            if _ev_tok and _ev_ns:
+                self.session_eval_tokens += _ev_tok
+                self.session_eval_ns += _ev_ns
             self.messages.append(assistant)
             calls = assistant.get("tool_calls")
             if not calls:
@@ -11745,6 +11770,9 @@ def handle_info_command(agent, cfg, arg=""):
     if getattr(agent, "pinned_plan", ""):
         print(f"  plan:     pinned (GOAL+TODO, carried across compaction + load)")
     print(f"  usage:    in {agent.session_in:,}  out {agent.session_out:,}")
+    _tps = agent.decode_tok_s()
+    if _tps:
+        print(f"  decode:   {_tps:.1f} tok/s")
     _quota = _provider_usage_str(agent, cfg, verbose=True)   # backend quota incl. reset times
     if _quota:
         print(f"  quota:    {_quota.lstrip()}")
@@ -12810,6 +12838,9 @@ def handle_usage_command(agent, cfg, arg=""):
     print(bold(cfg.active_model()) + dim(f"  @ {loc}"))
     si, so = agent.session_in, agent.session_out
     print(dim(f"  session   in {si:,}   out {so:,}   total {si + so:,}"))
+    _tps = agent.decode_tok_s()
+    if _tps:
+        print(dim(f"  decode    {_tps:.1f} tok/s  ({agent.session_eval_tokens:,} tok)"))
     used = agent.last_prompt_tokens or messages_tokens(agent.messages, agent.tool_defs)
     window = cfg.ctx_window() or 1
     print(dim(f"  context   ~{used:,}/{window:,} ({used / window * 100:.0f}%)"))
