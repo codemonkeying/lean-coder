@@ -4152,7 +4152,7 @@ class Config:
     auto_reconnect: bool = False     # on /load of a session that ran remote, reconnect
                                      # to its host automatically (off = ask first)
     lean_tools_dir: str = ""            # "" -> ~/.config/leancoder/lean-tools
-    lean_tools_enabled: list = field(default_factory=list)  # enabled lean-tool names
+    lean_tools_enabled: list = field(default_factory=lambda: ["board"])  # enabled lean-tool names
     always_expand: list = field(default_factory=list)  # tool names
                                      # whose full args auto-print after the call line
                                      # (see /expand); default = none (diffs stay

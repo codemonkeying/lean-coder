@@ -460,11 +460,18 @@ around the wrong database before anyone confirmed it). The driver is the schedul
   edit files nor spawn anyone. In the tool, `create`/`add`/`assign`/`block` are
   **driver-only** (`worker_depth == 0`); a worker may only `done`/`fail` its own task
   and `list`/`find`.
-- **Auto-enabled per worker.** Dispatch with `taskboard=<name>` and the worker
-  automatically gets the (`safe`) board tool plus a one-line contract to report its
-  task `done` there - you do not also have to list it in `tools=`. Granting a worker
-  a board *is* the intent to let it coordinate; a worker with no `taskboard` grant
-  gets nothing extra.
+- **Collect the results in order (`reconcile`).** Once the DAG has run, `reconcile`
+  returns every `done` task's `result_ref` in dependency order (dep before dependent)
+  - what the driver concatenates to assemble the swarm's finished work. It is a read
+  action, open to workers too; a task that finished without a `result_ref` is skipped
+  and counted, and unfinished/failed tasks are reported so nothing is silently missed.
+- **On by default; auto-enabled per worker.** `board` is the one bundled lean-tool
+  that ships enabled (coordination is cheap and `safe`), so the driver can lay out a
+  plan without a `/tools` detour. Dispatching with `taskboard=<name>` also
+  auto-enables it for that worker plus a one-line contract to report its task `done`
+  there - you do not have to list it in `tools=`. Granting a worker a board *is* the
+  intent to let it coordinate; a worker with no `taskboard` grant still has the tool
+  but nothing to coordinate on.
 
 ## Context discipline
 
