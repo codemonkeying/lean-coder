@@ -457,21 +457,21 @@ around the wrong database before anyone confirmed it). The driver is the schedul
   a worker is gated by the recursion governor (`worker_max_depth` x
   `worker_max_children`, both off by default); acting on files is gated by the leash
   (`r`/`rw`/`rwe`). So a `leash: r` scout can coordinate on the board yet neither
-  edit files nor spawn anyone. In the tool, `create`/`add`/`assign`/`block` are
+  edit files nor spawn anyone. In the tool, `create`/`add`/`assign` are
   **driver-only** (`worker_depth == 0`); a worker may only `done`/`fail` its own task
-  and `list`/`find`.
+  and `list`/`reconcile`.
 - **Collect the results in order (`reconcile`).** Once the DAG has run, `reconcile`
   returns every `done` task's `result_ref` in dependency order (dep before dependent)
   - what the driver concatenates to assemble the swarm's finished work. It is a read
   action, open to workers too; a task that finished without a `result_ref` is skipped
   and counted, and unfinished/failed tasks are reported so nothing is silently missed.
-- **On by default; auto-enabled per worker.** `board` is the one bundled lean-tool
-  that ships enabled (coordination is cheap and `safe`), so the driver can lay out a
-  plan without a `/tools` detour. Dispatching with `taskboard=<name>` also
-  auto-enables it for that worker plus a one-line contract to report its task `done`
-  there - you do not have to list it in `tools=`. Granting a worker a board *is* the
-  intent to let it coordinate; a worker with no `taskboard` grant still has the tool
-  but nothing to coordinate on.
+- **Disabled by default; auto-enabled per worker.** `board` ships off like every
+  bundled lean-tool (it costs schema tokens only once you `/tools` it on) - keeping
+  the baseline overhead honest. Enable it on the driver when you want to run a swarm.
+  Dispatching a worker with `taskboard=<name>` auto-enables it for that worker (plus a
+  one-line contract to report its task `done` there) - you do not have to list it in
+  `tools=`. Granting a worker a board *is* the intent to let it coordinate; no
+  `taskboard` grant, no board.
 
 ## Context discipline
 
