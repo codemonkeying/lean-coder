@@ -177,7 +177,7 @@ actual code. lean-coder treats context as the scarce resource it is:
 
   | lean-tool | ~tokens | | lean-tool | ~tokens |
   |---|---|---|---|---|
-  | dispatch_worker | ~1640 | | web_screenshot | ~525 |
+  | dispatch_worker | ~1145 | | web_screenshot | ~525 |
   | board | ~505 | | shell_session | ~360 |
   | symbols | ~330 | | web_fetch | ~180 |
   | brave_search | ~165 | | ssh | ~140 |
@@ -186,7 +186,7 @@ actual code. lean-coder treats context as the scarce resource it is:
 
   Most are tiny; `dispatch_worker` is the heavy one (it drives a whole background-worker
   subsystem, so its schema carries the most behaviour). Turn on **every** bundled
-  lean-tool at once and the total is about **~6.3k tokens**; enable only what a job needs
+  lean-tool at once and the total is about **~5.8k tokens**; enable only what a job needs
   and it stays far lower. The meter always shows the real current figure.
 
   **For scale:** a *single* MCP server's tool definitions are commonly
