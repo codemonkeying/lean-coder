@@ -66,7 +66,8 @@ TOOL = {
         "type": "object",
         "properties": {
             "action": {"type": "string",
-                       "enum": ["dispatch", "status", "result", "cancel", "inject"],
+                       "enum": ["dispatch", "status", "result", "cancel", "inject",
+                                "set_plan", "add_note"],
                        "default": "dispatch",
                        "description": "What to do (default 'dispatch'): 'dispatch' launches a "
                                       "new worker from `task`; 'status' reports your dispatched "
@@ -76,7 +77,10 @@ TOOL = {
                                       "kills the worker named by `pid`; 'inject' (pid=, text=) "
                                       "sends a mid-task correction/steer to a RUNNING worker - it "
                                       "arrives on the worker's next reasoning step (does NOT "
-                                      "interrupt a running command; use 'cancel' to stop hard)."},
+                                      "interrupt a running command; use 'cancel' to stop hard); "
+                                      "'set_plan' (pid=, plan=) REPLACES a running worker's pinned "
+                                      "plan; 'add_note' (pid=, notes=) adds a note to a running "
+                                      "worker's notebook. Both land on its next step, no interrupt."},
             "pid": {"type": "integer",
                     "description": "Worker pid to act on (required for action='cancel'; optional "
                                    "for 'status' to show just one). From the dispatch return line."},
@@ -129,10 +133,13 @@ TOOL = {
             "plan": {"type": "string",
                      "description": "Optional starting plan for the worker (GOAL + a '- [ ]' TODO "
                                     "list) - seeds its pinned plan so it begins with your goal "
-                                    "decomposition instead of cold."},
+                                    "decomposition instead of cold. Also the payload for "
+                                    "action='set_plan' (replaces a running worker's pinned plan)."},
             "notes": {"type": "string",
                       "description": "Optional seed notes for the worker's notebook, one per line "
-                                     "(your relevant findings). They are tagged as coming from you."},
+                                     "(your relevant findings). They are tagged as coming from you. "
+                                     "Also the payload for action='add_note' (adds to a running "
+                                     "worker's notebook)."},
         },
         "required": [],
     },
@@ -248,9 +255,13 @@ def run(args, cwd):
         return _worker_cancel(args.get("pid"))
     if action == "inject":
         return _worker_inject(args.get("pid"), args.get("text"), source="parent-agent")
+    if action == "set_plan":
+        return _worker_set_plan(args.get("pid"), args.get("plan") or args.get("text"))
+    if action == "add_note":
+        return _worker_add_note(args.get("pid"), args.get("notes") or args.get("text"))
     if action != "dispatch":
-        return ("error: unknown action %r (use dispatch | status | result | cancel | inject)."
-                % action)
+        return ("error: unknown action %r (use dispatch | status | result | cancel | "
+                "inject | set_plan | add_note)." % action)
     task = (args.get("task") or "").strip()
     if not task:
         return "error: dispatch_worker action='dispatch' needs a non-empty task."
@@ -735,14 +746,79 @@ def _worker_inject(pid, text, source="operator"):
             f"worker is prompted to briefly acknowledge it. Check delivery with action='status'.")
 
 
+def _running_worker_sidecar(pid, action, suffix):
+    """Shared guard for the live-steer actions (inject/set_plan/add_note): validate that
+    `pid` names a RUNNING worker and return (sidecar_path, None), else (None, error_str).
+    `suffix` is the sidecar to target ('.inject'/'.plan'/'.note')."""
+    workers = _H["workers"]
+    if pid is None:
+        return None, f"error: action='{action}' needs a pid (which worker)."
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return None, f"error: bad pid {pid!r}."
+    meta = workers.get(pid)
+    if not meta:
+        return None, f"no worker with pid {pid} this session (nothing to steer)."
+    if _read_result(meta["result"]) is not None:
+        return None, (f"worker {pid} already finished - too late to {action}; its result "
+                      f"stands. Read it, or dispatch a fresh worker for the change.")
+    row = _worker_rows().get(pid)
+    if row and row["state"] != "running":
+        return None, f"worker {pid} is not running ({row['state']}); can't {action}."
+    return Path(_brief_from_result(meta["result"]) + suffix), None
+
+
+def _worker_set_plan(pid, text):
+    """Live-steer a RUNNING worker's PINNED PLAN (the tool's action='set_plan'). Writes
+    the full plan (GOAL + '- [ ]' TODO) to the worker's <brief>.plan sidecar; the worker
+    drains it at its next between-iteration boundary and REPLACES its pinned plan via
+    agent._update_plan (see run_agent_brief's _drain_plan). A full replacement, not an
+    append - the last set_plan wins. Empty text clears the worker's pinned plan. Does not
+    interrupt a running tool call. A finished/gone worker can't receive one."""
+    path, err = _running_worker_sidecar(pid, "set_plan", ".plan")
+    if err:
+        return err
+    try:
+        with path.open("a") as f:
+            f.write((text or "").strip() + "\0")
+    except OSError as e:
+        return f"error: could not write plan for worker {pid}: {e}"
+    return (f"queued a plan update for worker {pid}. It replaces the worker's pinned plan on "
+            f"its NEXT reasoning step (not an interrupt). Confirm with action='status'.")
+
+
+def _worker_add_note(pid, text):
+    """Live-steer a RUNNING worker's NOTEBOOK (the tool's action='add_note'). Appends the
+    note (NUL-separated so two quick notes can't clobber) to the worker's <brief>.note
+    sidecar; the worker drains it at its next between-iteration boundary and appends it to
+    agent.notes, tagged 'parent:' so it reads as handed down (see _drain_notes). Does not
+    interrupt a running tool call. A finished/gone worker can't receive one."""
+    msg = (text or "").strip()
+    if not msg:
+        return "error: action='add_note' needs non-empty text (the note to add)."
+    path, err = _running_worker_sidecar(pid, "add_note", ".note")
+    if err:
+        return err
+    try:
+        with path.open("a") as f:
+            f.write(msg + "\0")
+    except OSError as e:
+        return f"error: could not write note for worker {pid}: {e}"
+    return (f"queued a note for worker {pid}'s notebook. It lands on the worker's NEXT "
+            f"reasoning step (not an interrupt). Confirm with action='status'.")
+
 def _worker_cmd(agent, cfg, arg):
     """/worker - human command, at PARITY with the model's dispatch_worker actions:
-      /worker                list dispatched workers (state + result-ready)
-      /worker <pid>          print that worker's full result
-      /worker status [pid]   the model-facing status view (state/runtime/ready)
-      /worker cancel <pid>   kill a still-running worker
-    Subcommands reuse the same _worker_status/_worker_result/_worker_cancel the tool
-    uses, so the human and the model see identical behaviour."""
+      /worker                    list dispatched workers (state + result-ready)
+      /worker <pid>              print that worker's full result
+      /worker status [pid]       the model-facing status view (state/runtime/ready)
+      /worker cancel <pid>       kill a still-running worker
+      /worker inject <pid> <msg> mid-task message to a running worker
+      /worker set_plan <pid> <plan>  replace a running worker's pinned plan
+      /worker add_note <pid> <note>  add a note to a running worker's notebook
+    Subcommands reuse the same helpers the tool uses, so the human and the model see
+    identical behaviour."""
     workers = _H["workers"]
     if not workers:
         print(_H["dim"]("no workers dispatched this session."))
@@ -753,7 +829,8 @@ def _worker_cmd(agent, cfg, arg):
     parts = arg.split()
 
     # Subcommands (parity with the model tool). A bare pid stays the result shortcut.
-    if parts and parts[0].lower() in ("status", "cancel", "result", "inject"):
+    if parts and parts[0].lower() in ("status", "cancel", "result", "inject",
+                                      "set_plan", "add_note"):
         sub = parts[0].lower()
         pid = parts[1] if len(parts) > 1 else None
         if sub == "status":
@@ -764,6 +841,14 @@ def _worker_cmd(agent, cfg, arg):
             # /worker inject <pid> <message...> - the rest of the line is the message.
             text = arg.split(None, 2)[2] if len(parts) > 2 else ""
             print(_worker_inject(pid, text, source="operator"))
+        elif sub == "set_plan":
+            # /worker set_plan <pid> <plan...> - the rest of the line is the plan.
+            text = arg.split(None, 2)[2] if len(parts) > 2 else ""
+            print(_worker_set_plan(pid, text))
+        elif sub == "add_note":
+            # /worker add_note <pid> <note...> - the rest of the line is the note.
+            text = arg.split(None, 2)[2] if len(parts) > 2 else ""
+            print(_worker_add_note(pid, text))
         else:  # cancel
             print(_worker_cancel(pid))
         return
@@ -820,14 +905,14 @@ def _worker_cmd(agent, cfg, arg):
                 if bits:
                     print(_H["dim"]("        " + "  ".join(bits)))
     print(_H["dim"]("  /worker <pid> = full result + progress/intent · status [pid] · "
-                    "cancel <pid> · inject <pid> <msg>"))
+                    "cancel <pid> · inject/set_plan/add_note <pid> <text>"))
 
 
 def _worker_completer(agent, cfg):
     """Tab-completion for /worker's first argument: the subcommand verbs plus every
     live worker pid (so `cancel <Tab>` / a bare `<Tab>` offers real pids). Matches the
     menu contract of other multi-verb commands (e.g. /mcp)."""
-    opts = ["status", "result", "cancel", "inject"]
+    opts = ["status", "result", "cancel", "inject", "set_plan", "add_note"]
     opts += [str(pid) for pid in _H.get("workers", {})]
     return opts
 
