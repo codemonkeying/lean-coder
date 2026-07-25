@@ -136,10 +136,13 @@ TOOL = {
             "cwd": {"type": "string",
                     "description": "Optional working directory (defaults to current)."},
             "iterations": {"type": "integer",
-                           "description": "For action='resume' only: grant the resumed worker a "
-                                          "FRESH max tool-call budget. Use it when the worker died "
-                                          "by hitting its iteration cap (else it just hits the same "
-                                          "cap again). Omit to reuse the original budget."},
+                           "description": "Optional max tool-call budget for the worker, capped at "
+                                          "the operator ceiling (min(requested, ceiling); omit = the "
+                                          "ceiling). On a DISPATCH it sets this worker's initial cap "
+                                          "(e.g. a tight leash for a scout, longer for a refactor). "
+                                          "On action='resume' it grants a FRESH budget to a worker "
+                                          "that died - use it when the worker died by hitting its cap "
+                                          "(else it just hits the same cap again)."},
             "leash": {"type": "string", "enum": ["r", "rw", "rwe"], "default": "r",
                       "description": "Worker capability: r=read-only (default), rw=edit, rwe=edit+run. "
                                      "Capped at your own leash."},
@@ -495,7 +498,21 @@ def run(args, cwd):
     seed_context = (args.get("context") or "").strip()
     seed_plan = (args.get("plan") or "").strip()
     seed_notes = (args.get("notes") or "").strip()
-    max_iter = _ceiling("max_iterations")
+    # Per-worker iteration budget: the driver MAY request a cap at dispatch (e.g. a tight
+    # leash for a scout, a longer one for a refactor), but it is capped at the operator
+    # ceiling (env > cfg > default) - a grant is never above the grantor's authority, and
+    # an env lockdown stays a hard limit. Junk/non-positive -> silently fall back to the
+    # ceiling (never crash on a bad arg).
+    _ceil_iter = _ceiling("max_iterations")
+    _req_iter = args.get("iterations")
+    max_iter = _ceil_iter
+    if _req_iter is not None:
+        try:
+            _ri = int(_req_iter)
+            if _ri > 0:
+                max_iter = min(_ri, _ceil_iter)
+        except (TypeError, ValueError):
+            pass
     idle_timeout = _ceiling("idle_timeout")
     # Progress-staleness watchdog: bark (alert the parent), never bite. The worker bumps
     # its .progress file every iteration, so if that mtime goes stale the worker is stuck
