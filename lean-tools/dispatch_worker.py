@@ -60,75 +60,55 @@ TOOL = {
     "name": "dispatch_worker",
     "glyph": "\u2691",   # flag: a dispatched sub-agent (distinct from bg's bolt; bigger blast radius - own context/leash, tracked via /worker)
     "description": (
-        "Hand a self-contained sub-task to a background worker agent (own session + context); "
-        "returns a pid. It runs in the BACKGROUND and you are NOTIFIED AUTOMATICALLY when it "
-        "finishes (a finish notice arrives on a later turn) - so DON'T sit and poll it; just "
-        "carry on with other work or end your turn. If you genuinely need to check before then, "
-        "action='status' gives a one-shot state read (don't call it repeatedly - nothing changes "
-        "in seconds; bg_status won't show workers, don't sleep/cat its file). The finish notice "
-        "truncates a long result, so action='result' (pid=) pulls the FULL output. For scoped "
-        "errands whose output would bloat this session - e.g. 'scout this module, report where X "
-        "is handled'. Default READ-ONLY; leash='rw'/'rwe' to let it edit/run, never above YOUR "
-        "capability."),
+        "Hand a self-contained sub-task to a background worker agent (own session + "
+        "context); returns a pid. It runs in the BACKGROUND and you're NOTIFIED "
+        "AUTOMATICALLY when it finishes (a notice on a later turn) - don't poll it, just "
+        "carry on or end your turn. For scoped errands whose output would bloat this "
+        "session, e.g. 'scout this module, report where X is handled'. Default READ-ONLY; "
+        "leash='rw'/'rwe' to let it edit/run, never above YOUR capability. Manage/steer a "
+        "worker (and list models, resume a dead one) via `action`."),
     "parameters": {
         "type": "object",
         "properties": {
             "action": {"type": "string",
-                       "enum": ["dispatch", "status", "result", "cancel", "inject",
+                       "enum": ["dispatch", "models", "status", "result", "cancel", "inject",
                                 "set_plan", "add_note", "resume", "board_claim",
                                 "board_release", "board_list"],
                        "default": "dispatch",
-                       "description": "What to do (default 'dispatch'): 'dispatch' launches a "
-                                      "new worker from `task`; 'status' reports your dispatched "
-                                      "workers (state, runtime, whether a result is ready); "
-                                      "'result' (pid=) returns a worker's FULL result untruncated "
-                                      "(the auto finish notice truncates a long one); 'cancel' "
-                                      "kills the worker named by `pid`; 'inject' (pid=, text=) "
-                                      "sends a mid-task correction/steer to a RUNNING worker - it "
-                                      "arrives on the worker's next reasoning step (does NOT "
-                                      "interrupt a running command; use 'cancel' to stop hard); "
-                                      "'set_plan' (pid=, plan=) REPLACES a running worker's pinned "
-                                      "plan (call with pid= only, no plan, to READ its live plan "
-                                      "first and edit it rather than clobber its progress); "
-                                      "'add_note' (pid=, notes=) adds a note to a running "
-                                      "worker's notebook. Both land on its next step, no interrupt, "
-                                      "and the worker is pinged inline so it can't miss the change. "
-                                      "'resume' (pid=, text=) RELAUNCHES a worker that DIED/timed "
-                                      "out/hit its limit WITHOUT finishing, reloading its saved "
-                                      "transcript so it continues from where it stopped (text= is "
-                                      "a fresh steer); needs worker_checkpoint on when it was "
-                                      "dispatched. Returns a NEW pid. "
-                                      "'board_claim'/'board_release' (text=<path>) claim/release a "
-                                      "file on the shared swarm board so peer workers on one repo "
-                                      "don't edit the same file (first-claim-wins + TTL); "
-                                      "'board_list' shows held claims. Board actions no-op for a "
-                                      "lone worker."},
+                       "description": "Default 'dispatch' (launch from `task`). 'models'=list "
+                                      "models you can dispatch on. 'status' [pid]=worker state/"
+                                      "runtime/ready. 'result' (pid=)=FULL untruncated result "
+                                      "(the finish notice truncates a long one). 'cancel' "
+                                      "(pid=)=kill it. Steer a RUNNING worker: 'inject' (text=) a "
+                                      "correction, 'set_plan' (plan=) replace its plan (omit plan "
+                                      "to READ it first), 'add_note' (notes=). 'resume' (pid=)="
+                                      "relaunch a DIED/capped worker from its checkpoint. "
+                                      "'board_claim'/'board_release' (text=<path>)/'board_list'="
+                                      "shared-file mutex so peer workers don't clash (no-op for a "
+                                      "lone worker)."},
             "pid": {"type": "integer",
-                    "description": "Worker pid to act on (required for action='cancel'; optional "
-                                   "for 'status' to show just one). From the dispatch return line."},
+                    "description": "Worker to act on (required for 'cancel'; optional for 'status' "
+                                   "to show one). From the dispatch return line."},
             "task": {"type": "string",
                      "description": "Full self-contained instruction: what to do and exactly "
                                     "what to report back (the worker has no other context). "
                                     "Required for action='dispatch'."},
             "text": {"type": "string",
-                     "description": "The mid-task message for action='inject' (pid=): a "
-                                    "correction or steer the running worker sees on its next "
-                                    "reasoning step. Required for action='inject'."},
+                     "description": "For 'inject' (pid=): a mid-task correction/steer the running "
+                                    "worker sees on its next reasoning step (does NOT interrupt a "
+                                    "running command). Also the fresh steer for 'resume'."},
             "model": {"type": "string",
-                      "description": "Optional model for the worker's brain - ANY model on an "
-                                     "ENABLED provider (see /models); its provider is inferred "
-                                     "automatically. Defaults to inheriting your current model."},
+                      "description": "Optional worker brain - ANY model on an enabled provider "
+                                     "(see action='models'); its provider is inferred. Default: "
+                                     "inherit your current model."},
             "provider": {"type": "string",
-                         "description": "Optional backend to run the worker's brain on (must be "
-                                        "enabled). Only needed to disambiguate when the same model "
-                                        "name exists on more than one enabled provider; otherwise "
-                                        "inferred from `model`."},
+                         "description": "Optional backend for the worker's brain (must be enabled). "
+                                        "Only needed to disambiguate when the same model name is on "
+                                        "more than one provider; else inferred from `model`."},
             "brain_host": {"type": "string",
-                           "description": "Optional ollama endpoint (URL or a /machines alias) to "
-                                          "run the worker's BRAIN (inference) on - distinct from "
-                                          "`host` (which is where its TOOLS run). Defaults to the "
-                                          "driver's own ollama host. Use it to run the worker's "
-                                          "model on a different box than the driver (ollama only)."},
+                           "description": "Optional ollama endpoint (URL or /machines alias) to run "
+                                          "the worker's BRAIN on - distinct from `host` (its TOOLS). "
+                                          "Runs the model on a different box (ollama only)."},
             "host": {"type": "string",
                      "description": "Optional box to run the worker's TOOLS on ([user@]host or a "
                                     "/connect name); defaults to this session's target. A password "
@@ -136,46 +116,35 @@ TOOL = {
             "cwd": {"type": "string",
                     "description": "Optional working directory (defaults to current)."},
             "taskboard": {"type": "string",
-                          "description": "Optional: assign this worker to a named task-board (see the "
-                                         "`board` tool). The worker auto-gets the board tool and is "
-                                         "told to report its task done there when finished. Usually "
-                                         "you add+assign the task on the board first, then dispatch "
-                                         "with taskboard=<name> so the worker knows where to report."},
+                          "description": "Optional: assign this worker to a named task-board (see "
+                                         "the `board` tool). The worker auto-gets the board tool and "
+                                         "is told to report its task done there. Usually add+assign "
+                                         "the task first, then dispatch with taskboard=<name>."},
             "iterations": {"type": "integer",
-                           "description": "Optional max tool-call budget for the worker, capped at "
-                                          "the operator ceiling (min(requested, ceiling); omit = the "
-                                          "ceiling). On a DISPATCH it sets this worker's initial cap "
-                                          "(e.g. a tight leash for a scout, longer for a refactor). "
-                                          "On action='resume' it grants a FRESH budget to a worker "
-                                          "that died - use it when the worker died by hitting its cap "
-                                          "(else it just hits the same cap again)."},
+                           "description": "Optional tool-call budget, capped at the operator ceiling "
+                                          "(omit = ceiling). On 'dispatch' sets the worker's cap; on "
+                                          "'resume' grants a FRESH budget (use it when the worker "
+                                          "died by hitting its cap)."},
             "leash": {"type": "string", "enum": ["r", "rw", "rwe"], "default": "r",
                       "description": "Worker capability: r=read-only (default), rw=edit, rwe=edit+run. "
                                      "Capped at your own leash."},
             "tools": {"type": "array", "items": {"type": "string"},
                       "description": "Optional ALLOWLIST of tool names the worker may use (e.g. "
-                                     "[\"read_file\",\"web_fetch\"] for a scout). Omit = the worker "
-                                     "gets your full leash-permitted toolset (the default). Least "
-                                     "privilege: a worker never gets a tool you didn't grant, and "
-                                     "the grant is still leash-capped. Its plan/note/compaction "
-                                     "meta tools are always kept."},
+                                     "[\"read_file\",\"web_fetch\"] for a scout). Omit = your full "
+                                     "leash-permitted set. A worker never gets a tool you lack, and "
+                                     "the grant is still leash-capped; its plan/note meta tools are "
+                                     "always kept."},
             "context": {"type": "string",
-                        "description": "Optional CURATED background the worker needs but that "
-                                       "isn't the task itself (e.g. 'the auth module was just "
-                                       "refactored; tokens now live in x'). Share the STATE it "
-                                       "needs, not your whole transcript - but give it as much as "
-                                       "the job genuinely requires (an emergency brief may need a "
-                                       "lot; it is not truncated)."},
+                        "description": "Optional CURATED background the worker needs but that isn't "
+                                       "the task itself (e.g. 'auth was just refactored; tokens now "
+                                       "live in x'). Share the STATE it needs, not your whole "
+                                       "transcript (not truncated)."},
             "plan": {"type": "string",
-                     "description": "Optional starting plan for the worker (GOAL + a '- [ ]' TODO "
-                                    "list) - seeds its pinned plan so it begins with your goal "
-                                    "decomposition instead of cold. Also the payload for "
-                                    "action='set_plan' (replaces a running worker's pinned plan)."},
+                     "description": "Optional starting plan (GOAL + '- [ ]' TODO) seeding the "
+                                    "worker's pinned plan. Also the payload for 'set_plan'."},
             "notes": {"type": "string",
                       "description": "Optional seed notes for the worker's notebook, one per line "
-                                     "(your relevant findings). They are tagged as coming from you. "
-                                     "Also the payload for action='add_note' (adds to a running "
-                                     "worker's notebook)."},
+                                     "(tagged as from you). Also the payload for 'add_note'."},
         },
         "required": [],
     },
@@ -335,6 +304,8 @@ def run(args, cwd):
     action = (args.get("action") or "dispatch").strip().lower()
     if action == "status":
         return _worker_status(args.get("pid"))
+    if action == "models":
+        return _worker_models()
     if action == "result":
         return _worker_result(args.get("pid"))
     if action == "cancel":
@@ -351,9 +322,9 @@ def run(args, cwd):
     if action in ("board_claim", "board_release", "board_list"):
         return _worker_board(action, args.get("text") or args.get("task"))
     if action != "dispatch":
-        return ("error: unknown action %r (use dispatch | status | result | cancel | "
-                "inject | set_plan | add_note | resume | board_claim | board_release | "
-                "board_list)." % action)
+        return ("error: unknown action %r (use dispatch | models | status | result | "
+                "cancel | inject | set_plan | add_note | resume | board_claim | "
+                "board_release | board_list)." % action)
     task = (args.get("task") or "").strip()
     if not task:
         return "error: dispatch_worker action='dispatch' needs a non-empty task."
@@ -846,6 +817,37 @@ def _worker_status(pid=None):
     return "\n".join(out)
 
 
+def _worker_models():
+    """List the models available to dispatch a worker on, grouped by enabled provider,
+    so the driver can pick a cheap leaf model without guessing an exact id. Honours the
+    operator worker-model allowlist when one is set. Read-only, no side effects."""
+    pmodels = _H.get("enabled_provider_models", lambda: {})()
+    if not pmodels:
+        return ("no enabled providers report models (a remote-brain ollama worker can "
+                "still be dispatched with brain_host= + model=).")
+    allow = _model_allowlist()
+    cur = getattr(_H.get("cfg"), "model", "") or ""
+    lines = [_H["bold"]("models you can dispatch a worker on:")]
+    for prov, models in pmodels.items():
+        models = list(models or [])
+        if allow:
+            models = [m for m in models if m in allow]
+        head = _H["cyan"](prov)
+        if not models:
+            lines.append(f"  {head}: (none available)")
+            continue
+        lines.append(f"  {head}:")
+        for m in models:
+            tag = _H["dim"]("  (current default)") if m == cur else ""
+            lines.append(f"    {m}{tag}")
+    lines.append(_H["dim"]("dispatch with model=<id> (provider= only if the id is on "
+                           "more than one). Omit model= to use your current default."))
+    if allow:
+        lines.append(_H["dim"](f"note: operator allowlist active - only these are grantable."))
+    return "\n".join(lines)
+
+
+
 def _worker_result(pid):
     """MODEL-facing full result (the tool's action='result'): return a worker's
     COMPLETE ===RESULT=== block, untruncated. The turn-rider finish notice caps the
@@ -1220,6 +1222,7 @@ def _worker_cmd(agent, cfg, arg):
       /worker add_note <pid> <note>  add a note to a running worker's notebook
       /worker resume <pid> <steer>   relaunch a DEAD worker from its saved transcript
       /worker board                  show the shared swarm board's held file claims
+      /worker models                 list the models you can dispatch a worker on
     Subcommands reuse the same helpers the tool uses, so the human and the model see
     identical behaviour."""
     workers = _H["workers"]
@@ -1234,6 +1237,9 @@ def _worker_cmd(agent, cfg, arg):
     # Subcommands (parity with the model tool). A bare pid stays the result shortcut.
     if parts and parts[0].lower() == "board":
         print(_worker_board("board_list", None))
+        return
+    if parts and parts[0].lower() == "models":
+        print(_worker_models())
         return
     if parts and parts[0].lower() in ("status", "cancel", "result", "inject",
                                       "set_plan", "add_note", "resume"):
@@ -1322,7 +1328,7 @@ def _worker_completer(agent, cfg):
     """Tab-completion for /worker's first argument: the subcommand verbs plus every
     live worker pid (so `cancel <Tab>` / a bare `<Tab>` offers real pids). Matches the
     menu contract of other multi-verb commands (e.g. /mcp)."""
-    opts = ["status", "result", "cancel", "inject", "set_plan", "add_note", "resume", "board"]
+    opts = ["status", "result", "cancel", "inject", "set_plan", "add_note", "resume", "board", "models"]
     opts += [str(pid) for pid in _H.get("workers", {})]
     return opts
 

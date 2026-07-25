@@ -168,23 +168,26 @@ actual code. lean-coder treats context as the scarce resource it is:
   | chat | ~500 | system prompt alone, no tools |
   | read (`r`) | ~1.2k | + update_plan, note, read_file, list_files, search_files |
   | write (`rw`) | ~1.65k | + apply_diff, replace_lines, write_file |
-  | exec (`rwe`) | **~2.4k** | + run_command, background, ask_user_to_run - the fresh-session floor |
+  | exec (`rwe`) | **~2.3k** | + run_command, background, ask_user_to_run - the fresh-session floor |
 
-  That **~2.4k** is the whole shipped agent: system prompt plus all eleven always-on
+  That **~2.3k** is the whole shipped agent: system prompt plus all eleven always-on
   builtin tools. On top, the **optional bundled lean-tools** are off by default and
+  cost nothing until you `/tools` them on. Roughly:
   cost nothing until you `/tools` them on. Roughly:
 
   | lean-tool | ~tokens | | lean-tool | ~tokens |
   |---|---|---|---|---|
-  | dispatch_worker | ~860 | | board | ~585 |
-  | web_screenshot | ~525 | | web_fetch | ~180 |
-  | shell_session | ~360 | | brave_search | ~165 |
-  | symbols | ~335 | | ssh | ~145 |
-  | diagnostics | ~65 | | git_summary | ~65 |
+  | dispatch_worker | ~1145 | | web_screenshot | ~525 |
+  | board | ~505 | | shell_session | ~360 |
+  | symbols | ~330 | | web_fetch | ~180 |
+  | brave_search | ~165 | | ssh | ~140 |
+  | diagnostics | ~65 | | git_summary | ~60 |
   | word_count | ~55 | | | |
 
-  Turn on **every** one and the total is still **under ~5.5k tokens**. The meter always
-  shows the real current figure.
+  Most are tiny; `dispatch_worker` is the heavy one (it drives a whole background-worker
+  subsystem, so its schema carries the most behaviour). Turn on **every** bundled
+  lean-tool at once and the total is about **~5.8k tokens**; enable only what a job needs
+  and it stays far lower. The meter always shows the real current figure.
 
   **For scale:** a *single* MCP server's tool definitions are commonly
   [300-710 tokens **per tool**](https://dev.to/piotr_hajdas/mcp-token-limits-the-hidden-cost-of-tool-overload-2d5),
@@ -384,13 +387,14 @@ one turn runs **concurrently**.
 
 Anything beyond local edit + shell is a **lean-tool**: a single `.py` file with a
 `TOOL` schema and a `run` function, discovered but **disabled by default**. Turn one
-on with `/tools` and it costs context only from that point. These ship bundled in
+on with `/tools` and it
+costs context only from that point. These ship bundled in
 [`lean-tools/`](lean-tools/), ready to enable:
 
 | Lean-tool         | Adds |
 |-------------------|------|
-| `dispatch_worker` | Hand a scoped sub-task to a background worker agent; collect its result. Steer a running worker (inject / set its plan / add notes), grant it a narrowed toolset, seed it with context/plan/notes, dispatch it against a named task `board`, and (with `worker_checkpoint` on) **resume** a worker that died without finishing from its saved transcript. Adds `/worker` (list / `<pid>` = full result / cancel / inject / set_plan / add_note / resume). |
-| `board`           | A driver-orchestrated **task board**: a named dependency DAG of tasks the driver lays out, assigns workers to, and marks progress on (workers report their own task `done` and read the board, but only the driver creates/assigns). Tasks with unmet deps stay blocked, so a worker never starts on the wrong assumption; `done` reports what it unblocked. Named + on disk, so it survives a crash and can be handed to another session. `safe`; auto-enabled for a worker dispatched with `taskboard=`. |
+| `dispatch_worker` | Hand a scoped sub-task to a background worker agent; collect its result. Steer a running worker (inject / set its plan / add notes), grant it a narrowed toolset, seed it with context/plan/notes, dispatch it against a named task `board`, and (with `worker_checkpoint` on) **resume** a worker that died without finishing from its saved transcript. Adds `/worker` (list / `<pid>` = full result / cancel / inject / set_plan / add_note / resume / models). |
+| `board`           | A driver-orchestrated **task board**: a named dependency DAG of tasks the driver lays out, assigns workers to, and marks progress on (workers report their own task `done` and read the board, but only the driver creates/assigns). Tasks with unmet deps stay blocked, so a worker never starts on the wrong assumption; `done` reports what it unblocked. Named + on disk, so it survives a crash and can be handed to another session. `safe`; disabled by default like every lean-tool, but auto-enabled for a worker dispatched with `taskboard=`. |
 | `web_fetch`       | Read a URL as clean text. |
 | `web_screenshot`  | Screenshot a URL with a headless browser + return the page text (and, on a vision model, the image itself). **Needs [Playwright](https://playwright.dev/python/) + a browser** (`pip install playwright && playwright install firefox`); says so if absent. Disabled by default. |
 | `brave_search`    | Web search (Brave API). |
