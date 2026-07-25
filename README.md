@@ -168,23 +168,26 @@ actual code. lean-coder treats context as the scarce resource it is:
   | chat | ~500 | system prompt alone, no tools |
   | read (`r`) | ~1.2k | + update_plan, note, read_file, list_files, search_files |
   | write (`rw`) | ~1.65k | + apply_diff, replace_lines, write_file |
-  | exec (`rwe`) | **~2.4k** | + run_command, background, ask_user_to_run - the fresh-session floor |
+  | exec (`rwe`) | **~2.3k** | + run_command, background, ask_user_to_run - the fresh-session floor |
 
-  That **~2.4k** is the whole shipped agent: system prompt plus all eleven always-on
+  That **~2.3k** is the whole shipped agent: system prompt plus all eleven always-on
   builtin tools. On top, the **optional bundled lean-tools** are off by default and
+  cost nothing until you `/tools` them on. Roughly:
   cost nothing until you `/tools` them on. Roughly:
 
   | lean-tool | ~tokens | | lean-tool | ~tokens |
   |---|---|---|---|---|
-  | dispatch_worker | ~860 | | board | ~505 |
-  | web_screenshot | ~525 | | web_fetch | ~180 |
-  | shell_session | ~360 | | brave_search | ~165 |
-  | symbols | ~335 | | ssh | ~145 |
-  | diagnostics | ~65 | | git_summary | ~65 |
+  | dispatch_worker | ~1640 | | web_screenshot | ~525 |
+  | board | ~505 | | shell_session | ~360 |
+  | symbols | ~330 | | web_fetch | ~180 |
+  | brave_search | ~165 | | ssh | ~140 |
+  | diagnostics | ~65 | | git_summary | ~60 |
   | word_count | ~55 | | | |
 
-  Turn on **every** one and the total is still **under ~5.5k tokens**. The meter always
-  shows the real current figure.
+  Most are tiny; `dispatch_worker` is the heavy one (it drives a whole background-worker
+  subsystem, so its schema carries the most behaviour). Turn on **every** bundled
+  lean-tool at once and the total is about **~6.3k tokens**; enable only what a job needs
+  and it stays far lower. The meter always shows the real current figure.
 
   **For scale:** a *single* MCP server's tool definitions are commonly
   [300-710 tokens **per tool**](https://dev.to/piotr_hajdas/mcp-token-limits-the-hidden-cost-of-tool-overload-2d5),
