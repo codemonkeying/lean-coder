@@ -12284,7 +12284,7 @@ def handle_session_command(agent, cfg, arg):
             age = f"{_fmt_age(now - mtime)} ago" if mtime else "?"
             print(f"  {bold(cyan(name))}  {dim(f'{when} {d} {age} {d} {turns} turns {d} {title}')}")
         if hidden:
-            print(dim(f"  ({hidden} pre-handover snapshot(s) hidden; "
+            print(dim(f"  ({hidden} pre-compact snapshot(s) hidden; "
                       f"/set show_snapshots true to show)"))
         return
 
