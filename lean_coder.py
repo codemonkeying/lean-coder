@@ -15,14 +15,14 @@ schemas, truncated tool results. See README.md.
   L2817   Composer (pinned input line, editor, stdin)
   L3667   Token accounting (calibrated context meter)
   L3832   Config (dataclass, field registry, load/save)
-  L6409   Tool execution + text tool-call parsing
-  L6830   Remote workspace (executor client, /connect)
-  L8395   Context meter
-  L8490   Agent (turn loop, context mgmt, tool dispatch)
-  L14174  Slash-command handlers + dispatch table
-  L14311  REPL (interactive loop, session resume)
-  L14686  Worker agent (headless --agent-run)
-  L15132  Entry (CLI arg parsing, main)
+  L6454   Tool execution + text tool-call parsing
+  L6875   Remote workspace (executor client, /connect)
+  L8440   Context meter
+  L8535   Agent (turn loop, context mgmt, tool dispatch)
+  L14219  Slash-command handlers + dispatch table
+  L14356  REPL (interactive loop, session resume)
+  L14731  Worker agent (headless --agent-run)
+  L15177  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -5246,6 +5246,45 @@ def _bg_kill(pid, sig=signal.SIGTERM):
     _kill_tree(pid, sig)
 
 
+def _bg_descendant_pids(root, recs=None):
+    """The pids of every DESCENDANT of `root` in the worker/bg tree, found via the
+    registry's `owner` field (owner = the pid that launched the record). This is the
+    reliable cross-platform cascade: a worker-spawned grandchild is launched with
+    start_new_session (its own process group), so os.killpg(worker_pid) does NOT reach
+    it - but its registry record still carries owner=worker_pid, so we can walk the
+    owner graph and reach every level. Same-box records only (a foreign pid isn't ours
+    to signal). Returns a de-duplicated, leaves-first list so a caller can kill children
+    before parents. Cycle-safe."""
+    recs = _bg_load() if recs is None else recs
+    kids = {}
+    for r in recs:
+        if not _bg_here(r):
+            continue
+        o, p = r.get("owner"), r.get("pid")
+        if o is not None and p is not None:
+            kids.setdefault(o, []).append(p)
+    out, seen = [], set()
+    def _walk(pid):
+        for child in kids.get(pid, []):
+            if child in seen:
+                continue
+            seen.add(child)
+            _walk(child)        # depth-first: grandchildren appended before children
+            out.append(child)
+    _walk(root)
+    return out
+
+
+def _bg_kill_tree(pid, sig=signal.SIGTERM):
+    """Kill `pid` AND every descendant it (transitively) launched. First reaps the
+    registry-tracked descendants leaves-first (reaching setsid-escaped grandchildren the
+    single-group kill can't), then kills the root's own process group. Best-effort;
+    never raises. Use this to cancel a WORKER so its whole subtree dies with it."""
+    for child in _bg_descendant_pids(pid):
+        _kill_tree(child, sig)
+    _kill_tree(pid, sig)
+
+
 def _bg_here(rec) -> bool:
     """True if this bg record was registered on THIS box (so its pid is ours to
     probe / reap). A record with no host predates the host field - treat as local
@@ -5972,6 +6011,12 @@ def _bg_kill_session():
     for r in recs:
         if mine(r):
             if _proc_alive(r.get("pid")):
+                # Cascade: kill this task AND any descendants it spawned (a worker's
+                # workers are owned by the worker, not me, so a flat kill would orphan
+                # them - _bg_kill_tree walks the owner graph). recs is passed so the
+                # walk sees the same snapshot.
+                for gk in _bg_descendant_pids(r.get("pid"), recs):
+                    _kill_tree(gk)
                 _bg_kill(r.get("pid"))
             _bg_clean_sidecars(r)
     remaining = [r for r in recs if not mine(r)]
