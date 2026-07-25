@@ -75,7 +75,8 @@ TOOL = {
         "properties": {
             "action": {"type": "string",
                        "enum": ["dispatch", "status", "result", "cancel", "inject",
-                                "set_plan", "add_note", "resume"],
+                                "set_plan", "add_note", "resume", "board_claim",
+                                "board_release", "board_list"],
                        "default": "dispatch",
                        "description": "What to do (default 'dispatch'): 'dispatch' launches a "
                                       "new worker from `task`; 'status' reports your dispatched "
@@ -96,7 +97,12 @@ TOOL = {
                                       "out/hit its limit WITHOUT finishing, reloading its saved "
                                       "transcript so it continues from where it stopped (text= is "
                                       "a fresh steer); needs worker_checkpoint on when it was "
-                                      "dispatched. Returns a NEW pid."},
+                                      "dispatched. Returns a NEW pid. "
+                                      "'board_claim'/'board_release' (text=<path>) claim/release a "
+                                      "file on the shared swarm board so peer workers on one repo "
+                                      "don't edit the same file (first-claim-wins + TTL); "
+                                      "'board_list' shows held claims. Board actions no-op for a "
+                                      "lone worker."},
             "pid": {"type": "integer",
                     "description": "Worker pid to act on (required for action='cancel'; optional "
                                    "for 'status' to show just one). From the dispatch return line."},
@@ -253,7 +259,7 @@ def _workers_dir():
 
 def _compose_brief(task, model, cwd, max_iter, leash="r", provider="", brain_host="",
                    tools="", context="", plan="", notes="", depth=0, child_budget=0,
-                   checkpoint=False, resume=""):
+                   checkpoint=False, resume="", board=0):
     """Build the brief file text: the task wrapped in BRIEF markers + a GRANT header.
     `leash` is the already-capped grant (see _capped_leash). `provider` (optional) is
     the backend the worker must activate for `model`; absent = inherit the driver's.
@@ -282,6 +288,8 @@ def _compose_brief(task, model, cwd, max_iter, leash="r", provider="", brain_hos
         grant.append(f"child_budget: {child_budget}")
     if checkpoint:
         grant.append("checkpoint: 1")
+    if board:
+        grant.append(f"board: {board}")
     out = [f"{B}\n{task.strip()}\n{B}", f"{G}\n" + "\n".join(grant) + f"\n{G}"]
     for text, mark_key in ((context, "SEED_CONTEXT_MARK"), (plan, "SEED_PLAN_MARK"),
                            (notes, "SEED_NOTES_MARK")):
@@ -323,9 +331,12 @@ def run(args, cwd):
         return _worker_add_note(args.get("pid"), args.get("notes") or args.get("text"))
     if action == "resume":
         return _worker_resume(args.get("pid"), args.get("text") or args.get("task"), cwd)
+    if action in ("board_claim", "board_release", "board_list"):
+        return _worker_board(action, args.get("text") or args.get("task"))
     if action != "dispatch":
         return ("error: unknown action %r (use dispatch | status | result | cancel | "
-                "inject | set_plan | add_note | resume)." % action)
+                "inject | set_plan | add_note | resume | board_claim | board_release | "
+                "board_list)." % action)
     task = (args.get("task") or "").strip()
     if not task:
         return "error: dispatch_worker action='dispatch' needs a non-empty task."
@@ -503,13 +514,17 @@ def run(args, cwd):
     result_file = wdir / f"{stamp}.result"
     # Checkpoint the transcript (opt-in) so a dead/timed-out worker can be action='resume'd.
     do_checkpoint = bool(getattr(_cfg, "worker_checkpoint", False))
+    # Shared swarm board session: peers coordinate on the driver's board (keyed by the
+    # driver's pid). A worker dispatching a child passes its own inherited board session
+    # DOWN so a whole subtree shares one board; the driver seeds it with its own pid.
+    board_session = int(getattr(_cfg, "worker_board_session", 0) or 0) or os.getpid()
     try:
         brief_file.write_text(_compose_brief(task, model, wcwd, max_iter, leash=leash,
                                              provider=provider, brain_host=brain_host,
                                              tools=tools_csv, context=seed_context,
                                              plan=seed_plan, notes=seed_notes,
                                              depth=my_depth + 1, child_budget=child_budget,
-                                             checkpoint=do_checkpoint))
+                                             checkpoint=do_checkpoint, board=board_session))
     except OSError as e:
         return f"error: cannot write brief file: {e}"
 
@@ -1081,6 +1096,60 @@ def _worker_resume(pid, text, cwd):
             f"it finishes - don't poll.")
 
 
+def _board_session_owner():
+    """This process's identity ON the shared board: (session_id, owner_tag).
+      - the DRIVER coordinates its OWN board, keyed by its pid; its owner tag is 'driver'.
+      - a WORKER uses the board session handed down in its grant (worker_board_session)
+        and tags claims with its own pid so peers can see who holds what.
+    Returns (0, tag) when there is no board (a lone worker), so board actions no-op safely."""
+    cfg = _H.get("cfg")
+    sess = int(getattr(cfg, "worker_board_session", 0) or 0)
+    if sess:
+        return sess, f"worker:{os.getpid()}"
+    # The driver: it IS the board root (its pid). Depth 0 = driver (workers carry a
+    # board session and never reach here with sess 0 unless boardless).
+    if int(getattr(cfg, "worker_depth", 0) or 0) == 0:
+        return os.getpid(), "driver"
+    return 0, f"worker:{os.getpid()}"
+
+
+def _worker_board(action, path):
+    """Shared swarm-board coordination (first-claim-wins + TTL). Lets peer workers on one
+    repo avoid editing the same file:
+      - board_claim  (text=<path>): claim a path before editing it. Succeeds if free (or
+        already yours); REFUSED if a live peer holds it (you pick other work / wait).
+      - board_release(text=<path>): release your claim when done, freeing it for peers.
+      - board_list   : the currently-held claims (path -> owner).
+    A claim carries a TTL, so a dead worker's claims expire and never deadlock the board.
+    No-op with a clear note when there is no board (a lone worker)."""
+    claim = _H.get("_board_claim")
+    if not claim:
+        return "error: this build has no shared board (update lean-coder)."
+    sess, owner = _board_session_owner()
+    if not sess:
+        return ("no shared board is active (you are a lone worker). Board coordination only "
+                "applies when several workers run on one repo.")
+    if action == "board_list":
+        live = _H["_board_read_claims"](sess)
+        if not live:
+            return "board: no paths are currently claimed."
+        rows = "\n".join(f"  {p}  ->  {v.get('owner')}" for p, v in sorted(live.items()))
+        return f"board: {len(live)} path(s) claimed:\n{rows}"
+    p = (path or "").strip()
+    if not p:
+        return f"error: action='{action}' needs text=<path> (the file to claim/release)."
+    if action == "board_release":
+        _H["_board_release"](sess, p, owner)
+        return f"released your claim on {p} (free for peers)."
+    # board_claim
+    ok, holder = claim(sess, p, owner)
+    if ok:
+        return (f"claimed {p} (yours until you release it or its TTL lapses). Edit it, then "
+                f"action='board_release' text='{p}' when done.")
+    return (f"REFUSED: {p} is already claimed by {holder}. Pick different work or wait for "
+            f"them to release it; do NOT edit it (a concurrent edit would clash).")
+
+
 def _worker_cmd(agent, cfg, arg):
     """/worker - human command, at PARITY with the model's dispatch_worker actions:
       /worker                    list dispatched workers (state + result-ready)
@@ -1091,6 +1160,7 @@ def _worker_cmd(agent, cfg, arg):
       /worker set_plan <pid> <plan>  replace a running worker's pinned plan
       /worker add_note <pid> <note>  add a note to a running worker's notebook
       /worker resume <pid> <steer>   relaunch a DEAD worker from its saved transcript
+      /worker board                  show the shared swarm board's held file claims
     Subcommands reuse the same helpers the tool uses, so the human and the model see
     identical behaviour."""
     workers = _H["workers"]
@@ -1103,6 +1173,9 @@ def _worker_cmd(agent, cfg, arg):
     parts = arg.split()
 
     # Subcommands (parity with the model tool). A bare pid stays the result shortcut.
+    if parts and parts[0].lower() == "board":
+        print(_worker_board("board_list", None))
+        return
     if parts and parts[0].lower() in ("status", "cancel", "result", "inject",
                                       "set_plan", "add_note", "resume"):
         sub = parts[0].lower()
@@ -1190,7 +1263,7 @@ def _worker_completer(agent, cfg):
     """Tab-completion for /worker's first argument: the subcommand verbs plus every
     live worker pid (so `cancel <Tab>` / a bare `<Tab>` offers real pids). Matches the
     menu contract of other multi-verb commands (e.g. /mcp)."""
-    opts = ["status", "result", "cancel", "inject", "set_plan", "add_note", "resume"]
+    opts = ["status", "result", "cancel", "inject", "set_plan", "add_note", "resume", "board"]
     opts += [str(pid) for pid in _H.get("workers", {})]
     return opts
 
@@ -1204,6 +1277,7 @@ def setup(lc, cfg):
               "SEED_CONTEXT_MARK", "SEED_PLAN_MARK", "SEED_NOTES_MARK",
               "active_remote", "_ssh_master_alive", "ensure_worker_master",
               "active_tool_names", "resolve_host", "_norm_host",
+              "_board_claim", "_board_release", "_board_read_claims",
               "dim", "bold", "green", "cyan"):
         if k in lc:
             _H[k] = lc[k]
