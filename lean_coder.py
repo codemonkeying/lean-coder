@@ -22,7 +22,7 @@ schemas, truncated tool results. See README.md.
   L14157  Slash-command handlers + dispatch table
   L14294  REPL (interactive loop, session resume)
   L14669  Worker agent (headless --agent-run)
-  L15060  Entry (CLI arg parsing, main)
+  L15101  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -5803,7 +5803,7 @@ def _worker_brief_from_cmd(cmd):
 # missed suffix would leak the file past every reap = a trace + unbounded growth).
 _WORKER_SIDECAR_SUFFIXES = (".brief", ".result", ".brief.progress",
                             ".brief.inject", ".brief.injects.log",
-                            ".brief.plan", ".brief.note")
+                            ".brief.plan", ".brief.note", ".brief.planview")
 
 
 def _clean_worker_sidecars(brief):
@@ -14867,6 +14867,11 @@ def run_agent_brief(args) -> int:
     _plan_path = Path(str(brief_file) + ".plan")
     _note_path = Path(str(brief_file) + ".note")
     _progress_path = Path(str(brief_file) + ".progress")
+    # Mirror of the worker's CURRENT pinned plan, refreshed each iteration. Lets a parent
+    # READ the live plan (with the worker's own checkbox progress) and send back an edited
+    # copy via set_plan - i.e. edit, not just blind overwrite. Read-only view; the .plan
+    # sidecar is the write channel.
+    _planview_path = Path(str(brief_file) + ".planview")
     _wstart = time.time()
     _witer = {"n": 0}
     _intent_cache = {"v": ""}   # the first assistant prose line; set once, never changes
@@ -14904,6 +14909,22 @@ def run_agent_brief(args) -> int:
         plan = blocks[-1].strip() if blocks else ""
         try:
             agent._update_plan(plan)
+            # _update_plan suppresses the plan reminder on the next send + defers a full
+            # re-inject (correct when the WORKER wrote its own plan - don't echo it back).
+            # But a PARENT wrote this one: the worker hasn't seen it, so undo the suppress
+            # and force a FULL reminder now, so the new plan lands on the very next send.
+            agent._skip_plan_reminder_once = False
+            agent._plan_full_next = True
+            # Visibility: the plan reminder is passive (rides the tail); a worker deep in a
+            # task might not register that it silently changed. Ride the inject channel too
+            # - append a user turn so the change is unmissable and gets acknowledged (the
+            # preamble tells the worker to weight [parent-agent inject] messages). This is
+            # ephemeral (may compact away); the pinned plan is the durable copy.
+            msg = ("[parent-agent inject] The agent that dispatched you REPLACED your pinned "
+                   "plan" + (" (it is now cleared)." if not plan else ". Your updated plan is "
+                   "in effect - follow it from here; where it conflicts with your old plan, "
+                   "the new one wins.") + " Briefly acknowledge, then continue.")
+            agent.messages.append({"role": "user", "content": msg})
             with _inject_log.open("a") as f:
                 f.write(f"{int(time.time())} plan set: {plan[:120]}\n")
         except Exception:
@@ -14919,16 +14940,30 @@ def run_agent_brief(args) -> int:
             _note_path.unlink()
         except OSError:
             return
+        added = []
         for block in raw.split("\0"):
             msg = block.strip()
             if not msg:
                 continue
             try:
                 agent._note({"action": "add", "text": "parent: " + msg})
+                added.append(msg)
                 with _inject_log.open("a") as f:
                     f.write(f"{int(time.time())} note added: {msg[:120]}\n")
             except Exception:
                 pass
+        # Visibility: a note only enters context if the worker CHOOSES to read its
+        # notebook - it may run a long time and never look. So also surface each new note
+        # inline on the inject channel (a user turn), guaranteeing the worker sees it now.
+        # The notebook copy is the durable record; this turn is the immediate ping.
+        if added:
+            body = "\n".join(f"- {m}" for m in added)
+            n = len(added)
+            agent.messages.append({"role": "user", "content":
+                "[parent-agent inject] The agent that dispatched you added "
+                + (f"{n} notes" if n > 1 else "a note")
+                + " to your notebook (also saved there for later recall):\n" + body
+                + "\nFactor this into what you're doing; briefly acknowledge, then continue."})
     def _write_progress():
         # Deterministic heartbeat (facts the harness already has - zero tokens, zero
         # model cooperation): iteration N, elapsed, the last tool it ran, and its stated
@@ -14963,6 +14998,12 @@ def run_agent_brief(args) -> int:
             if intent:
                 lines.append(f"intent: {intent}")
             _progress_path.write_text("\n".join(lines) + "\n")
+            # Mirror the worker's live pinned plan so a parent can read-modify-write it.
+            cur_plan = getattr(agent, "pinned_plan", "") or ""
+            if cur_plan.strip():
+                _planview_path.write_text(cur_plan.strip() + "\n")
+            elif _planview_path.exists():
+                _planview_path.unlink()   # plan cleared; don't leave a stale view
         except Exception:
             pass
 
