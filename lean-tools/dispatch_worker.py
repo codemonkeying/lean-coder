@@ -79,8 +79,11 @@ TOOL = {
                                       "arrives on the worker's next reasoning step (does NOT "
                                       "interrupt a running command; use 'cancel' to stop hard); "
                                       "'set_plan' (pid=, plan=) REPLACES a running worker's pinned "
-                                      "plan; 'add_note' (pid=, notes=) adds a note to a running "
-                                      "worker's notebook. Both land on its next step, no interrupt."},
+                                      "plan (call with pid= only, no plan, to READ its live plan "
+                                      "first and edit it rather than clobber its progress); "
+                                      "'add_note' (pid=, notes=) adds a note to a running "
+                                      "worker's notebook. Both land on its next step, no interrupt, "
+                                      "and the worker is pinged inline so it can't miss the change."},
             "pid": {"type": "integer",
                     "description": "Worker pid to act on (required for action='cancel'; optional "
                                    "for 'status' to show just one). From the dispatch return line."},
@@ -514,6 +517,16 @@ def _read_progress(result_path):
         return ""
 
 
+def _read_planview(result_path):
+    """The worker's CURRENT pinned plan, mirrored to <brief>.planview each iteration by
+    run_agent_brief. Lets a parent read the live plan (with the worker's own checkbox
+    progress) so action='set_plan' can send back an EDITED copy instead of a blind
+    overwrite. Returns the plan text (stripped) or "" if the worker has no pinned plan."""
+    try:
+        return Path(_brief_from_result(result_path) + ".planview").read_text().strip()
+    except OSError:
+        return ""
+
 def _inject_count(result_path):
     """How many injects this worker has CONSUMED (lines in <brief>.injects.log), and the
     last one's teaser - the delivery ack for action='inject'. (0, "") if none."""
@@ -633,6 +646,12 @@ def _worker_status(pid=None):
         prog = _read_progress(meta["result"])
         if prog and not ready:
             line += "\n  progress: " + " | ".join(prog.splitlines())
+        if not ready and pid is not None:
+            # Only when narrowed to one worker (the plan can be many lines) - show its live
+            # pinned plan so the parent can steer/edit it via set_plan.
+            plan = _read_planview(meta["result"])
+            if plan:
+                line += "\n  plan:\n    " + "\n    ".join(plan.splitlines())
         n_inj, last_inj = _inject_count(meta["result"])
         if n_inj:
             line += f"\n  injects delivered: {n_inj} (last: {last_inj[:80]})"
@@ -773,19 +792,34 @@ def _worker_set_plan(pid, text):
     """Live-steer a RUNNING worker's PINNED PLAN (the tool's action='set_plan'). Writes
     the full plan (GOAL + '- [ ]' TODO) to the worker's <brief>.plan sidecar; the worker
     drains it at its next between-iteration boundary and REPLACES its pinned plan via
-    agent._update_plan (see run_agent_brief's _drain_plan). A full replacement, not an
-    append - the last set_plan wins. Empty text clears the worker's pinned plan. Does not
-    interrupt a running tool call. A finished/gone worker can't receive one."""
+    agent._update_plan (see run_agent_brief's _drain_plan), and gets an inline inject so
+    it can't miss the change. A full replacement, not an append - the last set_plan wins.
+
+    Call with NO plan text to READ the worker's current plan (with its own checkbox
+    progress) - do that first, edit the returned plan, and send it back, so you EDIT the
+    plan rather than blindly clobbering the worker's progress. Does not interrupt a
+    running tool call. A finished/gone worker can't receive one."""
     path, err = _running_worker_sidecar(pid, "set_plan", ".plan")
     if err:
         return err
+    plan = (text or "").strip()
+    if not plan:
+        # No plan supplied -> READ affordance: hand back the live plan for editing.
+        meta = _H["workers"].get(int(pid))
+        cur = _read_planview(meta["result"]) if meta else ""
+        if not cur:
+            return (f"worker {pid} has no pinned plan yet (nothing to edit). Send a full plan "
+                    f"as `plan` to set one.")
+        return (f"worker {pid} current plan (edit this and send it back as `plan` to update "
+                f"it - tick/add boxes rather than overwrite its progress):\n{cur}")
     try:
         with path.open("a") as f:
-            f.write((text or "").strip() + "\0")
+            f.write(plan + "\0")
     except OSError as e:
         return f"error: could not write plan for worker {pid}: {e}"
     return (f"queued a plan update for worker {pid}. It replaces the worker's pinned plan on "
-            f"its NEXT reasoning step (not an interrupt). Confirm with action='status'.")
+            f"its NEXT reasoning step and the worker is pinged inline to acknowledge it. "
+            f"Confirm with action='status'.")
 
 
 def _worker_add_note(pid, text):
