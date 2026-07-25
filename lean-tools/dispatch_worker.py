@@ -44,12 +44,13 @@ from pathlib import Path
 
 # Built-in ceiling defaults (last resort: env var > live cfg > this - see docstring).
 _DEFAULTS = {"max_concurrent": 10, "idle_timeout": 1800, "max_iterations": 30,
-             "max_depth": 1, "max_children": 0}
+             "max_depth": 1, "max_children": 0, "token_budget": 0}
 _ENV = {"max_concurrent": "LEANCODER_WORKER_MAX_CONCURRENT",
         "idle_timeout": "LEANCODER_WORKER_IDLE_TIMEOUT",
         "max_iterations": "LEANCODER_WORKER_MAX_ITER",
         "max_depth": "LEANCODER_WORKER_MAX_DEPTH",
-        "max_children": "LEANCODER_WORKER_MAX_CHILDREN"}
+        "max_children": "LEANCODER_WORKER_MAX_CHILDREN",
+        "token_budget": "LEANCODER_WORKER_TOKEN_BUDGET"}
 
 TOOL = {
     "name": "dispatch_worker",
@@ -332,6 +333,25 @@ def run(args, cwd):
         return (f"error: at the worker limit ({max_conc} running). Wait for one to "
                 f"finish (its result reaches you automatically) or raise "
                 f"LEANCODER_WORKER_MAX_CONCURRENT.")
+
+    # Operator ceiling: shared TOKEN budget (the boss's slow-bleed guard). Count caps stop
+    # a fork-bomb; this stops a long swarm quietly draining quota one worker at a time. We
+    # meter FINISHED workers' spend (their .usage sidecars); refresh it first WITHOUT
+    # touching the finish-notice dedup (don't steal a notice owed to the model), then
+    # refuse once the cumulative total crosses the ceiling. A still-running worker's spend
+    # isn't counted until it exits (concurrency bounds in-flight burn); this deliberately
+    # gates on realized, not projected, cost.
+    tok_budget = _ceiling("token_budget")
+    if tok_budget:
+        for _m in _H["workers"].values():
+            if not _m.get("usage_counted") and _read_result(_m["result"]) is not None:
+                _accrue_usage(_m)        # count a finished worker's tokens (idempotent)
+        spent = _worker_tokens_spent()
+        if spent >= tok_budget:
+            return (f"error: the shared worker token budget is spent ({spent:,} of "
+                    f"{tok_budget:,} tokens used by workers this session). Not dispatching "
+                    f"another. Raise worker_token_budget / LEANCODER_WORKER_TOKEN_BUDGET, or "
+                    f"set it to 0 for unlimited.")
     # Model + provider. Default: inherit the driver's current model+provider (both
     # blank -> the worker keeps whatever it activates). A `model` may be ANY model on
     # ANY enabled provider; we infer its provider from the enabled-provider->models
@@ -545,6 +565,48 @@ def _read_result(path):
         return None
 
 
+def _read_usage(result_path):
+    """A finished worker's token spend from its '<brief>.usage' sidecar (written on exit
+    by run_agent_brief). Returns (in_tokens, out_tokens); (0, 0) if absent/unreadable.
+    Used to meter the shared token budget across workers."""
+    try:
+        txt = Path(_brief_from_result(result_path) + ".usage").read_text()
+    except OSError:
+        return 0, 0
+    vin = vout = 0
+    for tok in txt.split():
+        k, _, v = tok.partition("=")
+        try:
+            if k == "in":
+                vin = int(v)
+            elif k == "out":
+                vout = int(v)
+        except ValueError:
+            pass
+    return vin, vout
+
+
+def _accrue_usage(meta):
+    """Add a finished worker's token spend to the session's shared totals, ONCE. Guarded
+    by meta['usage_counted'] so a re-scan can't double-count. Best-effort - a worker with
+    no .usage sidecar (crashed before writing) simply contributes 0."""
+    if meta.get("usage_counted"):
+        return
+    meta["usage_counted"] = True
+    vin, vout = _read_usage(meta["result"])
+    meta["tokens_in"], meta["tokens_out"] = vin, vout
+    _H["tokens_in"] = _H.get("tokens_in", 0) + vin
+    _H["tokens_out"] = _H.get("tokens_out", 0) + vout
+
+
+def _worker_tokens_spent():
+    """Cumulative tokens (in+out) spent by all FINISHED workers this session, plus a
+    best-effort estimate for still-running ones (their .usage isn't written until exit,
+    so running workers count 0 - the budget meters completed spend, the concurrency cap
+    bounds in-flight burn). This is the shared budget the boss meters against
+    worker_token_budget."""
+    return _H.get("tokens_in", 0) + _H.get("tokens_out", 0)
+
 def _worker_stderr_tail(result_path, n=15):
     """Last few lines of a FAILED worker's combined stdout+stderr log (bg_launch runs it
     with stderr merged into the log), so a crash/early death leaves a visible trace in the
@@ -624,6 +686,7 @@ def _finished_notice():
         if res is not None:
             meta["announced"] = True
             just_finished.append(pid)
+            _accrue_usage(meta)          # meter this worker's token spend into the session
             tail = res.strip()
             if len(tail) > 1500:         # keep a long result from flooding the turn
                 tail = tail[:1500] + " ...[truncated; /worker %d for the full result]" % pid
@@ -697,9 +760,15 @@ def _worker_status(pid=None):
         state = row["state"] if row else "gone"
         runtime = row["runtime"] if row else "?"
         ready = _read_result(meta["result"]) is not None
+        if ready and not meta.get("usage_counted"):
+            _accrue_usage(meta)          # keep the shared spend current when status is read
         line = (f"pid {wp}  {state}  (ran {runtime})  "
                 f"result {'ready' if ready else 'pending'}  {meta['model']}  "
                 f"task: {meta['task'][:80]}")
+        if ready and meta.get("tokens_in") is not None:
+            _t = meta.get("tokens_in", 0) + meta.get("tokens_out", 0)
+            if _t:
+                line += f"  ({_t:,} tok)"
         prog = _read_progress(meta["result"])
         if prog and not ready:
             line += "\n  progress: " + " | ".join(prog.splitlines())
@@ -713,6 +782,11 @@ def _worker_status(pid=None):
         if n_inj:
             line += f"\n  injects delivered: {n_inj} (last: {last_inj[:80]})"
         out.append(line)
+    spent = _worker_tokens_spent()
+    budget = _ceiling("token_budget")
+    if spent:
+        cap = f" of {budget:,}" if budget else ""
+        out.append(f"shared worker spend: {spent:,}{cap} tokens (finished workers)")
     return "\n".join(out)
 
 
@@ -1028,6 +1102,8 @@ def setup(lc, cfg):
     _H["__file__"] = lc.get("__file__")     # the CORE module file, for the worker argv
     _H["cfg"] = cfg
     _H["workers"] = {}                       # pid -> {result, task, started, model, announced}
+    _H.setdefault("tokens_in", 0)            # shared token budget: cumulative worker spend
+    _H.setdefault("tokens_out", 0)           # (metered as each worker finishes; see _accrue_usage)
 
     # Desktop ping on a worker finish, IF the notify lean-tool is also enabled (its
     # _ping is exposed on lc when it runs). Optional - absent => notices are text-only.
