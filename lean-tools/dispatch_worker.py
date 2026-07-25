@@ -135,6 +135,12 @@ TOOL = {
                                     "host is prompted ONCE here - a worker can't answer prompts."},
             "cwd": {"type": "string",
                     "description": "Optional working directory (defaults to current)."},
+            "taskboard": {"type": "string",
+                          "description": "Optional: assign this worker to a named task-board (see the "
+                                         "`board` tool). The worker auto-gets the board tool and is "
+                                         "told to report its task done there when finished. Usually "
+                                         "you add+assign the task on the board first, then dispatch "
+                                         "with taskboard=<name> so the worker knows where to report."},
             "iterations": {"type": "integer",
                            "description": "Optional max tool-call budget for the worker, capped at "
                                           "the operator ceiling (min(requested, ceiling); omit = the "
@@ -267,7 +273,7 @@ def _workers_dir():
 
 def _compose_brief(task, model, cwd, max_iter, leash="r", provider="", brain_host="",
                    tools="", context="", plan="", notes="", depth=0, child_budget=0,
-                   checkpoint=False, resume="", board=0):
+                   checkpoint=False, resume="", board=0, taskboard=""):
     """Build the brief file text: the task wrapped in BRIEF markers + a GRANT header.
     `leash` is the already-capped grant (see _capped_leash). `provider` (optional) is
     the backend the worker must activate for `model`; absent = inherit the driver's.
@@ -298,6 +304,8 @@ def _compose_brief(task, model, cwd, max_iter, leash="r", provider="", brain_hos
         grant.append("checkpoint: 1")
     if board:
         grant.append(f"board: {board}")
+    if taskboard:
+        grant.append(f"taskboard: {taskboard}")
     out = [f"{B}\n{task.strip()}\n{B}", f"{G}\n" + "\n".join(grant) + f"\n{G}"]
     for text, mark_key in ((context, "SEED_CONTEXT_MARK"), (plan, "SEED_PLAN_MARK"),
                            (notes, "SEED_NOTES_MARK")):
@@ -490,6 +498,13 @@ def run(args, cwd):
                             f"{', '.join(sorted(parent_tools))}.")
             tools_csv = ",".join(want_tools)
 
+    # Optional named task-board (Phase 2b): assign this worker to a task DAG board by NAME.
+    # The worker's run_agent_brief auto-loads the `board` lean-tool when this is set (so it
+    # can report done/list) and injects the report-done contract into its brief. Distinct
+    # from the int `board` claim-session above. The driver has usually already added+assigned
+    # the task on the board; this just tells the worker WHICH board to report to.
+    taskboard = (args.get("taskboard") or "").strip()
+
     # Optional seed STATE the parent curated: a background blob, a starting plan, and
     # notebook lines. NOT size-capped - "share state, not context" is a discipline for
     # the parent to exercise, not something to enforce by clipping the payload to a
@@ -547,7 +562,8 @@ def run(args, cwd):
                                              tools=tools_csv, context=seed_context,
                                              plan=seed_plan, notes=seed_notes,
                                              depth=my_depth + 1, child_budget=child_budget,
-                                             checkpoint=do_checkpoint, board=board_session))
+                                             checkpoint=do_checkpoint, board=board_session,
+                                             taskboard=taskboard))
     except OSError as e:
         return f"error: cannot write brief file: {e}"
 
