@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L925    Lean-tools (plugin tools: discovery, manager)
-  L1265   MCP client (connection, manager, OAuth, discovery)
-  L1719   Providers (backend plugin registry)
-  L1941   Interactive pickers + menus (raw-mode UI engine)
-  L2290   Terminal styling (colors, formatting helpers)
-  L2487   Streaming + markdown render (model output)
-  L2834   Composer (pinned input line, editor, stdin)
-  L3684   Token accounting (calibrated context meter)
-  L3849   Config (dataclass, field registry, load/save)
-  L6684   Tool execution + text tool-call parsing
-  L7105   Remote workspace (executor client, /connect)
-  L8670   Context meter
-  L8765   Agent (turn loop, context mgmt, tool dispatch)
-  L14454  Slash-command handlers + dispatch table
-  L14591  REPL (interactive loop, session resume)
-  L14966  Worker agent (headless --agent-run)
-  L15524  Entry (CLI arg parsing, main)
+  L939    Lean-tools (plugin tools: discovery, manager)
+  L1279   MCP client (connection, manager, OAuth, discovery)
+  L1733   Providers (backend plugin registry)
+  L1955   Interactive pickers + menus (raw-mode UI engine)
+  L2304   Terminal styling (colors, formatting helpers)
+  L2501   Streaming + markdown render (model output)
+  L2848   Composer (pinned input line, editor, stdin)
+  L3698   Token accounting (calibrated context meter)
+  L3863   Config (dataclass, field registry, load/save)
+  L6976   Tool execution + text tool-call parsing
+  L7397   Remote workspace (executor client, /connect)
+  L8962   Context meter
+  L9057   Agent (turn loop, context mgmt, tool dispatch)
+  L14746  Slash-command handlers + dispatch table
+  L14883  REPL (interactive loop, session resume)
+  L15258  Worker agent (headless --agent-run)
+  L15853  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -111,7 +111,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.9.6"
+__version__ = "0.9.7"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -119,6 +119,20 @@ __version__ = "0.9.6"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.9.7": [
+        "new `board` lean-tool: a driver-orchestrated task board (a named dependency",
+        "  DAG). The driver lays out tasks with deps, assigns a worker to each ready one,",
+        "  and marks progress; workers report their own task done and read the board but",
+        "  never self-select. Tasks with unmet deps stay blocked, so a worker never starts",
+        "  on a wrong assumption. Enable it with /tools.",
+        "dispatch a worker against a board with taskboard=<name>: it auto-gets the board",
+        "  tool and reports its task done there when finished. Pair a strong driver model",
+        "  with cheaper leaf-worker models - the scheduling judgment stays in one seat.",
+        "a board is a named JSON file on disk, so a swarm survives a crash and can be",
+        "  handed to another session to keep driving.",
+        "fix: the swarm file-claim board now resolves a true concurrent race to exactly",
+        "  one winner (it used to tell every racer it won).",
+    ],
     "0.9.6": [
         "workers grew up: dispatch a background sub-agent with a scoped tool allowlist",
         "  and seeded state (curated context / a starting plan / notebook lines), then",
@@ -4103,6 +4117,11 @@ class Config:
     worker_board_session: int = 0    # INTERNAL: the shared-board session id (the driver's pid) a
                                      # worker uses to reach the swarm claim board. Set from the
                                      # grant ('board: N'); 0 = no board (a lone worker). Not a knob.
+    worker_taskboard: str = ""       # INTERNAL: the NAMED task DAG board (Phase 2b) this worker was
+                                     # assigned to. Set from the grant ('taskboard: <name>'); when
+                                     # set, run_agent_brief auto-loads the `board` lean-tool so the
+                                     # worker can report done/list. Distinct from worker_board_session
+                                     # (the int file-claim mutex). "" = no task board. Not a knob.
     tool_allowlist: tuple = None     # None = no restriction (all leash-permitted tools).
                                      # Else a set/tuple of tool NAMES the surface is
                                      # narrowed to (still leash-capped). Runtime-only,
@@ -4407,9 +4426,10 @@ _EPHEMERAL_KEYS = frozenset((
     "composer", "leash", "incognito", "think", "cwd", "model_explicit", "auto_num_ctx",
     "tool_allowlist",     # runtime-only per-worker tool grant; never persisted (a fresh
                           # launch must default to the full surface, like leash)
-    "worker_depth", "worker_child_budget", "worker_board_session",  # runtime-only tree
-                          # position + granted child budget + shared-board session id, set
-                          # from the grant per worker; never a saved knob
+    "worker_depth", "worker_child_budget", "worker_board_session", "worker_taskboard",
+                          # runtime-only tree position + granted child budget + shared-board
+                          # session id + assigned task-board name, set from the grant per
+                          # worker; never a saved knob
     # Not config.toml scalars: `_defaults` is the DEFAULTS snapshot save_config writes
     # FROM; `session_overrides` is the per-key override map persisted in the SESSION
     # meta (not config.toml) and re-applied at load runtime-only. Classified here so
@@ -6055,17 +6075,23 @@ def _board_claims_path(session_id):
 
 def _board_read_claims(session_id, now=None):
     """Reduce the append-only claims.jsonl to the LIVE claim per path. Each line is a
-    JSON record {path, owner, ts, ttl, action:'claim'|'release'}. Last write wins per
-    path; a 'release' or an expired claim (ts+ttl <= now) drops the path. Returns
-    {path: {owner, ts, ttl}} of currently-held claims. Corrupt lines are skipped
-    (best-effort: a partial append must never crash a reader)."""
+    JSON record {path, owner, ts, ttl, action:'claim'|'release'}. The winner of a path is
+    the FIRST claim IN FILE (append) ORDER that is still live - not expired (ts+ttl > now)
+    and not followed by a release from its own owner. File order is the arbiter, not ts: a
+    POSIX O_APPEND write is atomic per line, so once a claimer's line is in the file nobody
+    can insert ahead of it - which makes the winner permanent and independent of clock skew
+    (an earlier ts appended LATER must not retroactively steal a held path). Every reader
+    reduces the same file to the same winner. Returns {path: {owner, ts, ttl}} of currently
+    held claims. Corrupt lines are skipped (a partial append must never crash a reader)."""
     now = time.time() if now is None else now
     p = _board_claims_path(session_id)
-    live = {}
     try:
         raw = p.read_text()
     except OSError:
-        return live
+        return {}
+    # Gather per path: all claim records + every release (owner, ts).
+    claims = {}     # path -> [rec, ...]
+    releases = {}   # path -> [(owner, ts), ...]
     for line in raw.splitlines():
         line = line.strip()
         if not line:
@@ -6078,27 +6104,37 @@ def _board_read_claims(session_id, now=None):
         if not path:
             continue
         if rec.get("action") == "release":
-            live.pop(path, None)
-            continue
-        ttl = rec.get("ttl", _BOARD_CLAIM_TTL)
-        if rec.get("ts", 0) + ttl <= now:
-            live.pop(path, None)          # expired -> not held
-            continue
-        live[path] = {"owner": rec.get("owner"), "ts": rec.get("ts", 0), "ttl": ttl}
+            releases.setdefault(path, []).append((rec.get("owner"), rec.get("ts", 0)))
+        else:
+            claims.setdefault(path, []).append(rec)
+    live = {}
+    for path, recs in claims.items():
+        rel = releases.get(path, [])
+        for rec in recs:                                   # recs are in file (append) order
+            ts = rec.get("ts", 0)
+            ttl = rec.get("ttl", _BOARD_CLAIM_TTL)
+            owner = rec.get("owner")
+            if ts + ttl <= now:
+                continue                                   # expired -> yields to a later claim
+            if any(ro == owner and rts >= ts for ro, rts in rel):
+                continue                                   # released by its own owner
+            live[path] = {"owner": owner, "ts": ts, "ttl": ttl}
+            break                                          # first live claim in file order wins
     return live
 
 
 def _board_claim(session_id, path, owner, ttl=_BOARD_CLAIM_TTL, now=None):
-    """Try to claim `path` for `owner` (first-claim-wins). Appends a claim record IFF the
-    path is free (no live claim, or the live claim is already this owner's = refresh).
-    Returns (ok, holder): ok True + holder=owner on success; ok False + holder=<other
-    owner> when another live claim blocks it. Append-only + atomic single write, so two
-    racing claimers are resolved by read-back (the loser sees the winner's record)."""
+    """Try to claim `path` for `owner` (first-claim-wins). Appends a claim record when the
+    path looks free (no live claim, or the live claim is already this owner's = refresh),
+    then READS BACK and lets the deterministic reduction (first live claim in file order)
+    pick the winner - so N truly-concurrent claimers who all append still resolve to exactly one
+    holder, and a loser is told who won. Returns (ok, holder): ok True + holder=owner when
+    this owner is the resolved winner; ok False + holder=<winner> otherwise. The append-only
+    log + deterministic read-back IS the arbiter (no lock, no daemon)."""
     now = time.time() if now is None else now
-    live = _board_read_claims(session_id, now=now)
-    held = live.get(path)
+    held = _board_read_claims(session_id, now=now).get(path)
     if held and held.get("owner") != owner:
-        return False, held.get("owner")
+        return False, held.get("owner")                    # already lost before we even wrote
     d = _board_dir(session_id)
     try:
         d.mkdir(parents=True, exist_ok=True)
@@ -6107,7 +6143,11 @@ def _board_claim(session_id, path, owner, ttl=_BOARD_CLAIM_TTL, now=None):
             f.write(json.dumps(rec) + "\n")
     except OSError:
         return False, None
-    return True, owner
+    # Read back and resolve: a concurrent claimer with an earlier ts wins the path.
+    winner = _board_read_claims(session_id, now=now).get(path, {}).get("owner")
+    if winner == owner:
+        return True, owner
+    return False, winner
 
 
 def _board_release(session_id, path, owner, now=None):
@@ -6168,6 +6208,258 @@ def _board_sweep(grace=3600):
             d.rmdir()
         except OSError:
             pass
+
+
+# --- Task DAG board (Phase 2b) --------------------------------------------------------
+# A driver-orchestrated task board: a NAMED, session-shaped JSON doc the driver schedules
+# over (push model - the driver assigns workers to tasks; workers never self-select). It
+# is the SWARM-LEVEL analogue of a saved session: named + on disk + atomic + crash-
+# survivable + hand-offable (a different leancoder can load it and keep driving). Distinct
+# from the claims board above: claims.jsonl is the file-touch MUTEX ("don't both edit
+# auth.py"); this is the task DAG ("C waits for D"). See docs/design section 9.
+#
+# Shape:  CONFIG_DIR/workers/taskboards/<name>.json
+#   {"meta": {created_at, updated_at, owner, title, counts:{status->n}},
+#    "tasks": [{id, name, status, assignee, deps:[id...], note, result_ref}, ...]}
+# status in: open | assigned | blocked | done | failed.  deps = task ids that must be
+# `done` first (AND semantics). ready(t) := status==open AND every dep is done.
+
+TASKBOARDS_DIR = CONFIG_DIR / "workers" / "taskboards"
+_TB_STATUSES = ("open", "assigned", "blocked", "done", "failed")
+
+
+def _taskboard_path(name):
+    """Path to a named taskboard, or None if the name sanitizes to nothing (reuses the
+    session-name rules: a safe single filename component, no traversal)."""
+    safe = _session_name_ok(name or "")
+    return (TASKBOARDS_DIR / f"{safe}.json") if safe else None
+
+
+def _tb_recount(board):
+    """Recompute meta.counts from the live tasks (called on every save so the cached
+    header never drifts from the array)."""
+    counts = {s: 0 for s in _TB_STATUSES}
+    for t in board.get("tasks", []):
+        st = t.get("status")
+        if st in counts:
+            counts[st] += 1
+    board.setdefault("meta", {})["counts"] = counts
+    return counts
+
+
+def _taskboard_load(name):
+    """Return a named board dict, or None if it does not exist / the name is bad. A
+    corrupt or half-written file degrades to a minimal empty board (never raises) - same
+    tolerance saved sessions have."""
+    p = _taskboard_path(name)
+    if not p or not p.is_file():
+        return None
+    try:
+        data = json.loads(p.read_text())
+        if not isinstance(data, dict):
+            raise ValueError("not an object")
+    except (json.JSONDecodeError, OSError, ValueError):
+        return {"meta": {"title": "", "counts": {}}, "tasks": []}
+    data.setdefault("meta", {})
+    data.setdefault("tasks", [])
+    return data
+
+
+def _taskboard_save(name, board):
+    """Atomically write a board (recomputes counts + updated_at). Returns the path, or
+    None if the name is bad."""
+    p = _taskboard_path(name)
+    if not p:
+        return None
+    TASKBOARDS_DIR.mkdir(parents=True, exist_ok=True)
+    _tb_recount(board)
+    board.setdefault("meta", {})["updated_at"] = time.strftime("%Y-%m-%d %H:%M")
+    _atomic_write_text(p, json.dumps(board, indent=2))
+    return p
+
+
+def _taskboard_create(name, title="", owner=""):
+    """Create a new empty board. Returns (board, err): err set (board None) if the name is
+    bad or a board of that name already exists (create never clobbers)."""
+    p = _taskboard_path(name)
+    if not p:
+        return None, "invalid board name"
+    if p.is_file():
+        return None, f"a board named '{_session_name_ok(name)}' already exists"
+    board = {"meta": {"created_at": time.strftime("%Y-%m-%d %H:%M"),
+                      "updated_at": "", "owner": str(owner or ""), "title": title or "",
+                      "counts": {}},
+             "tasks": []}
+    _taskboard_save(name, board)
+    return board, ""
+
+
+def _tb_task(board, task_id):
+    for t in board.get("tasks", []):
+        if t.get("id") == task_id:
+            return t
+    return None
+
+
+def _tb_next_id(board):
+    """A short stable id (t1, t2, ...): one past the highest existing tN, so ids are never
+    reused even after a delete."""
+    hi = 0
+    for t in board.get("tasks", []):
+        tid = str(t.get("id", ""))
+        if tid.startswith("t") and tid[1:].isdigit():
+            hi = max(hi, int(tid[1:]))
+    return f"t{hi + 1}"
+
+
+def _tb_has_cycle(board, new_from=None, new_to=None):
+    """True if the dep graph has a cycle. Optionally test a HYPOTHETICAL extra edge
+    new_from -> new_to (new_from depends on new_to) WITHOUT mutating the board - used to
+    refuse an add that would create a cycle (a real footgun: a cycle makes a task un-ready
+    forever). deps point child->prereq; a cycle in that relation is the thing to reject."""
+    adj = {}
+    for t in board.get("tasks", []):
+        adj[t.get("id")] = list(t.get("deps", []))
+    if new_from is not None:
+        adj.setdefault(new_from, [])
+        if new_to not in adj[new_from]:
+            adj[new_from] = adj[new_from] + [new_to]
+    WHITE, GRAY, BLACK = 0, 1, 2
+    color = {n: WHITE for n in adj}
+
+    def visit(n):
+        if color.get(n, WHITE) == GRAY:
+            return True
+        if color.get(n, WHITE) == BLACK:
+            return False
+        color[n] = GRAY
+        for m in adj.get(n, []):
+            if m in adj and visit(m):
+                return True
+        color[n] = BLACK
+        return False
+
+    return any(visit(n) for n in list(adj))
+
+
+def _taskboard_add(board, name, deps=None, note=""):
+    """Append a task. Returns (task, err): err set if a dep id is unknown or the new task
+    would create a dependency cycle. Does NOT save (caller saves)."""
+    deps = list(deps or [])
+    known = {t.get("id") for t in board.get("tasks", [])}
+    unknown = [d for d in deps if d not in known]
+    if unknown:
+        return None, f"unknown dep id(s): {', '.join(unknown)}"
+    tid = _tb_next_id(board)
+    for d in deps:
+        if _tb_has_cycle(board, new_from=tid, new_to=d):
+            return None, f"dep {tid}->{d} would create a cycle"
+    task = {"id": tid, "name": name or tid, "status": "open",
+            "assignee": None, "deps": deps, "note": note or "", "result_ref": None}
+    board.setdefault("tasks", []).append(task)
+    return task, ""
+
+
+def _taskboard_ready(board):
+    """Split tasks into (ready, blocked) by the pure rule: a task is READY iff status is
+    'open' AND every dep resolves to a task with status 'done'; an open/blocked task with
+    an unmet dep is BLOCKED. Returns (ready_list, blocked_list) of task dicts. A missing
+    dep id counts as unmet (never crashes)."""
+    by_id = {t.get("id"): t for t in board.get("tasks", [])}
+    ready, blocked = [], []
+    for t in board.get("tasks", []):
+        if t.get("status") not in ("open", "blocked"):
+            continue
+        deps = t.get("deps", [])
+        met = all((by_id.get(d) or {}).get("status") == "done" for d in deps)
+        if t.get("status") == "open" and met:
+            ready.append(t)
+        else:
+            blocked.append(t)
+    return ready, blocked
+
+
+def _taskboard_set_status(board, task_id, status, assignee=None, note=None,
+                          result_ref=None):
+    """Mutate one task's status (+ optional assignee/note/result_ref). Returns (task, err):
+    err on an unknown id or an invalid status. Does NOT save (caller saves)."""
+    if status not in _TB_STATUSES:
+        return None, f"invalid status '{status}' (use {', '.join(_TB_STATUSES)})"
+    t = _tb_task(board, task_id)
+    if not t:
+        return None, f"unknown task id '{task_id}'"
+    t["status"] = status
+    if assignee is not None:
+        t["assignee"] = assignee
+    if note is not None:
+        t["note"] = note
+    if result_ref is not None:
+        t["result_ref"] = result_ref
+    return t, ""
+
+
+def _taskboard_reconcile(board):
+    """Reconciler v1: the result_refs of every DONE task in DEPENDENCY (topological) order,
+    dep-before-dependent. Ties (independent tasks) keep board order. Returns a list of
+    (task, result_ref) for done tasks that have a result_ref. Dumb, no merge - concatenate
+    upstream. A dependency cycle (should be impossible via _taskboard_add) degrades to
+    board order rather than looping."""
+    tasks = board.get("tasks", [])
+    by_id = {t.get("id"): t for t in tasks}
+    order, seen, temp = [], set(), set()
+
+    def visit(tid):
+        if tid in seen or tid not in by_id:
+            return
+        if tid in temp:            # cycle guard: bail this branch
+            return
+        temp.add(tid)
+        for d in by_id[tid].get("deps", []):
+            visit(d)
+        temp.discard(tid)
+        seen.add(tid)
+        order.append(tid)
+
+    for t in tasks:
+        visit(t.get("id"))
+    out = []
+    for tid in order:
+        t = by_id[tid]
+        if t.get("status") == "done" and t.get("result_ref"):
+            out.append((t, t["result_ref"]))
+    return out
+
+
+def _taskboard_load_defensive(name):
+    """Load a board for a NEW driver taking it over (hand-off / post-crash): reset stale
+    runtime state so the new driver starts from a clean schedulable view. An 'assigned'
+    task whose worker belonged to the dead driver is meaningless now, so it reverts to
+    'open' (its deps still gate it); 'blocked' likewise reverts to 'open' to be re-derived.
+    'done'/'failed' (terminal facts) are preserved. Returns (board, err)."""
+    board = _taskboard_load(name)
+    if board is None:
+        return None, f"no board named '{_session_name_ok(name or '')}'"
+    for t in board.get("tasks", []):
+        if t.get("status") in ("assigned", "blocked"):
+            t["status"] = "open"
+            t["assignee"] = None
+    return board, ""
+
+
+def _taskboards_list():
+    """(name, meta) for every saved taskboard, newest-updated first. Best-effort."""
+    if not TASKBOARDS_DIR.is_dir():
+        return []
+    out = []
+    for p in TASKBOARDS_DIR.glob("*.json"):
+        try:
+            meta = json.loads(p.read_text()).get("meta", {})
+        except (json.JSONDecodeError, OSError):
+            meta = {}
+        out.append((p.stem, meta))
+    out.sort(key=lambda nm: nm[1].get("updated_at", ""), reverse=True)
+    return out
+
 
 
 def _bg_reap_orphans():
@@ -15054,6 +15346,23 @@ def run_agent_brief(args) -> int:
             cfg.worker_board_session = int(grant["board"])
         except ValueError:
             pass
+    # Named task DAG board (Phase 2b): the driver assigned this worker to a board by NAME.
+    # Auto-load the `board` lean-tool so the worker can report its task done + read the
+    # board - granting a worker a board IS the intent to let it coordinate, so requiring the
+    # driver to also list 'board' in tools= would be a silent-failure footgun (worker can't
+    # report -> board stalls -> driver waits forever). The board tool is safe (touches only
+    # board JSON under the config dir, never the user tree), so this never widens the leash;
+    # and it's scoped - a worker with no taskboard grant gets nothing extra. If the grant
+    # ALSO carries a tools= allowlist, keep 'board' in it (the worker still needs it).
+    tb_name = (grant.get("taskboard") or "").strip()
+    if tb_name:
+        cfg.worker_taskboard = tb_name
+        enabled = list(cfg.lean_tools_enabled or [])
+        if "board" not in enabled:
+            enabled.append("board")
+        cfg.lean_tools_enabled = enabled
+        if cfg.tool_allowlist is not None and "board" not in cfg.tool_allowlist:
+            cfg.tool_allowlist = tuple(cfg.tool_allowlist) + ("board",)
     # The worker attaches its TOOLS to the parent's remote when one is passed. In that
     # case the grant 'cwd' is a path on the REMOTE (not the driver), so it must NOT
     # constrain the driver-local cfg.cwd - leave cfg.cwd at the driver default and hand
@@ -15075,6 +15384,15 @@ def run_agent_brief(args) -> int:
         agent = Agent(cfg)
     except Exception as e:
         return _fail(f"worker failed to initialise (Agent build): {e}")
+    # A worker is a full agent, so its enabled lean-tools need their setup() run too - the
+    # REPL does this at startup, but the headless worker path skipped it, so a tool that
+    # depends on setup() (e.g. `board` capturing its core hooks into _H) loaded but ran
+    # uninitialised. Run it here now that cfg + the enabled set are final. Not the
+    # --tool-exec executor (that path never builds an Agent); a real worker agent.
+    try:
+        _run_lean_tool_setup(cfg, agent.lean_tools)
+    except Exception as e:
+        print(yellow(f"agent-run: lean-tool setup warning: {e}"))
     # Apply the parent's seed STATE onto the fresh worker (before its first turn). A plan
     # goes straight to pinned_plan (rides the worker's own compaction); notes seed the
     # notebook one entry per non-blank line, tagged so the worker reads them as given, not
@@ -15176,6 +15494,17 @@ def run_agent_brief(args) -> int:
         # know", distinct from the task itself. Only when present.
         + (f"\nCONTEXT FROM THE AGENT THAT DISPATCHED YOU (background you need; not the task "
            f"itself):\n{seed_context.strip()}\n" if seed_context.strip() else "")
+        # Task-board contract (Phase 2b): when the driver assigned this worker to a named
+        # board, tell it - once, structurally - to report its own task done there. The
+        # `board` tool was auto-loaded above; the worker marks its task done (and may read
+        # the board with list/find), but cannot assign/create - that's the driver's job.
+        + (f"\nTASK BOARD: you are working task board '{cfg.worker_taskboard}'. Use the "
+           f"`board` tool: when your task is complete, call action='done' board="
+           f"'{cfg.worker_taskboard}' task=<your task id> result_ref=<path to your work "
+           f"product>, so the driver knows to schedule what your task unblocks. You may "
+           f"also action='list'/'find' to see the board, but you cannot create/add/assign "
+           f"(that is the driver's role). Your task id is stated in the task below.\n"
+           if getattr(cfg, "worker_taskboard", "") else "")
         + "\nTASK:\n"
         + brief)
 
