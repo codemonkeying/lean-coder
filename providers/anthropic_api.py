@@ -49,6 +49,28 @@ def _backoff(attempt):
     return min(2.0 * (2 ** attempt), _MAX_WAIT)
 
 
+# SSE error-event types that are transient overloads/5xx. Anthropic can signal an
+# overload MID-STREAM as an {"type":"error","error":{"type":...}} frame (HTTP 200,
+# then this) instead of an HTTP 529 - those must retry like a 529, not die raw.
+_TRANSIENT_SSE_ERR_TYPES = ("overloaded_error", "overloaded", "api_error")
+
+
+class _TransientStreamError(RuntimeError):
+    """A mid-stream SSE error frame that is a transient overload/5xx worth retrying.
+    Distinct type so _send's retry loop can catch it (the stream is consumed inside
+    the urlopen `with`, so this escapes past the HTTPError handler otherwise)."""
+
+
+def _raise_sse_error(err):
+    """Raise an SSE error frame's error dict. A transient overload/5xx raises
+    _TransientStreamError (retried); anything else raises a plain RuntimeError."""
+    etype = str((err or {}).get("type", "")).lower()
+    msg = (err or {}).get("message") or "API error"
+    if etype in _TRANSIENT_SSE_ERR_TYPES:
+        raise _TransientStreamError(f"{msg} (sse:{etype})")
+    raise RuntimeError(msg)
+
+
 def _interruptible_sleep(secs, should_abort):
     """Sleep in slices so should_abort()/Ctrl-C breaks the wait. False if aborted."""
     waited = 0.0
@@ -476,7 +498,7 @@ class _ApiKeyClient:
                     output_eval = obj.get("usage", {}).get("output_tokens")
 
                 elif etype == "error":
-                    raise RuntimeError(obj.get("error", {}).get("message", "API error"))
+                    _raise_sse_error(obj.get("error", {}))
 
         finally:
             spin.stop()
@@ -516,6 +538,18 @@ class _ApiKeyClient:
                         timeout=(getattr(self.cfg, "gen_connect_timeout", None) or 600)) as resp:
                     self._last_rl = {k.lower(): v for k, v in resp.headers.items()}
                     return self._consume_urllib(resp, should_abort)
+            except _TransientStreamError as e:
+                # A mid-stream overload/5xx SSE frame - retry like a 529 (it escaped the
+                # urlopen with-block, so the HTTPError handler below never saw it).
+                if attempt < _MAX_RETRIES:
+                    wait = _backoff(attempt)
+                    attempt += 1
+                    print(_lc["red"](f"[!] {payload.get('model', '')} overloaded (stream) - "
+                                     f"retry {attempt}/{_MAX_RETRIES} in {wait:.0f}s"))
+                    if not _interruptible_sleep(wait, should_abort):
+                        raise RuntimeError("aborted during retry wait") from None
+                    continue
+                raise RuntimeError(f"API 529: {e}") from None
             except urllib.error.HTTPError as e:
                 self._last_rl = {k.lower(): v for k, v in (e.headers or {}).items()}
                 body = e.read().decode(errors="replace")
