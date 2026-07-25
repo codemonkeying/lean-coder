@@ -15,14 +15,14 @@ schemas, truncated tool results. See README.md.
   L2834   Composer (pinned input line, editor, stdin)
   L3684   Token accounting (calibrated context meter)
   L3849   Config (dataclass, field registry, load/save)
-  L6704   Tool execution + text tool-call parsing
-  L7125   Remote workspace (executor client, /connect)
-  L8690   Context meter
-  L8785   Agent (turn loop, context mgmt, tool dispatch)
-  L14474  Slash-command handlers + dispatch table
-  L14611  REPL (interactive loop, session resume)
-  L14986  Worker agent (headless --agent-run)
-  L15544  Entry (CLI arg parsing, main)
+  L6956   Tool execution + text tool-call parsing
+  L7377   Remote workspace (executor client, /connect)
+  L8942   Context meter
+  L9037   Agent (turn loop, context mgmt, tool dispatch)
+  L14726  Slash-command handlers + dispatch table
+  L14863  REPL (interactive loop, session resume)
+  L15238  Worker agent (headless --agent-run)
+  L15796  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -6188,6 +6188,258 @@ def _board_sweep(grace=3600):
             d.rmdir()
         except OSError:
             pass
+
+
+# --- Task DAG board (Phase 2b) --------------------------------------------------------
+# A driver-orchestrated task board: a NAMED, session-shaped JSON doc the driver schedules
+# over (push model - the driver assigns workers to tasks; workers never self-select). It
+# is the SWARM-LEVEL analogue of a saved session: named + on disk + atomic + crash-
+# survivable + hand-offable (a different leancoder can load it and keep driving). Distinct
+# from the claims board above: claims.jsonl is the file-touch MUTEX ("don't both edit
+# auth.py"); this is the task DAG ("C waits for D"). See docs/design section 9.
+#
+# Shape:  CONFIG_DIR/workers/taskboards/<name>.json
+#   {"meta": {created_at, updated_at, owner, title, counts:{status->n}},
+#    "tasks": [{id, name, status, assignee, deps:[id...], note, result_ref}, ...]}
+# status in: open | assigned | blocked | done | failed.  deps = task ids that must be
+# `done` first (AND semantics). ready(t) := status==open AND every dep is done.
+
+TASKBOARDS_DIR = CONFIG_DIR / "workers" / "taskboards"
+_TB_STATUSES = ("open", "assigned", "blocked", "done", "failed")
+
+
+def _taskboard_path(name):
+    """Path to a named taskboard, or None if the name sanitizes to nothing (reuses the
+    session-name rules: a safe single filename component, no traversal)."""
+    safe = _session_name_ok(name or "")
+    return (TASKBOARDS_DIR / f"{safe}.json") if safe else None
+
+
+def _tb_recount(board):
+    """Recompute meta.counts from the live tasks (called on every save so the cached
+    header never drifts from the array)."""
+    counts = {s: 0 for s in _TB_STATUSES}
+    for t in board.get("tasks", []):
+        st = t.get("status")
+        if st in counts:
+            counts[st] += 1
+    board.setdefault("meta", {})["counts"] = counts
+    return counts
+
+
+def _taskboard_load(name):
+    """Return a named board dict, or None if it does not exist / the name is bad. A
+    corrupt or half-written file degrades to a minimal empty board (never raises) - same
+    tolerance saved sessions have."""
+    p = _taskboard_path(name)
+    if not p or not p.is_file():
+        return None
+    try:
+        data = json.loads(p.read_text())
+        if not isinstance(data, dict):
+            raise ValueError("not an object")
+    except (json.JSONDecodeError, OSError, ValueError):
+        return {"meta": {"title": "", "counts": {}}, "tasks": []}
+    data.setdefault("meta", {})
+    data.setdefault("tasks", [])
+    return data
+
+
+def _taskboard_save(name, board):
+    """Atomically write a board (recomputes counts + updated_at). Returns the path, or
+    None if the name is bad."""
+    p = _taskboard_path(name)
+    if not p:
+        return None
+    TASKBOARDS_DIR.mkdir(parents=True, exist_ok=True)
+    _tb_recount(board)
+    board.setdefault("meta", {})["updated_at"] = time.strftime("%Y-%m-%d %H:%M")
+    _atomic_write_text(p, json.dumps(board, indent=2))
+    return p
+
+
+def _taskboard_create(name, title="", owner=""):
+    """Create a new empty board. Returns (board, err): err set (board None) if the name is
+    bad or a board of that name already exists (create never clobbers)."""
+    p = _taskboard_path(name)
+    if not p:
+        return None, "invalid board name"
+    if p.is_file():
+        return None, f"a board named '{_session_name_ok(name)}' already exists"
+    board = {"meta": {"created_at": time.strftime("%Y-%m-%d %H:%M"),
+                      "updated_at": "", "owner": str(owner or ""), "title": title or "",
+                      "counts": {}},
+             "tasks": []}
+    _taskboard_save(name, board)
+    return board, ""
+
+
+def _tb_task(board, task_id):
+    for t in board.get("tasks", []):
+        if t.get("id") == task_id:
+            return t
+    return None
+
+
+def _tb_next_id(board):
+    """A short stable id (t1, t2, ...): one past the highest existing tN, so ids are never
+    reused even after a delete."""
+    hi = 0
+    for t in board.get("tasks", []):
+        tid = str(t.get("id", ""))
+        if tid.startswith("t") and tid[1:].isdigit():
+            hi = max(hi, int(tid[1:]))
+    return f"t{hi + 1}"
+
+
+def _tb_has_cycle(board, new_from=None, new_to=None):
+    """True if the dep graph has a cycle. Optionally test a HYPOTHETICAL extra edge
+    new_from -> new_to (new_from depends on new_to) WITHOUT mutating the board - used to
+    refuse an add that would create a cycle (a real footgun: a cycle makes a task un-ready
+    forever). deps point child->prereq; a cycle in that relation is the thing to reject."""
+    adj = {}
+    for t in board.get("tasks", []):
+        adj[t.get("id")] = list(t.get("deps", []))
+    if new_from is not None:
+        adj.setdefault(new_from, [])
+        if new_to not in adj[new_from]:
+            adj[new_from] = adj[new_from] + [new_to]
+    WHITE, GRAY, BLACK = 0, 1, 2
+    color = {n: WHITE for n in adj}
+
+    def visit(n):
+        if color.get(n, WHITE) == GRAY:
+            return True
+        if color.get(n, WHITE) == BLACK:
+            return False
+        color[n] = GRAY
+        for m in adj.get(n, []):
+            if m in adj and visit(m):
+                return True
+        color[n] = BLACK
+        return False
+
+    return any(visit(n) for n in list(adj))
+
+
+def _taskboard_add(board, name, deps=None, note=""):
+    """Append a task. Returns (task, err): err set if a dep id is unknown or the new task
+    would create a dependency cycle. Does NOT save (caller saves)."""
+    deps = list(deps or [])
+    known = {t.get("id") for t in board.get("tasks", [])}
+    unknown = [d for d in deps if d not in known]
+    if unknown:
+        return None, f"unknown dep id(s): {', '.join(unknown)}"
+    tid = _tb_next_id(board)
+    for d in deps:
+        if _tb_has_cycle(board, new_from=tid, new_to=d):
+            return None, f"dep {tid}->{d} would create a cycle"
+    task = {"id": tid, "name": name or tid, "status": "open",
+            "assignee": None, "deps": deps, "note": note or "", "result_ref": None}
+    board.setdefault("tasks", []).append(task)
+    return task, ""
+
+
+def _taskboard_ready(board):
+    """Split tasks into (ready, blocked) by the pure rule: a task is READY iff status is
+    'open' AND every dep resolves to a task with status 'done'; an open/blocked task with
+    an unmet dep is BLOCKED. Returns (ready_list, blocked_list) of task dicts. A missing
+    dep id counts as unmet (never crashes)."""
+    by_id = {t.get("id"): t for t in board.get("tasks", [])}
+    ready, blocked = [], []
+    for t in board.get("tasks", []):
+        if t.get("status") not in ("open", "blocked"):
+            continue
+        deps = t.get("deps", [])
+        met = all((by_id.get(d) or {}).get("status") == "done" for d in deps)
+        if t.get("status") == "open" and met:
+            ready.append(t)
+        else:
+            blocked.append(t)
+    return ready, blocked
+
+
+def _taskboard_set_status(board, task_id, status, assignee=None, note=None,
+                          result_ref=None):
+    """Mutate one task's status (+ optional assignee/note/result_ref). Returns (task, err):
+    err on an unknown id or an invalid status. Does NOT save (caller saves)."""
+    if status not in _TB_STATUSES:
+        return None, f"invalid status '{status}' (use {', '.join(_TB_STATUSES)})"
+    t = _tb_task(board, task_id)
+    if not t:
+        return None, f"unknown task id '{task_id}'"
+    t["status"] = status
+    if assignee is not None:
+        t["assignee"] = assignee
+    if note is not None:
+        t["note"] = note
+    if result_ref is not None:
+        t["result_ref"] = result_ref
+    return t, ""
+
+
+def _taskboard_reconcile(board):
+    """Reconciler v1: the result_refs of every DONE task in DEPENDENCY (topological) order,
+    dep-before-dependent. Ties (independent tasks) keep board order. Returns a list of
+    (task, result_ref) for done tasks that have a result_ref. Dumb, no merge - concatenate
+    upstream. A dependency cycle (should be impossible via _taskboard_add) degrades to
+    board order rather than looping."""
+    tasks = board.get("tasks", [])
+    by_id = {t.get("id"): t for t in tasks}
+    order, seen, temp = [], set(), set()
+
+    def visit(tid):
+        if tid in seen or tid not in by_id:
+            return
+        if tid in temp:            # cycle guard: bail this branch
+            return
+        temp.add(tid)
+        for d in by_id[tid].get("deps", []):
+            visit(d)
+        temp.discard(tid)
+        seen.add(tid)
+        order.append(tid)
+
+    for t in tasks:
+        visit(t.get("id"))
+    out = []
+    for tid in order:
+        t = by_id[tid]
+        if t.get("status") == "done" and t.get("result_ref"):
+            out.append((t, t["result_ref"]))
+    return out
+
+
+def _taskboard_load_defensive(name):
+    """Load a board for a NEW driver taking it over (hand-off / post-crash): reset stale
+    runtime state so the new driver starts from a clean schedulable view. An 'assigned'
+    task whose worker belonged to the dead driver is meaningless now, so it reverts to
+    'open' (its deps still gate it); 'blocked' likewise reverts to 'open' to be re-derived.
+    'done'/'failed' (terminal facts) are preserved. Returns (board, err)."""
+    board = _taskboard_load(name)
+    if board is None:
+        return None, f"no board named '{_session_name_ok(name or '')}'"
+    for t in board.get("tasks", []):
+        if t.get("status") in ("assigned", "blocked"):
+            t["status"] = "open"
+            t["assignee"] = None
+    return board, ""
+
+
+def _taskboards_list():
+    """(name, meta) for every saved taskboard, newest-updated first. Best-effort."""
+    if not TASKBOARDS_DIR.is_dir():
+        return []
+    out = []
+    for p in TASKBOARDS_DIR.glob("*.json"):
+        try:
+            meta = json.loads(p.read_text()).get("meta", {})
+        except (json.JSONDecodeError, OSError):
+            meta = {}
+        out.append((p.stem, meta))
+    out.sort(key=lambda nm: nm[1].get("updated_at", ""), reverse=True)
+    return out
+
 
 
 def _bg_reap_orphans():
