@@ -45,6 +45,7 @@ NOTES.md
 # repo root) then re-include the BUNDLED tools that ship and load out of the box, so
 # they stay version-controlled while your own local drop-ins here stay untracked.
 /lean-tools/*
+!/lean-tools/board.py
 !/lean-tools/builtins.py
 !/lean-tools/dispatch_worker.py
 !/lean-tools/update.py
