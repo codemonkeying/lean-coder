@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L890    Lean-tools (plugin tools: discovery, manager)
-  L1230   MCP client (connection, manager, OAuth, discovery)
-  L1684   Providers (backend plugin registry)
-  L1906   Interactive pickers + menus (raw-mode UI engine)
-  L2255   Terminal styling (colors, formatting helpers)
-  L2452   Streaming + markdown render (model output)
-  L2799   Composer (pinned input line, editor, stdin)
-  L3649   Token accounting (calibrated context meter)
-  L3814   Config (dataclass, field registry, load/save)
-  L6338   Tool execution + text tool-call parsing
-  L6759   Remote workspace (executor client, /connect)
-  L8324   Context meter
-  L8419   Agent (turn loop, context mgmt, tool dispatch)
-  L14060  Slash-command handlers + dispatch table
-  L14197  REPL (interactive loop, session resume)
-  L14572  Worker agent (headless --agent-run)
-  L14885  Entry (CLI arg parsing, main)
+  L925    Lean-tools (plugin tools: discovery, manager)
+  L1265   MCP client (connection, manager, OAuth, discovery)
+  L1719   Providers (backend plugin registry)
+  L1941   Interactive pickers + menus (raw-mode UI engine)
+  L2290   Terminal styling (colors, formatting helpers)
+  L2487   Streaming + markdown render (model output)
+  L2834   Composer (pinned input line, editor, stdin)
+  L3684   Token accounting (calibrated context meter)
+  L3849   Config (dataclass, field registry, load/save)
+  L6684   Tool execution + text tool-call parsing
+  L7105   Remote workspace (executor client, /connect)
+  L8670   Context meter
+  L8765   Agent (turn loop, context mgmt, tool dispatch)
+  L14454  Slash-command handlers + dispatch table
+  L14591  REPL (interactive loop, session resume)
+  L14966  Worker agent (headless --agent-run)
+  L15524  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -111,7 +111,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.9.5"
+__version__ = "0.9.6"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -119,6 +119,22 @@ __version__ = "0.9.5"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.9.6": [
+        "workers grew up: dispatch a background sub-agent with a scoped tool allowlist",
+        "  and seeded state (curated context / a starting plan / notebook lines), then",
+        "  steer it live with /worker set_plan and add_note while it runs.",
+        "dead-worker recovery: a worker that times out, is killed, or hits its iteration",
+        "  cap can be resumed from a transcript checkpoint (opt in with worker_checkpoint)",
+        "  instead of restarting cold - optionally with a fresh, larger iteration budget.",
+        "the driver can now set a per-worker iteration cap at dispatch, capped at your",
+        "  operator ceiling (an env lockdown still wins).",
+        "swarm coordination: peers share a claims board (first-claim-wins with a TTL) so",
+        "  two workers on one repo don't stomp the same file.",
+        "safe-recursion governor bounds any worker subtree (depth x child-budget), and a",
+        "  worker's leash/tools can never exceed the grantor's.",
+        "config: a duplicate-key or partly-corrupt config.toml no longer wipes your",
+        "  settings - the good scalars are salvaged.",
+    ],
     "0.9.5": [
         "compaction is now one lever end to end: a single prompt, one pre-compact",
         "  snapshot (taken only once a usable summary exists), one code path.",
@@ -289,6 +305,13 @@ PLAN_MARK = "===PLAN==="            # the model wraps its pinned goal + TODO in 
 BRIEF_MARK = "===BRIEF==="          # a worker's task (its first user turn) - see --agent-run
 GRANT_MARK = "===GRANT==="          # a worker's grant header (leash/model/cwd/limits)
 RESULT_MARK = "===RESULT==="        # a worker wraps its final answer in these; the parent harvests it
+RESUME_MARK = "===RESUME==="        # a resumed worker's brief carries the checkpoint path here (see action='resume')
+# Optional seed blocks a parent may include in a worker's brief to hand it curated
+# STATE (not whole context): starting plan, episodic notes, shared-context blob. All
+# bounded by the dispatch tool so "share state, not context" holds. See run_agent_brief.
+SEED_PLAN_MARK = "===PLAN==="       # seeds the worker's pinned_plan (GOAL + TODO)
+SEED_NOTES_MARK = "===NOTES==="     # seeds the worker's notebook (one note per line)
+SEED_CONTEXT_MARK = "===CONTEXT===" # a short shared-context blob prepended to the task
 
 COMPACT_INSTR = (
     "You are compacting this session now: the older turns get replaced by what you write "
@@ -756,11 +779,21 @@ def active_tools(cfg, remote=False, lean_tool_schemas=(), model_tools=True,
         return []                    # chat-only (user ceiling OR model can't tool-call)
     allow_write = leash in ("rw", "rwe")
     allow_exec = leash == "rwe"
+    # Optional per-worker allowlist: when set, the surface is narrowed to these tool
+    # NAMES (still leash-capped below). None = no restriction (the everyday full
+    # surface). The agent-internal meta tools are never removed (a worker must always
+    # keep its plan/notebook/compaction), so allow() waves them through.
+    allow = getattr(cfg, "tool_allowlist", None)
+    _META = ("update_plan", "note", "request_compact")
+    def _named(nm):
+        return allow is None or nm in _META or nm in allow
     tools = [UPDATE_PLAN_TOOL, NOTE_TOOL]  # plan upkeep + session notebook: no fs/exec, every non-chat tier
     if offer_compact:               # soft zone: let the model elect a handover at a break
         tools.append(REQUEST_COMPACT_TOOL)
     for t in TOOLS:
         nm = t["function"]["name"]
+        if not _named(nm):
+            continue
         if nm in _WRITE_TIER and not allow_write:
             continue
         if nm in _EXEC_TIER and not allow_exec:
@@ -773,8 +806,8 @@ def active_tools(cfg, remote=False, lean_tool_schemas=(), model_tools=True,
                  "description": t["function"]["description"].format(
                      command_timeout=getattr(cfg, "command_timeout", 300))}}
         tools.append(t)
-    if cfg.ask_user_to_run and allow_exec:   # a handoff to RUN a command -> exec tier
-        tools.append(ASK_USER_TOOL)
+    if cfg.ask_user_to_run and allow_exec and _named(ASK_USER_TOOL["function"]["name"]):
+        tools.append(ASK_USER_TOOL)            # a handoff to RUN a command -> exec tier
     # A lean-tool must not shadow a core tool name (or another lean-tool): duplicate
     # tool names make the API 400 ("Tool names must be unique"). Core wins - a
     # lean-tool that reuses a builtin name (e.g. todo.py's `update_plan`, which is
@@ -784,6 +817,8 @@ def active_tools(cfg, remote=False, lean_tool_schemas=(), model_tools=True,
         if not (is_safe or allow_exec):      # non-safe lean-tools may write/run -> rwe only
             continue
         nm = sch.get("function", {}).get("name")
+        if not _named(nm):                   # narrowed out by the per-worker allowlist
+            continue
         if nm in seen:                       # collides with a core tool / earlier lean-tool
             continue
         seen.add(nm)
@@ -4050,6 +4085,29 @@ class Config:
     worker_max_concurrent: int = 10   # dispatch_worker: max worker agents alive at once (0 = unlimited)
     worker_idle_timeout: int = 1800  # dispatch_worker: worker lease secs; unattended self-kill
     worker_max_iterations: int = 30  # dispatch_worker: agentic-loop cap per worker
+    # SAFE-RECURSION governor (a worker spawning workers). Both default to the SAFE end:
+    # opt-IN to recursion, never opt-out. A misfire can't fork-bomb API quota.
+    worker_max_depth: int = 1        # dispatch_worker: max tree depth (driver->worker = 1);
+                                     # default 1 = fan-out only, a worker can't spawn (today's limit)
+    worker_max_children: int = 0     # dispatch_worker: max children ANY single worker may spawn
+                                     # (0 = none). Only bites once max_depth > 1 permits recursion.
+    worker_checkpoint: bool = False  # dispatch_worker: when on, a worker checkpoints its transcript
+                                     # to a '<brief>.checkpoint' sidecar each iteration so a dead/
+                                     # timed-out worker can be RELAUNCHED with action='resume'
+                                     # (opt-in; off = today's behaviour, no checkpoint file).
+    worker_depth: int = 0            # INTERNAL: this process's depth in the tree (driver=0,
+                                     # its workers=1, ...). Set from the grant in run_agent_brief;
+                                     # NOT a user knob (not in _ROUNDTRIP / /settings).
+    worker_child_budget: int = 0     # INTERNAL: how many children THIS worker was granted (from
+                                     # the grant). Driver is ungated by this (uses max_concurrent).
+    worker_board_session: int = 0    # INTERNAL: the shared-board session id (the driver's pid) a
+                                     # worker uses to reach the swarm claim board. Set from the
+                                     # grant ('board: N'); 0 = no board (a lone worker). Not a knob.
+    tool_allowlist: tuple = None     # None = no restriction (all leash-permitted tools).
+                                     # Else a set/tuple of tool NAMES the surface is
+                                     # narrowed to (still leash-capped). Runtime-only,
+                                     # per-worker (set from a dispatch grant); not persisted
+                                     # - the everyday session leaves it None = full surface.
     editor: str = ""                 # preferred editor for /prompt etc.; "" -> $EDITOR/nano
     user_name: str = "operator"      # label on the operator's own turn in scrollback
                                      # (yellow left-bar marker so a human turn is easy to
@@ -4301,6 +4359,9 @@ _SCALAR_FIELDS = (
     ("worker_max_concurrent",     10,                  True),
     ("worker_idle_timeout",       1800,                True),
     ("worker_max_iterations",     30,                  True),
+    ("worker_max_depth",          1,                   True),
+    ("worker_max_children",       0,                   True),
+    ("worker_checkpoint",         False,               True),
     ("approval",                  "ask",               False),
     ("confirm_reads",             False,               False),
     ("auto_reconnect",            False,               False),
@@ -4344,6 +4405,11 @@ def _emit_scalars(cfg) -> list:
 # per-session send flag; `cwd`/`model_explicit`/`auto_num_ctx` are derived at launch.
 _EPHEMERAL_KEYS = frozenset((
     "composer", "leash", "incognito", "think", "cwd", "model_explicit", "auto_num_ctx",
+    "tool_allowlist",     # runtime-only per-worker tool grant; never persisted (a fresh
+                          # launch must default to the full surface, like leash)
+    "worker_depth", "worker_child_budget", "worker_board_session",  # runtime-only tree
+                          # position + granted child budget + shared-board session id, set
+                          # from the grant per worker; never a saved knob
     # Not config.toml scalars: `_defaults` is the DEFAULTS snapshot save_config writes
     # FROM; `session_overrides` is the per-key override map persisted in the SESSION
     # meta (not config.toml) and re-applied at load runtime-only. Classified here so
@@ -4359,16 +4425,73 @@ _BESPOKE_KEYS = frozenset((
 ))
 
 
+def _salvage_config_scalars(raw: str) -> dict:
+    """Lenient recovery parser for a config.toml that tomllib REJECTED (e.g. a duplicate
+    top-level key written by a stale session). Reads only the top-level 'key = value'
+    scalars BEFORE the first '[table]' header (tables are bespoke - hosts/providers - and
+    are safely re-derived from defaults if lost), coercing TOML-ish scalars (int, float,
+    bool, quoted string). LAST value wins per key (mirrors what a save intends and what a
+    lenient TOML reader would keep). Never raises; returns {} on total garbage. This
+    turns a hard 'drop everything to defaults' into 'keep what's readable'."""
+    out = {}
+    for line in (raw or "").splitlines():
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        if s.startswith("["):        # first table header -> stop; the rest is bespoke
+            break
+        if "=" not in s:
+            continue
+        k, _, v = s.partition("=")
+        k, v = k.strip(), v.strip()
+        if not k or not v or v.startswith(("[", "{")):   # skip inline arrays/tables
+            continue
+        # strip an inline comment on unquoted values (a '#' inside quotes is data)
+        if not v.startswith(("'", '"')) and "#" in v:
+            v = v.split("#", 1)[0].strip()
+        val = None
+        if v.lower() in ("true", "false"):
+            val = (v.lower() == "true")
+        elif len(v) >= 2 and v[0] in "'\"" and v[-1] == v[0]:
+            val = v[1:-1]
+        else:
+            try:
+                val = int(v)
+            except ValueError:
+                try:
+                    val = float(v)
+                except ValueError:
+                    val = None
+        if val is not None:
+            out[k] = val            # last write wins on a duplicate key
+    return out
+
 def load_config(args) -> Config:
     cfg = Config()
     # config file (lowest, above defaults)
     file_vals = {}
     if CONFIG_PATH.is_file():
+        raw = ""
         try:
             import tomllib  # lazy: the hermetic --tool-exec role never needs it
-            file_vals = tomllib.loads(CONFIG_PATH.read_text())
+            raw = CONFIG_PATH.read_text()
+            file_vals = tomllib.loads(raw)
         except Exception as e:
-            print(yellow(f"warning: could not parse {CONFIG_PATH}: {e}"))
+            # Don't nuke the whole config to defaults over ONE bad line (e.g. a stale
+            # session that serialised a duplicate key from its own in-memory field list -
+            # a duplicate key makes tomllib reject the ENTIRE file, which would silently
+            # drop the user's model pin, host, provider, etc). Recover the top-level
+            # scalars with a lenient parse (last value wins per key). Tables (hosts/
+            # providers) can't be salvaged safely here, so they fall back to defaults; the
+            # file self-heals on the next normal save (any /set or clean exit rewrites it).
+            salvaged = _salvage_config_scalars(raw) if raw else {}
+            if salvaged:
+                file_vals = salvaged
+                print(yellow(f"warning: {CONFIG_PATH} was malformed ({e}); "
+                             f"recovered {len(salvaged)} top-level setting(s). It will be "
+                             f"rewritten clean on the next settings change or clean exit."))
+            else:
+                print(yellow(f"warning: could not parse {CONFIG_PATH} ({e}); using defaults."))
     # Back-compat: compact_hard was renamed to compact_at (>0.9.4). A config still
     # carrying the old key maps onto the new field, unless the new key is also present.
     if "compact_hard" in file_vals and "compact_at" not in file_vals:
@@ -5206,6 +5329,45 @@ def _bg_kill(pid, sig=signal.SIGTERM):
     _kill_tree(pid, sig)
 
 
+def _bg_descendant_pids(root, recs=None):
+    """The pids of every DESCENDANT of `root` in the worker/bg tree, found via the
+    registry's `owner` field (owner = the pid that launched the record). This is the
+    reliable cross-platform cascade: a worker-spawned grandchild is launched with
+    start_new_session (its own process group), so os.killpg(worker_pid) does NOT reach
+    it - but its registry record still carries owner=worker_pid, so we can walk the
+    owner graph and reach every level. Same-box records only (a foreign pid isn't ours
+    to signal). Returns a de-duplicated, leaves-first list so a caller can kill children
+    before parents. Cycle-safe."""
+    recs = _bg_load() if recs is None else recs
+    kids = {}
+    for r in recs:
+        if not _bg_here(r):
+            continue
+        o, p = r.get("owner"), r.get("pid")
+        if o is not None and p is not None:
+            kids.setdefault(o, []).append(p)
+    out, seen = [], set()
+    def _walk(pid):
+        for child in kids.get(pid, []):
+            if child in seen:
+                continue
+            seen.add(child)
+            _walk(child)        # depth-first: grandchildren appended before children
+            out.append(child)
+    _walk(root)
+    return out
+
+
+def _bg_kill_tree(pid, sig=signal.SIGTERM):
+    """Kill `pid` AND every descendant it (transitively) launched. First reaps the
+    registry-tracked descendants leaves-first (reaching setsid-escaped grandchildren the
+    single-group kill can't), then kills the root's own process group. Best-effort;
+    never raises. Use this to cancel a WORKER so its whole subtree dies with it."""
+    for child in _bg_descendant_pids(pid):
+        _kill_tree(child, sig)
+    _kill_tree(pid, sig)
+
+
 def _bg_here(rec) -> bool:
     """True if this bg record was registered on THIS box (so its pid is ours to
     probe / reap). A record with no host predates the host field - treat as local
@@ -5663,6 +5825,22 @@ def active_remote():
             "cwd": ws.remote_cwd or ws.cwd}
 
 
+def active_tool_names():
+    """The set of tool names the parent session currently exposes to the model (core
+    + lean-tools + MCP, at the live leash). dispatch_worker uses this to VALIDATE a
+    per-worker tool allowlist so a typo fails loud at dispatch, not silently inside
+    the worker. Empty set when there's no active agent."""
+    ag = _active_agent
+    if ag is None:
+        return set()
+    out = set()
+    for t in (getattr(ag, "tool_defs", None) or []):
+        nm = (t.get("function") or t).get("name")
+        if nm:
+            out.add(nm)
+    return out
+
+
 # ControlMasters opened SOLELY to carry workers to a host the parent isn't itself
 # connected to (host -> ctl path). Kept alive for the workers' lifetime and torn down
 # at session exit. A host the parent IS connected to reuses that master instead (never
@@ -5753,17 +5931,29 @@ def _worker_brief_from_cmd(cmd):
     return None
 
 
+# A worker's on-disk sidecar family, as suffixes on the STAMP (the brief path minus
+# its '.brief'). The dispatch tool writes '<stamp>.brief' + '<stamp>.result'; the
+# worker loop adds the '.brief.progress' heartbeat and the '.brief.inject' /
+# '.brief.injects.log' inject files. SINGLE source of truth: both the family-nuker
+# (_clean_worker_sidecars) and the startup backstop sweep (_worker_dir_sweep) consume
+# this, so a NEW sidecar is added in ONE place and can never be half-registered (a
+# missed suffix would leak the file past every reap = a trace + unbounded growth).
+_WORKER_SIDECAR_SUFFIXES = (".brief", ".result", ".brief.progress",
+                            ".brief.inject", ".brief.injects.log",
+                            ".brief.plan", ".brief.note", ".brief.planview",
+                            ".brief.usage", ".brief.checkpoint", ".brief.checkpoint.tmp")
+
+
 def _clean_worker_sidecars(brief):
-    """Unlink a worker's entire sidecar family given its '<stamp>.brief' path: the brief,
-    its .result, and the .progress/.inject/.injects.log heartbeat+inject files. Best-
-    effort; a missing file is fine."""
+    """Unlink a worker's entire sidecar family given its '<stamp>.brief' path (see
+    _WORKER_SIDECAR_SUFFIXES for the family). Best-effort; a missing file is fine."""
     if not brief:
         return
     b = str(brief)
-    base = b[:-len(".brief")] if b.endswith(".brief") else b
-    for p in (b, base + ".result", b + ".progress", b + ".inject", b + ".injects.log"):
+    stamp = b[:-len(".brief")] if b.endswith(".brief") else b
+    for suf in _WORKER_SIDECAR_SUFFIXES:
         try:
-            Path(p).unlink()
+            Path(stamp + suf).unlink()
         except OSError:
             pass
 
@@ -5816,9 +6006,13 @@ def _worker_dir_sweep(grace=3600):
         except OSError:
             continue
         _clean_worker_sidecars(str(f))
-    # Belt-and-braces: a stray .result/.progress/.inject/.injects.log whose .brief is
-    # already gone (partial prior cleanup) - drop it once aged out.
-    for suf in (".brief.injects.log", ".brief.inject", ".brief.progress", ".result"):
+    # Belt-and-braces: a stray non-brief sidecar (.result/.progress/.inject/.injects.log)
+    # whose .brief is already gone (partial prior cleanup) - drop it once aged out. Derived
+    # from _WORKER_SIDECAR_SUFFIXES (minus '.brief', the anchor above), longest-first so a
+    # '.brief.injects.log' strips fully before the shorter '.brief.inject' can mis-match.
+    strays = sorted((s for s in _WORKER_SIDECAR_SUFFIXES if s != ".brief"),
+                    key=len, reverse=True)
+    for suf in strays:
         for f in wdir.glob("*" + suf):
             stamp = f.name[:-len(suf)]
             if (wdir / (stamp + ".brief")).exists():
@@ -5828,6 +6022,152 @@ def _worker_dir_sweep(grace=3600):
                     f.unlink()
             except OSError:
                 pass
+
+
+# ==========================================================================
+# Shared worker BOARD (swarm coordination - Phase 2). A session-level directory of
+# append-only files that peer workers on ONE repo read/write to avoid stepping on
+# each other. NOT a service: a claims file + a small claim-with-TTL helper, mirroring
+# the sidecar-file pattern (no server, no DB, no new transport). Driver-side only,
+# under CONFIG_DIR/workers/board/<session>, so it is purely a LOCAL concern and is
+# torn down at session exit + aged-out on startup, same two-trigger zero-trace scheme
+# as the worker sidecars (Constraint A). Only meaningful when >1 worker runs on one
+# repo; a lone worker never touches it.
+#
+# CLAIM POLICY (resolves the design open-Q): FIRST-CLAIM-WINS + TTL. A worker claims a
+# path (a file it is about to edit); the claim carries an owner + an expiry. A second
+# worker's claim on the same live path is REFUSED (it must pick other work or wait).
+# The TTL doubles as a liveness signal: a dead worker's claim expires and the path frees
+# itself, so a crash can't deadlock the board. No central arbiter - the append-only log
+# + last-write-wins-per-path reconciliation IS the arbitration (lean over an orchestrator
+# round-trip; an orchestrator can still layer on top by reading the same file).
+_BOARD_CLAIM_TTL = 900          # seconds a claim holds before it is considered stale/expired
+
+def _board_dir(session_id):
+    """The board directory for a session (created lazily by the claim writer). Keyed by
+    session so concurrent sessions on one box never share a board."""
+    return CONFIG_DIR / "workers" / "board" / str(session_id)
+
+
+def _board_claims_path(session_id):
+    return _board_dir(session_id) / "claims.jsonl"
+
+
+def _board_read_claims(session_id, now=None):
+    """Reduce the append-only claims.jsonl to the LIVE claim per path. Each line is a
+    JSON record {path, owner, ts, ttl, action:'claim'|'release'}. Last write wins per
+    path; a 'release' or an expired claim (ts+ttl <= now) drops the path. Returns
+    {path: {owner, ts, ttl}} of currently-held claims. Corrupt lines are skipped
+    (best-effort: a partial append must never crash a reader)."""
+    now = time.time() if now is None else now
+    p = _board_claims_path(session_id)
+    live = {}
+    try:
+        raw = p.read_text()
+    except OSError:
+        return live
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except (ValueError, TypeError):
+            continue
+        path = rec.get("path")
+        if not path:
+            continue
+        if rec.get("action") == "release":
+            live.pop(path, None)
+            continue
+        ttl = rec.get("ttl", _BOARD_CLAIM_TTL)
+        if rec.get("ts", 0) + ttl <= now:
+            live.pop(path, None)          # expired -> not held
+            continue
+        live[path] = {"owner": rec.get("owner"), "ts": rec.get("ts", 0), "ttl": ttl}
+    return live
+
+
+def _board_claim(session_id, path, owner, ttl=_BOARD_CLAIM_TTL, now=None):
+    """Try to claim `path` for `owner` (first-claim-wins). Appends a claim record IFF the
+    path is free (no live claim, or the live claim is already this owner's = refresh).
+    Returns (ok, holder): ok True + holder=owner on success; ok False + holder=<other
+    owner> when another live claim blocks it. Append-only + atomic single write, so two
+    racing claimers are resolved by read-back (the loser sees the winner's record)."""
+    now = time.time() if now is None else now
+    live = _board_read_claims(session_id, now=now)
+    held = live.get(path)
+    if held and held.get("owner") != owner:
+        return False, held.get("owner")
+    d = _board_dir(session_id)
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+        rec = {"path": path, "owner": owner, "ts": now, "ttl": ttl, "action": "claim"}
+        with _board_claims_path(session_id).open("a") as f:
+            f.write(json.dumps(rec) + "\n")
+    except OSError:
+        return False, None
+    return True, owner
+
+
+def _board_release(session_id, path, owner, now=None):
+    """Release `owner`'s claim on `path` (append a 'release' record). Best-effort; a
+    release for a path this owner doesn't hold is a harmless no-op on read-back."""
+    now = time.time() if now is None else now
+    d = _board_dir(session_id)
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+        rec = {"path": path, "owner": owner, "ts": now, "action": "release"}
+        with _board_claims_path(session_id).open("a") as f:
+            f.write(json.dumps(rec) + "\n")
+    except OSError:
+        return False
+    return True
+
+
+def _board_teardown(session_id):
+    """Session exit: remove this session's board dir entirely (zero trace). Best-effort."""
+    d = _board_dir(session_id)
+    try:
+        for f in d.glob("*"):
+            try:
+                f.unlink()
+            except OSError:
+                pass
+        d.rmdir()
+    except OSError:
+        pass
+
+
+def _board_sweep(grace=3600):
+    """Startup backstop: remove aged-out board dirs left by a crashed session (where
+    _board_teardown never ran). A board whose claims.jsonl mtime is older than `grace`
+    (default 1h) is nuked. Empty/parentless dirs are pruned. Driver-side only; mirrors
+    _worker_dir_sweep's aged-out guard so a concurrent session's live board is never
+    touched. Best-effort."""
+    root = CONFIG_DIR / "workers" / "board"
+    if not root.is_dir():
+        return
+    now = time.time()
+    for d in root.glob("*"):
+        if not d.is_dir():
+            continue
+        claims = d / "claims.jsonl"
+        try:
+            mtime = claims.stat().st_mtime if claims.exists() else d.stat().st_mtime
+            if now - mtime < grace:
+                continue
+        except OSError:
+            continue
+        for f in d.glob("*"):
+            try:
+                f.unlink()
+            except OSError:
+                pass
+        try:
+            d.rmdir()
+        except OSError:
+            pass
 
 
 def _bg_reap_orphans():
@@ -5901,6 +6241,12 @@ def _bg_kill_session():
     for r in recs:
         if mine(r):
             if _proc_alive(r.get("pid")):
+                # Cascade: kill this task AND any descendants it spawned (a worker's
+                # workers are owned by the worker, not me, so a flat kill would orphan
+                # them - _bg_kill_tree walks the owner graph). recs is passed so the
+                # walk sees the same snapshot.
+                for gk in _bg_descendant_pids(r.get("pid"), recs):
+                    _kill_tree(gk)
                 _bg_kill(r.get("pid"))
             _bg_clean_sidecars(r)
     remaining = [r for r in recs if not mine(r)]
@@ -8440,6 +8786,13 @@ class Agent:
         self.last_prompt_tokens = None
         self.session_in = 0              # tokens sent/received this session (any backend);
         self.session_out = 0            # accumulated per chat() call, zeroed on /clear
+        # Generation telemetry for honest DECODE throughput (tok/s). Only providers that
+        # expose per-call gen timing (ollama's eval_count/eval_duration) contribute; the
+        # rest never set the client attrs so these stay 0 (Agent reads with a getattr
+        # default). Excludes prefill + tool round-trips by construction, so tok/s here is
+        # real decode speed, not tokens/wall-clock. Zeroed on /clear.
+        self.session_eval_tokens = 0     # decode tokens (ollama eval_count) summed
+        self.session_eval_ns = 0         # decode wall time (ollama eval_duration) summed
         self._last_provider = None       # last active provider, for '/provider on'
         self._abort = False
         self._compact_capture = None    # set by finalize_compact -> stops the loop
@@ -8666,6 +9019,16 @@ class Agent:
             print(red(f"\n{GLYPH['warn']} blocked {name}: above the '{self.cfg.leash}' leash "
                       f"(not run; raise with /leash {_min_leash_for(name, _leash_safe)})"))
             return _leash_block_msg(self.cfg.leash, name, lean_safe=_leash_safe)
+        # Per-worker tool allowlist (hard lock behind the surface filter): a worker
+        # dispatched with a narrowed grant must not RUN a tool outside it, however the
+        # call arrived. None = no restriction; the meta tools are always permitted.
+        allow = getattr(self.cfg, "tool_allowlist", None)
+        if allow is not None and name not in ("update_plan", "note", "request_compact") \
+                and name not in allow:
+            print(red(f"\n{GLYPH['warn']} blocked {name}: not in this worker's tool grant "
+                      f"(not run)"))
+            return (f"tool '{name}' is not in your granted toolset. You were dispatched with "
+                    f"a restricted set of tools; work within it or report what you need.")
         # ask-on-read: when confirm_reads is on, read-only tools (core reads + safe
         # lean-tools) confirm too, not just writers - for anyone who doesn't want it
         # reading files without an OK. auto/session-armed approval still skips it.
@@ -9138,10 +9501,20 @@ class Agent:
                 "input. React to the result now: inspect it, decide the next step, and "
                 "either act or hand back.]\n\n" + "\n\n".join(parts))
 
+    def decode_tok_s(self):
+        """Honest session decode throughput (tokens/sec), or None when no provider
+        reported per-call gen timing this session (e.g. an API-only session - see
+        session_eval_*). Decode-only: excludes prefill + tool round-trips by
+        construction, so it's real generation speed, not tokens/wall-clock."""
+        if self.session_eval_tokens and self.session_eval_ns:
+            return self.session_eval_tokens / (self.session_eval_ns / 1e9)
+        return None
+
     def reset(self):
         self.messages = [{"role": "system", "content": self._system()}]
         self.last_prompt_tokens = None
         self.session_in = self.session_out = 0
+        self.session_eval_tokens = self.session_eval_ns = 0
         self.tools.changed_files.clear()
         self.dirty = False
         # A fresh session starts with no goal. The pinned plan is separate agent
@@ -10139,6 +10512,9 @@ class Agent:
     def _loop(self):
         # max_iterations <= 0 means unlimited (count up forever).
         cap = self.cfg.max_iterations
+        self._hit_iteration_cap = False   # set True below iff we stop ON the cap (not a
+                                          # natural finish) - a headless worker reads this
+                                          # to know it ran out of budget mid-task (resumable).
         i = 0
         while cap <= 0 or i < cap:
             i += 1
@@ -10204,6 +10580,14 @@ class Agent:
             # output_tokens) on an optional attribute, so any backend contributes
             # to the session count without a chat() signature change.
             self.session_out += getattr(self.client, "last_out_tokens", 0) or 0
+            # Decode-throughput telemetry: accumulate only when BOTH the token count and
+            # the gen-time are present for this call (ollama), so tok/s = tokens/time stays
+            # honest. A provider that reports neither contributes nothing (getattr -> 0).
+            _ev_tok = getattr(self.client, "last_out_tokens", 0) or 0
+            _ev_ns = getattr(self.client, "last_eval_ns", 0) or 0
+            if _ev_tok and _ev_ns:
+                self.session_eval_tokens += _ev_tok
+                self.session_eval_ns += _ev_ns
             self.messages.append(assistant)
             calls = assistant.get("tool_calls")
             if not calls:
@@ -10259,6 +10643,7 @@ class Agent:
                     print(_tool_result_preview(name, result, cid))
                 self.messages.append(_tool_result_msg(name, result,
                                                       tool_call_id=call.get("id", "")))
+        self._hit_iteration_cap = True    # stopped on the budget, not a natural finish
         print(yellow(f"\n{GLYPH['warn']} hit {cap}-iteration cap; stopping this turn. "
                      f"Refine your request or continue, or raise the limit: "
                      f"/set -> max_iterations (0 = unlimited), or set "
@@ -11032,7 +11417,10 @@ _SETTINGS_FIELDS = [
     ("temperature", "temperature", "float"),
     ("top_p", "top_p", "float"),
     ("top_k", "top_k", "int"),
-    ("repeat_penalty", "repeat_penalty", "float"),
+    ("worker_max_iterations", "max tool-call rounds per worker", "int"),
+    ("worker_max_depth", "max worker tree depth (1 = fan-out only, no recursion)", "int"),
+    ("worker_max_children", "max children any one worker may spawn (0 = none)", "int"),
+    ("worker_checkpoint", "checkpoint a worker's transcript so a dead one can be resumed", "bool"),
     ("editor", "editor (for /prompt)", "str"),
     ("user_name", "your name on your own turn in scrollback", "str"),
     ("approval", "approval mode", tuple(APPROVAL_MODES)),
@@ -11686,6 +12074,9 @@ def handle_info_command(agent, cfg, arg=""):
     if getattr(agent, "pinned_plan", ""):
         print(f"  plan:     pinned (GOAL+TODO, carried across compaction + load)")
     print(f"  usage:    in {agent.session_in:,}  out {agent.session_out:,}")
+    _tps = agent.decode_tok_s()
+    if _tps:
+        print(f"  decode:   {_tps:.1f} tok/s")
     _quota = _provider_usage_str(agent, cfg, verbose=True)   # backend quota incl. reset times
     if _quota:
         print(f"  quota:    {_quota.lstrip()}")
@@ -12751,6 +13142,9 @@ def handle_usage_command(agent, cfg, arg=""):
     print(bold(cfg.active_model()) + dim(f"  @ {loc}"))
     si, so = agent.session_in, agent.session_out
     print(dim(f"  session   in {si:,}   out {so:,}   total {si + so:,}"))
+    _tps = agent.decode_tok_s()
+    if _tps:
+        print(dim(f"  decode    {_tps:.1f} tok/s  ({agent.session_eval_tokens:,} tok)"))
     used = agent.last_prompt_tokens or messages_tokens(agent.messages, agent.tool_defs)
     window = cfg.ctx_window() or 1
     print(dim(f"  context   ~{used:,}/{window:,} ({used / window * 100:.0f}%)"))
@@ -14602,6 +14996,16 @@ def run_agent_brief(args) -> int:
     if not brief:
         return _fail(f"brief file has no {BRIEF_MARK} block")
     grant = _parse_grant(_extract_marked(raw, GRANT_MARK) or "")
+    # Optional seed STATE the parent curated for this worker (all bounded at dispatch):
+    # a starting plan, notebook entries, and a shared-context blob. Parsed here, applied
+    # onto the agent below once it's built. Absent -> the worker starts clean (default).
+    seed_plan = _extract_marked(raw, SEED_PLAN_MARK) or ""
+    seed_notes = _extract_marked(raw, SEED_NOTES_MARK) or ""
+    seed_context = _extract_marked(raw, SEED_CONTEXT_MARK) or ""
+    # Resume: a dead worker's transcript checkpoint path (action='resume'). When present,
+    # the worker RELOADS that transcript below and runs `brief` as a fresh steer turn on
+    # top of it, instead of starting cold. Absent -> a normal cold start (default).
+    resume_ckpt = (_extract_marked(raw, RESUME_MARK) or "").strip()
 
     # Build the worker's config from CLI + grant (grant wins - it's the parent's grant).
     cfg = load_config(args)
@@ -14615,6 +15019,41 @@ def run_agent_brief(args) -> int:
     os.environ["LEANCODER_HEADLESS_WORKER"] = "1"
     if grant.get("leash"):
         cfg.leash = _norm_leash(grant["leash"]) or cfg.leash
+    # Per-worker tool allowlist: the parent may grant a NARROWED toolset (a comma list
+    # of tool names in the grant). Absent -> None -> the full leash-permitted surface
+    # (today's behaviour). The meta tools are always kept regardless (enforced in
+    # active_tools / _gate_tool), so a scout granted just "read_file,web_fetch" still
+    # has its plan/notebook. The leash cap still applies on top.
+    if grant.get("tools"):
+        names = tuple(t.strip() for t in grant["tools"].split(",") if t.strip())
+        if names:
+            cfg.tool_allowlist = names
+    if grant.get("max_iterations"):
+        try:
+            cfg.max_iterations = int(grant["max_iterations"])
+        except ValueError:
+            pass
+    # Safe-recursion governor: the grant carries this worker's DEPTH in the tree and the
+    # CHILD BUDGET the parent granted it. The dispatch tool reads these back off cfg to
+    # decide whether this worker may spawn (and how many). Absent -> depth 1, 0 children
+    # (a plain fan-out worker that can't recurse - the safe default).
+    if grant.get("depth"):
+        try:
+            cfg.worker_depth = int(grant["depth"])
+        except ValueError:
+            pass
+    if grant.get("child_budget"):
+        try:
+            cfg.worker_child_budget = int(grant["child_budget"])
+        except ValueError:
+            pass
+    # Shared swarm board: the driver's session id, so this worker's board claims land on
+    # the SAME claims file its peers use. Absent -> 0 -> a lone worker with no board.
+    if grant.get("board"):
+        try:
+            cfg.worker_board_session = int(grant["board"])
+        except ValueError:
+            pass
     # The worker attaches its TOOLS to the parent's remote when one is passed. In that
     # case the grant 'cwd' is a path on the REMOTE (not the driver), so it must NOT
     # constrain the driver-local cfg.cwd - leave cfg.cwd at the driver default and hand
@@ -14636,6 +15075,17 @@ def run_agent_brief(args) -> int:
         agent = Agent(cfg)
     except Exception as e:
         return _fail(f"worker failed to initialise (Agent build): {e}")
+    # Apply the parent's seed STATE onto the fresh worker (before its first turn). A plan
+    # goes straight to pinned_plan (rides the worker's own compaction); notes seed the
+    # notebook one entry per non-blank line, tagged so the worker reads them as given, not
+    # self-recorded. The shared-context blob is folded into the task preamble below.
+    if seed_plan.strip():
+        agent.pinned_plan = seed_plan.strip()
+    if seed_notes.strip():
+        _dtg = time.strftime("%Y-%m-%d %H:%M")
+        for _ln in seed_notes.splitlines():
+            if _ln.strip():
+                agent.notes.append({"dtg": _dtg, "text": "parent: " + _ln.strip()})
     prov = _maybe_autostart_provider(agent, cfg)
     if prov is None or agent.client is None:
         why = getattr(agent, "_provider_fail_reason", "") or (
@@ -14721,7 +15171,12 @@ def run_agent_brief(args) -> int:
         "FIRST, before your first tool call, state your understanding of the task in about one "
         "sentence (what you're going to do). This stated intent lets whoever dispatched you "
         "catch a misread early and stop or redirect you. Keep it short, but don't truncate a "
-        "thought to hit a length.\n\nTASK:\n"
+        "thought to hit a length.\n"
+        # Seed context the parent curated (bounded at dispatch) - "here's what you need to
+        # know", distinct from the task itself. Only when present.
+        + (f"\nCONTEXT FROM THE AGENT THAT DISPATCHED YOU (background you need; not the task "
+           f"itself):\n{seed_context.strip()}\n" if seed_context.strip() else "")
+        + "\nTASK:\n"
         + brief)
 
     # Wire the inject poller: at each between-iteration boundary the worker drains any
@@ -14729,10 +15184,29 @@ def run_agent_brief(args) -> int:
     # and appends it as a user turn, so an operator/parent mid-task message lands on the
     # worker's next think without interrupting a running tool call. Sidecar lives beside the
     # brief file (driver-side, even for a remote worker). Consumption is logged to
-    # '<brief>.injects.log' so status can confirm delivery. Best-effort; never raises.
     _inject_path = Path(str(brief_file) + ".inject")
     _inject_log = Path(str(brief_file) + ".injects.log")
     _progress_path = Path(str(brief_file) + ".progress")
+    # Live-steer sidecars, drained alongside .inject each iteration: a .plan replaces the
+    # worker's pinned plan (agent._update_plan), a .note appends notebook entries
+    # (agent._note). Written by dispatch_worker action='set_plan'/'add_note'. Same
+    # best-effort, never-raise contract as inject; consumption logged to .injects.log.
+    _plan_path = Path(str(brief_file) + ".plan")
+    _note_path = Path(str(brief_file) + ".note")
+    _progress_path = Path(str(brief_file) + ".progress")
+    # Mirror of the worker's CURRENT pinned plan, refreshed each iteration. Lets a parent
+    # READ the live plan (with the worker's own checkbox progress) and send back an edited
+    # copy via set_plan - i.e. edit, not just blind overwrite. Read-only view; the .plan
+    # sidecar is the write channel.
+    _planview_path = Path(str(brief_file) + ".planview")
+    # Transcript checkpoint (opt-in via the grant's 'checkpoint: 1'). When on, the worker
+    # dumps agent.messages to <brief>.checkpoint each iteration so a dead/timed-out/crashed
+    # worker can be RELAUNCHED with action='resume' (it reloads this transcript). Off ->
+    # no file written (today's behaviour). A resumed worker always gets it re-enabled (its
+    # brief carries checkpoint:1) so it can be resumed again. Registered in
+    # _WORKER_SIDECAR_SUFFIXES so every reap path sweeps it (zero trace).
+    _do_checkpoint = bool(grant.get("checkpoint"))
+    _checkpoint_path = Path(str(brief_file) + ".checkpoint")
     _wstart = time.time()
     _witer = {"n": 0}
     _intent_cache = {"v": ""}   # the first assistant prose line; set once, never changes
@@ -14756,6 +15230,75 @@ def run_agent_brief(args) -> int:
             except OSError:
                 pass
 
+    def _drain_plan():
+        # A parent set_plan: the LAST written plan wins (it's a full replacement, not a
+        # queue), so read, delete, apply once. Empty payload clears the pinned plan.
+        try:
+            if not _plan_path.exists():
+                return
+            raw = _plan_path.read_text()
+            _plan_path.unlink()
+        except OSError:
+            return
+        blocks = [b for b in raw.split("\0") if b.strip()]
+        plan = blocks[-1].strip() if blocks else ""
+        try:
+            agent._update_plan(plan)
+            # _update_plan suppresses the plan reminder on the next send + defers a full
+            # re-inject (correct when the WORKER wrote its own plan - don't echo it back).
+            # But a PARENT wrote this one: the worker hasn't seen it, so undo the suppress
+            # and force a FULL reminder now, so the new plan lands on the very next send.
+            agent._skip_plan_reminder_once = False
+            agent._plan_full_next = True
+            # Visibility: the plan reminder is passive (rides the tail); a worker deep in a
+            # task might not register that it silently changed. Ride the inject channel too
+            # - append a user turn so the change is unmissable and gets acknowledged (the
+            # preamble tells the worker to weight [parent-agent inject] messages). This is
+            # ephemeral (may compact away); the pinned plan is the durable copy.
+            msg = ("[parent-agent inject] The agent that dispatched you REPLACED your pinned "
+                   "plan" + (" (it is now cleared)." if not plan else ". Your updated plan is "
+                   "in effect - follow it from here; where it conflicts with your old plan, "
+                   "the new one wins.") + " Briefly acknowledge, then continue.")
+            agent.messages.append({"role": "user", "content": msg})
+            with _inject_log.open("a") as f:
+                f.write(f"{int(time.time())} plan set: {plan[:120]}\n")
+        except Exception:
+            pass
+
+    def _drain_notes():
+        # A parent add_note: append each queued note to the worker's notebook (tagged so
+        # it reads them as handed down, not self-recorded). Multiple notes may be queued.
+        try:
+            if not _note_path.exists():
+                return
+            raw = _note_path.read_text()
+            _note_path.unlink()
+        except OSError:
+            return
+        added = []
+        for block in raw.split("\0"):
+            msg = block.strip()
+            if not msg:
+                continue
+            try:
+                agent._note({"action": "add", "text": "parent: " + msg})
+                added.append(msg)
+                with _inject_log.open("a") as f:
+                    f.write(f"{int(time.time())} note added: {msg[:120]}\n")
+            except Exception:
+                pass
+        # Visibility: a note only enters context if the worker CHOOSES to read its
+        # notebook - it may run a long time and never look. So also surface each new note
+        # inline on the inject channel (a user turn), guaranteeing the worker sees it now.
+        # The notebook copy is the durable record; this turn is the immediate ping.
+        if added:
+            body = "\n".join(f"- {m}" for m in added)
+            n = len(added)
+            agent.messages.append({"role": "user", "content":
+                "[parent-agent inject] The agent that dispatched you added "
+                + (f"{n} notes" if n > 1 else "a note")
+                + " to your notebook (also saved there for later recall):\n" + body
+                + "\nFactor this into what you're doing; briefly acknowledge, then continue."})
     def _write_progress():
         # Deterministic heartbeat (facts the harness already has - zero tokens, zero
         # model cooperation): iteration N, elapsed, the last tool it ran, and its stated
@@ -14790,17 +15333,79 @@ def run_agent_brief(args) -> int:
             if intent:
                 lines.append(f"intent: {intent}")
             _progress_path.write_text("\n".join(lines) + "\n")
+            # Mirror the worker's live pinned plan so a parent can read-modify-write it.
+            cur_plan = getattr(agent, "pinned_plan", "") or ""
+            if cur_plan.strip():
+                _planview_path.write_text(cur_plan.strip() + "\n")
+            elif _planview_path.exists():
+                _planview_path.unlink()   # plan cleared; don't leave a stale view
+        except Exception:
+            pass
+
+    def _write_checkpoint():
+        # Dump the live transcript so a dead worker can be resumed (action='resume').
+        # Atomic (tmp + replace) so a crash mid-write can't leave a truncated JSON that
+        # would poison a resume. Best-effort - a serialisation hiccup never kills the run.
+        if not _do_checkpoint:
+            return
+        try:
+            payload = {"messages": agent.messages,
+                       "pinned_plan": getattr(agent, "pinned_plan", "") or "",
+                       "notes": getattr(agent, "notes", []) or []}
+            tmp = Path(str(_checkpoint_path) + ".tmp")
+            tmp.write_text(json.dumps(payload))
+            tmp.replace(_checkpoint_path)
         except Exception:
             pass
 
     def _pre_iter():
         _witer["n"] += 1
         _drain_injects()
+        _drain_plan()
+        _drain_notes()
         _write_progress()
+        _write_checkpoint()
     agent._pre_iter_hook = _pre_iter
 
+    # RESUME: reload a dead worker's transcript checkpoint (written by a prior run's
+    # _write_checkpoint) so this relaunch continues WITH the prior work rather than cold.
+    # We replace the message body (keeping a FRESH system prompt - this build's, in case it
+    # changed) with the checkpoint's non-system turns, restore the pinned plan + notes, heal
+    # any dangling tool pair (a checkpoint taken mid-tool-batch), then run `brief` as a
+    # steer turn on top. A missing/corrupt checkpoint falls back to a cold start (never
+    # fatal - a resume must not be worse than a fresh dispatch).
+    first_turn = preamble
+    if resume_ckpt:
+        try:
+            data = json.loads(Path(resume_ckpt).read_text())
+            body = [m for m in data.get("messages", []) if m.get("role") != "system"]
+            if body:
+                agent.messages = [{"role": "system", "content": agent._system()}] + body
+                agent.messages = repair_tool_pairs(agent.messages)
+                if data.get("pinned_plan"):
+                    agent.pinned_plan = data["pinned_plan"]
+                if data.get("notes"):
+                    agent.notes = data["notes"]
+                # On a resume the transcript already carries the original task + all prior
+                # work, so the first turn is just the parent's steer (not the full preamble).
+                first_turn = (
+                    "[resume] You are being RESUMED: your prior transcript above is your own "
+                    "earlier work on this task (it ended before you wrote your "
+                    f"{RESULT_MARK} block - you hit a limit, were stopped, or crashed). "
+                    "Continue from where you left off. The same rules apply: keep working via "
+                    f"tool calls, and when finished write your final answer between two "
+                    f"{RESULT_MARK} markers as a message with no tool call.\n\n"
+                    "STEER FROM THE AGENT THAT RESUMED YOU (outranks your prior plan where "
+                    f"they conflict):\n{brief}")
+                print(dim(f"agent-run: resumed from checkpoint ({len(body)} prior messages)"))
+            else:
+                print(yellow("agent-run: resume checkpoint had no usable messages; "
+                             "starting cold."))
+        except Exception as e:
+            print(yellow(f"agent-run: could not load resume checkpoint ({e}); starting cold."))
+
     try:
-        agent.run_turn(preamble)
+        agent.run_turn(first_turn)
     except Exception as e:
         return _fail(f"worker run failed: {e}")
 
@@ -14849,6 +15454,31 @@ def run_agent_brief(args) -> int:
         except Exception as e:
             return _fail(f"worker corrective turn failed: {e}")
 
+    # Ran out of iteration budget mid-task: the loop stopped ON the cap, not because the
+    # worker chose to finish. Do NOT rescue-nudge it into a RESULT (there's no budget left,
+    # and the last assistant line is a mid-step "now I'll increment it to 3:" that would be
+    # harvested as a bogus success), and do NOT write a normal result - that would report
+    # fake completion AND block a resume (which refuses a worker that "already finished").
+    # Instead, if checkpointing is on, leave NO result so the parent sees an incomplete
+    # worker it can action='resume'; else write an explicit INCOMPLETE result so the parent
+    # is told honestly rather than handed a lie.
+    if getattr(agent, "_hit_iteration_cap", False) and RESULT_MARK not in _final_asst_content():
+        if _do_checkpoint:
+            _write_checkpoint()   # flush the FINAL state (the _pre_iter copy is one round stale)
+            print(dim("agent-run: hit iteration cap mid-task; checkpoint left for resume "
+                      "(no result written)."))
+            return 2
+        try:
+            Path(resultf).write_text(
+                f"{RESULT_MARK}\nINCOMPLETE: the worker hit its {cfg.max_iterations}-iteration "
+                f"budget before finishing the task, and checkpointing was off so it cannot be "
+                f"resumed. Re-dispatch with a higher worker_max_iterations, or turn on "
+                f"worker_checkpoint to make such a worker resumable.\n{RESULT_MARK}\n")
+        except OSError as e:
+            return _fail(f"cannot write result file: {e}")
+        print(dim(f"agent-run: incomplete (iteration cap) -> {resultf}"))
+        return 2
+
     # Missing-RESULT rescue: the loop ends the moment the model emits an assistant
     # message with no tool call - but a worker sometimes stops on a bare "let me compile
     # the findings" preamble WITHOUT ever writing the RESULT block, so the harvest below
@@ -14877,6 +15507,15 @@ def run_agent_brief(args) -> int:
         Path(resultf).write_text(f"{RESULT_MARK}\n{block}\n{RESULT_MARK}\n")
     except OSError as e:
         return _fail(f"cannot write result file: {e}")
+    # Report this worker's token spend (observability): the parent sums finished workers'
+    # spend for /worker status (see dispatch_worker _worker_tokens_spent). A tiny
+    # '<brief>.usage' sidecar with in/out totals; best-effort, never fatal.
+    try:
+        Path(str(brief_file) + ".usage").write_text(
+            f"in={int(getattr(agent, 'session_in', 0) or 0)} "
+            f"out={int(getattr(agent, 'session_out', 0) or 0)}\n")
+    except OSError:
+        pass
     print(dim(f"agent-run: done -> {resultf}"))
     return 0
 
@@ -14998,7 +15637,9 @@ def main():
     _register_dir_providers(cfg)          # register enabled providers/ plugins (bundled ollama + user)
     _bg_reap_orphans()                    # kill background tasks left by a crashed session
     _worker_dir_sweep()                   # nuke orphaned worker sidecars (reboot/SIGKILL residue)
+    _board_sweep()                        # nuke aged-out swarm board dirs from a crashed session
     atexit.register(_bg_kill_session)     # peg this session's bg tasks to it: kill on exit
+    atexit.register(lambda: _board_teardown(os.getpid()))  # tear down this session's swarm board
     atexit.register(_close_worker_masters)  # tear down masters opened just to carry workers
     try:
         repl(cfg, resume=args.resume)
