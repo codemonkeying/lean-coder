@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L890    Lean-tools (plugin tools: discovery, manager)
-  L1230   MCP client (connection, manager, OAuth, discovery)
-  L1684   Providers (backend plugin registry)
-  L1906   Interactive pickers + menus (raw-mode UI engine)
-  L2255   Terminal styling (colors, formatting helpers)
-  L2452   Streaming + markdown render (model output)
-  L2799   Composer (pinned input line, editor, stdin)
-  L3649   Token accounting (calibrated context meter)
-  L3814   Config (dataclass, field registry, load/save)
-  L6352   Tool execution + text tool-call parsing
-  L6773   Remote workspace (executor client, /connect)
-  L8338   Context meter
-  L8433   Agent (turn loop, context mgmt, tool dispatch)
-  L14074  Slash-command handlers + dispatch table
-  L14211  REPL (interactive loop, session resume)
-  L14586  Worker agent (headless --agent-run)
-  L14899  Entry (CLI arg parsing, main)
+  L902    Lean-tools (plugin tools: discovery, manager)
+  L1242   MCP client (connection, manager, OAuth, discovery)
+  L1696   Providers (backend plugin registry)
+  L1918   Interactive pickers + menus (raw-mode UI engine)
+  L2267   Terminal styling (colors, formatting helpers)
+  L2464   Streaming + markdown render (model output)
+  L2811   Composer (pinned input line, editor, stdin)
+  L3661   Token accounting (calibrated context meter)
+  L3826   Config (dataclass, field registry, load/save)
+  L6387   Tool execution + text tool-call parsing
+  L6808   Remote workspace (executor client, /connect)
+  L8373   Context meter
+  L8468   Agent (turn loop, context mgmt, tool dispatch)
+  L14119  Slash-command handlers + dispatch table
+  L14256  REPL (interactive loop, session resume)
+  L14631  Worker agent (headless --agent-run)
+  L14953  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -756,11 +756,21 @@ def active_tools(cfg, remote=False, lean_tool_schemas=(), model_tools=True,
         return []                    # chat-only (user ceiling OR model can't tool-call)
     allow_write = leash in ("rw", "rwe")
     allow_exec = leash == "rwe"
+    # Optional per-worker allowlist: when set, the surface is narrowed to these tool
+    # NAMES (still leash-capped below). None = no restriction (the everyday full
+    # surface). The agent-internal meta tools are never removed (a worker must always
+    # keep its plan/notebook/compaction), so allow() waves them through.
+    allow = getattr(cfg, "tool_allowlist", None)
+    _META = ("update_plan", "note", "request_compact")
+    def _named(nm):
+        return allow is None or nm in _META or nm in allow
     tools = [UPDATE_PLAN_TOOL, NOTE_TOOL]  # plan upkeep + session notebook: no fs/exec, every non-chat tier
     if offer_compact:               # soft zone: let the model elect a handover at a break
         tools.append(REQUEST_COMPACT_TOOL)
     for t in TOOLS:
         nm = t["function"]["name"]
+        if not _named(nm):
+            continue
         if nm in _WRITE_TIER and not allow_write:
             continue
         if nm in _EXEC_TIER and not allow_exec:
@@ -773,8 +783,8 @@ def active_tools(cfg, remote=False, lean_tool_schemas=(), model_tools=True,
                  "description": t["function"]["description"].format(
                      command_timeout=getattr(cfg, "command_timeout", 300))}}
         tools.append(t)
-    if cfg.ask_user_to_run and allow_exec:   # a handoff to RUN a command -> exec tier
-        tools.append(ASK_USER_TOOL)
+    if cfg.ask_user_to_run and allow_exec and _named(ASK_USER_TOOL["function"]["name"]):
+        tools.append(ASK_USER_TOOL)            # a handoff to RUN a command -> exec tier
     # A lean-tool must not shadow a core tool name (or another lean-tool): duplicate
     # tool names make the API 400 ("Tool names must be unique"). Core wins - a
     # lean-tool that reuses a builtin name (e.g. todo.py's `update_plan`, which is
@@ -784,6 +794,8 @@ def active_tools(cfg, remote=False, lean_tool_schemas=(), model_tools=True,
         if not (is_safe or allow_exec):      # non-safe lean-tools may write/run -> rwe only
             continue
         nm = sch.get("function", {}).get("name")
+        if not _named(nm):                   # narrowed out by the per-worker allowlist
+            continue
         if nm in seen:                       # collides with a core tool / earlier lean-tool
             continue
         seen.add(nm)
@@ -4050,6 +4062,11 @@ class Config:
     worker_max_concurrent: int = 10   # dispatch_worker: max worker agents alive at once (0 = unlimited)
     worker_idle_timeout: int = 1800  # dispatch_worker: worker lease secs; unattended self-kill
     worker_max_iterations: int = 30  # dispatch_worker: agentic-loop cap per worker
+    tool_allowlist: tuple = None     # None = no restriction (all leash-permitted tools).
+                                     # Else a set/tuple of tool NAMES the surface is
+                                     # narrowed to (still leash-capped). Runtime-only,
+                                     # per-worker (set from a dispatch grant); not persisted
+                                     # - the everyday session leaves it None = full surface.
     editor: str = ""                 # preferred editor for /prompt etc.; "" -> $EDITOR/nano
     user_name: str = "operator"      # label on the operator's own turn in scrollback
                                      # (yellow left-bar marker so a human turn is easy to
@@ -4344,6 +4361,8 @@ def _emit_scalars(cfg) -> list:
 # per-session send flag; `cwd`/`model_explicit`/`auto_num_ctx` are derived at launch.
 _EPHEMERAL_KEYS = frozenset((
     "composer", "leash", "incognito", "think", "cwd", "model_explicit", "auto_num_ctx",
+    "tool_allowlist",     # runtime-only per-worker tool grant; never persisted (a fresh
+                          # launch must default to the full surface, like leash)
     # Not config.toml scalars: `_defaults` is the DEFAULTS snapshot save_config writes
     # FROM; `session_overrides` is the per-key override map persisted in the SESSION
     # meta (not config.toml) and re-applied at load runtime-only. Classified here so
@@ -5661,6 +5680,22 @@ def active_remote():
         return None
     return {"host": ws.host, "ctl": ws.ctl,
             "cwd": ws.remote_cwd or ws.cwd}
+
+
+def active_tool_names():
+    """The set of tool names the parent session currently exposes to the model (core
+    + lean-tools + MCP, at the live leash). dispatch_worker uses this to VALIDATE a
+    per-worker tool allowlist so a typo fails loud at dispatch, not silently inside
+    the worker. Empty set when there's no active agent."""
+    ag = _active_agent
+    if ag is None:
+        return set()
+    out = set()
+    for t in (getattr(ag, "tool_defs", None) or []):
+        nm = (t.get("function") or t).get("name")
+        if nm:
+            out.add(nm)
+    return out
 
 
 # ControlMasters opened SOLELY to carry workers to a host the parent isn't itself
@@ -8680,6 +8715,16 @@ class Agent:
             print(red(f"\n{GLYPH['warn']} blocked {name}: above the '{self.cfg.leash}' leash "
                       f"(not run; raise with /leash {_min_leash_for(name, _leash_safe)})"))
             return _leash_block_msg(self.cfg.leash, name, lean_safe=_leash_safe)
+        # Per-worker tool allowlist (hard lock behind the surface filter): a worker
+        # dispatched with a narrowed grant must not RUN a tool outside it, however the
+        # call arrived. None = no restriction; the meta tools are always permitted.
+        allow = getattr(self.cfg, "tool_allowlist", None)
+        if allow is not None and name not in ("update_plan", "note", "request_compact") \
+                and name not in allow:
+            print(red(f"\n{GLYPH['warn']} blocked {name}: not in this worker's tool grant "
+                      f"(not run)"))
+            return (f"tool '{name}' is not in your granted toolset. You were dispatched with "
+                    f"a restricted set of tools; work within it or report what you need.")
         # ask-on-read: when confirm_reads is on, read-only tools (core reads + safe
         # lean-tools) confirm too, not just writers - for anyone who doesn't want it
         # reading files without an OK. auto/session-armed approval still skips it.
@@ -14629,6 +14674,15 @@ def run_agent_brief(args) -> int:
     os.environ["LEANCODER_HEADLESS_WORKER"] = "1"
     if grant.get("leash"):
         cfg.leash = _norm_leash(grant["leash"]) or cfg.leash
+    # Per-worker tool allowlist: the parent may grant a NARROWED toolset (a comma list
+    # of tool names in the grant). Absent -> None -> the full leash-permitted surface
+    # (today's behaviour). The meta tools are always kept regardless (enforced in
+    # active_tools / _gate_tool), so a scout granted just "read_file,web_fetch" still
+    # has its plan/notebook. The leash cap still applies on top.
+    if grant.get("tools"):
+        names = tuple(t.strip() for t in grant["tools"].split(",") if t.strip())
+        if names:
+            cfg.tool_allowlist = names
     # The worker attaches its TOOLS to the parent's remote when one is passed. In that
     # case the grant 'cwd' is a path on the REMOTE (not the driver), so it must NOT
     # constrain the driver-local cfg.cwd - leave cfg.cwd at the driver default and hand

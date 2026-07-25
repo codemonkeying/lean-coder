@@ -112,6 +112,13 @@ TOOL = {
             "leash": {"type": "string", "enum": ["r", "rw", "rwe"], "default": "r",
                       "description": "Worker capability: r=read-only (default), rw=edit, rwe=edit+run. "
                                      "Capped at your own leash."},
+            "tools": {"type": "array", "items": {"type": "string"},
+                      "description": "Optional ALLOWLIST of tool names the worker may use (e.g. "
+                                     "[\"read_file\",\"web_fetch\"] for a scout). Omit = the worker "
+                                     "gets your full leash-permitted toolset (the default). Least "
+                                     "privilege: a worker never gets a tool you didn't grant, and "
+                                     "the grant is still leash-capped. Its plan/note/compaction "
+                                     "meta tools are always kept."},
         },
         "required": [],
     },
@@ -175,12 +182,14 @@ def _workers_dir():
     return Path(_H["CONFIG_DIR"]) / "workers"
 
 
-def _compose_brief(task, model, cwd, max_iter, leash="r", provider="", brain_host=""):
+def _compose_brief(task, model, cwd, max_iter, leash="r", provider="", brain_host="",
+                   tools=""):
     """Build the brief file text: the task wrapped in BRIEF markers + a GRANT header.
     `leash` is the already-capped grant (see _capped_leash). `provider` (optional) is
     the backend the worker must activate for `model`; absent = inherit the driver's.
     `brain_host` (optional) is an ollama inference endpoint for the worker's BRAIN,
-    distinct from where its tools run; absent = the driver's own host."""
+    distinct from where its tools run; absent = the driver's own host. `tools`
+    (optional) is a comma-separated allowlist of tool names; absent = full toolset."""
     B, G = _H["BRIEF_MARK"], _H["GRANT_MARK"]
     grant = [f"leash: {leash}", f"cwd: {cwd}", f"max_iterations: {max_iter}"]
     if model:
@@ -189,6 +198,8 @@ def _compose_brief(task, model, cwd, max_iter, leash="r", provider="", brain_hos
         grant.append(f"provider: {provider}")
     if brain_host:
         grant.append(f"brain_host: {brain_host}")
+    if tools:
+        grant.append(f"tools: {tools}")
     return (f"{B}\n{task.strip()}\n{B}\n{G}\n" + "\n".join(grant) + f"\n{G}\n")
 
 
@@ -323,6 +334,29 @@ def run(args, cwd):
         cap_note = (f" (capped to '{leash}' - a worker can't exceed your current "
                     f"'{getattr(_H.get('cfg'), 'leash', '?')}' leash)")
 
+    # Optional per-worker tool allowlist. Accept a list or a comma string; validate every
+    # name against what the PARENT actually exposes so a typo fails loud HERE, not silently
+    # inside the worker. Meta tools (plan/note/compaction) are always kept, so a caller
+    # need not list them. Empty after filtering -> treat as no restriction.
+    tools_arg = args.get("tools")
+    tools_csv = ""
+    if tools_arg:
+        if isinstance(tools_arg, str):
+            want_tools = [t.strip() for t in tools_arg.split(",") if t.strip()]
+        else:
+            want_tools = [str(t).strip() for t in tools_arg if str(t).strip()]
+        _META = {"update_plan", "note", "request_compact"}
+        want_tools = [t for t in want_tools if t not in _META]
+        if want_tools:
+            parent_tools = _H.get("active_tool_names", lambda: set())()
+            if parent_tools:
+                bad = [t for t in want_tools if t not in parent_tools]
+                if bad:
+                    return (f"error: tool(s) not available to you: {', '.join(bad)}. "
+                            f"You can only grant tools you have. Available: "
+                            f"{', '.join(sorted(parent_tools))}.")
+            tools_csv = ",".join(want_tools)
+
     max_iter = _ceiling("max_iterations")
     idle_timeout = _ceiling("idle_timeout")
     # Progress-staleness watchdog: bark (alert the parent), never bite. The worker bumps
@@ -348,7 +382,8 @@ def run(args, cwd):
     result_file = wdir / f"{stamp}.result"
     try:
         brief_file.write_text(_compose_brief(task, model, wcwd, max_iter, leash=leash,
-                                             provider=provider, brain_host=brain_host))
+                                             provider=provider, brain_host=brain_host,
+                                             tools=tools_csv))
     except OSError as e:
         return f"error: cannot write brief file: {e}"
 
@@ -383,8 +418,9 @@ def run(args, cwd):
     lstr = {"r": "read-only", "rw": "read+write", "rwe": "read+write+exec"}.get(leash, leash)
     _H["workers"][launched["pid"]]["leash"] = leash
     wnote = f"on {remote['host']}" if remote else "local (driver)"
-    return (f"dispatched worker pid {launched['pid']} ({mstr}, {lstr}, tools {wnote}, "
-            f"cwd {wcwd}){cap_note}.\n"
+    tnote = f", tools limited to [{tools_csv}]" if tools_csv else ""
+    return (f"dispatched worker pid {launched['pid']} ({mstr}, {lstr}, tools {wnote}"
+            f"{tnote}, cwd {wcwd}){cap_note}.\n"
             f"It runs in the BACKGROUND. You do NOT need to poll for it: when it "
             f"finishes, its result is delivered to you automatically on a later turn. "
             f"Do NOT call bg_status (workers are hidden from it by design) and do NOT "
@@ -767,7 +803,7 @@ def setup(lc, cfg):
     for k in ("bg_launch", "bg_list", "bg_status", "_bg_kill", "_bg_log_tail", "_extract_marked", "CONFIG_DIR",
               "BRIEF_MARK", "GRANT_MARK", "RESULT_MARK", "LEASH_LEVELS", "_norm_leash",
               "active_remote", "_ssh_master_alive", "ensure_worker_master",
-              "resolve_host", "_norm_host",
+              "active_tool_names", "resolve_host", "_norm_host",
               "dim", "bold", "green", "cyan"):
         if k in lc:
             _H[k] = lc[k]
