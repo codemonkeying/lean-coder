@@ -11,10 +11,10 @@ crash and can be handed to a different lean-coder session to keep driving.
 Distinct from a worker's file CLAIM (dispatch_worker board_claim): a claim is the
 "don't both edit auth.py" MUTEX; this is the "task C waits for task D" DAG.
 
-Least privilege - three separate capabilities, each capped at the grantor:
-  - assign is DRIVER-ONLY (it directs a worker); a worker cannot assign.
+Least privilege - separate capabilities, each capped at the grantor:
+  - create / add / assign are DRIVER-ONLY (they direct the swarm); a worker cannot.
   - done / fail a worker may call for the task IT was assigned.
-  - create / add / block are driver actions; list / find are read, open to anyone.
+  - list / reconcile are read, open to anyone.
 The board grants COORDINATION, not spawn (the recursion governor gates spawn) and
 not act (the leash gates read/edit/run).
 
@@ -30,52 +30,45 @@ TOOL = {
     "name": "board",
     "glyph": "\u25a4",   # a ruled square: the task board / map
     "description": (
-        "Driver task board: a named dependency DAG of tasks you (the driver) schedule "
-        "workers over. action='create' a board, 'add' tasks (with deps=[t1,t2] that must "
-        "finish first), 'assign' a worker pid to a ready task, 'list' to see every task "
-        "with a computed ready/blocked flag (assign only READY ones - a blocked task's "
-        "deps aren't done yet), 'done'/'fail' to record an outcome, 'block' to park a "
-        "running task, 'find' to search, 'reconcile' to collect every finished task's "
-        "result in dependency order (dep before dependent) once the DAG is done. Workers "
-        "report their OWN task done/fail and can list/find/reconcile; only the driver "
-        "creates/adds/assigns/blocks. The board is the map: hand out work whose deps are "
-        "done, mark each finish, re-check what is ready, reconcile the results at the end."),
+        "A named task board: a dependency DAG of tasks you (the driver) schedule workers "
+        "over. Lay out tasks with deps, assign each ready one to a worker, mark finishes, and "
+        "the board recomputes what's ready next; 'reconcile' collects the results in "
+        "dependency order at the end. A task is READY only once its deps are all done. Push "
+        "model: the driver schedules; workers report their own task + read the board, but "
+        "never self-select. Lifecycle: open -> assigned -> done|failed."),
     "parameters": {
         "type": "object",
         "properties": {
             "action": {"type": "string",
-                       "enum": ["create", "add", "assign", "block", "done", "fail",
-                                "list", "find", "reconcile"],
-                       "description": "create=new board; add=append a task; assign=put a "
-                                      "worker on a ready task (driver); block=park a task; "
-                                      "done/fail=record an outcome; list=all tasks + ready/"
-                                      "blocked; find=search tasks by text; reconcile=finished "
-                                      "results in dependency order."},
+                       "enum": ["create", "add", "assign", "done", "fail",
+                                "list", "reconcile"],
+                       "description": "create=new board; add=append a task (deps=[...]); "
+                                      "assign=put a worker on a READY task; done/fail=record an "
+                                      "outcome; list=tasks (status= or query= filters); "
+                                      "reconcile=done results in dependency order. Driver-only: "
+                                      "create/add/assign. Workers: done/fail their task + list/"
+                                      "reconcile."},
             "board": {"type": "string",
-                      "description": "The board name (like a session name). Required by every "
-                                     "action."},
+                      "description": "Board name (like a session name). Required by every action."},
             "task": {"type": "string",
-                     "description": "For add: the new task's name/description. For assign/block/"
-                                    "done/fail: the task id (e.g. 't3', from add or list)."},
+                     "description": "add: the new task's name. assign/done/fail: the task id "
+                                    "(e.g. 't3', from add or list)."},
             "deps": {"type": "array", "items": {"type": "string"},
-                     "description": "For add: task ids this task depends on (must all be 'done' "
-                                    "before it is ready). Omit for no deps."},
+                     "description": "add: task ids that must be 'done' before this is ready. Omit "
+                                    "for none."},
             "worker": {"type": "string",
-                       "description": "For assign: the worker pid (or label) to put on the task."},
+                       "description": "assign: the worker pid (or label) to put on the task."},
             "note": {"type": "string",
-                     "description": "Optional free text: driver->worker context on assign/block "
-                                    "(e.g. 'the DB is postgres'), or worker->driver why on fail."},
+                     "description": "Optional free text: driver->worker context on assign, or "
+                                    "worker->driver why on fail."},
             "result_ref": {"type": "string",
-                           "description": "For done: a pointer to the work product (e.g. the "
-                                          "worker's result file path). Used by the reconciler."},
-            "title": {"type": "string",
-                      "description": "For create: an optional human title for the board."},
-            "query": {"type": "string",
-                      "description": "For find: match tasks whose id/name/note contains this text."},
+                           "description": "done: pointer to the work product (e.g. the worker's "
+                                          "result file). Collected by reconcile."},
             "status": {"type": "string",
-                       "description": "For list: optionally filter to one status "
-                                      "(open|assigned|blocked|done|failed), or 'ready' for only "
-                                      "the ready-to-assign tasks."},
+                       "description": "list: filter to one status (open|assigned|done|failed), or "
+                                      "'ready' for the assignable ones."},
+            "query": {"type": "string",
+                      "description": "list: only tasks whose id/name/note contains this text."},
         },
         "required": ["action", "board"],
     },
@@ -150,7 +143,7 @@ def run(args, cwd):
     if action == "create":
         if not _is_driver():
             return _driver_only(action)
-        board, err = _H["_taskboard_create"](name, title=(args.get("title") or "").strip(),
+        board, err = _H["_taskboard_create"](name,
                                               owner=str(getattr(_H.get("cfg"), "worker_board_session", "") or ""))
         if err:
             return f"error: {err}"
@@ -162,38 +155,31 @@ def run(args, cwd):
         return f"error: no board named '{name}' (create it first with action='create')."
 
     if action == "list":
+        ready, _ = _H["_taskboard_ready"](board)
+        ready_ids = {t.get("id") for t in ready}
+        q = (args.get("query") or "").strip().lower()
+        if q:
+            hits = [t for t in board.get("tasks", [])
+                    if q in str(t.get("id", "")).lower()
+                    or q in str(t.get("name", "")).lower()
+                    or q in str(t.get("note", "")).lower()]
+            if not hits:
+                return f"board '{name}': no task matches '{q}'."
+            return "\n".join([_H["bold"](f"board '{name}' matches for '{q}':")]
+                             + [_fmt_task(t, ready_ids) for t in hits])
         flt = (args.get("status") or "").strip().lower()
         if flt == "ready":
-            ready, _ = _H["_taskboard_ready"](board)
             if not ready:
                 return f"board '{name}': no tasks are ready to assign."
-            ready_ids = {t.get("id") for t in ready}
             return "\n".join([_H["bold"](f"board '{name}' ready:")]
                              + [_fmt_task(t, ready_ids) for t in ready])
         if flt:
-            ready, _ = _H["_taskboard_ready"](board)
-            ready_ids = {t.get("id") for t in ready}
             sel = [t for t in board.get("tasks", []) if t.get("status") == flt]
             if not sel:
                 return f"board '{name}': no tasks with status '{flt}'."
             return "\n".join([_H["bold"](f"board '{name}' [{flt}]:")]
                              + [_fmt_task(t, ready_ids) for t in sel])
         return _render(name, board)
-
-    if action == "find":
-        q = (args.get("query") or args.get("task") or "").strip().lower()
-        if not q:
-            return "error: action='find' needs a 'query'."
-        ready, _ = _H["_taskboard_ready"](board)
-        ready_ids = {t.get("id") for t in ready}
-        hits = [t for t in board.get("tasks", [])
-                if q in str(t.get("id", "")).lower()
-                or q in str(t.get("name", "")).lower()
-                or q in str(t.get("note", "")).lower()]
-        if not hits:
-            return f"board '{name}': no task matches '{q}'."
-        return "\n".join([_H["bold"](f"board '{name}' matches for '{q}':")]
-                         + [_fmt_task(t, ready_ids) for t in hits])
 
     if action == "reconcile":
         # Read action, open to anyone: the result_refs of every DONE task in dependency
@@ -265,28 +251,22 @@ def run(args, cwd):
         _H["_taskboard_save"](name, board)
         return f"assigned {tid} '{t.get('name','')}' to worker {worker}."
 
-    if action in ("done", "fail", "block"):
+    if action in ("done", "fail"):
         tid = (args.get("task") or "").strip()
         if not tid:
             return f"error: action='{action}' needs a 'task' id."
         t = _H["_tb_task"](board, tid)
         if not t:
             return f"error: unknown task id '{tid}'."
-        # block is a driver action (parking a task); done/fail a worker may call for the
-        # task it was assigned (or the driver, for any task).
-        if action == "block" and not _is_driver():
-            return _driver_only(action)
+        # done/fail: a worker may call for the task it was assigned (or the driver, for any).
         note = (args.get("note") or "").strip()
         if action == "done":
             _H["_taskboard_set_status"](board, tid, "done", note=note or None,
                                         result_ref=(args.get("result_ref") or "").strip() or None)
             msg = f"marked {tid} DONE."
-        elif action == "fail":
+        else:  # fail
             _H["_taskboard_set_status"](board, tid, "failed", note=note or None)
             msg = f"marked {tid} FAILED."
-        else:  # block
-            _H["_taskboard_set_status"](board, tid, "blocked", note=note or None)
-            msg = f"parked {tid} as BLOCKED."
         _H["_taskboard_save"](name, board)
         # On a done, surface what that unblocked so the driver knows what to assign next.
         if action == "done":
