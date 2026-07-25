@@ -15,14 +15,14 @@ schemas, truncated tool results. See README.md.
   L2817   Composer (pinned input line, editor, stdin)
   L3667   Token accounting (calibrated context meter)
   L3832   Config (dataclass, field registry, load/save)
-  L6394   Tool execution + text tool-call parsing
-  L6815   Remote workspace (executor client, /connect)
-  L8380   Context meter
-  L8475   Agent (turn loop, context mgmt, tool dispatch)
-  L14157  Slash-command handlers + dispatch table
-  L14294  REPL (interactive loop, session resume)
-  L14669  Worker agent (headless --agent-run)
-  L15101  Entry (CLI arg parsing, main)
+  L6409   Tool execution + text tool-call parsing
+  L6830   Remote workspace (executor client, /connect)
+  L8395   Context meter
+  L8490   Agent (turn loop, context mgmt, tool dispatch)
+  L14174  Slash-command handlers + dispatch table
+  L14311  REPL (interactive loop, session resume)
+  L14686  Worker agent (headless --agent-run)
+  L15132  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -4068,6 +4068,17 @@ class Config:
     worker_max_concurrent: int = 10   # dispatch_worker: max worker agents alive at once (0 = unlimited)
     worker_idle_timeout: int = 1800  # dispatch_worker: worker lease secs; unattended self-kill
     worker_max_iterations: int = 30  # dispatch_worker: agentic-loop cap per worker
+    # SAFE-RECURSION governor (a worker spawning workers). Both default to the SAFE end:
+    # opt-IN to recursion, never opt-out. A misfire can't fork-bomb API quota.
+    worker_max_depth: int = 1        # dispatch_worker: max tree depth (driver->worker = 1);
+                                     # default 1 = fan-out only, a worker can't spawn (today's limit)
+    worker_max_children: int = 0     # dispatch_worker: max children ANY single worker may spawn
+                                     # (0 = none). Only bites once max_depth > 1 permits recursion.
+    worker_depth: int = 0            # INTERNAL: this process's depth in the tree (driver=0,
+                                     # its workers=1, ...). Set from the grant in run_agent_brief;
+                                     # NOT a user knob (not in _ROUNDTRIP / /settings).
+    worker_child_budget: int = 0     # INTERNAL: how many children THIS worker was granted (from
+                                     # the grant). Driver is ungated by this (uses max_concurrent).
     tool_allowlist: tuple = None     # None = no restriction (all leash-permitted tools).
                                      # Else a set/tuple of tool NAMES the surface is
                                      # narrowed to (still leash-capped). Runtime-only,
@@ -4324,6 +4335,8 @@ _SCALAR_FIELDS = (
     ("worker_max_concurrent",     10,                  True),
     ("worker_idle_timeout",       1800,                True),
     ("worker_max_iterations",     30,                  True),
+    ("worker_max_depth",          1,                   True),
+    ("worker_max_children",       0,                   True),
     ("approval",                  "ask",               False),
     ("confirm_reads",             False,               False),
     ("auto_reconnect",            False,               False),
@@ -4369,6 +4382,8 @@ _EPHEMERAL_KEYS = frozenset((
     "composer", "leash", "incognito", "think", "cwd", "model_explicit", "auto_num_ctx",
     "tool_allowlist",     # runtime-only per-worker tool grant; never persisted (a fresh
                           # launch must default to the full surface, like leash)
+    "worker_depth", "worker_child_budget",  # runtime-only tree position + granted child
+                          # budget, set from the grant per worker; never a saved knob
     # Not config.toml scalars: `_defaults` is the DEFAULTS snapshot save_config writes
     # FROM; `session_overrides` is the per-key override map persisted in the SESSION
     # meta (not config.toml) and re-applied at load runtime-only. Classified here so
@@ -11123,7 +11138,9 @@ _SETTINGS_FIELDS = [
     ("temperature", "temperature", "float"),
     ("top_p", "top_p", "float"),
     ("top_k", "top_k", "int"),
-    ("repeat_penalty", "repeat_penalty", "float"),
+    ("worker_max_iterations", "max tool-call rounds per worker", "int"),
+    ("worker_max_depth", "max worker tree depth (1 = fan-out only, no recursion)", "int"),
+    ("worker_max_children", "max children any one worker may spawn (0 = none)", "int"),
     ("editor", "editor (for /prompt)", "str"),
     ("user_name", "your name on your own turn in scrollback", "str"),
     ("approval", "approval mode", tuple(APPROVAL_MODES)),
@@ -14720,11 +14737,25 @@ def run_agent_brief(args) -> int:
         cfg.leash = _norm_leash(grant["leash"]) or cfg.leash
     # Per-worker tool allowlist: the parent may grant a NARROWED toolset (a comma list
     # of tool names in the grant). Absent -> None -> the full leash-permitted surface
-    # (today's behaviour). The meta tools are always kept regardless (enforced in
-    # active_tools / _gate_tool), so a scout granted just "read_file,web_fetch" still
-    # has its plan/notebook. The leash cap still applies on top.
-    if grant.get("tools"):
-        names = tuple(t.strip() for t in grant["tools"].split(",") if t.strip())
+    if grant.get("max_iterations"):
+        try:
+            cfg.max_iterations = int(grant["max_iterations"])
+        except ValueError:
+            pass
+    # Safe-recursion governor: the grant carries this worker's DEPTH in the tree and the
+    # CHILD BUDGET the parent granted it. The dispatch tool reads these back off cfg to
+    # decide whether this worker may spawn (and how many). Absent -> depth 1, 0 children
+    # (a plain fan-out worker that can't recurse - the safe default).
+    if grant.get("depth"):
+        try:
+            cfg.worker_depth = int(grant["depth"])
+        except ValueError:
+            pass
+    if grant.get("child_budget"):
+        try:
+            cfg.worker_child_budget = int(grant["child_budget"])
+        except ValueError:
+            pass
         if names:
             cfg.tool_allowlist = names
     # The worker attaches its TOOLS to the parent's remote when one is passed. In that

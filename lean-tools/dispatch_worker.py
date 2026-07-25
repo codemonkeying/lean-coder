@@ -43,10 +43,13 @@ import time
 from pathlib import Path
 
 # Built-in ceiling defaults (last resort: env var > live cfg > this - see docstring).
-_DEFAULTS = {"max_concurrent": 10, "idle_timeout": 1800, "max_iterations": 30}
+_DEFAULTS = {"max_concurrent": 10, "idle_timeout": 1800, "max_iterations": 30,
+             "max_depth": 1, "max_children": 0}
 _ENV = {"max_concurrent": "LEANCODER_WORKER_MAX_CONCURRENT",
         "idle_timeout": "LEANCODER_WORKER_IDLE_TIMEOUT",
-        "max_iterations": "LEANCODER_WORKER_MAX_ITER"}
+        "max_iterations": "LEANCODER_WORKER_MAX_ITER",
+        "max_depth": "LEANCODER_WORKER_MAX_DEPTH",
+        "max_children": "LEANCODER_WORKER_MAX_CHILDREN"}
 
 TOOL = {
     "name": "dispatch_worker",
@@ -179,6 +182,38 @@ def _ceiling(key):
     return _DEFAULTS[key]
 
 
+def _governor_check(my_depth):
+    """Safe-recursion gate for the process trying to spawn a worker. `my_depth` is this
+    process's depth in the worker tree (driver = 0, its workers = 1, ...). Returns
+    (ok, error_str, granted_child_budget):
+      - the DRIVER (depth 0) may always spawn (only max_concurrent bounds it); the child
+        it makes is depth 1 and gets a child budget of worker_max_children.
+      - a WORKER (depth >= 1) may spawn ONLY IF depth < worker_max_depth AND it still has
+        child budget left (granted by its parent, decremented per spawn). The child it
+        makes is depth my_depth+1 and inherits a SHRINKING budget (its own remaining
+        minus the one it's spending), so a subtree is bounded by depth x count, never a
+        fork-bomb. Both gates REFUSE loudly rather than silently succeed."""
+    cfg = _H.get("cfg")
+    max_depth = _ceiling("max_depth")
+    if my_depth <= 0:
+        # The driver: ungated here (max_concurrent is its bound). Its children are depth 1
+        # and get the operator's per-worker child allowance.
+        return True, "", _ceiling("max_children")
+    if my_depth >= max_depth:
+        return (False, (f"error: recursion depth limit reached (this worker is at depth "
+                        f"{my_depth}, worker_max_depth is {max_depth}). A worker at the max "
+                        f"depth cannot spawn its own workers. Raise worker_max_depth / "
+                        f"LEANCODER_WORKER_MAX_DEPTH to allow deeper recursion."), 0)
+    remaining = int(getattr(cfg, "worker_child_budget", 0) or 0)
+    if remaining <= 0:
+        return (False, ("error: this worker was granted no child budget (worker_max_children "
+                        "is 0, or its budget is spent), so it cannot spawn workers. This is the "
+                        "safe default - recursion is opt-in. Raise worker_max_children / "
+                        "LEANCODER_WORKER_MAX_CHILDREN to grant one."), 0)
+    # Spend one from this worker's budget; the child inherits what's left after this spawn.
+    cfg.worker_child_budget = remaining - 1
+    return True, "", remaining - 1
+
 def _model_allowlist():
     """The model allowlist (LEANCODER_WORKER_MODELS, comma-separated), or None = any."""
     raw = os.environ.get("LEANCODER_WORKER_MODELS", "").strip()
@@ -207,7 +242,7 @@ def _workers_dir():
 
 
 def _compose_brief(task, model, cwd, max_iter, leash="r", provider="", brain_host="",
-                   tools="", context="", plan="", notes=""):
+                   tools="", context="", plan="", notes="", depth=0, child_budget=0):
     """Build the brief file text: the task wrapped in BRIEF markers + a GRANT header.
     `leash` is the already-capped grant (see _capped_leash). `provider` (optional) is
     the backend the worker must activate for `model`; absent = inherit the driver's.
@@ -217,7 +252,9 @@ def _compose_brief(task, model, cwd, max_iter, leash="r", provider="", brain_hos
     `context`/`plan`/`notes` (optional) seed the worker with curated STATE - a
     background blob, a starting plan, notebook entries - each emitted as its own marker
     block the worker parses in run_agent_brief. Not truncated: the parent decides how
-    much state the job needs."""
+    much state the job needs. `depth` is this worker's depth in the tree (driver->worker
+    = 1); `child_budget` is how many children it may itself spawn (0 = none) - both drive
+    the safe-recursion governor."""
     B, G = _H["BRIEF_MARK"], _H["GRANT_MARK"]
     grant = [f"leash: {leash}", f"cwd: {cwd}", f"max_iterations: {max_iter}"]
     if model:
@@ -228,6 +265,10 @@ def _compose_brief(task, model, cwd, max_iter, leash="r", provider="", brain_hos
         grant.append(f"brain_host: {brain_host}")
     if tools:
         grant.append(f"tools: {tools}")
+    if depth:
+        grant.append(f"depth: {depth}")
+    if child_budget:
+        grant.append(f"child_budget: {child_budget}")
     out = [f"{B}\n{task.strip()}\n{B}", f"{G}\n" + "\n".join(grant) + f"\n{G}"]
     for text, mark_key in ((context, "SEED_CONTEXT_MARK"), (plan, "SEED_PLAN_MARK"),
                            (notes, "SEED_NOTES_MARK")):
@@ -268,6 +309,20 @@ def run(args, cwd):
     task = (args.get("task") or "").strip()
     if not task:
         return "error: dispatch_worker action='dispatch' needs a non-empty task."
+    # SAFE-RECURSION governor: is THIS process allowed to spawn a worker at all, and if
+    # so how many? The driver (worker_depth 0) is governed only by max_concurrent. A
+    # WORKER (depth >= 1) must pass two gates before it can spawn a child:
+    #   (a) DEPTH: my depth < worker_max_depth (default 1 -> a depth-1 worker is blocked;
+    #       recursion is opt-IN by raising the ceiling).
+    #   (b) CHILD BUDGET: I was granted a child budget by my parent, and I have some left
+    #       (each spawn decrements it). Grandchildren get a SHRINKING budget so a subtree
+    #       is bounded by depth x a decrementing count, not a flat number.
+    # Both refuse rather than silently succeed - a misfire can't fork-bomb the API.
+    _cfg = _H.get("cfg")
+    my_depth = int(getattr(_cfg, "worker_depth", 0) or 0)
+    ok, why, child_budget = _governor_check(my_depth)
+    if not ok:
+        return why
 
     # Operator ceiling: concurrency.
     bg_list = _H["bg_list"]
@@ -277,7 +332,6 @@ def run(args, cwd):
         return (f"error: at the worker limit ({max_conc} running). Wait for one to "
                 f"finish (its result reaches you automatically) or raise "
                 f"LEANCODER_WORKER_MAX_CONCURRENT.")
-
     # Model + provider. Default: inherit the driver's current model+provider (both
     # blank -> the worker keeps whatever it activates). A `model` may be ANY model on
     # ANY enabled provider; we infer its provider from the enabled-provider->models
@@ -430,7 +484,10 @@ def run(args, cwd):
         brief_file.write_text(_compose_brief(task, model, wcwd, max_iter, leash=leash,
                                              provider=provider, brain_host=brain_host,
                                              tools=tools_csv, context=seed_context,
-                                             plan=seed_plan, notes=seed_notes))
+                                             plan=seed_plan, notes=seed_notes,
+                                             depth=my_depth + 1, child_budget=child_budget))
+    except OSError as e:
+        return f"error: cannot write brief file: {e}"
     except OSError as e:
         return f"error: cannot write brief file: {e}"
 
