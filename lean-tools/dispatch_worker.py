@@ -35,6 +35,11 @@ WORKER CEILINGS (the cost lever) - each resolves in priority order:
   worker_idle_timeout    lease secs; self-kill    LEANCODER_WORKER_IDLE_TIMEOUT     1800
   worker_max_iterations  agentic-loop cap/worker  LEANCODER_WORKER_MAX_ITER         30
   model_allowlist        (env only)               LEANCODER_WORKER_MODELS           any
+
+RESUME: with cfg.worker_checkpoint on, a worker dumps its transcript to a
+'<brief>.checkpoint' sidecar each iteration; action='resume' (pid=, text=) relaunches a
+DEAD/timed-out/incomplete worker from that checkpoint (a NEW pid - resume is a fresh OS
+process; lineage kept in meta['resumed_from']). Off by default = no checkpoint file.
 """
 import os
 import shlex
@@ -70,7 +75,7 @@ TOOL = {
         "properties": {
             "action": {"type": "string",
                        "enum": ["dispatch", "status", "result", "cancel", "inject",
-                                "set_plan", "add_note"],
+                                "set_plan", "add_note", "resume"],
                        "default": "dispatch",
                        "description": "What to do (default 'dispatch'): 'dispatch' launches a "
                                       "new worker from `task`; 'status' reports your dispatched "
@@ -86,7 +91,12 @@ TOOL = {
                                       "first and edit it rather than clobber its progress); "
                                       "'add_note' (pid=, notes=) adds a note to a running "
                                       "worker's notebook. Both land on its next step, no interrupt, "
-                                      "and the worker is pinged inline so it can't miss the change."},
+                                      "and the worker is pinged inline so it can't miss the change. "
+                                      "'resume' (pid=, text=) RELAUNCHES a worker that DIED/timed "
+                                      "out/hit its limit WITHOUT finishing, reloading its saved "
+                                      "transcript so it continues from where it stopped (text= is "
+                                      "a fresh steer); needs worker_checkpoint on when it was "
+                                      "dispatched. Returns a NEW pid."},
             "pid": {"type": "integer",
                     "description": "Worker pid to act on (required for action='cancel'; optional "
                                    "for 'status' to show just one). From the dispatch return line."},
@@ -242,7 +252,8 @@ def _workers_dir():
 
 
 def _compose_brief(task, model, cwd, max_iter, leash="r", provider="", brain_host="",
-                   tools="", context="", plan="", notes="", depth=0, child_budget=0):
+                   tools="", context="", plan="", notes="", depth=0, child_budget=0,
+                   checkpoint=False, resume=""):
     """Build the brief file text: the task wrapped in BRIEF markers + a GRANT header.
     `leash` is the already-capped grant (see _capped_leash). `provider` (optional) is
     the backend the worker must activate for `model`; absent = inherit the driver's.
@@ -269,12 +280,19 @@ def _compose_brief(task, model, cwd, max_iter, leash="r", provider="", brain_hos
         grant.append(f"depth: {depth}")
     if child_budget:
         grant.append(f"child_budget: {child_budget}")
+    if checkpoint:
+        grant.append("checkpoint: 1")
     out = [f"{B}\n{task.strip()}\n{B}", f"{G}\n" + "\n".join(grant) + f"\n{G}"]
     for text, mark_key in ((context, "SEED_CONTEXT_MARK"), (plan, "SEED_PLAN_MARK"),
                            (notes, "SEED_NOTES_MARK")):
         if text and text.strip():
             m = _H[mark_key]
             out.append(f"{m}\n{text.strip()}\n{m}")
+    # A resumed worker: point it at the dead worker's transcript checkpoint. run_agent_brief
+    # reloads that transcript, then runs `task` as a fresh steer turn on top of it.
+    if resume:
+        rm = _H["RESUME_MARK"]
+        out.append(f"{rm}\n{resume.strip()}\n{rm}")
     return "\n".join(out) + "\n"
 
 
@@ -303,9 +321,11 @@ def run(args, cwd):
         return _worker_set_plan(args.get("pid"), args.get("plan") or args.get("text"))
     if action == "add_note":
         return _worker_add_note(args.get("pid"), args.get("notes") or args.get("text"))
+    if action == "resume":
+        return _worker_resume(args.get("pid"), args.get("text") or args.get("task"), cwd)
     if action != "dispatch":
         return ("error: unknown action %r (use dispatch | status | result | cancel | "
-                "inject | set_plan | add_note)." % action)
+                "inject | set_plan | add_note | resume)." % action)
     task = (args.get("task") or "").strip()
     if not task:
         return "error: dispatch_worker action='dispatch' needs a non-empty task."
@@ -481,14 +501,15 @@ def run(args, cwd):
     stamp = f"{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}-{_H['_seq']}"
     brief_file = wdir / f"{stamp}.brief"
     result_file = wdir / f"{stamp}.result"
+    # Checkpoint the transcript (opt-in) so a dead/timed-out worker can be action='resume'd.
+    do_checkpoint = bool(getattr(_cfg, "worker_checkpoint", False))
     try:
         brief_file.write_text(_compose_brief(task, model, wcwd, max_iter, leash=leash,
                                              provider=provider, brain_host=brain_host,
                                              tools=tools_csv, context=seed_context,
                                              plan=seed_plan, notes=seed_notes,
-                                             depth=my_depth + 1, child_budget=child_budget))
-    except OSError as e:
-        return f"error: cannot write brief file: {e}"
+                                             depth=my_depth + 1, child_budget=child_budget,
+                                             checkpoint=do_checkpoint))
     except OSError as e:
         return f"error: cannot write brief file: {e}"
 
@@ -518,7 +539,11 @@ def run(args, cwd):
     where = remote["host"] if remote else "local"
     _H["workers"][launched["pid"]] = {"result": str(result_file), "task": task,
                                       "started": time.time(), "model": model or "(default)",
-                                      "where": where, "log": launched.get("log")}
+                                      "where": where, "log": launched.get("log"),
+                                      "brief": str(brief_file),
+                                      "checkpoint": do_checkpoint, "cmd": cmd,
+                                      "launch_cwd": launch_cwd, "idle_timeout": idle_timeout,
+                                      "hb_timeout": hb_timeout}
     mstr = model or "current model"
     lstr = {"r": "read-only", "rw": "read+write", "rwe": "read+write+exec"}.get(leash, leash)
     _H["workers"][launched["pid"]]["leash"] = leash
@@ -955,6 +980,107 @@ def _worker_add_note(pid, text):
     return (f"queued a note for worker {pid}'s notebook. It lands on the worker's NEXT "
             f"reasoning step (not an interrupt). Confirm with action='status'.")
 
+
+def _worker_resume(pid, text, cwd):
+    """RELAUNCH a worker that DIED without finishing (max_iterations / lease-kill / crash /
+    stopped incomplete), reloading its transcript checkpoint so it continues from where it
+    left off instead of cold. `text` is a fresh steer (what to fix/do next). Returns a NEW
+    pid (the old process is dead - resume is a new OS process; lineage is tracked via
+    meta['resumed_from']). Requirements: the worker was dispatched with worker_checkpoint
+    on (so a '<brief>.checkpoint' exists), it is NOT still running (use inject for that),
+    and it has not already delivered a result (that stands - dispatch fresh instead)."""
+    workers = _H["workers"]
+    if pid is None:
+        return "error: action='resume' needs a pid (which dead worker to relaunch)."
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return f"error: bad pid {pid!r}."
+    meta = workers.get(pid)
+    if not meta:
+        return f"no worker with pid {pid} this session (nothing to resume)."
+    if _read_result(meta["result"]) is not None:
+        return (f"worker {pid} already finished with a result - nothing to resume (its "
+                f"result stands; read it, or dispatch a fresh worker for new work).")
+    row = _worker_rows().get(pid)
+    if row is not None and row.get("state") == "running":
+        return (f"worker {pid} is still running - don't resume a live worker. Use "
+                f"action='inject' to steer it, or action='cancel' to stop it first.")
+    ckpt = _brief_from_result(meta["result"]) + ".checkpoint"
+    if not Path(ckpt).exists():
+        return (f"worker {pid} has no transcript checkpoint, so it can't be resumed - it "
+                f"was dispatched with checkpointing off. Turn on worker_checkpoint (/set "
+                f"or config) before dispatching workers you may want to resume.")
+    steer = (text or "").strip() or ("Continue your task from where you left off and "
+                                     "finish it.")
+    # Concurrency ceiling still applies (a resume is a new running worker).
+    max_conc = _ceiling("max_concurrent")
+    if max_conc and len(_H["bg_list"](kind="worker")) >= max_conc:
+        return (f"error: at the worker limit ({max_conc} running); can't resume now. Wait "
+                f"for one to finish or raise LEANCODER_WORKER_MAX_CONCURRENT.")
+
+    # Build a FRESH brief that reuses the dead worker's GRANT verbatim (same leash/model/
+    # tools/cwd), plus a RESUME marker pointing at its checkpoint and checkpoint:1 so the
+    # resumed worker is itself resumable. New stamp -> new brief/result files (the old
+    # ones are swept normally); the steer becomes the brief's task (its first turn on top
+    # of the reloaded transcript).
+    try:
+        orig = Path(meta["brief"]).read_text()
+    except OSError as e:
+        return f"error: cannot read worker {pid}'s brief to resume it: {e}"
+    grant = _H["_extract_marked"](orig, _H["GRANT_MARK"]) or ""
+    B, G, RM = _H["BRIEF_MARK"], _H["GRANT_MARK"], _H["RESUME_MARK"]
+    grant_lines = [l for l in grant.splitlines() if l.strip()
+                   and not l.strip().lower().startswith("checkpoint:")]
+    grant_lines.append("checkpoint: 1")
+    new_brief_text = "\n".join([
+        f"{B}\n{steer}\n{B}",
+        f"{G}\n" + "\n".join(grant_lines) + f"\n{G}",
+        f"{RM}\n{ckpt}\n{RM}"]) + "\n"
+
+    wdir = _workers_dir()
+    _H["_seq"] = _H.get("_seq", 0) + 1
+    stamp = f"{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}-{_H['_seq']}"
+    brief_file = wdir / f"{stamp}.brief"
+    result_file = wdir / f"{stamp}.result"
+    try:
+        brief_file.write_text(new_brief_text)
+    except OSError as e:
+        return f"error: cannot write resume brief: {e}"
+
+    # Relaunch: reuse the dead worker's launch command verbatim but swap in the new brief/
+    # result paths (this preserves its --cwd / --remote-host / --remote-ctl / --host wiring,
+    # so a remote/remote-brain worker resumes on the same target).
+    old_cmd = meta.get("cmd", "")
+    cmd = old_cmd.replace(shlex.quote(str(meta["brief"])), shlex.quote(str(brief_file)))
+    cmd = cmd.replace(shlex.quote(meta["result"]), shlex.quote(str(result_file)))
+    if str(brief_file) not in cmd or str(result_file) not in cmd:
+        return ("error: could not reconstruct the resume launch command (the worker's "
+                "original launch is unavailable). Dispatch a fresh worker instead.")
+    launch_cwd = meta.get("launch_cwd") or cwd
+    launched = _H["bg_launch"](cmd, cwd=launch_cwd, kind="worker",
+                               idle_timeout=meta.get("idle_timeout") or _ceiling("idle_timeout"),
+                               heartbeat_timeout=meta.get("hb_timeout") or 0,
+                               heartbeat_file=str(brief_file) + ".progress")
+    if "error" in launched:
+        return f"error: could not relaunch worker: {launched['error']}"
+    new_pid = launched["pid"]
+    workers[new_pid] = {"result": str(result_file), "task": meta["task"],
+                        "started": time.time(), "model": meta.get("model", "(default)"),
+                        "where": meta.get("where", "local"), "log": launched.get("log"),
+                        "brief": str(brief_file), "checkpoint": True, "cmd": cmd,
+                        "launch_cwd": launch_cwd,
+                        "idle_timeout": meta.get("idle_timeout"),
+                        "hb_timeout": meta.get("hb_timeout"),
+                        "leash": meta.get("leash", "r"), "resumed_from": pid}
+    # The old worker is retired - suppress any lingering failure notice for it.
+    meta["announced"] = True
+    return (f"resumed worker {pid} as NEW pid {new_pid} (a resume is a fresh process; the "
+            f"old pid is dead). It reloaded the saved transcript and continues from where "
+            f"it stopped, with your steer on top. Its result reaches you automatically when "
+            f"it finishes - don't poll.")
+
+
 def _worker_cmd(agent, cfg, arg):
     """/worker - human command, at PARITY with the model's dispatch_worker actions:
       /worker                    list dispatched workers (state + result-ready)
@@ -964,6 +1090,7 @@ def _worker_cmd(agent, cfg, arg):
       /worker inject <pid> <msg> mid-task message to a running worker
       /worker set_plan <pid> <plan>  replace a running worker's pinned plan
       /worker add_note <pid> <note>  add a note to a running worker's notebook
+      /worker resume <pid> <steer>   relaunch a DEAD worker from its saved transcript
     Subcommands reuse the same helpers the tool uses, so the human and the model see
     identical behaviour."""
     workers = _H["workers"]
@@ -977,7 +1104,7 @@ def _worker_cmd(agent, cfg, arg):
 
     # Subcommands (parity with the model tool). A bare pid stays the result shortcut.
     if parts and parts[0].lower() in ("status", "cancel", "result", "inject",
-                                      "set_plan", "add_note"):
+                                      "set_plan", "add_note", "resume"):
         sub = parts[0].lower()
         pid = parts[1] if len(parts) > 1 else None
         if sub == "status":
@@ -996,6 +1123,10 @@ def _worker_cmd(agent, cfg, arg):
             # /worker add_note <pid> <note...> - the rest of the line is the note.
             text = arg.split(None, 2)[2] if len(parts) > 2 else ""
             print(_worker_add_note(pid, text))
+        elif sub == "resume":
+            # /worker resume <pid> <steer...> - the rest of the line is the steer.
+            text = arg.split(None, 2)[2] if len(parts) > 2 else ""
+            print(_worker_resume(pid, text, str(getattr(cfg, "cwd", "."))))
         else:  # cancel
             print(_worker_cancel(pid))
         return
@@ -1052,14 +1183,14 @@ def _worker_cmd(agent, cfg, arg):
                 if bits:
                     print(_H["dim"]("        " + "  ".join(bits)))
     print(_H["dim"]("  /worker <pid> = full result + progress/intent · status [pid] · "
-                    "cancel <pid> · inject/set_plan/add_note <pid> <text>"))
+                    "cancel <pid> · inject/set_plan/add_note <pid> <text> · resume <pid> <steer>"))
 
 
 def _worker_completer(agent, cfg):
     """Tab-completion for /worker's first argument: the subcommand verbs plus every
     live worker pid (so `cancel <Tab>` / a bare `<Tab>` offers real pids). Matches the
     menu contract of other multi-verb commands (e.g. /mcp)."""
-    opts = ["status", "result", "cancel", "inject", "set_plan", "add_note"]
+    opts = ["status", "result", "cancel", "inject", "set_plan", "add_note", "resume"]
     opts += [str(pid) for pid in _H.get("workers", {})]
     return opts
 
@@ -1069,7 +1200,7 @@ def setup(lc, cfg):
     # no lc). setup() is driver-only = exactly where a worker is launched, so these
     # are always present when run() fires.
     for k in ("bg_launch", "bg_list", "bg_status", "_bg_kill", "_bg_kill_tree", "_bg_log_tail", "_extract_marked", "CONFIG_DIR",
-              "BRIEF_MARK", "GRANT_MARK", "RESULT_MARK", "LEASH_LEVELS", "_norm_leash",
+              "BRIEF_MARK", "GRANT_MARK", "RESULT_MARK", "RESUME_MARK", "LEASH_LEVELS", "_norm_leash",
               "SEED_CONTEXT_MARK", "SEED_PLAN_MARK", "SEED_NOTES_MARK",
               "active_remote", "_ssh_master_alive", "ensure_worker_master",
               "active_tool_names", "resolve_host", "_norm_host",
