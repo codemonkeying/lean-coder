@@ -15,14 +15,14 @@ schemas, truncated tool results. See README.md.
   L2834   Composer (pinned input line, editor, stdin)
   L3684   Token accounting (calibrated context meter)
   L3849   Config (dataclass, field registry, load/save)
-  L6684   Tool execution + text tool-call parsing
-  L7105   Remote workspace (executor client, /connect)
-  L8670   Context meter
-  L8765   Agent (turn loop, context mgmt, tool dispatch)
-  L14454  Slash-command handlers + dispatch table
-  L14591  REPL (interactive loop, session resume)
-  L14966  Worker agent (headless --agent-run)
-  L15524  Entry (CLI arg parsing, main)
+  L6704   Tool execution + text tool-call parsing
+  L7125   Remote workspace (executor client, /connect)
+  L8690   Context meter
+  L8785   Agent (turn loop, context mgmt, tool dispatch)
+  L14474  Slash-command handlers + dispatch table
+  L14611  REPL (interactive loop, session resume)
+  L14986  Worker agent (headless --agent-run)
+  L15544  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -6055,17 +6055,23 @@ def _board_claims_path(session_id):
 
 def _board_read_claims(session_id, now=None):
     """Reduce the append-only claims.jsonl to the LIVE claim per path. Each line is a
-    JSON record {path, owner, ts, ttl, action:'claim'|'release'}. Last write wins per
-    path; a 'release' or an expired claim (ts+ttl <= now) drops the path. Returns
-    {path: {owner, ts, ttl}} of currently-held claims. Corrupt lines are skipped
-    (best-effort: a partial append must never crash a reader)."""
+    JSON record {path, owner, ts, ttl, action:'claim'|'release'}. The winner of a path is
+    the FIRST claim IN FILE (append) ORDER that is still live - not expired (ts+ttl > now)
+    and not followed by a release from its own owner. File order is the arbiter, not ts: a
+    POSIX O_APPEND write is atomic per line, so once a claimer's line is in the file nobody
+    can insert ahead of it - which makes the winner permanent and independent of clock skew
+    (an earlier ts appended LATER must not retroactively steal a held path). Every reader
+    reduces the same file to the same winner. Returns {path: {owner, ts, ttl}} of currently
+    held claims. Corrupt lines are skipped (a partial append must never crash a reader)."""
     now = time.time() if now is None else now
     p = _board_claims_path(session_id)
-    live = {}
     try:
         raw = p.read_text()
     except OSError:
-        return live
+        return {}
+    # Gather per path: all claim records + every release (owner, ts).
+    claims = {}     # path -> [rec, ...]
+    releases = {}   # path -> [(owner, ts), ...]
     for line in raw.splitlines():
         line = line.strip()
         if not line:
@@ -6078,27 +6084,37 @@ def _board_read_claims(session_id, now=None):
         if not path:
             continue
         if rec.get("action") == "release":
-            live.pop(path, None)
-            continue
-        ttl = rec.get("ttl", _BOARD_CLAIM_TTL)
-        if rec.get("ts", 0) + ttl <= now:
-            live.pop(path, None)          # expired -> not held
-            continue
-        live[path] = {"owner": rec.get("owner"), "ts": rec.get("ts", 0), "ttl": ttl}
+            releases.setdefault(path, []).append((rec.get("owner"), rec.get("ts", 0)))
+        else:
+            claims.setdefault(path, []).append(rec)
+    live = {}
+    for path, recs in claims.items():
+        rel = releases.get(path, [])
+        for rec in recs:                                   # recs are in file (append) order
+            ts = rec.get("ts", 0)
+            ttl = rec.get("ttl", _BOARD_CLAIM_TTL)
+            owner = rec.get("owner")
+            if ts + ttl <= now:
+                continue                                   # expired -> yields to a later claim
+            if any(ro == owner and rts >= ts for ro, rts in rel):
+                continue                                   # released by its own owner
+            live[path] = {"owner": owner, "ts": ts, "ttl": ttl}
+            break                                          # first live claim in file order wins
     return live
 
 
 def _board_claim(session_id, path, owner, ttl=_BOARD_CLAIM_TTL, now=None):
-    """Try to claim `path` for `owner` (first-claim-wins). Appends a claim record IFF the
-    path is free (no live claim, or the live claim is already this owner's = refresh).
-    Returns (ok, holder): ok True + holder=owner on success; ok False + holder=<other
-    owner> when another live claim blocks it. Append-only + atomic single write, so two
-    racing claimers are resolved by read-back (the loser sees the winner's record)."""
+    """Try to claim `path` for `owner` (first-claim-wins). Appends a claim record when the
+    path looks free (no live claim, or the live claim is already this owner's = refresh),
+    then READS BACK and lets the deterministic reduction (first live claim in file order)
+    pick the winner - so N truly-concurrent claimers who all append still resolve to exactly one
+    holder, and a loser is told who won. Returns (ok, holder): ok True + holder=owner when
+    this owner is the resolved winner; ok False + holder=<winner> otherwise. The append-only
+    log + deterministic read-back IS the arbiter (no lock, no daemon)."""
     now = time.time() if now is None else now
-    live = _board_read_claims(session_id, now=now)
-    held = live.get(path)
+    held = _board_read_claims(session_id, now=now).get(path)
     if held and held.get("owner") != owner:
-        return False, held.get("owner")
+        return False, held.get("owner")                    # already lost before we even wrote
     d = _board_dir(session_id)
     try:
         d.mkdir(parents=True, exist_ok=True)
@@ -6107,7 +6123,11 @@ def _board_claim(session_id, path, owner, ttl=_BOARD_CLAIM_TTL, now=None):
             f.write(json.dumps(rec) + "\n")
     except OSError:
         return False, None
-    return True, owner
+    # Read back and resolve: a concurrent claimer with an earlier ts wins the path.
+    winner = _board_read_claims(session_id, now=now).get(path, {}).get("owner")
+    if winner == owner:
+        return True, owner
+    return False, winner
 
 
 def _board_release(session_id, path, owner, now=None):
