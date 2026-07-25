@@ -135,6 +135,11 @@ TOOL = {
                                     "host is prompted ONCE here - a worker can't answer prompts."},
             "cwd": {"type": "string",
                     "description": "Optional working directory (defaults to current)."},
+            "iterations": {"type": "integer",
+                           "description": "For action='resume' only: grant the resumed worker a "
+                                          "FRESH max tool-call budget. Use it when the worker died "
+                                          "by hitting its iteration cap (else it just hits the same "
+                                          "cap again). Omit to reuse the original budget."},
             "leash": {"type": "string", "enum": ["r", "rw", "rwe"], "default": "r",
                       "description": "Worker capability: r=read-only (default), rw=edit, rwe=edit+run. "
                                      "Capped at your own leash."},
@@ -330,7 +335,8 @@ def run(args, cwd):
     if action == "add_note":
         return _worker_add_note(args.get("pid"), args.get("notes") or args.get("text"))
     if action == "resume":
-        return _worker_resume(args.get("pid"), args.get("text") or args.get("task"), cwd)
+        return _worker_resume(args.get("pid"), args.get("text") or args.get("task"), cwd,
+                              iterations=args.get("iterations"))
     if action in ("board_claim", "board_release", "board_list"):
         return _worker_board(action, args.get("text") or args.get("task"))
     if action != "dispatch":
@@ -996,14 +1002,17 @@ def _worker_add_note(pid, text):
             f"reasoning step (not an interrupt). Confirm with action='status'.")
 
 
-def _worker_resume(pid, text, cwd):
+def _worker_resume(pid, text, cwd, iterations=None):
     """RELAUNCH a worker that DIED without finishing (max_iterations / lease-kill / crash /
     stopped incomplete), reloading its transcript checkpoint so it continues from where it
-    left off instead of cold. `text` is a fresh steer (what to fix/do next). Returns a NEW
-    pid (the old process is dead - resume is a new OS process; lineage is tracked via
-    meta['resumed_from']). Requirements: the worker was dispatched with worker_checkpoint
-    on (so a '<brief>.checkpoint' exists), it is NOT still running (use inject for that),
-    and it has not already delivered a result (that stands - dispatch fresh instead)."""
+    left off instead of cold. `text` is a fresh steer (what to fix/do next). `iterations`
+    (optional) grants the resumed worker a FRESH max_iterations budget - important when the
+    worker died BY hitting its cap, or it would just hit the same cap again; absent = reuse
+    the original grant's budget. Returns a NEW pid (the old process is dead - resume is a
+    new OS process; lineage is tracked via meta['resumed_from']). Requirements: the worker
+    was dispatched with worker_checkpoint on (so a '<brief>.checkpoint' exists), it is NOT
+    still running (use inject for that), and it has not already delivered a result (that
+    stands - dispatch fresh instead)."""
     workers = _H["workers"]
     if pid is None:
         return "error: action='resume' needs a pid (which dead worker to relaunch)."
@@ -1045,8 +1054,21 @@ def _worker_resume(pid, text, cwd):
         return f"error: cannot read worker {pid}'s brief to resume it: {e}"
     grant = _H["_extract_marked"](orig, _H["GRANT_MARK"]) or ""
     B, G, RM = _H["BRIEF_MARK"], _H["GRANT_MARK"], _H["RESUME_MARK"]
+    # Optionally bump the iteration budget (a worker that died ON its cap needs a bigger
+    # one, or it dies on it again). Strip the old max_iterations line and re-add it.
+    new_iter = None
+    if iterations is not None:
+        try:
+            new_iter = int(iterations)
+        except (TypeError, ValueError):
+            return f"error: bad iterations {iterations!r} (want an integer)."
+        if new_iter <= 0:
+            return "error: iterations must be a positive integer."
+    drop = ("checkpoint:",) + (("max_iterations:",) if new_iter is not None else ())
     grant_lines = [l for l in grant.splitlines() if l.strip()
-                   and not l.strip().lower().startswith("checkpoint:")]
+                   and not l.strip().lower().startswith(drop)]
+    if new_iter is not None:
+        grant_lines.append(f"max_iterations: {new_iter}")
     grant_lines.append("checkpoint: 1")
     new_brief_text = "\n".join([
         f"{B}\n{steer}\n{B}",
@@ -1054,6 +1076,10 @@ def _worker_resume(pid, text, cwd):
         f"{RM}\n{ckpt}\n{RM}"]) + "\n"
 
     wdir = _workers_dir()
+    try:
+        wdir.mkdir(parents=True, exist_ok=True)   # may have been swept since dispatch
+    except OSError as e:
+        return f"error: cannot create workers dir: {e}"
     _H["_seq"] = _H.get("_seq", 0) + 1
     stamp = f"{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}-{_H['_seq']}"
     brief_file = wdir / f"{stamp}.brief"

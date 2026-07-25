@@ -19,10 +19,10 @@ schemas, truncated tool results. See README.md.
   L7089   Remote workspace (executor client, /connect)
   L8654   Context meter
   L8749   Agent (turn loop, context mgmt, tool dispatch)
-  L14434  Slash-command handlers + dispatch table
-  L14571  REPL (interactive loop, session resume)
-  L14946  Worker agent (headless --agent-run)
-  L15479  Entry (CLI arg parsing, main)
+  L14438  Slash-command handlers + dispatch table
+  L14575  REPL (interactive loop, session resume)
+  L14950  Worker agent (headless --agent-run)
+  L15508  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -10496,6 +10496,9 @@ class Agent:
     def _loop(self):
         # max_iterations <= 0 means unlimited (count up forever).
         cap = self.cfg.max_iterations
+        self._hit_iteration_cap = False   # set True below iff we stop ON the cap (not a
+                                          # natural finish) - a headless worker reads this
+                                          # to know it ran out of budget mid-task (resumable).
         i = 0
         while cap <= 0 or i < cap:
             i += 1
@@ -10624,6 +10627,7 @@ class Agent:
                     print(_tool_result_preview(name, result, cid))
                 self.messages.append(_tool_result_msg(name, result,
                                                       tool_call_id=call.get("id", "")))
+        self._hit_iteration_cap = True    # stopped on the budget, not a natural finish
         print(yellow(f"\n{GLYPH['warn']} hit {cap}-iteration cap; stopping this turn. "
                      f"Refine your request or continue, or raise the limit: "
                      f"/set -> max_iterations (0 = unlimited), or set "
@@ -15433,6 +15437,31 @@ def run_agent_brief(args) -> int:
                 f"{RESULT_MARK} block alone.")
         except Exception as e:
             return _fail(f"worker corrective turn failed: {e}")
+
+    # Ran out of iteration budget mid-task: the loop stopped ON the cap, not because the
+    # worker chose to finish. Do NOT rescue-nudge it into a RESULT (there's no budget left,
+    # and the last assistant line is a mid-step "now I'll increment it to 3:" that would be
+    # harvested as a bogus success), and do NOT write a normal result - that would report
+    # fake completion AND block a resume (which refuses a worker that "already finished").
+    # Instead, if checkpointing is on, leave NO result so the parent sees an incomplete
+    # worker it can action='resume'; else write an explicit INCOMPLETE result so the parent
+    # is told honestly rather than handed a lie.
+    if getattr(agent, "_hit_iteration_cap", False) and RESULT_MARK not in _final_asst_content():
+        if _do_checkpoint:
+            _write_checkpoint()   # flush the FINAL state (the _pre_iter copy is one round stale)
+            print(dim("agent-run: hit iteration cap mid-task; checkpoint left for resume "
+                      "(no result written)."))
+            return 2
+        try:
+            Path(resultf).write_text(
+                f"{RESULT_MARK}\nINCOMPLETE: the worker hit its {cfg.max_iterations}-iteration "
+                f"budget before finishing the task, and checkpointing was off so it cannot be "
+                f"resumed. Re-dispatch with a higher worker_max_iterations, or turn on "
+                f"worker_checkpoint to make such a worker resumable.\n{RESULT_MARK}\n")
+        except OSError as e:
+            return _fail(f"cannot write result file: {e}")
+        print(dim(f"agent-run: incomplete (iteration cap) -> {resultf}"))
+        return 2
 
     # Missing-RESULT rescue: the loop ends the moment the model emits an assistant
     # message with no tool call - but a worker sometimes stops on a bare "let me compile
