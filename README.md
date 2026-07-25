@@ -239,7 +239,13 @@ can drive reliably.
 - **Parallel background workers.** With a capable model, `dispatch_worker` hands a
   scoped sub-task to a headless worker agent that runs in the background on its own
   context, then reports just its result back, so the main session spends its window
-  on the plan, not the raw output. Run several at once.
+  on the plan, not the raw output. Run several at once. The parent (or you, via
+  `/worker`) can **steer a live worker** - inject a mid-task correction, replace its
+  plan, add notes - grant it **only the tools it needs** (least privilege), and seed
+  it with curated context. A worker that hits its limit, times out, or crashes can be
+  **resumed** from a saved transcript (turn on `worker_checkpoint`) instead of
+  restarted cold, and peers working one repo coordinate through a **shared claim
+  board** so two of them never edit the same file.
 - **Any tool can return an image.** On a vision-capable model, a tool result can
   carry a picture (a screenshot, a rendered chart, a diff image) and lean-coder
   feeds it to the model the right way for each backend (Anthropic, OpenAI, Gemini).
@@ -382,7 +388,7 @@ on with `/tools` and it costs context only from that point. These ship bundled i
 
 | Lean-tool         | Adds |
 |-------------------|------|
-| `dispatch_worker` | Hand a scoped sub-task to a background worker agent; collect its result. Adds `/worker` (list workers / `/worker <pid>` = full result / cancel). |
+| `dispatch_worker` | Hand a scoped sub-task to a background worker agent; collect its result. Steer a running worker (inject / set its plan / add notes), grant it a narrowed toolset, seed it with context/plan/notes, and (with `worker_checkpoint` on) **resume** a worker that died without finishing from its saved transcript. Adds `/worker` (list / `<pid>` = full result / cancel / inject / set_plan / add_note / resume / board). |
 | `web_fetch`       | Read a URL as clean text. |
 | `web_screenshot`  | Screenshot a URL with a headless browser + return the page text (and, on a vision model, the image itself). **Needs [Playwright](https://playwright.dev/python/) + a browser** (`pip install playwright && playwright install firefox`); says so if absent. Disabled by default. |
 | `brave_search`    | Web search (Brave API). |
