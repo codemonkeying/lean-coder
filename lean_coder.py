@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L908    Lean-tools (plugin tools: discovery, manager)
-  L1248   MCP client (connection, manager, OAuth, discovery)
-  L1702   Providers (backend plugin registry)
-  L1924   Interactive pickers + menus (raw-mode UI engine)
-  L2273   Terminal styling (colors, formatting helpers)
-  L2470   Streaming + markdown render (model output)
-  L2817   Composer (pinned input line, editor, stdin)
-  L3667   Token accounting (calibrated context meter)
-  L3832   Config (dataclass, field registry, load/save)
-  L6512   Tool execution + text tool-call parsing
-  L6933   Remote workspace (executor client, /connect)
-  L8498   Context meter
-  L8593   Agent (turn loop, context mgmt, tool dispatch)
-  L14277  Slash-command handlers + dispatch table
-  L14414  REPL (interactive loop, session resume)
-  L14789  Worker agent (headless --agent-run)
-  L15249  Entry (CLI arg parsing, main)
+  L909    Lean-tools (plugin tools: discovery, manager)
+  L1249   MCP client (connection, manager, OAuth, discovery)
+  L1703   Providers (backend plugin registry)
+  L1925   Interactive pickers + menus (raw-mode UI engine)
+  L2274   Terminal styling (colors, formatting helpers)
+  L2471   Streaming + markdown render (model output)
+  L2818   Composer (pinned input line, editor, stdin)
+  L3668   Token accounting (calibrated context meter)
+  L3833   Config (dataclass, field registry, load/save)
+  L6518   Tool execution + text tool-call parsing
+  L6939   Remote workspace (executor client, /connect)
+  L8504   Context meter
+  L8599   Agent (turn loop, context mgmt, tool dispatch)
+  L14284  Slash-command handlers + dispatch table
+  L14421  REPL (interactive loop, session resume)
+  L14796  Worker agent (headless --agent-run)
+  L15322  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -289,6 +289,7 @@ PLAN_MARK = "===PLAN==="            # the model wraps its pinned goal + TODO in 
 BRIEF_MARK = "===BRIEF==="          # a worker's task (its first user turn) - see --agent-run
 GRANT_MARK = "===GRANT==="          # a worker's grant header (leash/model/cwd/limits)
 RESULT_MARK = "===RESULT==="        # a worker wraps its final answer in these; the parent harvests it
+RESUME_MARK = "===RESUME==="        # a resumed worker's brief carries the checkpoint path here (see action='resume')
 # Optional seed blocks a parent may include in a worker's brief to hand it curated
 # STATE (not whole context): starting plan, episodic notes, shared-context blob. All
 # bounded by the dispatch tool so "share state, not context" holds. See run_agent_brief.
@@ -4074,6 +4075,10 @@ class Config:
                                      # default 1 = fan-out only, a worker can't spawn (today's limit)
     worker_max_children: int = 0     # dispatch_worker: max children ANY single worker may spawn
                                      # (0 = none). Only bites once max_depth > 1 permits recursion.
+    worker_checkpoint: bool = False  # dispatch_worker: when on, a worker checkpoints its transcript
+                                     # to a '<brief>.checkpoint' sidecar each iteration so a dead/
+                                     # timed-out worker can be RELAUNCHED with action='resume'
+                                     # (opt-in; off = today's behaviour, no checkpoint file).
     worker_depth: int = 0            # INTERNAL: this process's depth in the tree (driver=0,
                                      # its workers=1, ...). Set from the grant in run_agent_brief;
                                      # NOT a user knob (not in _ROUNDTRIP / /settings).
@@ -4337,6 +4342,7 @@ _SCALAR_FIELDS = (
     ("worker_max_iterations",     30,                  True),
     ("worker_max_depth",          1,                   True),
     ("worker_max_children",       0,                   True),
+    ("worker_checkpoint",         False,               True),
     ("approval",                  "ask",               False),
     ("confirm_reads",             False,               False),
     ("auto_reconnect",            False,               False),
@@ -5915,7 +5921,7 @@ def _worker_brief_from_cmd(cmd):
 _WORKER_SIDECAR_SUFFIXES = (".brief", ".result", ".brief.progress",
                             ".brief.inject", ".brief.injects.log",
                             ".brief.plan", ".brief.note", ".brief.planview",
-                            ".brief.usage")
+                            ".brief.usage", ".brief.checkpoint", ".brief.checkpoint.tmp")
 
 
 def _clean_worker_sidecars(brief):
@@ -11244,6 +11250,7 @@ _SETTINGS_FIELDS = [
     ("worker_max_iterations", "max tool-call rounds per worker", "int"),
     ("worker_max_depth", "max worker tree depth (1 = fan-out only, no recursion)", "int"),
     ("worker_max_children", "max children any one worker may spawn (0 = none)", "int"),
+    ("worker_checkpoint", "checkpoint a worker's transcript so a dead one can be resumed", "bool"),
     ("editor", "editor (for /prompt)", "str"),
     ("user_name", "your name on your own turn in scrollback", "str"),
     ("approval", "approval mode", tuple(APPROVAL_MODES)),
@@ -14825,6 +14832,10 @@ def run_agent_brief(args) -> int:
     seed_plan = _extract_marked(raw, SEED_PLAN_MARK) or ""
     seed_notes = _extract_marked(raw, SEED_NOTES_MARK) or ""
     seed_context = _extract_marked(raw, SEED_CONTEXT_MARK) or ""
+    # Resume: a dead worker's transcript checkpoint path (action='resume'). When present,
+    # the worker RELOADS that transcript below and runs `brief` as a fresh steer turn on
+    # top of it, instead of starting cold. Absent -> a normal cold start (default).
+    resume_ckpt = (_extract_marked(raw, RESUME_MARK) or "").strip()
 
     # Build the worker's config from CLI + grant (grant wins - it's the parent's grant).
     cfg = load_config(args)
@@ -15011,6 +15022,14 @@ def run_agent_brief(args) -> int:
     # copy via set_plan - i.e. edit, not just blind overwrite. Read-only view; the .plan
     # sidecar is the write channel.
     _planview_path = Path(str(brief_file) + ".planview")
+    # Transcript checkpoint (opt-in via the grant's 'checkpoint: 1'). When on, the worker
+    # dumps agent.messages to <brief>.checkpoint each iteration so a dead/timed-out/crashed
+    # worker can be RELAUNCHED with action='resume' (it reloads this transcript). Off ->
+    # no file written (today's behaviour). A resumed worker always gets it re-enabled (its
+    # brief carries checkpoint:1) so it can be resumed again. Registered in
+    # _WORKER_SIDECAR_SUFFIXES so every reap path sweeps it (zero trace).
+    _do_checkpoint = bool(grant.get("checkpoint"))
+    _checkpoint_path = Path(str(brief_file) + ".checkpoint")
     _wstart = time.time()
     _witer = {"n": 0}
     _intent_cache = {"v": ""}   # the first assistant prose line; set once, never changes
@@ -15146,16 +15165,70 @@ def run_agent_brief(args) -> int:
         except Exception:
             pass
 
+    def _write_checkpoint():
+        # Dump the live transcript so a dead worker can be resumed (action='resume').
+        # Atomic (tmp + replace) so a crash mid-write can't leave a truncated JSON that
+        # would poison a resume. Best-effort - a serialisation hiccup never kills the run.
+        if not _do_checkpoint:
+            return
+        try:
+            payload = {"messages": agent.messages,
+                       "pinned_plan": getattr(agent, "pinned_plan", "") or "",
+                       "notes": getattr(agent, "notes", []) or []}
+            tmp = Path(str(_checkpoint_path) + ".tmp")
+            tmp.write_text(json.dumps(payload))
+            tmp.replace(_checkpoint_path)
+        except Exception:
+            pass
+
     def _pre_iter():
         _witer["n"] += 1
         _drain_injects()
         _drain_plan()
         _drain_notes()
         _write_progress()
+        _write_checkpoint()
     agent._pre_iter_hook = _pre_iter
 
+    # RESUME: reload a dead worker's transcript checkpoint (written by a prior run's
+    # _write_checkpoint) so this relaunch continues WITH the prior work rather than cold.
+    # We replace the message body (keeping a FRESH system prompt - this build's, in case it
+    # changed) with the checkpoint's non-system turns, restore the pinned plan + notes, heal
+    # any dangling tool pair (a checkpoint taken mid-tool-batch), then run `brief` as a
+    # steer turn on top. A missing/corrupt checkpoint falls back to a cold start (never
+    # fatal - a resume must not be worse than a fresh dispatch).
+    first_turn = preamble
+    if resume_ckpt:
+        try:
+            data = json.loads(Path(resume_ckpt).read_text())
+            body = [m for m in data.get("messages", []) if m.get("role") != "system"]
+            if body:
+                agent.messages = [{"role": "system", "content": agent._system()}] + body
+                agent.messages = repair_tool_pairs(agent.messages)
+                if data.get("pinned_plan"):
+                    agent.pinned_plan = data["pinned_plan"]
+                if data.get("notes"):
+                    agent.notes = data["notes"]
+                # On a resume the transcript already carries the original task + all prior
+                # work, so the first turn is just the parent's steer (not the full preamble).
+                first_turn = (
+                    "[resume] You are being RESUMED: your prior transcript above is your own "
+                    "earlier work on this task (it ended before you wrote your "
+                    f"{RESULT_MARK} block - you hit a limit, were stopped, or crashed). "
+                    "Continue from where you left off. The same rules apply: keep working via "
+                    f"tool calls, and when finished write your final answer between two "
+                    f"{RESULT_MARK} markers as a message with no tool call.\n\n"
+                    "STEER FROM THE AGENT THAT RESUMED YOU (outranks your prior plan where "
+                    f"they conflict):\n{brief}")
+                print(dim(f"agent-run: resumed from checkpoint ({len(body)} prior messages)"))
+            else:
+                print(yellow("agent-run: resume checkpoint had no usable messages; "
+                             "starting cold."))
+        except Exception as e:
+            print(yellow(f"agent-run: could not load resume checkpoint ({e}); starting cold."))
+
     try:
-        agent.run_turn(preamble)
+        agent.run_turn(first_turn)
     except Exception as e:
         return _fail(f"worker run failed: {e}")
 
