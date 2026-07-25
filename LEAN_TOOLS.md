@@ -357,8 +357,19 @@ How it works (it piggybacks the background-task machinery, no new transport):
 
 - The model calls `dispatch_worker(task=..., [model=...], [provider=...], [cwd=...],
   [leash=...], [host=...])` to launch one. The same tool also manages workers via
-  `action`: `action='status'` reports dispatched workers, `action='cancel'` (with
-  `pid=...`) kills one; the default `action='dispatch'` launches from `task`.
+  `action`: `action='models'` lists the models you can dispatch on (per provider, so
+  you can pick a cheap leaf model without guessing an id), `action='status'` reports
+  dispatched workers, `action='cancel'` (with `pid=...`) kills one; the default
+  `action='dispatch'` launches from `task`.
+- **A worker does not self-compact.** Its context is deliberately *not* auto-managed
+  (`run_agent_brief` forces `auto_compact` off): a worker runs one scoped brief, so
+  the compaction/handover machinery - built for a long, evolving *driver* session -
+  does not apply. A worker that runs long simply hits its iteration cap and, rather
+  than lie, writes an `INCOMPLETE` result (or, with `worker_checkpoint` on, leaves a
+  transcript the driver can `action='resume'` with fresh budget). Checkpoint + resume
+  *is* the worker's equivalent of compaction: the driver, not the worker, decides to
+  extend it. So keep a worker's task scoped; hand a genuinely large job out as a DAG
+  of smaller tasks on a `board` instead of one worker that outgrows its window.
 - The tool writes a **brief file** (the task + a grant header) and launches
   `lean_coder --agent-run` as a detached background task tagged `kind="worker"`,
   with a **lease** (it self-terminates if this session stops attending it, so a

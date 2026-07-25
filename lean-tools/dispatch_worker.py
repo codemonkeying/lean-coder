@@ -74,14 +74,17 @@ TOOL = {
         "type": "object",
         "properties": {
             "action": {"type": "string",
-                       "enum": ["dispatch", "status", "result", "cancel", "inject",
+                       "enum": ["dispatch", "models", "status", "result", "cancel", "inject",
                                 "set_plan", "add_note", "resume", "board_claim",
                                 "board_release", "board_list"],
                        "default": "dispatch",
                        "description": "What to do (default 'dispatch'): 'dispatch' launches a "
-                                      "new worker from `task`; 'status' reports your dispatched "
+                                      "new worker from `task`; 'models' lists the models you can "
+                                      "dispatch on (per provider) so you can pick a cheap leaf "
+                                      "model; 'status' reports your dispatched "
                                       "workers (state, runtime, whether a result is ready); "
                                       "'result' (pid=) returns a worker's FULL result untruncated "
+                                      "(the auto finish notice truncates a long one); 'cancel' "
                                       "(the auto finish notice truncates a long one); 'cancel' "
                                       "kills the worker named by `pid`; 'inject' (pid=, text=) "
                                       "sends a mid-task correction/steer to a RUNNING worker - it "
@@ -335,6 +338,8 @@ def run(args, cwd):
     action = (args.get("action") or "dispatch").strip().lower()
     if action == "status":
         return _worker_status(args.get("pid"))
+    if action == "models":
+        return _worker_models()
     if action == "result":
         return _worker_result(args.get("pid"))
     if action == "cancel":
@@ -351,9 +356,9 @@ def run(args, cwd):
     if action in ("board_claim", "board_release", "board_list"):
         return _worker_board(action, args.get("text") or args.get("task"))
     if action != "dispatch":
-        return ("error: unknown action %r (use dispatch | status | result | cancel | "
-                "inject | set_plan | add_note | resume | board_claim | board_release | "
-                "board_list)." % action)
+        return ("error: unknown action %r (use dispatch | models | status | result | "
+                "cancel | inject | set_plan | add_note | resume | board_claim | "
+                "board_release | board_list)." % action)
     task = (args.get("task") or "").strip()
     if not task:
         return "error: dispatch_worker action='dispatch' needs a non-empty task."
@@ -846,6 +851,37 @@ def _worker_status(pid=None):
     return "\n".join(out)
 
 
+def _worker_models():
+    """List the models available to dispatch a worker on, grouped by enabled provider,
+    so the driver can pick a cheap leaf model without guessing an exact id. Honours the
+    operator worker-model allowlist when one is set. Read-only, no side effects."""
+    pmodels = _H.get("enabled_provider_models", lambda: {})()
+    if not pmodels:
+        return ("no enabled providers report models (a remote-brain ollama worker can "
+                "still be dispatched with brain_host= + model=).")
+    allow = _model_allowlist()
+    cur = getattr(_H.get("cfg"), "model", "") or ""
+    lines = [_H["bold"]("models you can dispatch a worker on:")]
+    for prov, models in pmodels.items():
+        models = list(models or [])
+        if allow:
+            models = [m for m in models if m in allow]
+        head = _H["cyan"](prov)
+        if not models:
+            lines.append(f"  {head}: (none available)")
+            continue
+        lines.append(f"  {head}:")
+        for m in models:
+            tag = _H["dim"]("  (current default)") if m == cur else ""
+            lines.append(f"    {m}{tag}")
+    lines.append(_H["dim"]("dispatch with model=<id> (provider= only if the id is on "
+                           "more than one). Omit model= to use your current default."))
+    if allow:
+        lines.append(_H["dim"](f"note: operator allowlist active - only these are grantable."))
+    return "\n".join(lines)
+
+
+
 def _worker_result(pid):
     """MODEL-facing full result (the tool's action='result'): return a worker's
     COMPLETE ===RESULT=== block, untruncated. The turn-rider finish notice caps the
@@ -1220,6 +1256,7 @@ def _worker_cmd(agent, cfg, arg):
       /worker add_note <pid> <note>  add a note to a running worker's notebook
       /worker resume <pid> <steer>   relaunch a DEAD worker from its saved transcript
       /worker board                  show the shared swarm board's held file claims
+      /worker models                 list the models you can dispatch a worker on
     Subcommands reuse the same helpers the tool uses, so the human and the model see
     identical behaviour."""
     workers = _H["workers"]
@@ -1234,6 +1271,9 @@ def _worker_cmd(agent, cfg, arg):
     # Subcommands (parity with the model tool). A bare pid stays the result shortcut.
     if parts and parts[0].lower() == "board":
         print(_worker_board("board_list", None))
+        return
+    if parts and parts[0].lower() == "models":
+        print(_worker_models())
         return
     if parts and parts[0].lower() in ("status", "cancel", "result", "inject",
                                       "set_plan", "add_note", "resume"):
@@ -1322,7 +1362,7 @@ def _worker_completer(agent, cfg):
     """Tab-completion for /worker's first argument: the subcommand verbs plus every
     live worker pid (so `cancel <Tab>` / a bare `<Tab>` offers real pids). Matches the
     menu contract of other multi-verb commands (e.g. /mcp)."""
-    opts = ["status", "result", "cancel", "inject", "set_plan", "add_note", "resume", "board"]
+    opts = ["status", "result", "cancel", "inject", "set_plan", "add_note", "resume", "board", "models"]
     opts += [str(pid) for pid in _H.get("workers", {})]
     return opts
 
