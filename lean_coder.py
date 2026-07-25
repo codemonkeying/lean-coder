@@ -15,14 +15,14 @@ schemas, truncated tool results. See README.md.
   L2817   Composer (pinned input line, editor, stdin)
   L3667   Token accounting (calibrated context meter)
   L3832   Config (dataclass, field registry, load/save)
-  L6393   Tool execution + text tool-call parsing
-  L6814   Remote workspace (executor client, /connect)
-  L8379   Context meter
-  L8474   Agent (turn loop, context mgmt, tool dispatch)
-  L14156  Slash-command handlers + dispatch table
-  L14293  REPL (interactive loop, session resume)
-  L14668  Worker agent (headless --agent-run)
-  L15012  Entry (CLI arg parsing, main)
+  L6394   Tool execution + text tool-call parsing
+  L6815   Remote workspace (executor client, /connect)
+  L8380   Context meter
+  L8475   Agent (turn loop, context mgmt, tool dispatch)
+  L14157  Slash-command handlers + dispatch table
+  L14294  REPL (interactive loop, session resume)
+  L14669  Worker agent (headless --agent-run)
+  L15060  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -5802,7 +5802,8 @@ def _worker_brief_from_cmd(cmd):
 # this, so a NEW sidecar is added in ONE place and can never be half-registered (a
 # missed suffix would leak the file past every reap = a trace + unbounded growth).
 _WORKER_SIDECAR_SUFFIXES = (".brief", ".result", ".brief.progress",
-                            ".brief.inject", ".brief.injects.log")
+                            ".brief.inject", ".brief.injects.log",
+                            ".brief.plan", ".brief.note")
 
 
 def _clean_worker_sidecars(brief):
@@ -14856,9 +14857,15 @@ def run_agent_brief(args) -> int:
     # and appends it as a user turn, so an operator/parent mid-task message lands on the
     # worker's next think without interrupting a running tool call. Sidecar lives beside the
     # brief file (driver-side, even for a remote worker). Consumption is logged to
-    # '<brief>.injects.log' so status can confirm delivery. Best-effort; never raises.
     _inject_path = Path(str(brief_file) + ".inject")
     _inject_log = Path(str(brief_file) + ".injects.log")
+    _progress_path = Path(str(brief_file) + ".progress")
+    # Live-steer sidecars, drained alongside .inject each iteration: a .plan replaces the
+    # worker's pinned plan (agent._update_plan), a .note appends notebook entries
+    # (agent._note). Written by dispatch_worker action='set_plan'/'add_note'. Same
+    # best-effort, never-raise contract as inject; consumption logged to .injects.log.
+    _plan_path = Path(str(brief_file) + ".plan")
+    _note_path = Path(str(brief_file) + ".note")
     _progress_path = Path(str(brief_file) + ".progress")
     _wstart = time.time()
     _witer = {"n": 0}
@@ -14883,6 +14890,45 @@ def run_agent_brief(args) -> int:
             except OSError:
                 pass
 
+    def _drain_plan():
+        # A parent set_plan: the LAST written plan wins (it's a full replacement, not a
+        # queue), so read, delete, apply once. Empty payload clears the pinned plan.
+        try:
+            if not _plan_path.exists():
+                return
+            raw = _plan_path.read_text()
+            _plan_path.unlink()
+        except OSError:
+            return
+        blocks = [b for b in raw.split("\0") if b.strip()]
+        plan = blocks[-1].strip() if blocks else ""
+        try:
+            agent._update_plan(plan)
+            with _inject_log.open("a") as f:
+                f.write(f"{int(time.time())} plan set: {plan[:120]}\n")
+        except Exception:
+            pass
+
+    def _drain_notes():
+        # A parent add_note: append each queued note to the worker's notebook (tagged so
+        # it reads them as handed down, not self-recorded). Multiple notes may be queued.
+        try:
+            if not _note_path.exists():
+                return
+            raw = _note_path.read_text()
+            _note_path.unlink()
+        except OSError:
+            return
+        for block in raw.split("\0"):
+            msg = block.strip()
+            if not msg:
+                continue
+            try:
+                agent._note({"action": "add", "text": "parent: " + msg})
+                with _inject_log.open("a") as f:
+                    f.write(f"{int(time.time())} note added: {msg[:120]}\n")
+            except Exception:
+                pass
     def _write_progress():
         # Deterministic heartbeat (facts the harness already has - zero tokens, zero
         # model cooperation): iteration N, elapsed, the last tool it ran, and its stated
@@ -14923,6 +14969,8 @@ def run_agent_brief(args) -> int:
     def _pre_iter():
         _witer["n"] += 1
         _drain_injects()
+        _drain_plan()
+        _drain_notes()
         _write_progress()
     agent._pre_iter_hook = _pre_iter
 
