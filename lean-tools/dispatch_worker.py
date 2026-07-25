@@ -44,10 +44,6 @@ from pathlib import Path
 
 # Built-in ceiling defaults (last resort: env var > live cfg > this - see docstring).
 _DEFAULTS = {"max_concurrent": 10, "idle_timeout": 1800, "max_iterations": 30}
-# Size cap (chars) per seed block (context/plan/notes). The point is to share curated
-# STATE, not smuggle the parent's whole context into a worker - an oversized seed is
-# truncated (with a marker) rather than passed whole. Generous but bounded.
-_SEED_CAP = 4000
 _ENV = {"max_concurrent": "LEANCODER_WORKER_MAX_CONCURRENT",
         "idle_timeout": "LEANCODER_WORKER_IDLE_TIMEOUT",
         "max_iterations": "LEANCODER_WORKER_MAX_ITER"}
@@ -126,16 +122,17 @@ TOOL = {
             "context": {"type": "string",
                         "description": "Optional CURATED background the worker needs but that "
                                        "isn't the task itself (e.g. 'the auth module was just "
-                                       "refactored; tokens now live in x'). Share STATE, not your "
-                                       "whole context - keep it short; it is size-capped."},
+                                       "refactored; tokens now live in x'). Share the STATE it "
+                                       "needs, not your whole transcript - but give it as much as "
+                                       "the job genuinely requires (an emergency brief may need a "
+                                       "lot; it is not truncated)."},
             "plan": {"type": "string",
                      "description": "Optional starting plan for the worker (GOAL + a '- [ ]' TODO "
                                     "list) - seeds its pinned plan so it begins with your goal "
-                                    "decomposition instead of cold. Size-capped."},
+                                    "decomposition instead of cold."},
             "notes": {"type": "string",
                       "description": "Optional seed notes for the worker's notebook, one per line "
-                                     "(your relevant findings). They are tagged as coming from you. "
-                                     "Size-capped."},
+                                     "(your relevant findings). They are tagged as coming from you."},
         },
         "required": [],
     },
@@ -207,9 +204,10 @@ def _compose_brief(task, model, cwd, max_iter, leash="r", provider="", brain_hos
     `brain_host` (optional) is an ollama inference endpoint for the worker's BRAIN,
     distinct from where its tools run; absent = the driver's own host. `tools`
     (optional) is a comma-separated allowlist of tool names; absent = full toolset.
-    `context`/`plan`/`notes` (optional, size-bounded by the caller) seed the worker
-    with curated STATE - a background blob, a starting plan, notebook entries - each
-    emitted as its own marker block the worker parses in run_agent_brief."""
+    `context`/`plan`/`notes` (optional) seed the worker with curated STATE - a
+    background blob, a starting plan, notebook entries - each emitted as its own marker
+    block the worker parses in run_agent_brief. Not truncated: the parent decides how
+    much state the job needs."""
     B, G = _H["BRIEF_MARK"], _H["GRANT_MARK"]
     grant = [f"leash: {leash}", f"cwd: {cwd}", f"max_iterations: {max_iter}"]
     if model:
@@ -383,17 +381,14 @@ def run(args, cwd):
                             f"{', '.join(sorted(parent_tools))}.")
             tools_csv = ",".join(want_tools)
 
-    # Optional seed STATE (curated background, starting plan, notebook lines). Each is
-    # size-capped so a worker gets shared STATE, not the parent's whole context. An
-    # oversized block is truncated with a visible marker rather than rejected.
-    def _bounded(key):
-        v = (args.get(key) or "").strip()
-        if len(v) > _SEED_CAP:
-            v = v[:_SEED_CAP] + "\n...[truncated at seed cap]"
-        return v
-    seed_context = _bounded("context")
-    seed_plan = _bounded("plan")
-    seed_notes = _bounded("notes")
+    # Optional seed STATE the parent curated: a background blob, a starting plan, and
+    # notebook lines. NOT size-capped - "share state, not context" is a discipline for
+    # the parent to exercise, not something to enforce by clipping the payload to a
+    # useless state (an emergency brief may legitimately need a lot of context; a hard
+    # cap could silently truncate the one step that matters). Passed through whole.
+    seed_context = (args.get("context") or "").strip()
+    seed_plan = (args.get("plan") or "").strip()
+    seed_notes = (args.get("notes") or "").strip()
     max_iter = _ceiling("max_iterations")
     idle_timeout = _ceiling("idle_timeout")
     # Progress-staleness watchdog: bark (alert the parent), never bite. The worker bumps
