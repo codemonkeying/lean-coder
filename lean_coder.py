@@ -15,14 +15,14 @@ schemas, truncated tool results. See README.md.
   L2799   Composer (pinned input line, editor, stdin)
   L3649   Token accounting (calibrated context meter)
   L3814   Config (dataclass, field registry, load/save)
-  L6338   Tool execution + text tool-call parsing
-  L6759   Remote workspace (executor client, /connect)
-  L8324   Context meter
-  L8419   Agent (turn loop, context mgmt, tool dispatch)
-  L14060  Slash-command handlers + dispatch table
-  L14197  REPL (interactive loop, session resume)
-  L14572  Worker agent (headless --agent-run)
-  L14885  Entry (CLI arg parsing, main)
+  L6352   Tool execution + text tool-call parsing
+  L6773   Remote workspace (executor client, /connect)
+  L8338   Context meter
+  L8433   Agent (turn loop, context mgmt, tool dispatch)
+  L14074  Slash-command handlers + dispatch table
+  L14211  REPL (interactive loop, session resume)
+  L14586  Worker agent (headless --agent-run)
+  L14899  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -5753,17 +5753,27 @@ def _worker_brief_from_cmd(cmd):
     return None
 
 
+# A worker's on-disk sidecar family, as suffixes on the STAMP (the brief path minus
+# its '.brief'). The dispatch tool writes '<stamp>.brief' + '<stamp>.result'; the
+# worker loop adds the '.brief.progress' heartbeat and the '.brief.inject' /
+# '.brief.injects.log' inject files. SINGLE source of truth: both the family-nuker
+# (_clean_worker_sidecars) and the startup backstop sweep (_worker_dir_sweep) consume
+# this, so a NEW sidecar is added in ONE place and can never be half-registered (a
+# missed suffix would leak the file past every reap = a trace + unbounded growth).
+_WORKER_SIDECAR_SUFFIXES = (".brief", ".result", ".brief.progress",
+                            ".brief.inject", ".brief.injects.log")
+
+
 def _clean_worker_sidecars(brief):
-    """Unlink a worker's entire sidecar family given its '<stamp>.brief' path: the brief,
-    its .result, and the .progress/.inject/.injects.log heartbeat+inject files. Best-
-    effort; a missing file is fine."""
+    """Unlink a worker's entire sidecar family given its '<stamp>.brief' path (see
+    _WORKER_SIDECAR_SUFFIXES for the family). Best-effort; a missing file is fine."""
     if not brief:
         return
     b = str(brief)
-    base = b[:-len(".brief")] if b.endswith(".brief") else b
-    for p in (b, base + ".result", b + ".progress", b + ".inject", b + ".injects.log"):
+    stamp = b[:-len(".brief")] if b.endswith(".brief") else b
+    for suf in _WORKER_SIDECAR_SUFFIXES:
         try:
-            Path(p).unlink()
+            Path(stamp + suf).unlink()
         except OSError:
             pass
 
@@ -5816,9 +5826,13 @@ def _worker_dir_sweep(grace=3600):
         except OSError:
             continue
         _clean_worker_sidecars(str(f))
-    # Belt-and-braces: a stray .result/.progress/.inject/.injects.log whose .brief is
-    # already gone (partial prior cleanup) - drop it once aged out.
-    for suf in (".brief.injects.log", ".brief.inject", ".brief.progress", ".result"):
+    # Belt-and-braces: a stray non-brief sidecar (.result/.progress/.inject/.injects.log)
+    # whose .brief is already gone (partial prior cleanup) - drop it once aged out. Derived
+    # from _WORKER_SIDECAR_SUFFIXES (minus '.brief', the anchor above), longest-first so a
+    # '.brief.injects.log' strips fully before the shorter '.brief.inject' can mis-match.
+    strays = sorted((s for s in _WORKER_SIDECAR_SUFFIXES if s != ".brief"),
+                    key=len, reverse=True)
+    for suf in strays:
         for f in wdir.glob("*" + suf):
             stamp = f.name[:-len(suf)]
             if (wdir / (stamp + ".brief")).exists():
