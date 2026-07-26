@@ -17,12 +17,12 @@ schemas, truncated tool results. See README.md.
   L3874   Config (dataclass, field registry, load/save)
   L7009   Tool execution + text tool-call parsing
   L7430   Remote workspace (executor client, /connect)
-  L8995   Context meter
-  L9090   Agent (turn loop, context mgmt, tool dispatch)
-  L14779  Slash-command handlers + dispatch table
-  L14916  REPL (interactive loop, session resume)
-  L15291  Worker agent (headless --agent-run)
-  L15886  Entry (CLI arg parsing, main)
+  L9021   Context meter
+  L9116   Agent (turn loop, context mgmt, tool dispatch)
+  L14805  Slash-command handlers + dispatch table
+  L14942  REPL (interactive loop, session resume)
+  L15317  Worker agent (headless --agent-run)
+  L15912  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -8035,27 +8035,53 @@ class RemoteWorkspace:
         behaviour). All Windows commands are stdin-free (powershell -EncodedCommand /
         scp over its own channel), so the historic stdin-piped deadlock can't recur."""
         print(dim(f"connecting to {self.host} ..."))
-        with _stage("opening ssh", done="ssh ready") as _st:
-            _clear_master(self.host, self.ctl)     # drop any stale socket first
-            argv = _ssh_master_argv(self.host, self.ctl, batch=batch)
+        _clear_master(self.host, self.ctl)     # drop any stale socket first
+        argv = _ssh_master_argv(self.host, self.ctl, batch=batch)
+
+        def _classify_and_maybe_fallback(rc, err, st):
+            # Shared post-open handling for both modes. Nonzero rc that is unreachable/
+            # auth is fatal; anything else means "connected but the master didn't hold"
+            # (a Windows sshd that won't multiplex) -> per-call fallback.
+            if rc == 0:
+                return
+            kind, detail = _classify_ssh_probe(rc, "", err)
+            _clear_master(self.host, self.ctl)
+            if kind in ("unreachable", "auth"):
+                if st:
+                    st.done = "unreachable" if kind == "unreachable" else "auth failed"
+                raise ConnectionError(f"can't reach {self.host}: {detail}")
+            self.ctl = None                        # per-call fallback
+            if st:
+                st.done = "ssh ready (per-call)"
+
+        if batch:
+            # BATCH: no prompt can appear (BatchMode), so it is safe to run under the
+            # spinner and capture stderr for unreachable-vs-auth classification.
+            with _stage("opening ssh", done="ssh ready") as _st:
+                try:
+                    r = subprocess.run(argv, capture_output=True, text=True, timeout=30)
+                except subprocess.TimeoutExpired:
+                    _clear_master(self.host, self.ctl)
+                    raise ConnectionError(f"ssh connection to {self.host} timed out")
+                _classify_and_maybe_fallback(r.returncode, r.stderr, _st)
+        else:
+            # INTERACTIVE: ssh must OWN the terminal for its 'password:'/passphrase
+            # prompt AND the first-contact host-key question. Two things would break it:
+            #  1. capture_output would pipe ssh's stdio and swallow the prompt;
+            #  2. the _stage spinner rewrites column 0 every 0.12s and would stomp the
+            #     prompt line even when it reaches the tty.
+            # So the interactive open runs PLAINLY (no capture, no spinner). This is the
+            # fix for the b537592 regression where a password host looked hung then died
+            # on Ctrl-C. ssh prints its own error to the tty; a nonzero rc suffices.
+            print(dim("  opening ssh (you may be prompted for a password) ..."))
             try:
-                # capture_output so we can classify a failure from ssh's own stderr;
-                # an interactive password prompt still reaches the tty regardless.
-                r = subprocess.run(argv, capture_output=True, text=True,
-                                   timeout=30 if batch else None)
-            except subprocess.TimeoutExpired:
+                rc = subprocess.run(argv).returncode
+            except KeyboardInterrupt:
                 _clear_master(self.host, self.ctl)
-                raise ConnectionError(f"ssh connection to {self.host} timed out")
-            if r.returncode != 0:
-                kind, detail = _classify_ssh_probe(r.returncode, "", r.stderr)
-                _clear_master(self.host, self.ctl)
-                if kind in ("unreachable", "auth"):
-                    _st.done = "unreachable" if kind == "unreachable" else "auth failed"
-                    raise ConnectionError(f"can't reach {self.host}: {detail}")
-                # Connected + authed but the shared master didn't hold (a Windows
-                # sshd that won't multiplex): fall back to per-call connections.
-                self.ctl = None
-                _st.done = "ssh ready (per-call)"
+                raise ConnectionError(f"ssh connection to {self.host} cancelled")
+            _classify_and_maybe_fallback(rc, "", None)
+            print(dim(f"  {GLYPH.get('ok', 'v')} ssh ready"
+                      + ("" if self.ctl else " (per-call)")))
         # Master (or per-call fallback) is up. Detect the OS by running `uname` over
         # it - reuses the master when we have one (BatchMode, no re-auth).
         with _stage("probing host", done="probed") as _st:
