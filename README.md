@@ -177,7 +177,7 @@ actual code. lean-coder treats context as the scarce resource it is:
 
   | lean-tool | ~tokens | | lean-tool | ~tokens |
   |---|---|---|---|---|
-  | dispatch_worker | ~1225 | | web_screenshot | ~525 |
+  | dispatch_worker | ~1295 | | web_screenshot | ~525 |
   | board | ~505 | | shell_session | ~360 |
   | symbols | ~330 | | web_fetch | ~180 |
   | brave_search | ~165 | | ssh | ~140 |

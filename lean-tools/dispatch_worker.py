@@ -73,7 +73,8 @@ TOOL = {
         "properties": {
             "action": {"type": "string",
                        "enum": ["dispatch", "models", "status", "result", "transcript",
-                                "cancel", "inject", "set_plan", "add_note", "resume",
+                                "cancel", "pause", "pause_all", "stop_all", "resume",
+                                "resume_all", "inject", "set_plan", "add_note",
                                 "board_claim", "board_release", "board_list"],
                        "default": "dispatch",
                        "description": "Default 'dispatch' (launch from `task`). 'models'=list "
@@ -82,10 +83,14 @@ TOOL = {
                                       "(the finish notice truncates a long one). 'transcript' "
                                       "(pid=, [page=])=read the worker's OWN full reasoning/tool "
                                       "trail, paged (needs worker_checkpoint on). 'cancel' "
-                                      "(pid=)=kill it. Steer a RUNNING worker: 'inject' (text=) a "
-                                      "correction, 'set_plan' (plan=) replace its plan (omit plan "
-                                      "to READ it first), 'add_note' (notes=). 'resume' (pid=)="
-                                      "relaunch a DIED/capped worker from its checkpoint. "
+                                      "(pid=)=kill+discard it. FLEET lifecycle: 'pause' (pid=)="
+                                      "kill but KEEP its checkpoint so 'resume' (pid=) can "
+                                      "relaunch it later (also relaunches a DIED/capped worker); "
+                                      "'pause_all'/'stop_all'/'resume_all' ([taskboard=])=do it to "
+                                      "every worker (pause=resumable, stop=discarded), optionally "
+                                      "just one board's team. Steer a RUNNING worker: 'inject' "
+                                      "(text=) a correction, 'set_plan' (plan=) replace its plan "
+                                      "(omit plan to READ it first), 'add_note' (notes=). "
                                       "'board_claim'/'board_release' (text=<path>)/'board_list'="
                                       "shared-file mutex so peer workers don't clash (no-op for a "
                                       "lone worker)."},
@@ -304,6 +309,13 @@ def _self_argv():
     return f"{shlex.quote(sys.executable)} {shlex.quote(str(core))}"
 
 
+def _tb_arg(args):
+    """The optional taskboard scope for a fleet action (pause_all/stop_all/resume_all):
+    args['taskboard'] stripped, or None = all workers this session (unscoped)."""
+    tb = (args.get("taskboard") or "").strip()
+    return tb or None
+
+
 def run(args, cwd):
     if "bg_launch" not in _H:
         return ("error: dispatch_worker is not initialised (its setup() did not run; "
@@ -317,6 +329,14 @@ def run(args, cwd):
         return _worker_result(args.get("pid"))
     if action == "cancel":
         return _worker_cancel(args.get("pid"))
+    if action == "pause":
+        return _worker_pause(args.get("pid"))
+    if action == "pause_all":
+        return _worker_pause_all(_tb_arg(args))
+    if action == "stop_all":
+        return _worker_stop_all(_tb_arg(args))
+    if action == "resume_all":
+        return _worker_resume_all(cwd, _tb_arg(args))
     if action == "inject":
         return _worker_inject(args.get("pid"), args.get("text"), source="parent-agent")
     if action == "set_plan":
@@ -332,8 +352,9 @@ def run(args, cwd):
         return _worker_board(action, args.get("text") or args.get("task"))
     if action != "dispatch":
         return ("error: unknown action %r (use dispatch | models | status | result | "
-                "transcript | cancel | inject | set_plan | add_note | resume | "
-                "board_claim | board_release | board_list)." % action)
+                "transcript | cancel | pause | pause_all | stop_all | resume | resume_all | "
+                "inject | set_plan | add_note | board_claim | board_release | "
+                "board_list)." % action)
     task = (args.get("task") or "").strip()
     if not task:
         return "error: dispatch_worker action='dispatch' needs a non-empty task."
@@ -577,7 +598,7 @@ def run(args, cwd):
                                       "brief": str(brief_file),
                                       "checkpoint": do_checkpoint, "cmd": cmd,
                                       "launch_cwd": launch_cwd, "idle_timeout": idle_timeout,
-                                      "hb_timeout": hb_timeout}
+                                      "hb_timeout": hb_timeout, "taskboard": taskboard}
     mstr = model or "current model"
     lstr = {"r": "read-only", "rw": "read+write", "rwe": "read+write+exec"}.get(leash, leash)
     _H["workers"][launched["pid"]]["leash"] = leash
@@ -1022,6 +1043,134 @@ def _worker_cancel(pid):
             f"task: {meta['task'][:80]}")
 
 
+def _live_worker_pids(taskboard=None):
+    """pids of THIS session's workers that are still running (a bg row in 'running' state)
+    and have not delivered a result. Optionally narrowed to one taskboard (the fleet
+    gesture: 'pause the mining team'). Order: dispatch order (dict insertion)."""
+    workers = _H["workers"]
+    rows = _worker_rows()
+    out = []
+    for pid, meta in workers.items():
+        if taskboard is not None and meta.get("taskboard", "") != taskboard:
+            continue
+        if _read_result(meta["result"]) is not None:
+            continue
+        row = rows.get(pid)
+        if row is not None and row.get("state") != "running":
+            continue
+        out.append(pid)
+    return out
+
+
+def _pause_one(pid):
+    """PAUSE a running worker: kill its process but KEEP its transcript checkpoint so it
+    can be action='resume'd later. Writes a '<brief>.suspended' sentinel first (so the
+    reaper leaves the checkpoint intact - a paused worker is parked, not orphaned), then
+    SIGTERMs the pid. Requires worker_checkpoint (else there's nothing to resume from);
+    the worker checkpoints each iteration, so a checkpoint already exists on disk. Returns
+    (ok, message)."""
+    workers = _H["workers"]
+    meta = workers.get(pid)
+    if not meta:
+        return False, f"no worker with pid {pid} this session."
+    if _read_result(meta["result"]) is not None:
+        return False, f"worker {pid} already finished - nothing to pause (its result stands)."
+    if not meta.get("checkpoint"):
+        return False, (f"worker {pid} has checkpointing off, so it can't be paused+resumed "
+                       f"(nothing would survive the kill). Dispatch with worker_checkpoint on.")
+    brief = meta.get("brief") or _brief_from_result(meta["result"])
+    ckpt = brief + ".checkpoint"
+    if not Path(ckpt).exists():
+        return False, (f"worker {pid} has not written a checkpoint yet (too early to pause - "
+                       f"let it run one iteration first).")
+    # Sentinel BEFORE the kill: if the reaper races in the instant after SIGTERM, the
+    # sentinel is already there to protect the checkpoint family.
+    try:
+        Path(brief + ".suspended").write_text(str(time.time()))
+    except OSError as e:
+        return False, f"error: could not mark worker {pid} suspended: {e}"
+    kill = _H.get("_bg_kill_tree") or _H.get("_bg_kill")
+    if not kill:
+        return False, "error: no kill hook available (core too old)."
+    kill(pid)
+    meta["announced"] = True          # a deliberate pause is not a failure - no finish notice
+    meta["paused"] = True
+    return True, f"paused worker {pid} (checkpoint parked; task: {meta['task'][:60]})"
+
+
+def _worker_pause(pid):
+    """MODEL-facing pause (the tool's action='pause'): kill a running worker but KEEP its
+    checkpoint parked on disk so action='resume' can bring it back later. Unlike 'cancel'
+    (which lets the reaper wipe everything), a paused worker is resumable indefinitely -
+    the fleet-controller 'stop everyone, resume later' gesture. Needs worker_checkpoint on."""
+    if pid is None:
+        return "error: action='pause' needs a pid (which worker to pause)."
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return f"error: bad pid {pid!r}."
+    ok, msg = _pause_one(pid)
+    if ok:
+        msg += ". Bring it back with action='resume' pid=%d (a resume is a new pid)." % pid
+    return msg
+
+
+def _worker_pause_all(taskboard=None):
+    """MODEL-facing pause-all (the tool's action='pause_all'): pause EVERY running worker
+    this session (optionally only those on taskboard=<name>) in one call, each keeping its
+    checkpoint for a later resume. The fleet 'freeze the whole team' gesture."""
+    pids = _live_worker_pids(taskboard)
+    scope = f" on board '{taskboard}'" if taskboard else ""
+    if not pids:
+        return f"no running workers{scope} to pause."
+    done, failed = [], []
+    for pid in pids:
+        ok, msg = _pause_one(pid)
+        (done if ok else failed).append((pid, msg))
+    lines = [f"paused {len(done)} worker(s){scope} (each resumable via action='resume'):"]
+    for pid, _ in done:
+        lines.append(f"  pid {pid} paused")
+    for pid, msg in failed:
+        lines.append(f"  pid {pid} NOT paused: {msg}")
+    return "\n".join(lines)
+
+
+def _worker_stop_all(taskboard=None):
+    """MODEL-facing stop-all (the tool's action='stop_all'): kill EVERY running worker
+    this session (optionally only taskboard=<name>) and DISCARD it (the reaper wipes its
+    sidecars - not resumable). The hard 'shut the fleet down' gesture; use pause_all to
+    keep them resumable."""
+    pids = _live_worker_pids(taskboard)
+    scope = f" on board '{taskboard}'" if taskboard else ""
+    if not pids:
+        return f"no running workers{scope} to stop."
+    stopped = []
+    for pid in pids:
+        out = _worker_cancel(pid)
+        stopped.append((pid, out))
+    return (f"stopped {len(stopped)} worker(s){scope} (killed + discarded, not resumable; "
+            f"use pause_all to keep them resumable):\n"
+            + "\n".join(f"  pid {pid}" for pid, _ in stopped))
+
+
+def _worker_resume_all(cwd, taskboard=None):
+    """MODEL-facing resume-all (the tool's action='resume_all'): relaunch EVERY paused
+    worker this session (optionally only taskboard=<name>), each from its parked
+    checkpoint. The counterpart to pause_all - 'unfreeze the team'. Each resume is a new
+    pid; skips workers that aren't paused."""
+    paused = [(pid, meta) for pid, meta in _H["workers"].items()
+              if meta.get("paused")
+              and (taskboard is None or meta.get("taskboard", "") == taskboard)]
+    scope = f" on board '{taskboard}'" if taskboard else ""
+    if not paused:
+        return f"no paused workers{scope} to resume."
+    lines = [f"resuming {len(paused)} paused worker(s){scope}:"]
+    for pid, _ in paused:
+        out = _worker_resume(pid, "", cwd)
+        first = out.splitlines()[0] if out else out
+        lines.append(f"  {first}")
+    return "\n".join(lines)
+
 def _brief_from_result(result_path):
     """The worker's brief-file path from its result path (they share a stamp: the tool
     writes <stamp>.brief + <stamp>.result). The inject sidecar lives beside the brief
@@ -1259,9 +1408,18 @@ def _worker_resume(pid, text, cwd, iterations=None):
                         "launch_cwd": launch_cwd,
                         "idle_timeout": meta.get("idle_timeout"),
                         "hb_timeout": meta.get("hb_timeout"),
-                        "leash": meta.get("leash", "r"), "resumed_from": pid}
+                        "leash": meta.get("leash", "r"), "resumed_from": pid,
+                        "taskboard": meta.get("taskboard", "")}
     # The old worker is retired - suppress any lingering failure notice for it.
     meta["announced"] = True
+    # If this worker was deliberately PAUSED, clear its sentinel now that we've read the
+    # checkpoint + relaunched: the old sidecars are no longer parked and reap normally.
+    if meta.get("paused"):
+        try:
+            Path(_brief_from_result(meta["result"]) + ".suspended").unlink()
+        except OSError:
+            pass
+        meta["paused"] = False
     return (f"resumed worker {pid} as NEW pid {new_pid} (a resume is a fresh process; the "
             f"old pid is dead). It reloaded the saved transcript and continues from where "
             f"it stopped, with your steer on top. Its result reaches you automatically when "
@@ -1328,7 +1486,11 @@ def _worker_cmd(agent, cfg, arg):
       /worker <pid>              print that worker's full result
       /worker transcript <pid> [page]  read a worker's own reasoning/tool trail (paged)
       /worker status [pid]       the model-facing status view (state/runtime/ready)
-      /worker cancel <pid>       kill a still-running worker
+      /worker cancel <pid>       kill + discard a still-running worker
+      /worker pause <pid>        kill but KEEP its checkpoint (resumable later)
+      /worker pause_all [board]   pause every worker (or one board's team) - resumable
+      /worker stop_all [board]    kill + discard every worker (or one board's team)
+      /worker resume_all [board]  relaunch every paused worker (or one board's team)
       /worker inject <pid> <msg> mid-task message to a running worker
       /worker set_plan <pid> <plan>  replace a running worker's pinned plan
       /worker add_note <pid> <note>  add a note to a running worker's notebook
@@ -1353,10 +1515,22 @@ def _worker_cmd(agent, cfg, arg):
     if parts and parts[0].lower() == "models":
         print(_worker_models())
         return
-    if parts and parts[0].lower() in ("status", "cancel", "result", "transcript",
+    # Fleet lifecycle (optional taskboard scope): /worker pause_all [board]
+    if parts and parts[0].lower() in ("pause_all", "stop_all", "resume_all"):
+        tb = parts[1] if len(parts) > 1 else None
+        if parts[0].lower() == "pause_all":
+            print(_worker_pause_all(tb))
+        elif parts[0].lower() == "stop_all":
+            print(_worker_stop_all(tb))
+        else:
+            print(_worker_resume_all(str(getattr(cfg, "cwd", ".")), tb))
+        return
+    if parts and parts[0].lower() in ("status", "cancel", "pause", "result", "transcript",
                                       "inject", "set_plan", "add_note", "resume"):
         sub = parts[0].lower()
         pid = parts[1] if len(parts) > 1 else None
+        if sub == "status":
+            print(_worker_status(pid))
         if sub == "status":
             print(_worker_status(pid))
         elif sub == "result":
@@ -1381,6 +1555,8 @@ def _worker_cmd(agent, cfg, arg):
             # /worker resume <pid> <steer...> - the rest of the line is the steer.
             text = arg.split(None, 2)[2] if len(parts) > 2 else ""
             print(_worker_resume(pid, text, str(getattr(cfg, "cwd", "."))))
+        elif sub == "pause":
+            print(_worker_pause(pid))
         else:  # cancel
             print(_worker_cancel(pid))
         return
@@ -1444,7 +1620,8 @@ def _worker_completer(agent, cfg):
     """Tab-completion for /worker's first argument: the subcommand verbs plus every
     live worker pid (so `cancel <Tab>` / a bare `<Tab>` offers real pids). Matches the
     menu contract of other multi-verb commands (e.g. /mcp)."""
-    opts = ["status", "result", "transcript", "cancel", "inject", "set_plan", "add_note", "resume", "board", "models"]
+    opts = ["status", "result", "transcript", "cancel", "pause", "pause_all", "stop_all",
+            "resume", "resume_all", "inject", "set_plan", "add_note", "board", "models"]
     opts += [str(pid) for pid in _H.get("workers", {})]
     return opts
 
