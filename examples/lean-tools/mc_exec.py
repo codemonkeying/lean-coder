@@ -1,7 +1,7 @@
 # lean-coder lean-tool: mc_exec  (drive a Mineflayer bot in Minecraft)
 #
-# The brain->game bridge for the LLM bot fleet. Each bot is a Node/Mineflayer
-# process exposing a tiny HTTP endpoint (see mc-fleet/bot.js):
+# The brain->game bridge for the LLM bot swarm. Each bot is a Node/Mineflayer
+# process exposing a tiny HTTP endpoint (see mc-bots/bot.js):
 #   GET  /state       -> current world state
 #   POST /exec  body=JS async snippet ('bot','goals','Movements' in scope)
 #                     -> {result, ready, position, health, food, inventory,

@@ -1130,7 +1130,7 @@ check("dispatch_worker: inject too late on a finished worker",
       "already finished" in _strip_dwm(_dw.run({"action": "inject", "pid": 5001, "text": "hi"}, str(FIX))))
 del _dw._H["workers"][5001]
 del _dw._H["workers"][5002]
-# --- fleet lifecycle: pause / stop_all / pause_all + the reaper sentinel guard ---
+# --- team lifecycle: pause / stop_all / pause_all + the reaper sentinel guard ---
 # reaper guard (core): a '.suspended' sentinel makes _clean_worker_sidecars a no-op
 _susp_stamp = str(FIX / "wk_susp")
 open(_susp_stamp + ".brief", "w").write("b")

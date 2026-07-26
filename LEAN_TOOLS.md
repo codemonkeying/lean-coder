@@ -109,7 +109,7 @@ def setup(lc, cfg):
 ### Shaping `parameters`: verb dispatch and progressive disclosure
 
 Two schema shapes keep a capable tool from ballooning the context budget or
-splintering into a fleet of near-identical tools. Both are used by the bundled
+splintering into a swarm of near-identical tools. Both are used by the bundled
 tools (`note`, `background`, `dispatch_worker`); copy them.
 
 **One multi-verb tool, not N tools (note-style verb dispatch).** When several

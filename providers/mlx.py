@@ -3,7 +3,7 @@
 Apple Silicon (M-series) runs models fastest through MLX (unified memory, no
 copy). mlx_lm.server exposes an OpenAI-compatible HTTP API, so lean-coder can
 drive an MLX model on a Mac exactly like any OpenAI-shaped backend. Target box
-in our fleet: the M4 Mac (216) - serves qwen3-14b MLX-4bit natively instead of
+in our lineup: the M4 Mac (216) - serves qwen3-14b MLX-4bit natively instead of
 the slower GGUF/Ollama path.
 
 BACKEND: `mlx_lm.server --model <hf-repo-or-local> --port 8080`
