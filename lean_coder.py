@@ -15,14 +15,14 @@ schemas, truncated tool results. See README.md.
   L2859   Composer (pinned input line, editor, stdin)
   L3709   Token accounting (calibrated context meter)
   L3874   Config (dataclass, field registry, load/save)
-  L6987   Tool execution + text tool-call parsing
-  L7408   Remote workspace (executor client, /connect)
-  L8973   Context meter
-  L9068   Agent (turn loop, context mgmt, tool dispatch)
-  L14757  Slash-command handlers + dispatch table
-  L14894  REPL (interactive loop, session resume)
-  L15269  Worker agent (headless --agent-run)
-  L15864  Entry (CLI arg parsing, main)
+  L7009   Tool execution + text tool-call parsing
+  L7430   Remote workspace (executor client, /connect)
+  L8995   Context meter
+  L9090   Agent (turn loop, context mgmt, tool dispatch)
+  L14779  Slash-command handlers + dispatch table
+  L14916  REPL (interactive loop, session resume)
+  L15291  Worker agent (headless --agent-run)
+  L15886  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -5972,13 +5972,36 @@ def _worker_brief_from_cmd(cmd):
 _WORKER_SIDECAR_SUFFIXES = (".brief", ".result", ".brief.progress",
                             ".brief.inject", ".brief.injects.log",
                             ".brief.plan", ".brief.note", ".brief.planview",
-                            ".brief.usage", ".brief.checkpoint", ".brief.checkpoint.tmp")
+                            ".brief.usage", ".brief.checkpoint", ".brief.checkpoint.tmp",
+                            ".brief.suspended")
+
+
+def _worker_suspended(brief):
+    """True if a worker (identified by its '<stamp>.brief' path) is deliberately PAUSED
+    - i.e. a '<stamp>.brief.suspended' sentinel sits beside it. A paused worker's pid is
+    dead (killed on purpose) but its transcript checkpoint must SURVIVE for a later
+    action='resume', so the reap paths must NOT treat it as an orphan to wipe. On-disk so
+    it outlives the driver session too. Best-effort (unreadable dir -> not suspended)."""
+    if not brief:
+        return False
+    b = str(brief)
+    stamp = b[:-len(".brief")] if b.endswith(".brief") else b
+    try:
+        return Path(stamp + ".brief.suspended").exists()
+    except OSError:
+        return False
 
 
 def _clean_worker_sidecars(brief):
     """Unlink a worker's entire sidecar family given its '<stamp>.brief' path (see
-    _WORKER_SIDECAR_SUFFIXES for the family). Best-effort; a missing file is fine."""
+    _WORKER_SIDECAR_SUFFIXES for the family). Best-effort; a missing file is fine.
+    GUARD: a deliberately-SUSPENDED worker (a '.suspended' sentinel beside its brief) is
+    left entirely intact - its checkpoint is parked for a future resume, not orphaned
+    residue. To actually reclaim a paused worker, clear the sentinel first (stop), then
+    this cleans as normal."""
     if not brief:
+        return
+    if _worker_suspended(brief):
         return
     b = str(brief)
     stamp = b[:-len(".brief")] if b.endswith(".brief") else b
@@ -5987,7 +6010,6 @@ def _clean_worker_sidecars(brief):
             Path(stamp + suf).unlink()
         except OSError:
             pass
-
 
 def _bg_clean_sidecars(rec):
     """Remove a finished/killed task's sidecars so CONFIG_DIR doesn't grow without
