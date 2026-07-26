@@ -310,7 +310,7 @@ def _self_argv():
 
 
 def _tb_arg(args):
-    """The optional taskboard scope for a fleet action (pause_all/stop_all/resume_all):
+    """The optional taskboard scope for a team action (pause_all/stop_all/resume_all):
     args['taskboard'] stripped, or None = all workers this session (unscoped)."""
     tb = (args.get("taskboard") or "").strip()
     return tb or None
@@ -1045,7 +1045,7 @@ def _worker_cancel(pid):
 
 def _live_worker_pids(taskboard=None):
     """pids of THIS session's workers that are still running (a bg row in 'running' state)
-    and have not delivered a result. Optionally narrowed to one taskboard (the fleet
+    and have not delivered a result. Optionally narrowed to one taskboard (the team
     gesture: 'pause the mining team'). Order: dispatch order (dict insertion)."""
     workers = _H["workers"]
     rows = _worker_rows()
@@ -1102,7 +1102,7 @@ def _worker_pause(pid):
     """MODEL-facing pause (the tool's action='pause'): kill a running worker but KEEP its
     checkpoint parked on disk so action='resume' can bring it back later. Unlike 'cancel'
     (which lets the reaper wipe everything), a paused worker is resumable indefinitely -
-    the fleet-controller 'stop everyone, resume later' gesture. Needs worker_checkpoint on."""
+    the controller's 'stop everyone, resume later' gesture. Needs worker_checkpoint on."""
     if pid is None:
         return "error: action='pause' needs a pid (which worker to pause)."
     try:
@@ -1118,7 +1118,7 @@ def _worker_pause(pid):
 def _worker_pause_all(taskboard=None):
     """MODEL-facing pause-all (the tool's action='pause_all'): pause EVERY running worker
     this session (optionally only those on taskboard=<name>) in one call, each keeping its
-    checkpoint for a later resume. The fleet 'freeze the whole team' gesture."""
+    checkpoint for a later resume. The 'freeze the whole team' gesture."""
     pids = _live_worker_pids(taskboard)
     scope = f" on board '{taskboard}'" if taskboard else ""
     if not pids:
@@ -1138,7 +1138,7 @@ def _worker_pause_all(taskboard=None):
 def _worker_stop_all(taskboard=None):
     """MODEL-facing stop-all (the tool's action='stop_all'): kill EVERY running worker
     this session (optionally only taskboard=<name>) and DISCARD it (the reaper wipes its
-    sidecars - not resumable). The hard 'shut the fleet down' gesture; use pause_all to
+    sidecars - not resumable). The hard 'shut the whole team down' gesture; use pause_all to
     keep them resumable."""
     pids = _live_worker_pids(taskboard)
     scope = f" on board '{taskboard}'" if taskboard else ""
