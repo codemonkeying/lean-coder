@@ -41,6 +41,7 @@ RESUME: with cfg.worker_checkpoint on, a worker dumps its transcript to a
 DEAD/timed-out/incomplete worker from that checkpoint (a NEW pid - resume is a fresh OS
 process; lineage kept in meta['resumed_from']). Off by default = no checkpoint file.
 """
+import json
 import os
 import shlex
 import sys
@@ -71,14 +72,16 @@ TOOL = {
         "type": "object",
         "properties": {
             "action": {"type": "string",
-                       "enum": ["dispatch", "models", "status", "result", "cancel", "inject",
-                                "set_plan", "add_note", "resume", "board_claim",
-                                "board_release", "board_list"],
+                       "enum": ["dispatch", "models", "status", "result", "transcript",
+                                "cancel", "inject", "set_plan", "add_note", "resume",
+                                "board_claim", "board_release", "board_list"],
                        "default": "dispatch",
                        "description": "Default 'dispatch' (launch from `task`). 'models'=list "
                                       "models you can dispatch on. 'status' [pid]=worker state/"
                                       "runtime/ready. 'result' (pid=)=FULL untruncated result "
-                                      "(the finish notice truncates a long one). 'cancel' "
+                                      "(the finish notice truncates a long one). 'transcript' "
+                                      "(pid=, [page=])=read the worker's OWN full reasoning/tool "
+                                      "trail, paged (needs worker_checkpoint on). 'cancel' "
                                       "(pid=)=kill it. Steer a RUNNING worker: 'inject' (text=) a "
                                       "correction, 'set_plan' (plan=) replace its plan (omit plan "
                                       "to READ it first), 'add_note' (notes=). 'resume' (pid=)="
@@ -145,6 +148,10 @@ TOOL = {
             "notes": {"type": "string",
                       "description": "Optional seed notes for the worker's notebook, one per line "
                                      "(tagged as from you). Also the payload for 'add_note'."},
+            "page": {"type": "integer",
+                     "description": "For 'transcript' (pid=): which page of the worker's trail to "
+                                    "show (1-based, default 1). The reply tells you the page count "
+                                    "and whether more remain."},
         },
         "required": [],
     },
@@ -319,12 +326,14 @@ def run(args, cwd):
     if action == "resume":
         return _worker_resume(args.get("pid"), args.get("text") or args.get("task"), cwd,
                               iterations=args.get("iterations"))
+    if action == "transcript":
+        return _worker_transcript(args.get("pid"), args.get("page"))
     if action in ("board_claim", "board_release", "board_list"):
         return _worker_board(action, args.get("text") or args.get("task"))
     if action != "dispatch":
         return ("error: unknown action %r (use dispatch | models | status | result | "
-                "cancel | inject | set_plan | add_note | resume | board_claim | "
-                "board_release | board_list)." % action)
+                "transcript | cancel | inject | set_plan | add_note | resume | "
+                "board_claim | board_release | board_list)." % action)
     task = (args.get("task") or "").strip()
     if not task:
         return "error: dispatch_worker action='dispatch' needs a non-empty task."
@@ -877,6 +886,108 @@ def _worker_result(pid):
     return f"worker {pid} result (task: {meta['task'][:100]}):\n{res.strip()}"
 
 
+_TRANSCRIPT_PAGE = 6000   # chars of rendered trail per page (keeps one read digestible)
+
+
+def _render_transcript_turn(m):
+    """One transcript message -> readable lines. Assistant reasoning, its tool calls
+    (name + compact args), and tool results are each shown with a role tag; the raw
+    provider shapes (list content, tool_calls arrays) are flattened to text."""
+    role = m.get("role", "?")
+    content = m.get("content")
+    if isinstance(content, list):   # provider block form -> join text parts
+        parts = []
+        for b in content:
+            if isinstance(b, dict):
+                parts.append(b.get("text") or b.get("content") or "")
+            else:
+                parts.append(str(b))
+        content = "\n".join(p for p in parts if p)
+    content = "" if content is None else str(content).strip()
+    tag = {"user": "STEER", "assistant": "worker", "tool": "tool"}.get(role, role)
+    # The first STEER turn is the fixed worker preamble (~2KB of boilerplate the driver
+    # already knows) followed by 'TASK:\n<the task>'. Collapse it to just the task so the
+    # transcript shows the worker's ACTUAL work, not the rubric.
+    if role == "user" and "\nTASK:\n" in content:
+        content = "TASK: " + content.split("\nTASK:\n", 1)[1].strip()
+    out = []
+    if content:
+        out.append(f"[{tag}] {content}")
+    for tc in m.get("tool_calls", []) or []:
+        fn = tc.get("function") or tc
+        name = fn.get("name", "?")
+        args = fn.get("arguments")
+        if isinstance(args, (dict, list)):
+            args = json.dumps(args)
+        args = (args or "").strip()
+        if len(args) > 300:
+            args = args[:300] + "..."
+        out.append(f"[worker>tool] {name}({args})")
+    if role == "tool" and not content:
+        out.append(f"[tool] {m.get('tool_name', '')}: (no output)")
+    return "\n".join(out)
+
+
+def _worker_transcript(pid, page):
+    """MODEL-facing transcript (the tool's action='transcript'): render a worker's OWN
+    full reasoning + tool trail from its checkpoint, paged, so the driver can inspect HOW
+    a worker reached its result (or where a dead one got stuck) without resuming it. Needs
+    the worker to have been dispatched with worker_checkpoint on (the same sidecar resume
+    uses). `page` is 1-based (default 1); the reply reports the page count and whether more
+    remain. Read-only - never mutates the worker or its checkpoint."""
+    workers = _H["workers"]
+    if not workers:
+        return "no workers dispatched this session."
+    if pid is None:
+        if len(workers) == 1:
+            pid = next(iter(workers))
+        else:
+            return ("error: action='transcript' needs a pid (which worker). "
+                    "Use action='status' to list them.")
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return f"error: bad pid {pid!r}."
+    meta = workers.get(pid)
+    if not meta:
+        return f"no worker with pid {pid} this session."
+    ckpt = _brief_from_result(meta["result"]) + ".checkpoint"
+    if not Path(ckpt).exists():
+        return (f"worker {pid} has no transcript checkpoint (dispatched with checkpointing "
+                f"off, so nothing was recorded). Turn on worker_checkpoint (/set or config) "
+                f"before dispatching workers whose trail you may want to read.")
+    try:
+        data = json.loads(Path(ckpt).read_text())
+    except Exception as e:
+        return f"worker {pid} checkpoint is unreadable ({e})."
+    body = [m for m in data.get("messages", []) if m.get("role") != "system"]
+    if not body:
+        return f"worker {pid} checkpoint has no recorded turns yet."
+    blocks = [b for b in (_render_transcript_turn(m) for m in body) if b]
+    full = "\n\n".join(blocks)
+    # Paginate on rendered chars, breaking only at turn boundaries so no turn is split.
+    pages, cur = [], ""
+    for b in blocks:
+        if cur and len(cur) + len(b) + 2 > _TRANSCRIPT_PAGE:
+            pages.append(cur)
+            cur = b
+        else:
+            cur = (cur + "\n\n" + b) if cur else b
+    if cur:
+        pages.append(cur)
+    npages = len(pages) or 1
+    try:
+        p = max(1, int(page or 1))
+    except (TypeError, ValueError):
+        p = 1
+    if p > npages:
+        p = npages
+    head = (f"worker {pid} transcript (task: {meta['task'][:80]}) - "
+            f"page {p}/{npages}, {len(body)} turns:")
+    footer = ("" if p >= npages
+              else f"\n\n[more: {npages - p} page(s) left - action='transcript' page={p + 1}]")
+    return f"{head}\n\n{pages[p - 1]}{footer}"
+
 def _worker_cancel(pid):
     """MODEL-facing cancel (the tool's action='cancel'): kill a still-running worker
     by pid. An already-finished worker is a no-op (its result stands - use it). Reuses
@@ -1215,6 +1326,7 @@ def _worker_cmd(agent, cfg, arg):
     """/worker - human command, at PARITY with the model's dispatch_worker actions:
       /worker                    list dispatched workers (state + result-ready)
       /worker <pid>              print that worker's full result
+      /worker transcript <pid> [page]  read a worker's own reasoning/tool trail (paged)
       /worker status [pid]       the model-facing status view (state/runtime/ready)
       /worker cancel <pid>       kill a still-running worker
       /worker inject <pid> <msg> mid-task message to a running worker
@@ -1241,14 +1353,18 @@ def _worker_cmd(agent, cfg, arg):
     if parts and parts[0].lower() == "models":
         print(_worker_models())
         return
-    if parts and parts[0].lower() in ("status", "cancel", "result", "inject",
-                                      "set_plan", "add_note", "resume"):
+    if parts and parts[0].lower() in ("status", "cancel", "result", "transcript",
+                                      "inject", "set_plan", "add_note", "resume"):
         sub = parts[0].lower()
         pid = parts[1] if len(parts) > 1 else None
         if sub == "status":
             print(_worker_status(pid))
         elif sub == "result":
             print(_worker_result(pid))
+        elif sub == "transcript":
+            # /worker transcript <pid> [page]
+            page = parts[2] if len(parts) > 2 else None
+            print(_worker_transcript(pid, page))
         elif sub == "inject":
             # /worker inject <pid> <message...> - the rest of the line is the message.
             text = arg.split(None, 2)[2] if len(parts) > 2 else ""
@@ -1328,7 +1444,7 @@ def _worker_completer(agent, cfg):
     """Tab-completion for /worker's first argument: the subcommand verbs plus every
     live worker pid (so `cancel <Tab>` / a bare `<Tab>` offers real pids). Matches the
     menu contract of other multi-verb commands (e.g. /mcp)."""
-    opts = ["status", "result", "cancel", "inject", "set_plan", "add_note", "resume", "board", "models"]
+    opts = ["status", "result", "transcript", "cancel", "inject", "set_plan", "add_note", "resume", "board", "models"]
     opts += [str(pid) for pid in _H.get("workers", {})]
     return opts
 
