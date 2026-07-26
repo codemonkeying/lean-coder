@@ -359,8 +359,12 @@ How it works (it piggybacks the background-task machinery, no new transport):
   [leash=...], [host=...])` to launch one. The same tool also manages workers via
   `action`: `action='models'` lists the models you can dispatch on (per provider, so
   you can pick a cheap leaf model without guessing an id), `action='status'` reports
-  dispatched workers, `action='cancel'` (with `pid=...`) kills one; the default
-  `action='dispatch'` launches from `task`.
+  dispatched workers, `action='result'` (with `pid=...`) returns a worker's full
+  untruncated result, `action='transcript'` (with `pid=...`, optional `page=...`)
+  pages through a worker's own reasoning + tool trail so the driver can inspect HOW it
+  reached its answer or where a dead one stuck (needs `worker_checkpoint` on, the same
+  sidecar `resume` uses; read-only), `action='cancel'` (with `pid=...`) kills one; the
+  default `action='dispatch'` launches from `task`.
 - **A worker does not self-compact.** Its context is deliberately *not* auto-managed
   (`run_agent_brief` forces `auto_compact` off): a worker runs one scoped brief, so
   the compaction/handover machinery - built for a long, evolving *driver* session -
