@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L950    Lean-tools (plugin tools: discovery, manager)
-  L1290   MCP client (connection, manager, OAuth, discovery)
-  L1744   Providers (backend plugin registry)
-  L1966   Interactive pickers + menus (raw-mode UI engine)
-  L2315   Terminal styling (colors, formatting helpers)
-  L2512   Streaming + markdown render (model output)
-  L2859   Composer (pinned input line, editor, stdin)
-  L3709   Token accounting (calibrated context meter)
-  L3874   Config (dataclass, field registry, load/save)
-  L7035   Tool execution + text tool-call parsing
-  L7456   Remote workspace (executor client, /connect)
-  L9047   Context meter
-  L9142   Agent (turn loop, context mgmt, tool dispatch)
-  L14896  Slash-command handlers + dispatch table
-  L15033  REPL (interactive loop, session resume)
-  L15408  Worker agent (headless --agent-run)
-  L16020  Entry (CLI arg parsing, main)
+  L966    Lean-tools (plugin tools: discovery, manager)
+  L1306   MCP client (connection, manager, OAuth, discovery)
+  L1760   Providers (backend plugin registry)
+  L1982   Interactive pickers + menus (raw-mode UI engine)
+  L2331   Terminal styling (colors, formatting helpers)
+  L2528   Streaming + markdown render (model output)
+  L2875   Composer (pinned input line, editor, stdin)
+  L3725   Token accounting (calibrated context meter)
+  L3890   Config (dataclass, field registry, load/save)
+  L7051   Tool execution + text tool-call parsing
+  L7472   Remote workspace (executor client, /connect)
+  L9063   Context meter
+  L9158   Agent (turn loop, context mgmt, tool dispatch)
+  L14912  Slash-command handlers + dispatch table
+  L15049  REPL (interactive loop, session resume)
+  L15424  Worker agent (headless --agent-run)
+  L16036  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -111,7 +111,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.9.8"
+__version__ = "0.9.9"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -119,6 +119,22 @@ __version__ = "0.9.8"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.9.9": [
+        "sessions and workers now share ONE on-disk format, so you can move work",
+        "  between them: `/load <name> --worker [task]` spins up a background worker",
+        "  seeded from a saved session, and `/save <name> --from-worker <pid>` promotes",
+        "  a worker's transcript back into a loadable session. `/save --rename old new`",
+        "  renames a session in place; promoted sessions are tagged as ex-worker.",
+        "new `/worker` command: list and manage the workers you've dispatched this",
+        "  session (result / transcript / cancel / pause / resume / ...), the way /bg",
+        "  surfaces background tasks. Worker fleet lifecycle: pause/resume a worker and",
+        "  pause_all / stop_all / resume_all a whole team.",
+        "new `mc_exec` lean-tool: drive a Mineflayer bot through its HTTP bridge.",
+        "llama.cpp provider: multi-turn tool calling fixed (stock llama-server no longer",
+        "  500s when a tool call is replayed in history), function arguments accepted as",
+        "  a string or an object, and `--think` is finally honoured - a thinking model no",
+        "  longer returns empty content on a pure-text turn (e.g. compaction).",
+    ],
     "0.9.8": [
         "board `reconcile`: once a task DAG is done the driver can collect every",
         "  task's reported result in dependency order, so a multi-worker job folds back",
