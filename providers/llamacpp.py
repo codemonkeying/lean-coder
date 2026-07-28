@@ -17,6 +17,27 @@ BACKEND: `llama-server -m model.gguf --port 8080 --jinja`
     may also text-encode calls, so we run core's parse_text_tool_calls fallback
     exactly like OllamaClient.chat does.
 
+SERVER-SIDE TOOL-USE NOTES (stock llama-server):
+  - Multi-turn tool use needs each replayed assistant tool_call to carry the strict
+    OpenAI shape {"id","type":"function","function":{...}} or --jinja 500s with
+    "Missing tool call type" on turn 2+. We emit that shape (see _consume).
+  - Verify the loaded template actually supports tools: GET {base}/props ->
+    chat_template_tool_use should be present.
+  - Qwen models: if calls come back as literal `<function=...>` text instead of
+    structured tool_calls, start the server with
+    --chat-template-kwargs '{"tool_call_format":"json"}' (else our text fallback
+    catches them, but structured is cleaner).
+  - arguments type (llama.cpp #20198): recent llama-server returns
+    tool_calls[].function.arguments as a JSON object, older/OpenAI/ollama as a
+    string - _consume accepts either.
+  - thinking control: stock llama-server IGNORES a top-level enable_thinking/think
+    key; Qwen-class templates only honour it via chat_template_kwargs. chat() maps
+    cfg.think (bool|None) -> chat_template_kwargs.enable_thinking so --think off/on
+    actually takes effect (None = leave the template default). Without it, a
+    thinking model dumps everything into reasoning_content and a pure-text turn
+    (e.g. auto_compact) returns EMPTY content. _consume streams the reasoning_content
+    channel dimmed (like ollama) and keeps it out of the content body.
+
 Free + local, like ollama - not gated behind EVAL_ALLOW_PAID.
 """
 import json
@@ -85,6 +106,7 @@ class LlamaCppClient:
         prompt_total  = None
         out_tokens    = None
         printed       = False
+        printed_think = False
         aborted       = False
         md            = _lc["MarkdownStream"](sys.stdout.write)
 
@@ -107,10 +129,24 @@ class LlamaCppClient:
 
                 for ch in obj.get("choices", []):
                     delta = ch.get("delta", {})
+                    # Thinking channel: stock llama-server streams reasoning on
+                    # delta.reasoning_content (some builds/models use delta.thinking).
+                    # Dim it like ollama, and keep it OUT of content_parts so an
+                    # all-reasoning span never inflates the (possibly empty) content.
+                    think = delta.get("reasoning_content") or delta.get("thinking")
+                    if think:
+                        if not printed_think and not printed:
+                            spin.stop()
+                            sys.stdout.write(_lc["dim"](_lc["GLYPH"]["think"] + " "))
+                            printed_think = True
+                        sys.stdout.write(_lc["dim"](think))
+                        sys.stdout.flush()
                     txt   = delta.get("content")
                     if txt:
                         if not printed:
                             spin.stop()
+                            if printed_think:
+                                sys.stdout.write("\n")
                             sys.stdout.write(_lc["blue"]("● "))
                             printed = True
                         md.feed(txt)
@@ -118,7 +154,7 @@ class LlamaCppClient:
                     for tcd in (delta.get("tool_calls") or []):
                         idx = tcd.get("index", 0)
                         if idx not in tool_acc:
-                            tool_acc[idx] = {"id": "", "name": "", "args": []}
+                            tool_acc[idx] = {"id": "", "name": "", "args": [], "args_obj": None}
                             order.append(idx)
                         slot = tool_acc[idx]
                         if tcd.get("id"):
@@ -126,8 +162,16 @@ class LlamaCppClient:
                         fn = tcd.get("function", {})
                         if fn.get("name"):
                             slot["name"] = fn["name"]
-                        if fn.get("arguments"):
-                            slot["args"].append(fn["arguments"])
+                        _a = fn.get("arguments")
+                        if _a is not None and _a != "":
+                            # llama.cpp #20198: recent llama-server returns arguments
+                            # as an already-parsed JSON OBJECT, whereas OpenAI/ollama
+                            # stream it as string fragments. Keep string deltas for
+                            # concatenation; stash a dict/list whole (last-wins).
+                            if isinstance(_a, str):
+                                slot["args"].append(_a)
+                            else:
+                                slot["args_obj"] = _a
 
                 um = obj.get("usage")
                 if um:
@@ -140,16 +184,31 @@ class LlamaCppClient:
             md.flush()
             sys.stdout.write("\n")
             sys.stdout.flush()
+        elif printed_think:
+            # thinking-only turn (no content channel yet): close the dim reasoning
+            # line so the next thing printed isn't glued to it.
+            sys.stdout.write("\n")
+            sys.stdout.flush()
 
         tool_calls = []
         for idx in order:
             slot = tool_acc[idx]
-            try:
-                args = json.loads("".join(slot["args"])) if slot["args"] else {}
-            except Exception:
-                args = {}
+            if slot.get("args_obj") is not None:
+                # Server already handed us a parsed object (llama.cpp #20198).
+                args = slot["args_obj"]
+            else:
+                try:
+                    args = json.loads("".join(slot["args"])) if slot["args"] else {}
+                except Exception:
+                    args = {}
             tool_calls.append({
                 "id":       slot["id"] or f"call_{idx}",
+                # OpenAI spec requires "type":"function" on assistant tool_calls.
+                # Stock llama-server (--jinja) strictly re-validates this when the
+                # assistant message is REPLAYED in history on turn 2+; omitting it
+                # 500s ("Missing tool call type"). A fresh turn-1 call works either
+                # way, which is why the bug only shows on multi-turn tool use.
+                "type":     "function",
                 "function": {"name": slot["name"], "arguments": args},
             })
 
@@ -181,6 +240,12 @@ class LlamaCppClient:
 
         assistant = {"role": "assistant", "content": content}
         if tool_calls:
+            # Normalize EVERY tool_call (native + text-fallback) to the strict OpenAI
+            # shape - id + type:function - so it survives being replayed in history to
+            # a --jinja llama-server on later turns (see the type note above).
+            for _i, _tc in enumerate(tool_calls):
+                _tc.setdefault("id", f"call_{_i}")
+                _tc.setdefault("type", "function")
             assistant["tool_calls"] = tool_calls
         return assistant, prompt_total, aborted
 
@@ -199,6 +264,16 @@ class LlamaCppClient:
         }
         if tools:
             body["tools"] = tools
+        # Thinking control. cfg.think is the same bool|None the ollama provider sends
+        # (True/False = force on/off; None = don't touch, let the template default
+        # decide). BUT stock llama-server IGNORES a top-level enable_thinking / think
+        # key - Qwen-class templates only honour it via chat_template_kwargs. Without
+        # this, a thinking model dumps everything into reasoning_content and a
+        # pure-TEXT turn (e.g. auto_compact's no-tools summary) comes back with EMPTY
+        # content. So map the toggle into chat_template_kwargs.enable_thinking; leave
+        # it off entirely when think is None so we don't override the model default.
+        if self.cfg.think is not None:
+            body["chat_template_kwargs"] = {"enable_thinking": bool(self.cfg.think)}
 
         req = urllib.request.Request(
             f"{_base()}/v1/chat/completions",

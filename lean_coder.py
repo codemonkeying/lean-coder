@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L950    Lean-tools (plugin tools: discovery, manager)
-  L1290   MCP client (connection, manager, OAuth, discovery)
-  L1744   Providers (backend plugin registry)
-  L1966   Interactive pickers + menus (raw-mode UI engine)
-  L2315   Terminal styling (colors, formatting helpers)
-  L2512   Streaming + markdown render (model output)
-  L2859   Composer (pinned input line, editor, stdin)
-  L3709   Token accounting (calibrated context meter)
-  L3874   Config (dataclass, field registry, load/save)
-  L6987   Tool execution + text tool-call parsing
-  L7408   Remote workspace (executor client, /connect)
-  L8973   Context meter
-  L9068   Agent (turn loop, context mgmt, tool dispatch)
-  L14757  Slash-command handlers + dispatch table
-  L14894  REPL (interactive loop, session resume)
-  L15269  Worker agent (headless --agent-run)
-  L15864  Entry (CLI arg parsing, main)
+  L966    Lean-tools (plugin tools: discovery, manager)
+  L1306   MCP client (connection, manager, OAuth, discovery)
+  L1760   Providers (backend plugin registry)
+  L1982   Interactive pickers + menus (raw-mode UI engine)
+  L2331   Terminal styling (colors, formatting helpers)
+  L2528   Streaming + markdown render (model output)
+  L2875   Composer (pinned input line, editor, stdin)
+  L3725   Token accounting (calibrated context meter)
+  L3890   Config (dataclass, field registry, load/save)
+  L7051   Tool execution + text tool-call parsing
+  L7472   Remote workspace (executor client, /connect)
+  L9063   Context meter
+  L9158   Agent (turn loop, context mgmt, tool dispatch)
+  L14912  Slash-command handlers + dispatch table
+  L15049  REPL (interactive loop, session resume)
+  L15424  Worker agent (headless --agent-run)
+  L16036  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -111,7 +111,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.9.8"
+__version__ = "0.9.9"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -119,6 +119,22 @@ __version__ = "0.9.8"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.9.9": [
+        "sessions and workers now share ONE on-disk format, so you can move work",
+        "  between them: `/load <name> --worker [task]` spins up a background worker",
+        "  seeded from a saved session, and `/save <name> --from-worker <pid>` promotes",
+        "  a worker's transcript back into a loadable session. `/save --rename old new`",
+        "  renames a session in place; promoted sessions are tagged as ex-worker.",
+        "new `/worker` command: list and manage the workers you've dispatched this",
+        "  session (result / transcript / cancel / pause / resume / ...), the way /bg",
+        "  surfaces background tasks. Worker fleet lifecycle: pause/resume a worker and",
+        "  pause_all / stop_all / resume_all a whole team.",
+        "new `mc_exec` lean-tool: drive a Mineflayer bot through its HTTP bridge.",
+        "llama.cpp provider: multi-turn tool calling fixed (stock llama-server no longer",
+        "  500s when a tool call is replayed in history), function arguments accepted as",
+        "  a string or an object, and `--think` is finally honoured - a thinking model no",
+        "  longer returns empty content on a pure-text turn (e.g. compaction).",
+    ],
     "0.9.8": [
         "board `reconcile`: once a task DAG is done the driver can collect every",
         "  task's reported result in dependency order, so a multi-worker job folds back",
@@ -4903,7 +4919,31 @@ def _atomic_write_text(path: Path, text: str):
         path.write_text(text)
 
 
-def save_session(messages, cfg, name: str, remote=None, pinned_plan="", notes=None):
+def _session_envelope(messages, meta):
+    """The one on-disk shape for BOTH a saved session and a worker checkpoint:
+    {'meta': {...}, 'messages': [...]}. `meta` carries pinned_plan + notes (plus
+    config: provider/model/host/leash/...). Keeping a single envelope means a
+    session file IS a valid worker checkpoint and vice-versa - see load_envelope."""
+    return {"meta": dict(meta or {}), "messages": messages}
+
+
+def load_envelope(data):
+    """Inverse of _session_envelope. Returns (body, meta) where body is the
+    non-system messages and meta is the metadata dict. Back-compat: an OLD flat
+    worker checkpoint stored pinned_plan/notes at TOP level with no 'meta' - fold
+    those into a synthesised meta so old checkpoints still load."""
+    body = [m for m in data.get("messages", []) if m.get("role") != "system"]
+    meta = dict(data.get("meta") or {})
+    # old flat checkpoint: {messages, pinned_plan, notes} with no meta wrapper
+    if "meta" not in data:
+        if "pinned_plan" in data:
+            meta.setdefault("pinned_plan", data.get("pinned_plan") or "")
+        if "notes" in data:
+            meta.setdefault("notes", data.get("notes") or [])
+    return body, meta
+
+
+def save_session(messages, cfg, name: str, remote=None, pinned_plan="", notes=None, origin=None):
     """Write the conversation to ~/.config/leancoder/sessions/<name>.json with a
     metadata header. Returns (path, meta). Raises ValueError on a bad name.
 
@@ -4934,9 +4974,11 @@ def save_session(messages, cfg, name: str, remote=None, pinned_plan="", notes=No
         "notes": list(notes or []),          # session-scoped episodic memory (note tool)
         "session_overrides": dict(getattr(cfg, "session_overrides", {}) or {}),
         "tok_factor": _tok_factor(),         # learned estimate->actual factor (calibrated meter)
+        "origin": origin,                    # None for a normal save; else where it came from,
+                                             # e.g. "worker:20250611-143022-84213-3" (promoted)
     }
     path = _session_path(safe)
-    _atomic_write_text(path, json.dumps({"meta": meta, "messages": messages}, indent=2))
+    _atomic_write_text(path, json.dumps(_session_envelope(messages, meta), indent=2))
     return path, meta
 
 
@@ -5972,13 +6014,36 @@ def _worker_brief_from_cmd(cmd):
 _WORKER_SIDECAR_SUFFIXES = (".brief", ".result", ".brief.progress",
                             ".brief.inject", ".brief.injects.log",
                             ".brief.plan", ".brief.note", ".brief.planview",
-                            ".brief.usage", ".brief.checkpoint", ".brief.checkpoint.tmp")
+                            ".brief.usage", ".brief.checkpoint", ".brief.checkpoint.tmp",
+                            ".brief.suspended")
+
+
+def _worker_suspended(brief):
+    """True if a worker (identified by its '<stamp>.brief' path) is deliberately PAUSED
+    - i.e. a '<stamp>.brief.suspended' sentinel sits beside it. A paused worker's pid is
+    dead (killed on purpose) but its transcript checkpoint must SURVIVE for a later
+    action='resume', so the reap paths must NOT treat it as an orphan to wipe. On-disk so
+    it outlives the driver session too. Best-effort (unreadable dir -> not suspended)."""
+    if not brief:
+        return False
+    b = str(brief)
+    stamp = b[:-len(".brief")] if b.endswith(".brief") else b
+    try:
+        return Path(stamp + ".brief.suspended").exists()
+    except OSError:
+        return False
 
 
 def _clean_worker_sidecars(brief):
     """Unlink a worker's entire sidecar family given its '<stamp>.brief' path (see
-    _WORKER_SIDECAR_SUFFIXES for the family). Best-effort; a missing file is fine."""
+    _WORKER_SIDECAR_SUFFIXES for the family). Best-effort; a missing file is fine.
+    GUARD: a deliberately-SUSPENDED worker (a '.suspended' sentinel beside its brief) is
+    left entirely intact - its checkpoint is parked for a future resume, not orphaned
+    residue. To actually reclaim a paused worker, clear the sentinel first (stop), then
+    this cleans as normal."""
     if not brief:
+        return
+    if _worker_suspended(brief):
         return
     b = str(brief)
     stamp = b[:-len(".brief")] if b.endswith(".brief") else b
@@ -5987,7 +6052,6 @@ def _clean_worker_sidecars(brief):
             Path(stamp + suf).unlink()
         except OSError:
             pass
-
 
 def _bg_clean_sidecars(rec):
     """Remove a finished/killed task's sidecars so CONFIG_DIR doesn't grow without
@@ -8013,27 +8077,53 @@ class RemoteWorkspace:
         behaviour). All Windows commands are stdin-free (powershell -EncodedCommand /
         scp over its own channel), so the historic stdin-piped deadlock can't recur."""
         print(dim(f"connecting to {self.host} ..."))
-        with _stage("opening ssh", done="ssh ready") as _st:
-            _clear_master(self.host, self.ctl)     # drop any stale socket first
-            argv = _ssh_master_argv(self.host, self.ctl, batch=batch)
+        _clear_master(self.host, self.ctl)     # drop any stale socket first
+        argv = _ssh_master_argv(self.host, self.ctl, batch=batch)
+
+        def _classify_and_maybe_fallback(rc, err, st):
+            # Shared post-open handling for both modes. Nonzero rc that is unreachable/
+            # auth is fatal; anything else means "connected but the master didn't hold"
+            # (a Windows sshd that won't multiplex) -> per-call fallback.
+            if rc == 0:
+                return
+            kind, detail = _classify_ssh_probe(rc, "", err)
+            _clear_master(self.host, self.ctl)
+            if kind in ("unreachable", "auth"):
+                if st:
+                    st.done = "unreachable" if kind == "unreachable" else "auth failed"
+                raise ConnectionError(f"can't reach {self.host}: {detail}")
+            self.ctl = None                        # per-call fallback
+            if st:
+                st.done = "ssh ready (per-call)"
+
+        if batch:
+            # BATCH: no prompt can appear (BatchMode), so it is safe to run under the
+            # spinner and capture stderr for unreachable-vs-auth classification.
+            with _stage("opening ssh", done="ssh ready") as _st:
+                try:
+                    r = subprocess.run(argv, capture_output=True, text=True, timeout=30)
+                except subprocess.TimeoutExpired:
+                    _clear_master(self.host, self.ctl)
+                    raise ConnectionError(f"ssh connection to {self.host} timed out")
+                _classify_and_maybe_fallback(r.returncode, r.stderr, _st)
+        else:
+            # INTERACTIVE: ssh must OWN the terminal for its 'password:'/passphrase
+            # prompt AND the first-contact host-key question. Two things would break it:
+            #  1. capture_output would pipe ssh's stdio and swallow the prompt;
+            #  2. the _stage spinner rewrites column 0 every 0.12s and would stomp the
+            #     prompt line even when it reaches the tty.
+            # So the interactive open runs PLAINLY (no capture, no spinner). This is the
+            # fix for the b537592 regression where a password host looked hung then died
+            # on Ctrl-C. ssh prints its own error to the tty; a nonzero rc suffices.
+            print(dim("  opening ssh (you may be prompted for a password) ..."))
             try:
-                # capture_output so we can classify a failure from ssh's own stderr;
-                # an interactive password prompt still reaches the tty regardless.
-                r = subprocess.run(argv, capture_output=True, text=True,
-                                   timeout=30 if batch else None)
-            except subprocess.TimeoutExpired:
+                rc = subprocess.run(argv).returncode
+            except KeyboardInterrupt:
                 _clear_master(self.host, self.ctl)
-                raise ConnectionError(f"ssh connection to {self.host} timed out")
-            if r.returncode != 0:
-                kind, detail = _classify_ssh_probe(r.returncode, "", r.stderr)
-                _clear_master(self.host, self.ctl)
-                if kind in ("unreachable", "auth"):
-                    _st.done = "unreachable" if kind == "unreachable" else "auth failed"
-                    raise ConnectionError(f"can't reach {self.host}: {detail}")
-                # Connected + authed but the shared master didn't hold (a Windows
-                # sshd that won't multiplex): fall back to per-call connections.
-                self.ctl = None
-                _st.done = "ssh ready (per-call)"
+                raise ConnectionError(f"ssh connection to {self.host} cancelled")
+            _classify_and_maybe_fallback(rc, "", None)
+            print(dim(f"  {GLYPH.get('ok', 'v')} ssh ready"
+                      + ("" if self.ctl else " (per-call)")))
         # Master (or per-call fallback) is up. Detect the OS by running `uname` over
         # it - reuses the master when we have one (BatchMode, no re-auth).
         with _stage("probing host", done="probed") as _st:
@@ -12436,7 +12526,7 @@ def _arg_completions(agent, cfg, cmd):
     if cmd in ("/load", "/delete", "/session delete", "/session load", "/session save"):
         return [n for n, _, _ in _session_rows()]      # saved session names
     if cmd in ("/save", "/new"):
-        return [n for n, _, _ in _session_rows()]      # offer existing names (overwrite / reuse)
+        return ["--rename", "--from-worker"] + [n for n, _, _ in _session_rows()]
     if cmd in ("/autosave", "/incognito", "/askread"):
         return ["on", "off"]
     if cmd == "/leash":
@@ -12578,7 +12668,52 @@ def handle_save_command(agent, cfg, arg):
     """/save [name] - DEPRECATED alias: autosave already persists the conversation
     (and now its per-session overrides) each turn, so a manual save is rarely needed.
     Still works: it snapshots + names the session (autosave then continues into it).
-    No arg prompts for a name. Config persists automatically - /save never writes it."""
+    No arg prompts for a name. Config persists automatically - /save never writes it.
+    /save <name> --from-worker <pid> - promote a worker's transcript into a session
+    (loadable with /load); the file formats are unified, so it's a straight save.
+    /save --rename <old> <new> - rename a saved session on disk (load->save->delete)."""
+    parts = arg.split()
+    if "--rename" in parts:
+        i = parts.index("--rename")
+        rest = parts[i + 1:]
+        if len(rest) != 2:
+            print(dim("usage: /save --rename <old> <new>"))
+            return
+        old, new = rest
+        if not _session_name_ok(old) or not _session_name_ok(new):
+            print(red("invalid session name."))
+            return
+        try:
+            data = load_session(old)
+        except FileNotFoundError:
+            print(red(f"no such session: {old!r}"))
+            return
+        if _session_path(new).is_file():
+            print(red(f"target already exists: {new!r} (won't overwrite)."))
+            return
+        # Faithful rename: preserve the original meta verbatim (don't let save_session
+        # re-derive model/host/leash from the LIVE cfg). Just re-title on disk.
+        try:
+            _atomic_write_text(_session_path(new), json.dumps(data, indent=2))
+        except Exception as e:
+            print(red(f"rename failed on write: {e}"))
+            return
+        delete_session(old)
+        # follow the rename if we were autosaving into the old name
+        if getattr(agent, "autosave_name", None) == old:
+            agent.autosave_name = new
+        print(green(f"renamed session '{old}' -> '{new}'."))
+        return
+    if "--from-worker" in parts:
+        i = parts.index("--from-worker")
+        name = " ".join(parts[:i]).strip()
+        pid = next((p for p in parts[i + 1:] if p.isdigit()), None)
+        if not name or pid is None:
+            print(dim("usage: /save <name> --from-worker <pid>"))
+            return
+        print(agent._dispatch("dispatch_worker",
+                              {"action": "promote", "pid": int(pid), "name": name}))
+        return
     name = arg.strip()
     if not any(m.get("role") != "system" for m in agent.messages):
         # Empty conversation: a bare `/save` has nothing to snapshot, but an
@@ -12919,15 +13054,35 @@ def _session_picker(prompt="load session:", show_snapshots=False):
     labels = []
     for nm, meta, mtime in rows:
         age = f"{_fmt_age(now - mtime)} ago" if mtime else "?"
+        tag = f" {d} ex-worker" if str(meta.get("origin") or "").startswith("worker:") else ""
         labels.append(f"{nm}  ({meta.get('saved_at', '?')} {d} "
-                      f"{meta.get('turns', '?')} turns {d} {age})")
+                      f"{meta.get('turns', '?')} turns{tag} {d} {age})")
     choice = pick_one(prompt, labels)
     return rows[labels.index(choice)][0] if choice else None
 
 
 def handle_load_command(agent, cfg, arg):
     """/load [name] - resume a session. No arg opens the recent-first picker;
-    a name (Tab-completes) loads directly."""
+    a name (Tab-completes) loads directly.
+    /load <name> --worker [task...] - instead of loading into THIS session, spin up a
+    background worker seeded from that session (its transcript becomes the worker's
+    history); the optional trailing text is the steer task. The two file formats are
+    unified, so no conversion happens."""
+    parts = arg.split()
+    if "--worker" in parts:
+        i = parts.index("--worker")
+        name = " ".join(parts[:i]).strip()
+        task = " ".join(parts[i + 1:]).strip() or "Continue this session's work."
+        if not name:
+            name = _session_picker(prompt="load into worker:",
+                                   show_snapshots=cfg.show_snapshots)
+        if not name:
+            return
+        out = agent._dispatch("dispatch_worker",
+                              {"action": "dispatch", "task": task,
+                               "from_session": name, "leash": cfg.leash})
+        print(out)
+        return
     name = arg.strip() or _session_picker(show_snapshots=cfg.show_snapshots)
     if name:
         _load_session_into(agent, cfg, name)
@@ -15689,11 +15844,28 @@ def run_agent_brief(args) -> int:
         if not _do_checkpoint:
             return
         try:
-            payload = {"messages": agent.messages,
-                       "pinned_plan": getattr(agent, "pinned_plan", "") or "",
-                       "notes": getattr(agent, "notes", []) or []}
+            # Same envelope as a saved session, so a checkpoint IS a loadable
+            # session (and vice-versa). Config meta comes from the worker's cfg;
+            # pinned_plan + notes ride in meta exactly as save_session writes them.
+            meta = {
+                "saved_at": time.strftime("%Y-%m-%d %H:%M"),
+                "provider": cfg.provider,
+                "model": cfg.active_model(),
+                "host": cfg.host,
+                "cwd": str(cfg.cwd),
+                "leash": cfg.leash,
+                "approval": cfg.approval,
+                "thinking": cfg.setting("thinking"),
+                "effort": cfg.setting("effort"),
+                "remote": None,
+                "title": "",
+                "turns": len([m for m in agent.messages if m.get("role") != "system"]),
+                "pinned_plan": getattr(agent, "pinned_plan", "") or "",
+                "notes": list(getattr(agent, "notes", []) or []),
+                "kind": "worker-checkpoint",
+            }
             tmp = Path(str(_checkpoint_path) + ".tmp")
-            tmp.write_text(json.dumps(payload))
+            tmp.write_text(json.dumps(_session_envelope(agent.messages, meta)))
             tmp.replace(_checkpoint_path)
         except Exception:
             pass
@@ -15718,14 +15890,14 @@ def run_agent_brief(args) -> int:
     if resume_ckpt:
         try:
             data = json.loads(Path(resume_ckpt).read_text())
-            body = [m for m in data.get("messages", []) if m.get("role") != "system"]
+            body, _ckpt_meta = load_envelope(data)
             if body:
                 agent.messages = [{"role": "system", "content": agent._system()}] + body
                 agent.messages = repair_tool_pairs(agent.messages)
-                if data.get("pinned_plan"):
-                    agent.pinned_plan = data["pinned_plan"]
-                if data.get("notes"):
-                    agent.notes = data["notes"]
+                if _ckpt_meta.get("pinned_plan"):
+                    agent.pinned_plan = _ckpt_meta["pinned_plan"]
+                if _ckpt_meta.get("notes"):
+                    agent.notes = _ckpt_meta["notes"]
                 # On a resume the transcript already carries the original task + all prior
                 # work, so the first turn is just the parent's steer (not the full preamble).
                 first_turn = (
