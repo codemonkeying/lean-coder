@@ -15,14 +15,14 @@ schemas, truncated tool results. See README.md.
   L2859   Composer (pinned input line, editor, stdin)
   L3709   Token accounting (calibrated context meter)
   L3874   Config (dataclass, field registry, load/save)
-  L7009   Tool execution + text tool-call parsing
-  L7430   Remote workspace (executor client, /connect)
-  L9021   Context meter
-  L9116   Agent (turn loop, context mgmt, tool dispatch)
-  L14805  Slash-command handlers + dispatch table
-  L14942  REPL (interactive loop, session resume)
-  L15317  Worker agent (headless --agent-run)
-  L15912  Entry (CLI arg parsing, main)
+  L7035   Tool execution + text tool-call parsing
+  L7456   Remote workspace (executor client, /connect)
+  L9047   Context meter
+  L9142   Agent (turn loop, context mgmt, tool dispatch)
+  L14896  Slash-command handlers + dispatch table
+  L15033  REPL (interactive loop, session resume)
+  L15408  Worker agent (headless --agent-run)
+  L16020  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -4903,7 +4903,31 @@ def _atomic_write_text(path: Path, text: str):
         path.write_text(text)
 
 
-def save_session(messages, cfg, name: str, remote=None, pinned_plan="", notes=None):
+def _session_envelope(messages, meta):
+    """The one on-disk shape for BOTH a saved session and a worker checkpoint:
+    {'meta': {...}, 'messages': [...]}. `meta` carries pinned_plan + notes (plus
+    config: provider/model/host/leash/...). Keeping a single envelope means a
+    session file IS a valid worker checkpoint and vice-versa - see load_envelope."""
+    return {"meta": dict(meta or {}), "messages": messages}
+
+
+def load_envelope(data):
+    """Inverse of _session_envelope. Returns (body, meta) where body is the
+    non-system messages and meta is the metadata dict. Back-compat: an OLD flat
+    worker checkpoint stored pinned_plan/notes at TOP level with no 'meta' - fold
+    those into a synthesised meta so old checkpoints still load."""
+    body = [m for m in data.get("messages", []) if m.get("role") != "system"]
+    meta = dict(data.get("meta") or {})
+    # old flat checkpoint: {messages, pinned_plan, notes} with no meta wrapper
+    if "meta" not in data:
+        if "pinned_plan" in data:
+            meta.setdefault("pinned_plan", data.get("pinned_plan") or "")
+        if "notes" in data:
+            meta.setdefault("notes", data.get("notes") or [])
+    return body, meta
+
+
+def save_session(messages, cfg, name: str, remote=None, pinned_plan="", notes=None, origin=None):
     """Write the conversation to ~/.config/leancoder/sessions/<name>.json with a
     metadata header. Returns (path, meta). Raises ValueError on a bad name.
 
@@ -4934,9 +4958,11 @@ def save_session(messages, cfg, name: str, remote=None, pinned_plan="", notes=No
         "notes": list(notes or []),          # session-scoped episodic memory (note tool)
         "session_overrides": dict(getattr(cfg, "session_overrides", {}) or {}),
         "tok_factor": _tok_factor(),         # learned estimate->actual factor (calibrated meter)
+        "origin": origin,                    # None for a normal save; else where it came from,
+                                             # e.g. "worker:20250611-143022-84213-3" (promoted)
     }
     path = _session_path(safe)
-    _atomic_write_text(path, json.dumps({"meta": meta, "messages": messages}, indent=2))
+    _atomic_write_text(path, json.dumps(_session_envelope(messages, meta), indent=2))
     return path, meta
 
 
@@ -12484,7 +12510,7 @@ def _arg_completions(agent, cfg, cmd):
     if cmd in ("/load", "/delete", "/session delete", "/session load", "/session save"):
         return [n for n, _, _ in _session_rows()]      # saved session names
     if cmd in ("/save", "/new"):
-        return [n for n, _, _ in _session_rows()]      # offer existing names (overwrite / reuse)
+        return ["--rename", "--from-worker"] + [n for n, _, _ in _session_rows()]
     if cmd in ("/autosave", "/incognito", "/askread"):
         return ["on", "off"]
     if cmd == "/leash":
@@ -12626,7 +12652,52 @@ def handle_save_command(agent, cfg, arg):
     """/save [name] - DEPRECATED alias: autosave already persists the conversation
     (and now its per-session overrides) each turn, so a manual save is rarely needed.
     Still works: it snapshots + names the session (autosave then continues into it).
-    No arg prompts for a name. Config persists automatically - /save never writes it."""
+    No arg prompts for a name. Config persists automatically - /save never writes it.
+    /save <name> --from-worker <pid> - promote a worker's transcript into a session
+    (loadable with /load); the file formats are unified, so it's a straight save.
+    /save --rename <old> <new> - rename a saved session on disk (load->save->delete)."""
+    parts = arg.split()
+    if "--rename" in parts:
+        i = parts.index("--rename")
+        rest = parts[i + 1:]
+        if len(rest) != 2:
+            print(dim("usage: /save --rename <old> <new>"))
+            return
+        old, new = rest
+        if not _session_name_ok(old) or not _session_name_ok(new):
+            print(red("invalid session name."))
+            return
+        try:
+            data = load_session(old)
+        except FileNotFoundError:
+            print(red(f"no such session: {old!r}"))
+            return
+        if _session_path(new).is_file():
+            print(red(f"target already exists: {new!r} (won't overwrite)."))
+            return
+        # Faithful rename: preserve the original meta verbatim (don't let save_session
+        # re-derive model/host/leash from the LIVE cfg). Just re-title on disk.
+        try:
+            _atomic_write_text(_session_path(new), json.dumps(data, indent=2))
+        except Exception as e:
+            print(red(f"rename failed on write: {e}"))
+            return
+        delete_session(old)
+        # follow the rename if we were autosaving into the old name
+        if getattr(agent, "autosave_name", None) == old:
+            agent.autosave_name = new
+        print(green(f"renamed session '{old}' -> '{new}'."))
+        return
+    if "--from-worker" in parts:
+        i = parts.index("--from-worker")
+        name = " ".join(parts[:i]).strip()
+        pid = next((p for p in parts[i + 1:] if p.isdigit()), None)
+        if not name or pid is None:
+            print(dim("usage: /save <name> --from-worker <pid>"))
+            return
+        print(agent._dispatch("dispatch_worker",
+                              {"action": "promote", "pid": int(pid), "name": name}))
+        return
     name = arg.strip()
     if not any(m.get("role") != "system" for m in agent.messages):
         # Empty conversation: a bare `/save` has nothing to snapshot, but an
@@ -12967,15 +13038,35 @@ def _session_picker(prompt="load session:", show_snapshots=False):
     labels = []
     for nm, meta, mtime in rows:
         age = f"{_fmt_age(now - mtime)} ago" if mtime else "?"
+        tag = f" {d} ex-worker" if str(meta.get("origin") or "").startswith("worker:") else ""
         labels.append(f"{nm}  ({meta.get('saved_at', '?')} {d} "
-                      f"{meta.get('turns', '?')} turns {d} {age})")
+                      f"{meta.get('turns', '?')} turns{tag} {d} {age})")
     choice = pick_one(prompt, labels)
     return rows[labels.index(choice)][0] if choice else None
 
 
 def handle_load_command(agent, cfg, arg):
     """/load [name] - resume a session. No arg opens the recent-first picker;
-    a name (Tab-completes) loads directly."""
+    a name (Tab-completes) loads directly.
+    /load <name> --worker [task...] - instead of loading into THIS session, spin up a
+    background worker seeded from that session (its transcript becomes the worker's
+    history); the optional trailing text is the steer task. The two file formats are
+    unified, so no conversion happens."""
+    parts = arg.split()
+    if "--worker" in parts:
+        i = parts.index("--worker")
+        name = " ".join(parts[:i]).strip()
+        task = " ".join(parts[i + 1:]).strip() or "Continue this session's work."
+        if not name:
+            name = _session_picker(prompt="load into worker:",
+                                   show_snapshots=cfg.show_snapshots)
+        if not name:
+            return
+        out = agent._dispatch("dispatch_worker",
+                              {"action": "dispatch", "task": task,
+                               "from_session": name, "leash": cfg.leash})
+        print(out)
+        return
     name = arg.strip() or _session_picker(show_snapshots=cfg.show_snapshots)
     if name:
         _load_session_into(agent, cfg, name)
@@ -15737,11 +15828,28 @@ def run_agent_brief(args) -> int:
         if not _do_checkpoint:
             return
         try:
-            payload = {"messages": agent.messages,
-                       "pinned_plan": getattr(agent, "pinned_plan", "") or "",
-                       "notes": getattr(agent, "notes", []) or []}
+            # Same envelope as a saved session, so a checkpoint IS a loadable
+            # session (and vice-versa). Config meta comes from the worker's cfg;
+            # pinned_plan + notes ride in meta exactly as save_session writes them.
+            meta = {
+                "saved_at": time.strftime("%Y-%m-%d %H:%M"),
+                "provider": cfg.provider,
+                "model": cfg.active_model(),
+                "host": cfg.host,
+                "cwd": str(cfg.cwd),
+                "leash": cfg.leash,
+                "approval": cfg.approval,
+                "thinking": cfg.setting("thinking"),
+                "effort": cfg.setting("effort"),
+                "remote": None,
+                "title": "",
+                "turns": len([m for m in agent.messages if m.get("role") != "system"]),
+                "pinned_plan": getattr(agent, "pinned_plan", "") or "",
+                "notes": list(getattr(agent, "notes", []) or []),
+                "kind": "worker-checkpoint",
+            }
             tmp = Path(str(_checkpoint_path) + ".tmp")
-            tmp.write_text(json.dumps(payload))
+            tmp.write_text(json.dumps(_session_envelope(agent.messages, meta)))
             tmp.replace(_checkpoint_path)
         except Exception:
             pass
@@ -15766,14 +15874,14 @@ def run_agent_brief(args) -> int:
     if resume_ckpt:
         try:
             data = json.loads(Path(resume_ckpt).read_text())
-            body = [m for m in data.get("messages", []) if m.get("role") != "system"]
+            body, _ckpt_meta = load_envelope(data)
             if body:
                 agent.messages = [{"role": "system", "content": agent._system()}] + body
                 agent.messages = repair_tool_pairs(agent.messages)
-                if data.get("pinned_plan"):
-                    agent.pinned_plan = data["pinned_plan"]
-                if data.get("notes"):
-                    agent.notes = data["notes"]
+                if _ckpt_meta.get("pinned_plan"):
+                    agent.pinned_plan = _ckpt_meta["pinned_plan"]
+                if _ckpt_meta.get("notes"):
+                    agent.notes = _ckpt_meta["notes"]
                 # On a resume the transcript already carries the original task + all prior
                 # work, so the first turn is just the parent's steer (not the full preamble).
                 first_turn = (

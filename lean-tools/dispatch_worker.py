@@ -74,7 +74,7 @@ TOOL = {
             "action": {"type": "string",
                        "enum": ["dispatch", "models", "status", "result", "transcript",
                                 "cancel", "pause", "pause_all", "stop_all", "resume",
-                                "resume_all", "inject", "set_plan", "add_note",
+                                "resume_all", "inject", "set_plan", "add_note", "promote",
                                 "board_claim", "board_release", "board_list"],
                        "default": "dispatch",
                        "description": "Default 'dispatch' (launch from `task`). 'models'=list "
@@ -123,6 +123,15 @@ TOOL = {
                                     "host is prompted ONCE here - a worker can't answer prompts."},
             "cwd": {"type": "string",
                     "description": "Optional working directory (defaults to current)."},
+            "from_session": {"type": "string",
+                             "description": "Optional: seed this worker from a saved SESSION (name "
+                                            "under CONFIG_DIR/sessions, or a path). Its transcript "
+                                            "becomes the worker's history and `task` runs as a steer "
+                                            "turn on top; checkpointing is forced on so it can be "
+                                            "promoted back to a session later."},
+            "name": {"type": "string",
+                     "description": "For action='promote' (pid=): the session name to save the "
+                                    "worker's transcript under (loadable with /load)."},
             "taskboard": {"type": "string",
                           "description": "Optional: assign this worker to a named task-board (see "
                                          "the `board` tool). The worker auto-gets the board tool and "
@@ -348,16 +357,34 @@ def run(args, cwd):
                               iterations=args.get("iterations"))
     if action == "transcript":
         return _worker_transcript(args.get("pid"), args.get("page"))
+    if action == "promote":
+        return _worker_promote(args.get("pid"), args.get("name") or args.get("text"))
     if action in ("board_claim", "board_release", "board_list"):
         return _worker_board(action, args.get("text") or args.get("task"))
     if action != "dispatch":
         return ("error: unknown action %r (use dispatch | models | status | result | "
                 "transcript | cancel | pause | pause_all | stop_all | resume | resume_all | "
-                "inject | set_plan | add_note | board_claim | board_release | "
+                "inject | set_plan | add_note | promote | board_claim | board_release | "
                 "board_list)." % action)
     task = (args.get("task") or "").strip()
     if not task:
         return "error: dispatch_worker action='dispatch' needs a non-empty task."
+    # Optional: SEED this fresh worker from a saved SESSION (or any checkpoint-shaped
+    # file) - the unified {meta,messages} envelope means a session file is a valid
+    # worker checkpoint. Given a bare name, resolve it under CONFIG_DIR/sessions.
+    # run_agent_brief reloads that transcript, then runs `task` as a steer turn on top.
+    seed_session = (args.get("from_session") or "").strip()
+    seed_resume = ""
+    if seed_session:
+        p = Path(seed_session)
+        if not p.is_file():
+            cand = Path(_H["CONFIG_DIR"]) / "sessions" / (seed_session + ".json")
+            if cand.is_file():
+                p = cand
+        if not p.is_file():
+            return (f"error: from_session {seed_session!r} not found "
+                    f"(looked for a file and under CONFIG_DIR/sessions/).")
+        seed_resume = str(p.resolve())
     # SAFE-RECURSION governor: is THIS process allowed to spawn a worker at all, and if
     # so how many? The driver (worker_depth 0) is governed only by max_concurrent. A
     # WORKER (depth >= 1) must pass two gates before it can spawn a child:
@@ -552,7 +579,8 @@ def run(args, cwd):
     brief_file = wdir / f"{stamp}.brief"
     result_file = wdir / f"{stamp}.result"
     # Checkpoint the transcript (opt-in) so a dead/timed-out worker can be action='resume'd.
-    do_checkpoint = bool(getattr(_cfg, "worker_checkpoint", False))
+    # A session-seeded worker turns it ON regardless (so it can be promoted back later).
+    do_checkpoint = bool(getattr(_cfg, "worker_checkpoint", False)) or bool(seed_resume)
     # Shared swarm board session: peers coordinate on the driver's board (keyed by the
     # driver's pid). A worker dispatching a child passes its own inherited board session
     # DOWN so a whole subtree shares one board; the driver seeds it with its own pid.
@@ -564,7 +592,7 @@ def run(args, cwd):
                                              plan=seed_plan, notes=seed_notes,
                                              depth=my_depth + 1, child_budget=child_budget,
                                              checkpoint=do_checkpoint, board=board_session,
-                                             taskboard=taskboard))
+                                             taskboard=taskboard, resume=seed_resume))
     except OSError as e:
         return f"error: cannot write brief file: {e}"
 
@@ -1008,6 +1036,58 @@ def _worker_transcript(pid, page):
     footer = ("" if p >= npages
               else f"\n\n[more: {npages - p} page(s) left - action='transcript' page={p + 1}]")
     return f"{head}\n\n{pages[p - 1]}{footer}"
+
+
+def _worker_promote(pid, name):
+    """PROMOTE a worker's transcript into a saved SESSION you can /load. Reads the
+    worker's checkpoint (the unified {meta,messages} envelope) and writes it under
+    CONFIG_DIR/sessions/<name>.json via the core save_session. Needs worker_checkpoint
+    (the sidecar must exist). Works for a running, finished, or paused worker - it's a
+    snapshot of the trail so far."""
+    if pid is None:
+        return "error: action='promote' needs a pid (which worker to save)."
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return f"error: bad pid {pid!r}."
+    name = (name or "").strip()
+    if not name:
+        return "error: action='promote' needs name=<session name> to save under."
+    meta = _H["workers"].get(pid)
+    if not meta:
+        return f"no worker with pid {pid} this session."
+    ckpt = _brief_from_result(meta["result"]) + ".checkpoint"
+    if not Path(ckpt).exists():
+        return (f"worker {pid} has no checkpoint to promote (dispatched with checkpointing "
+                f"off). Dispatch with worker_checkpoint on (session-seeded workers force it).")
+    save_session = _H.get("save_session")
+    load_envelope = _H.get("load_envelope")
+    if not save_session or not load_envelope:
+        return "error: core save_session/load_envelope not available (old core?)."
+    try:
+        data = json.loads(Path(ckpt).read_text())
+    except Exception as e:
+        return f"worker {pid} checkpoint is unreadable ({e})."
+    body, cmeta = load_envelope(data)
+    if not body:
+        return f"worker {pid} checkpoint has no recorded turns yet - nothing to promote."
+    # Rebuild a full message list (system + body) as save_session expects, and carry the
+    # worker's pinned_plan + notes across from the checkpoint meta. Stamp origin so the
+    # promoted session is identifiable as an ex-worker (the worker's brief stamp).
+    messages = [{"role": "system", "content": ""}] + body
+    stamp = Path(_brief_from_result(meta["result"])).stem
+    try:
+        path, _ = save_session(messages, _H["cfg"], name,
+                               pinned_plan=cmeta.get("pinned_plan", ""),
+                               notes=cmeta.get("notes", []),
+                               origin=f"worker:{stamp}")
+    except ValueError:
+        return f"error: invalid session name {name!r}."
+    except Exception as e:
+        return f"error: could not save session: {e}"
+    return (f"promoted worker {pid} -> session '{name}' ({len(body)} turns). "
+            f"/load {name} to resume it here.")
+
 
 def _worker_cancel(pid):
     """MODEL-facing cancel (the tool's action='cancel'): kill a still-running worker
@@ -1636,6 +1716,7 @@ def setup(lc, cfg):
               "active_remote", "_ssh_master_alive", "ensure_worker_master",
               "active_tool_names", "resolve_host", "_norm_host",
               "_board_claim", "_board_release", "_board_read_claims",
+              "save_session", "load_envelope",
               "dim", "bold", "green", "cyan"):
         if k in lc:
             _H[k] = lc[k]

@@ -505,6 +505,12 @@ class OllamaClient:
                         sys.stdout.flush()
                         content_parts.append(chunk)
                     if msg.get("tool_calls"):
+                        # Relay tool_calls VERBATIM. ollama round-trips arguments as a
+                        # JSON object both in and out, so passing them through unchanged
+                        # can never introduce a mismatch. Do NOT json.dumps/loads or
+                        # otherwise "normalize" arguments here: reformatting reintroduces
+                        # the string-vs-object footgun (llama.cpp #20198) that bit the
+                        # llamacpp provider, and can silently break multi-turn tool use.
                         tool_calls.extend(msg["tool_calls"])
                     if obj.get("done"):
                         saw_done = True
