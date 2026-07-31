@@ -7,22 +7,22 @@ schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
   L974    Lean-tools (plugin tools: discovery, manager)
-  L1314   MCP client (connection, manager, OAuth, discovery)
-  L1768   Providers (backend plugin registry)
-  L1990   Interactive pickers + menus (raw-mode UI engine)
-  L2339   Terminal styling (colors, formatting helpers)
-  L2536   Streaming + markdown render (model output)
-  L2883   Composer (pinned input line, editor, stdin)
-  L3733   Token accounting (calibrated context meter)
-  L3898   Config (dataclass, field registry, load/save)
-  L7066   Tool execution + text tool-call parsing
-  L7487   Remote workspace (executor client, /connect)
-  L9078   Context meter
-  L9173   Agent (turn loop, context mgmt, tool dispatch)
-  L15096  Slash-command handlers + dispatch table
-  L15233  REPL (interactive loop, session resume)
-  L15594  Worker agent (headless --agent-run)
-  L16206  Entry (CLI arg parsing, main)
+  L1324   MCP client (connection, manager, OAuth, discovery)
+  L1778   Providers (backend plugin registry)
+  L2000   Interactive pickers + menus (raw-mode UI engine)
+  L2349   Terminal styling (colors, formatting helpers)
+  L2546   Streaming + markdown render (model output)
+  L2893   Composer (pinned input line, editor, stdin)
+  L3743   Token accounting (calibrated context meter)
+  L3908   Config (dataclass, field registry, load/save)
+  L7082   Tool execution + text tool-call parsing
+  L7508   Remote workspace (executor client, /connect)
+  L9099   Context meter
+  L9194   Agent (turn loop, context mgmt, tool dispatch)
+  L15163  Slash-command handlers + dispatch table
+  L15300  REPL (interactive loop, session resume)
+  L15661  Worker agent (headless --agent-run)
+  L16273  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -1043,6 +1043,16 @@ class LeanToolManager:
                     # worker brain runs on the driver). Never pushed to the executor,
                     # never routed remotely; see enabled_paths() + _run_tool routing.
                     entry["driver_only"] = bool(spec.get("driver_only"))
+                    # Wedge-cap opt-out (see Agent._dispatch). A tool that is
+                    # long-running BY DESIGN (spawns/awaits a process, drives a
+                    # browser, holds a REPL) sets TOOL["no_timeout"]=True to escape
+                    # the global tool_timeout tripwire; a tool that just needs a
+                    # DIFFERENT ceiling sets TOOL["timeout"]=<seconds>. Neither is
+                    # the norm - almost every tool is a fast in-process call and
+                    # wants the global default.
+                    entry["no_timeout"] = bool(spec.get("no_timeout"))
+                    _to = spec.get("timeout")
+                    entry["timeout"] = float(_to) if isinstance(_to, (int, float)) and _to > 0 else None
                     # Optional call-line icon: a lean-tool may set TOOL["glyph"] to a
                     # short display string (its own signature icon); it's registered so
                     # _tool_glyph can honour it over the derived category. No glyph = the
@@ -4136,6 +4146,11 @@ class Config:
                                      # Blank on a fresh install (first run shows nothing);
                                      # bumped after the "what's new" panel prints on startup.
     command_timeout: int = 300       # foreground run_command timeout (s); long tasks use the background tool
+    tool_timeout: int = 60           # wedge tripwire (s) for an in-process tool at _dispatch; a
+                                     # read/search that runs longer is declared wedged and control
+                                     # is handed back (narrow scope or use background). 0 = disabled.
+                                     # Long-by-design tools opt out (no_timeout); run_command has its
+                                     # own command_timeout tier. See _dispatch / UNBOUNDED_TOOLS.
     bg_max_concurrent: int = 5       # max background tasks at once (0 = unlimited)
     worker_max_concurrent: int = 10   # dispatch_worker: max worker agents alive at once (0 = unlimited)
     worker_idle_timeout: int = 1800  # dispatch_worker: worker lease secs; unattended self-kill
@@ -4416,6 +4431,7 @@ _SCALAR_FIELDS = (
     ("ask_user_to_run",           True,                True),
     ("autosave",                  True,                True),
     ("command_timeout",           300,                 True),
+    ("tool_timeout",              60,                  False),
     ("bg_max_concurrent",         5,                   True),
     ("worker_max_concurrent",     10,                  True),
     ("worker_idle_timeout",       1800,                True),
@@ -7207,6 +7223,11 @@ _EXEC_TIER = tuple(n for n, t in _TIERS.items() if t == "exec")  # ask_user_to_r
 SAFE_TOOLS = tuple(n for n, t in _TIERS.items() if t == "read")
 # Every builtin name - the remote executor allowlist (no nested ssh; ssh is a lean-tool).
 EXEC_TOOLS = tuple(_TIERS)
+# Core tools that opt OUT of the _dispatch wedge tripwire (tool_timeout). run_command
+# enforces its OWN command_timeout (300s) + prompts-to-background; background spawns a
+# detached task and returns at once. Both are long-by-design at their own tier. (Lean-tool
+# long-runners opt out declaratively via TOOL["no_timeout"] instead - see lean_tools reg.)
+UNBOUNDED_TOOLS = frozenset({"run_command", "background"})
 
 
 def _emit_json(stream, obj):
@@ -10622,7 +10643,52 @@ class Agent:
                            f"{self.cfg.ingest_cap_frac}, free {free:,} tok)")
         return text[:head] + notice + text[-tail:]
 
+    def _tool_timeout_for(self, name, plug):
+        """Seconds to allow this tool at _dispatch before declaring it wedged, or
+        None to run unbounded. None when: the global tool_timeout is disabled (0),
+        the tool is a core long-runner (UNBOUNDED_TOOLS), or a lean-tool opts out
+        (no_timeout). A lean-tool may also OVERRIDE the global with its own timeout."""
+        base = getattr(self.cfg, "tool_timeout", 0) or 0
+        if base <= 0:
+            return None
+        if name in UNBOUNDED_TOOLS or name.startswith(MCP_NS):
+            return None   # run_command/background self-bound; MCP calls have their own transport timeout
+        if plug:
+            if plug.get("no_timeout"):
+                return None
+            if plug.get("timeout"):
+                return float(plug["timeout"])
+        return float(base)
+
     def _dispatch(self, name: str, args: dict) -> str:
+        """Wedge tripwire around the real dispatch: run the tool body on a daemon
+        thread and join with a deadline. On trip we can't kill an in-process tool
+        cleanly (no portable thread-abort), so the worker is left orphaned to finish
+        or die on its own and control is HANDED BACK with an actionable message -
+        the agent is unwedged, which is the whole point. Long-by-design tools opt
+        out (_tool_timeout_for -> None) and run inline with no thread overhead."""
+        secs = self._tool_timeout_for(name, self.lean_tools.get(name))
+        if secs is None:
+            return self._dispatch_inner(name, args)
+        result, done = [None], threading.Event()
+
+        def work():
+            try:
+                result[0] = self._dispatch_inner(name, args)
+            except Exception as e:                       # match inline behaviour: surface, never crash the joiner
+                result[0] = f"error in {name}: {e}"
+            finally:
+                done.set()
+
+        threading.Thread(target=work, daemon=True).start()
+        if done.wait(secs):
+            return result[0]
+        return (f"error: tool '{name}' exceeded the {int(secs)}s wedge timeout and was abandoned "
+                f"(it may still be running in the background). Narrow its scope (e.g. pass an "
+                f"explicit path/pattern, read a slice), or if it is legitimately long-running use "
+                f"the background tool. Raise the ceiling with /set tool_timeout <secs> if needed.")
+
+    def _dispatch_inner(self, name: str, args: dict) -> str:
         if name.startswith(MCP_NS):
             return self._ingest_cap(self.mcp.call(name, args), name)
         plug = self.lean_tools.get(name)
@@ -11967,7 +12033,8 @@ _SETTINGS_FIELDS = [
     ("composer", "composer (pinned input)", "bool"),
     ("autosave", "autosave session (auto-load last on start)", "bool"),
     ("auto_update", "on launch, self-update to the latest published build (needs the 'update' lean-tool)", "bool"),
-    ("update_track", "which /update track to follow", ("stable", "beta")),
+    ("command_timeout", "run_command timeout (s)", "int"),
+    ("tool_timeout", "wedge tripwire (s) for an in-process tool; long-by-design tools opt out", "int"),
     ("command_timeout", "run_command timeout (s)", "int"),
     ("max_iterations", "max tool-call rounds per turn (0 = unlimited)", "int"),
     ("bg_max_concurrent", "max background tasks (0 = unlimited)", "int"),

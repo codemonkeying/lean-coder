@@ -170,6 +170,7 @@ TOOL = {
         "required": [],
     },
     "driver_only": True,   # spawns the worker process on the driver; never pushed remotely
+    "no_timeout": True,    # launches/awaits a background worker agent; long-by-design
     # NOT safe: dispatching a worker spends quota + runs commands, so it confirms
     # unless approval is auto/armed (same policy as any non-read tool).
 }
