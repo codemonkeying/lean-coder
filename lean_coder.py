@@ -19,10 +19,10 @@ schemas, truncated tool results. See README.md.
   L7472   Remote workspace (executor client, /connect)
   L9063   Context meter
   L9158   Agent (turn loop, context mgmt, tool dispatch)
-  L14912  Slash-command handlers + dispatch table
-  L15049  REPL (interactive loop, session resume)
-  L15424  Worker agent (headless --agent-run)
-  L16036  Entry (CLI arg parsing, main)
+  L14949  Slash-command handlers + dispatch table
+  L15086  REPL (interactive loop, session resume)
+  L15447  Worker agent (headless --agent-run)
+  L16059  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -11451,7 +11451,7 @@ def _render_tool_call(entry: dict, cap: int = EXPAND_MAX_CHARS) -> str:
 # REPL
 # ----------------------------------------------------------------------------
 
-SLASH_COMMANDS = ["/clear", "/new", "/trim", "/compact", "/session", "/save", "/load",
+SLASH_COMMANDS = ["/clear", "/new", "/trim", "/compact", "/compact_at", "/session", "/save", "/load",
                   "/prompt", "/sh", "/connect", "/machines", "/local", "/disconnect", "/tools", "/reload",
                   "/model", "/provider", "/think", "/effort",
                   "/set", "/usage", "/approve", "/leash", "/autosave", "/incognito",
@@ -11643,6 +11643,7 @@ HELP_COMMANDS = [
     ("/new [name]", "start a separate session"),
     ("/trim [keep]", "programmatic: stub old tool outputs, keep newest [keep] (no LLM)"),
     ("/compact", "agentic: summarize + commit docs, replace history (the lever auto-compact pulls)"),
+    ("/compact_at [frac]", "set THE auto-compaction lever (fill fraction; no arg shows zones)"),
     ("/save [name]", "name the current session"),
     ("/load [name]", "resume a session (no arg = picker)"),
     ("/session", "list | delete <name>"),
@@ -14108,13 +14109,29 @@ def _split_queued_commands(queued):
 def _drain_choice(raw):
     """Map a queue-drain keypress to combine / separate / discard. Pure -> tested.
     Default (Enter or anything unrecognized) is 'combine' - one turn carrying all the
-    queued lines, the least-surprising "I typed more while you worked, just take it"."""
+    queued lines, the least-surprising "I typed more while you worked, just take it".
+    (Legacy: the interactive 3-way prompt was retired in favour of always-combine;
+    kept for the unit tests + any caller that still wants the mapping.)"""
     r = (raw or "").strip().lower()
     if r in ("s", "separate", "split"):
         return "separate"
     if r in ("d", "n", "discard", "no", "drop"):
         return "discard"
     return "combine"
+
+
+def _coalesce_queued(msgs, interrupted=False):
+    """Fold banked mid-turn messages into ONE turn string. A single message passes
+    through bare (reads as a normal follow-up); >=2, or an interrupt, get a short
+    framing prefix so the model knows they landed WHILE it was working (not a fresh
+    turn). Pure -> tested."""
+    body = "\n".join(msgs)
+    if interrupted:
+        return ("[The user interrupted your previous turn to send this now:]\n" + body)
+    if len(msgs) > 1:
+        return ("[The user sent the following while you were working on the previous "
+                "turn - treat it as one message:]\n" + body)
+    return body
 
 
 def handle_clear_command(agent, cfg, arg):
@@ -14640,6 +14657,25 @@ def handle_trim_command(agent, cfg, arg):
     agent._print_ctx()
 
 
+def handle_compact_at_command(agent, cfg, arg):
+    """/compact_at [frac] - THE context lever: the fill fraction of the window at which
+    auto-compaction is forced (soft zone slides with it: soft = compact_at * soft_ratio).
+    No arg shows the current value + the derived soft/emergency zones. A shortcut for
+    `/set compact_at` (which still works); the other handover knobs (compact_soft,
+    compact_soft_ratio, compact_emergency, compact_min_interval) stay under /set."""
+    if not arg.strip():
+        c = cfg.compact_for()
+        print(bold(cyan("/compact_at")) + dim("  (the auto-compaction lever)"))
+        print(f"  compact_at   {cfg.compact_at:.2f}   " + dim(f"({cfg.compact_at:.0%} of the window)"))
+        print(dim(f"  soft zone    {c['soft']:.2f}   (model may electively hand over from here)"))
+        print(dim(f"  emergency    {cfg.compact_emergency:.2f}"))
+        print(dim("  usage: /compact_at <0-1>   ·   other knobs: /set compact_soft*, compact_emergency, ..."))
+        return
+    if _set_setting_field(agent, cfg, "compact_at", arg.strip()):
+        c = cfg.compact_for()
+        print(dim(f"compact_at -> {cfg.compact_at:.2f}  (soft zone {c['soft']:.2f})"))
+
+
 def handle_compact_command(agent, cfg, arg):
     """/compact - agentic compaction: the model saves+commits durable docs, writes
     the summary between the markers, and history is then replaced with that summary
@@ -14853,6 +14889,7 @@ _BUILTIN_COMMANDS_TABLE = {
     "/local": handle_local_command, "/disconnect": handle_local_command,
     "/trim": handle_trim_command,
     "/compact": handle_compact_command,
+    "/compact_at": handle_compact_at_command,
     "/session": handle_session_command,
     "/save": handle_save_command,
     "/load": handle_load_command,
@@ -14881,7 +14918,7 @@ _BUILTIN_COMMANDS_TABLE = {
 # Commands that persist a config change: the dispatch autosaves the config AFTER the
 # handler returns (these handlers have many early-return paths, so the autosave belongs
 # in the dispatch, exactly where the former chain ran it - not inside the handler).
-_CMD_AUTOSAVE = frozenset({"/provider", "/providers", "/set"})
+_CMD_AUTOSAVE = frozenset({"/provider", "/providers", "/set", "/compact_at"})
 
 # Single source of truth for shadow protection: every builtin command + alias, derived
 # from the dispatch table so the protected set can never drift from what's dispatched
@@ -15339,10 +15376,10 @@ def repl(cfg: Config, resume=None):
             if interrupted:
                 if queued:
                     # ^C WITH something typed = "stop this task and send what I typed
-                    # now" (steering): combine the typed lines into one redirect, drop
-                    # any older backlog (runaway can't outlive ^C).
+                    # now" (steering): fold the typed lines into one framed redirect,
+                    # drop any older backlog (runaway can't outlive ^C).
                     pending_inputs.clear()
-                    pending_inputs.append("\n".join(queued))
+                    pending_inputs.append(_coalesce_queued(queued, interrupted=True))
                     print(yellow("\n^C - stopped; sending your message now"
                                  + (f" ({len(queued)} lines combined)" if len(queued) > 1 else "")))
                 else:
@@ -15351,30 +15388,16 @@ def repl(cfg: Config, resume=None):
                     pending_inputs.clear()
                     print(yellow("\n^C - stopped"
                                  + (f"; cleared {dropped} queued message(s)" if dropped else "")))
-            elif len(queued) == 1:
-                # one typed-ahead message auto-runs next - tell the user so (no silent magic)
-                pending_inputs.extend(queued)
-                print(dim(f"  {GLYPH['dot']} 1 message queued -> sending as the next turn."))
             elif queued:
-                # several queued -> explicit 3-way (never a silent burst, never an
-                # ambiguous "send all now?"). Default (Enter) = combine into one turn.
-                print(dim(f"{len(queued)} messages queued while working:"))
-                for q in queued:
-                    print(dim(f"  {GLYPH['dot']} {q}"))
-                try:
-                    raw = input(_rl_safe(bold(
-                        "[c]ombine into 1 turn  ·  [s]eparate turns (one each)  ·  [d]iscard?  [c] ")))
-                except (EOFError, KeyboardInterrupt):
-                    raw = "d"
-                choice = _drain_choice(raw)
-                if choice == "combine":
-                    pending_inputs.append("\n".join(queued))
-                    print(dim(f"combined {len(queued)} into one turn."))
-                elif choice == "discard":
-                    print(dim("discarded queued messages."))
+                # Messages typed WHILE the model worked always coalesce into ONE next
+                # turn (framed when >1 so the model knows they arrived mid-turn) - no
+                # interactive prompt, no per-message turn-wedging. ^C sends them now.
+                pending_inputs.append(_coalesce_queued(queued))
+                if len(queued) == 1:
+                    print(dim(f"  {GLYPH['dot']} 1 message queued -> sending as the next turn."))
                 else:
-                    pending_inputs.extend(queued)
-                    print(dim(f"queued {len(queued)} as separate turns (one per turn)."))
+                    print(dim(f"  {GLYPH['dot']} {len(queued)} messages queued while working "
+                              f"-> combined into the next turn."))
             # queued commands run as commands, after any drained messages, in order typed
             if cmds:
                 pending_inputs.extend(cmds)
