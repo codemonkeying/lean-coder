@@ -19,10 +19,10 @@ schemas, truncated tool results. See README.md.
   L7534   Remote workspace (executor client, /connect)
   L9125   Context meter
   L9220   Agent (turn loop, context mgmt, tool dispatch)
-  L15211  Slash-command handlers + dispatch table
-  L15348  REPL (interactive loop, session resume)
-  L15709  Worker agent (headless --agent-run)
-  L16321  Entry (CLI arg parsing, main)
+  L15218  Slash-command handlers + dispatch table
+  L15355  REPL (interactive loop, session resume)
+  L15716  Worker agent (headless --agent-run)
+  L16328  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -10291,11 +10291,18 @@ class Agent:
         if last_assist is not None:
             anchors.add(last_assist)
         # Middle in chronological order; drop it oldest-first, whole messages at a time.
-        # (Dropping an assistant tool_call together with its tool answers is preserved
-        # naturally: we only ever KEEP anchors, and a tool_result whose tool_call was
-        # dropped is itself in the middle and dropped too - never kept orphaned.)
+        # A cut must NOT split a tool_call from its tool_result: dropping an assistant
+        # tool_call while keeping its tool answer leaves an orphan tool_result at the head
+        # of the kept tail, which the API rejects (messages.N: unexpected tool_use_id in
+        # tool_result). So skip any cut whose first KEPT middle message is a tool result -
+        # advance the cut until the boundary lands on a non-tool message (or the middle is
+        # fully dropped). (Historically this was assumed impossible; it wedged a session.)
         middle = [i for i in range(len(turn)) if i not in anchors]
         for cut in range(len(middle) + 1):
+            # A boundary that keeps a tool_result whose tool_call was just dropped orphans
+            # it - not a coherent candidate. Skip (a larger cut will drop it too).
+            if cut < len(middle) and turn[middle[cut]].get("role") == "tool":
+                continue
             # Drop the oldest `cut` middle messages; keep anchors + the rest of the middle.
             dropped_set = set(middle[:cut])
             kept_idx = [i for i in range(len(turn)) if i not in dropped_set]
