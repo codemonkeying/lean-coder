@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L974    Lean-tools (plugin tools: discovery, manager)
-  L1324   MCP client (connection, manager, OAuth, discovery)
-  L1778   Providers (backend plugin registry)
-  L2000   Interactive pickers + menus (raw-mode UI engine)
-  L2349   Terminal styling (colors, formatting helpers)
-  L2548   Streaming + markdown render (model output)
-  L2904   Composer (pinned input line, editor, stdin)
-  L3754   Token accounting (calibrated context meter)
-  L3919   Config (dataclass, field registry, load/save)
-  L7093   Tool execution + text tool-call parsing
-  L7519   Remote workspace (executor client, /connect)
-  L9110   Context meter
-  L9205   Agent (turn loop, context mgmt, tool dispatch)
-  L15183  Slash-command handlers + dispatch table
-  L15320  REPL (interactive loop, session resume)
-  L15681  Worker agent (headless --agent-run)
-  L16293  Entry (CLI arg parsing, main)
+  L989    Lean-tools (plugin tools: discovery, manager)
+  L1339   MCP client (connection, manager, OAuth, discovery)
+  L1793   Providers (backend plugin registry)
+  L2015   Interactive pickers + menus (raw-mode UI engine)
+  L2364   Terminal styling (colors, formatting helpers)
+  L2563   Streaming + markdown render (model output)
+  L2919   Composer (pinned input line, editor, stdin)
+  L3769   Token accounting (calibrated context meter)
+  L3934   Config (dataclass, field registry, load/save)
+  L7108   Tool execution + text tool-call parsing
+  L7534   Remote workspace (executor client, /connect)
+  L9125   Context meter
+  L9220   Agent (turn loop, context mgmt, tool dispatch)
+  L15198  Slash-command handlers + dispatch table
+  L15335  REPL (interactive loop, session resume)
+  L15696  Worker agent (headless --agent-run)
+  L16308  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -111,7 +111,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.9.9"
+__version__ = "0.10.0"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -119,6 +119,21 @@ __version__ = "0.9.9"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.10.0": [
+        "smarter auto-compaction: the verbatim tail kept after a compaction is now",
+        "  sized by a TOKEN budget (not a fixed turn count), so a huge multi-day turn",
+        "  gets trimmed to fit instead of re-filling the window or being dropped whole.",
+        "  New `/compact_at [frac]` command is the one lever for the auto-compact zone,",
+        "  and `compact_keep` (now default 15) is a ceiling, not a target.",
+        "messages you type while the model is working now fold into ONE framed next",
+        "  turn (no more combine/separate/discard prompt); ^C mid-work exits cleanly",
+        "  and your queued input still lands.",
+        "safety: a runaway in-process tool (e.g. an unscoped search) can no longer",
+        "  hang the session - it trips a `tool_timeout` (default 60s) and hands control",
+        "  back with an actionable message. Write tools are never abandoned mid-edit.",
+        "drafts you paste back (a 'message to send') render bar-free so a copy-paste",
+        "  stays clean - including fenced commands nested inside a quote.",
+    ],
     "0.9.9": [
         "sessions and workers now share ONE on-disk format, so you can move work",
         "  between them: `/load <name> --worker [task]` spins up a background worker",
