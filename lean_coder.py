@@ -11,18 +11,18 @@ schemas, truncated tool results. See README.md.
   L1778   Providers (backend plugin registry)
   L2000   Interactive pickers + menus (raw-mode UI engine)
   L2349   Terminal styling (colors, formatting helpers)
-  L2546   Streaming + markdown render (model output)
-  L2893   Composer (pinned input line, editor, stdin)
-  L3743   Token accounting (calibrated context meter)
-  L3908   Config (dataclass, field registry, load/save)
-  L7082   Tool execution + text tool-call parsing
-  L7508   Remote workspace (executor client, /connect)
-  L9099   Context meter
-  L9194   Agent (turn loop, context mgmt, tool dispatch)
-  L15163  Slash-command handlers + dispatch table
-  L15300  REPL (interactive loop, session resume)
-  L15661  Worker agent (headless --agent-run)
-  L16273  Entry (CLI arg parsing, main)
+  L2548   Streaming + markdown render (model output)
+  L2904   Composer (pinned input line, editor, stdin)
+  L3754   Token accounting (calibrated context meter)
+  L3919   Config (dataclass, field registry, load/save)
+  L7093   Tool execution + text tool-call parsing
+  L7519   Remote workspace (executor client, /connect)
+  L9110   Context meter
+  L9205   Agent (turn loop, context mgmt, tool dispatch)
+  L15174  Slash-command handlers + dispatch table
+  L15311  REPL (interactive loop, session resume)
+  L15672  Worker agent (headless --agent-run)
+  L16284  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -2510,8 +2510,11 @@ _MD_ITALIC = re.compile(r"(?<![\*\w])\*(?!\s)([^*\n]+?)(?<!\s)\*(?![\*\w])"
                         r"|(?<![_\w])_(?!\s)([^_\n]+?)(?<!\s)_(?![_\w])")
 # Blockquote: one or more leading '>' (nested), each optionally followed by a space.
 # The model emits these when it drafts "a message to send" - without handling, the
-# raw '> ' leaks on every line. We strip the markers and re-style as a dim, bar-led
-# quote so it reads as a set-apart block, not literal text.
+# raw '> ' leaks on every line. We STRIP the markers and render the remaining text as
+# plain dim prose. Deliberately NO left bar glyph here: a blockquote is copy-TARGETED
+# content (a message to paste), and a per-line bar prefix contaminates a terminal
+# drag-select. (The cyan/yellow userbars on worker notices + operator turns are a
+# different code path and keep their bar - those aren't copy targets.)
 _MD_QUOTE = re.compile(r"^\s{0,3}((?:>\s?)+)(.*)$")
 
 
@@ -2521,10 +2524,9 @@ def style_md_line(line: str) -> str:
     text pass through untouched."""
     q = _MD_QUOTE.match(line)
     if q:
-        # Strip the '>' marker(s); render the remaining text (still inline-styled) as a
-        # dim quote led by a bar glyph, so the block is visually set apart from prose.
-        inner = style_md_inline(q.group(2))
-        return dim(GLYPH["userbar"] + " ") + inner
+        # Strip the '>' marker(s); render the remaining text (still inline-styled) as
+        # plain dim prose - no bar prefix, so a copied "message to send" stays clean.
+        return dim(style_md_inline(q.group(2)))
     h = _MD_H.match(line)
     if h:
         inner = _MD_CODE.sub(lambda m: m.group(1), h.group(2))      # strip backticks
@@ -2618,13 +2620,22 @@ class MarkdownStream:
         self._fence = False
 
     def _emit(self, line, newline):
-        if line.lstrip().startswith("```"):
+        # A fence can be nested inside a blockquote ("> ```") - the model does this
+        # when it drafts "a message to send" containing commands to copy. Strip an
+        # optional leading blockquote prefix BEFORE fence detection, else the '> '
+        # defeats it and the code (git commands etc.) leaks out bar-prefixed and
+        # unformatted - exactly the lines you most need to copy clean.
+        stripped = _MD_QUOTE.match(line)
+        probe = stripped.group(2) if stripped else line
+        if probe.lstrip().startswith("```"):
             # toggle fence state but DON'T print the ``` delimiter itself - the
             # markers are noise on a terminal (consistent with stripping #, **).
             self._fence = not self._fence
             return
         elif self._fence:
-            out = dim(line)
+            # Inside a fence: emit the code VERBATIM (must stay exact + copyable) with
+            # any blockquote '> ' prefix stripped and no bar - just dimmed when colour.
+            out = dim(probe)
         else:
             out = style_md_line(line)
         self._write(out + ("\n" if newline else ""))
