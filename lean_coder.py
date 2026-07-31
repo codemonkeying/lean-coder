@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L966    Lean-tools (plugin tools: discovery, manager)
-  L1306   MCP client (connection, manager, OAuth, discovery)
-  L1760   Providers (backend plugin registry)
-  L1982   Interactive pickers + menus (raw-mode UI engine)
-  L2331   Terminal styling (colors, formatting helpers)
-  L2528   Streaming + markdown render (model output)
-  L2875   Composer (pinned input line, editor, stdin)
-  L3725   Token accounting (calibrated context meter)
-  L3890   Config (dataclass, field registry, load/save)
-  L7051   Tool execution + text tool-call parsing
-  L7472   Remote workspace (executor client, /connect)
-  L9063   Context meter
-  L9158   Agent (turn loop, context mgmt, tool dispatch)
-  L14949  Slash-command handlers + dispatch table
-  L15086  REPL (interactive loop, session resume)
-  L15447  Worker agent (headless --agent-run)
-  L16059  Entry (CLI arg parsing, main)
+  L974    Lean-tools (plugin tools: discovery, manager)
+  L1314   MCP client (connection, manager, OAuth, discovery)
+  L1768   Providers (backend plugin registry)
+  L1990   Interactive pickers + menus (raw-mode UI engine)
+  L2339   Terminal styling (colors, formatting helpers)
+  L2536   Streaming + markdown render (model output)
+  L2883   Composer (pinned input line, editor, stdin)
+  L3733   Token accounting (calibrated context meter)
+  L3898   Config (dataclass, field registry, load/save)
+  L7066   Tool execution + text tool-call parsing
+  L7487   Remote workspace (executor client, /connect)
+  L9078   Context meter
+  L9173   Agent (turn loop, context mgmt, tool dispatch)
+  L15096  Slash-command handlers + dispatch table
+  L15233  REPL (interactive loop, session resume)
+  L15594  Worker agent (headless --agent-run)
+  L16206  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -341,6 +341,14 @@ COMPACT_MARK = "===COMPACT==="     # the visible delimiter the model wraps its c
 COMPACT_EMERGENCY_KEEP = 1         # hardcoded backstop: on context OVERFLOW we trim to this many
                                    # turns. Not a preference (no /set) - it's a last-ditch rescue
                                    # that fires AT the overflow trigger; more would risk re-overflow.
+# Context-aware compaction keep (soft/hard/manual). After the summary is written we
+# know EXACTLY how big it is, so we compute how much verbatim recent thread can be kept
+# WITHOUT re-filling the window (that would defeat compaction + cost a fresh cache write).
+# keep_budget = min(headroom * frac, keep_cap); NO floor - if the summary itself already
+# eats the window (small local models), headroom<=0 and we keep NOTHING (summary only).
+KEEP_FRAC_LO = 0.2                 # fraction of headroom kept when there's lots of room (>threshold)
+KEEP_FRAC_HI = 0.5                 # fraction kept when headroom is small (keep a bigger share of little)
+KEEP_FRAC_THRESHOLD = 50_000       # headroom (tokens) above which we switch HI->LO so big windows don't hoard
 SELFPROMPT_MARK = "===NEXT==="      # the model wraps its post-compaction self-prompt in these
 PLAN_MARK = "===PLAN==="            # the model wraps its pinned goal + TODO in these
 BRIEF_MARK = "===BRIEF==="          # a worker's task (its first user turn) - see --agent-run
@@ -4065,10 +4073,16 @@ class Config:
     # thread for a voluntary compaction; hard is the middle ground when tight. A "turn"
     # = a user message + the assistant/tool run that answers it; the tail always starts
     # on a clean user boundary so a tool_result is never orphaned from its tool_call.
-    compact_keep: int = 3            # verbatim TURNS kept after any compaction (soft/hard/
-                                     # manual all share this; tail-trim stubs tool payloads
-                                     # so 3 turns of conversation is plenty). Emergency
-                                     # overflow uses a hardcoded backstop (COMPACT_EMERGENCY_KEEP).
+    compact_keep: int = 3            # CEILING on verbatim TURNS kept after a compaction (soft/
+                                     # hard/manual). Not a target: the real bound is a TOKEN budget
+                                     # (keep_cap + a fraction of post-summary headroom) so the kept
+                                     # tail never re-fills the window. Emergency overflow uses a
+                                     # hardcoded backstop (COMPACT_EMERGENCY_KEEP), ignoring the budget.
+    keep_cap: int = 25000            # absolute ceiling (TOKENS) on the verbatim tail kept after a
+                                     # compaction. The budget is min(headroom*frac, keep_cap): this
+                                     # cap stops a huge (1M) window from hoarding 100k+ of raw tail
+                                     # when the summary already carries the gist. NOT compact_-prefixed
+                                     # so /compact<TAB> stays clean; tune via /set keep_cap.
     compact_overrides: dict = field(default_factory=dict)  # per-model override of the
                                      # handover settings (models fill context at different
                                      # rates): model_id -> {auto, soft, hard, autostart}.
@@ -4389,6 +4403,7 @@ _SCALAR_FIELDS = (
     ("compact_min_interval",      60.0,                False),
     ("autostart_after_compact",   True,                False),
     ("compact_keep",              3,                   False),
+    ("keep_cap",                  25000,               False),
     ("auto_trim_interval",        0,                   False),
     ("auto_trim_hysteresis",      0.25,                False),
     ("auto_trim_keep",            TRIM_KEEP,           False),
@@ -10138,6 +10153,127 @@ class Agent:
                 return base + i
         return None
 
+    def _split_into_turns(self, msgs):
+        """Partition `msgs` (excluding a leading system message) into TURNS - each a list
+        starting on a user message and running up to the next user message. Any orphan
+        prefix before the first user message (rare: a hand-edited/loaded history) folds
+        into the first turn so nothing is lost. Returns [] when there's no user message.
+        Pure -> tested. The unit for compaction keep: a whole turn is the smallest slice
+        that never orphans a tool_result from its tool_call."""
+        head = 1 if (msgs and msgs[0].get("role") == "system") else 0
+        body = msgs[head:]
+        starts = [i for i, m in enumerate(body) if m.get("role") == "user"]
+        if not starts:
+            return []
+        # Fold any pre-first-user orphan into the first turn (start the first slice at 0).
+        starts[0] = 0
+        turns = []
+        for j, s in enumerate(starts):
+            e = starts[j + 1] if j + 1 < len(starts) else len(body)
+            turns.append(body[s:e])
+        return turns
+
+    def _keep_budget(self, summary_text):
+        """Token budget for the verbatim tail kept after a compaction, computed against the
+        REAL post-summary headroom (no guessing - the summary already exists here). NO floor:
+        if the summary itself eats the window (small local models) headroom<=0 -> budget 0 ->
+        keep nothing but the summary. keep_budget = min(headroom * frac, keep_cap), with a
+        bigger fraction kept when there's little room and a hard absolute cap so a huge window
+        never hoards raw tail the summary already distilled. Pure-ish (reads cfg + meter)."""
+        window     = self.cfg.ctx_window() or 0
+        compact_at = self.cfg.compact_for().get("hard", self.cfg.compact_at)
+        fixed = messages_tokens(
+            [{"role": "system", "content": self._system()}], self.tool_defs)
+        summary_tok = messages_tokens(
+            [{"role": "user", "content": summary_text}], None)
+        headroom = int(window * compact_at) - fixed - summary_tok
+        if headroom <= 0:
+            return 0
+        frac = KEEP_FRAC_LO if headroom > KEEP_FRAC_THRESHOLD else KEEP_FRAC_HI
+        return max(0, min(int(headroom * frac), int(getattr(self.cfg, "keep_cap", 25000))))
+
+    def _keep_tail_by_budget(self, pre, summary_text):
+        """The verbatim tail kept after a compaction, bounded by a TOKEN budget (not a
+        fixed turn count). Walk turns newest->oldest, at most compact_keep of them (a
+        CEILING): a turn that fits whole is kept; one that's too big is trimmed to fit
+        (drop oldest tool_call/result pairs, then stub tool bodies - see _trim_turn_to_budget)
+        and kept if a coherent remnant fits, else dropped. Stops when the budget is spent.
+        Returns the tail message list (possibly []). Never re-fills the window: the budget
+        is a fraction of post-summary headroom, hard-capped by keep_cap."""
+        budget = self._keep_budget(summary_text)
+        if budget <= 0:
+            return []
+        turns = self._split_into_turns(pre)
+        if not turns:
+            return []
+        remaining = budget
+        kept = []
+        for turn in reversed(turns[-int(self.cfg.compact_keep):] if self.cfg.compact_keep > 0 else []):
+            cost = messages_tokens(turn, None)
+            if cost <= remaining:
+                kept = turn + kept
+                remaining -= cost
+            else:
+                trimmed = self._trim_turn_to_budget(turn, remaining)
+                if trimmed:
+                    kept = trimmed + kept
+                    remaining -= messages_tokens(trimmed, None)
+                # else: this (older) turn won't fit coherently - drop it, keep newer ones
+            if remaining <= 0:
+                break
+        return kept
+
+    def _trim_turn_to_budget(self, turn, budget):
+        """Shrink a single over-budget TURN to fit `budget` tokens while staying coherent:
+        keep the first message (the user ask) + the last assistant message (latest state)
+        as non-negotiable anchors, then drop the OLDEST tool_call/tool_result pairs from the
+        middle until it fits, replacing the dropped span with one tiny marker so the model
+        isn't confused by the jump. If dropping the whole droppable middle still overflows
+        (giant final tool result), stub the remaining tool bodies (_trim_tool_indices-style).
+        Returns the trimmed message list, or None if even the anchors can't fit `budget`
+        (caller drops the whole turn). Never orphans a tool_result from its tool_call."""
+        if not turn:
+            return None
+        if messages_tokens(turn, None) <= budget:
+            return list(turn)
+        # Anchor indices: the user ask (0) + the latest assistant message. These are kept
+        # verbatim; everything between them is the droppable middle.
+        last_assist = next((i for i in range(len(turn) - 1, -1, -1)
+                            if turn[i].get("role") == "assistant"), None)
+        anchors = {0}
+        if last_assist is not None:
+            anchors.add(last_assist)
+        # Middle in chronological order; drop it oldest-first, whole messages at a time.
+        # (Dropping an assistant tool_call together with its tool answers is preserved
+        # naturally: we only ever KEEP anchors, and a tool_result whose tool_call was
+        # dropped is itself in the middle and dropped too - never kept orphaned.)
+        middle = [i for i in range(len(turn)) if i not in anchors]
+        for cut in range(len(middle) + 1):
+            # Drop the oldest `cut` middle messages; keep anchors + the rest of the middle.
+            dropped_set = set(middle[:cut])
+            kept_idx = [i for i in range(len(turn)) if i not in dropped_set]
+            marker = ([{"role": "user", "content": f"[{cut} intermediate step(s) omitted]"}]
+                      if cut else [])
+            cand = ([turn[kept_idx[0]]] + marker + [turn[i] for i in kept_idx[1:]])
+            if messages_tokens(cand, None) <= budget:
+                return cand
+        # Whole middle dropped and still over budget -> only anchors left, too big
+        # (a giant final tool/assistant message). Stub any tool bodies among the anchors.
+        kept_idx = sorted(anchors)
+        marker = ([{"role": "user", "content": f"[{len(middle)} intermediate step(s) omitted]"}]
+                  if middle else [])
+        anchor_msgs = [dict(turn[i]) for i in kept_idx]      # copy: we may stub in place
+        for m in anchor_msgs:
+            if m.get("role") == "tool" and isinstance(m.get("content"), str) \
+                    and not m["content"].startswith("[trimmed"):
+                n = len(m["content"].splitlines())
+                m["content"] = f"[trimmed {m.get('tool_name', 'tool')} result - {n} lines]"
+                m.pop("image_path", None)
+        cand = [anchor_msgs[0]] + marker + anchor_msgs[1:]
+        if messages_tokens(cand, None) <= budget:
+            return cand
+        return None
+
     # (_auto_evict removed - design decision 8. The universal ingestion cap
     # (_ingest_cap) supersedes continuous eviction; _trim_tool_indices still backs
     # the manual/emergency /trim path.)
@@ -10247,10 +10383,14 @@ class Agent:
             return None
         pre       = list(self.messages)                # capture BEFORE the compaction turn
         pre_plan  = getattr(self, "pinned_plan", "")   # for the recovery snapshot below
-        keep_turns = (COMPACT_EMERGENCY_KEEP if zone == "emergency"
-                      else self.cfg.compact_keep)
-        keep_from = self._keep_tail_turns(pre, keep_turns)
-        tail      = pre[keep_from:] if keep_from is not None else []
+        # Emergency keep is a fixed minimal backstop (fires AT overflow - no token math,
+        # just get small NOW). Soft/hard/manual defer the keep to AFTER the summary exists
+        # so we can budget against its ACTUAL size (see _keep_tail_by_budget below).
+        if zone == "emergency":
+            keep_from = self._keep_tail_turns(pre, COMPACT_EMERGENCY_KEEP)
+            tail = pre[keep_from:] if keep_from is not None else []
+        else:
+            tail = None                # computed post-summary
 
         saved = self.tool_defs
         # Shared retry-parse core: a turn to write the marked blocks, tolerant parse,
@@ -10284,11 +10424,17 @@ class Agent:
                          remote=rhost, pinned_plan=pre_plan, notes=getattr(self, "notes", None))
         except Exception:
             pass
+        # Now that the summary exists we know its exact token cost, so budget the verbatim
+        # keep against the REAL post-summary headroom (soft/hard/manual; emergency already
+        # set a fixed minimal tail above). No summary-size guess, no floor.
+        summary_prefix = "Earlier context (compacted summary):\n"
+        if tail is None:
+            tail = self._keep_tail_by_budget(pre, summary_prefix + block)
         # Consume the tolerant parse from the retry loop (NOT a second strict re-extract:
         # that would throw away plan/next salvaged from a degraded tier for exactly the
         # models the tolerant parser exists to rescue).
         return self._finish_compact(
-            parsed, summary_prefix="Earlier context (compacted summary):\n",
+            parsed, summary_prefix=summary_prefix,
             tail=tail, autostart=True, stamp_clock=not deliberate)
 
     def compact(self):
@@ -11851,7 +11997,8 @@ _SETTINGS_FIELDS = [
     ("gen_idle_timeout", "ollama: max gap between tokens (s; blank = off)", "float"),
     ("compact_min_interval", "min seconds between compactions", "float"),
     ("autostart_after_compact", "auto-continue the turn after a compaction (on by default; 5s ^C to cancel)", "bool"),
-    ("compact_keep", "verbatim turns kept after a compaction (soft/hard/manual)", "int"),
+    ("compact_keep", "max verbatim turns kept after a compaction (CEILING; real bound is a token budget)", "int"),
+    ("keep_cap", "absolute token ceiling on the verbatim tail kept after a compaction (big windows won't hoard)", "int"),
     ("wake_on_bg_finish", "wake + react autonomously when a background task finishes (off by default)", "bool"),
     ("auto_trim_interval", "auto-trim: stub old tool outputs every N tokens (0 = off)", "int"),
     ("auto_trim_hysteresis", "auto-trim re-arm margin (fraction of interval)", "float"),
