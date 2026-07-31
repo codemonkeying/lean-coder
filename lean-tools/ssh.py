@@ -27,6 +27,7 @@ TOOL = {
         "required": ["host", "cmd"],
     },
     # no "safe": runs a remote command, so it goes through the confirm gate
+    "no_timeout": True,   # runs a remote command with its OWN `timeout` arg (default 300s)
 }
 
 

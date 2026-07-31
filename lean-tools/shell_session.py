@@ -76,6 +76,7 @@ TOOL = {
         "required": ["action"],
     },
     "driver_only": True,   # the pty fd lives in the driver process; never run on a remote executor
+    "no_timeout": True,    # drives a persistent live shell/REPL; blocking is expected (has its own per-call timeout)
     # NOT safe: this runs commands / drives a live shell, so it confirms unless
     # approval is auto/armed (same policy as run_command).
 }

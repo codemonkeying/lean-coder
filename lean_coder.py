@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L966    Lean-tools (plugin tools: discovery, manager)
-  L1306   MCP client (connection, manager, OAuth, discovery)
-  L1760   Providers (backend plugin registry)
-  L1982   Interactive pickers + menus (raw-mode UI engine)
-  L2331   Terminal styling (colors, formatting helpers)
-  L2528   Streaming + markdown render (model output)
-  L2875   Composer (pinned input line, editor, stdin)
-  L3725   Token accounting (calibrated context meter)
-  L3890   Config (dataclass, field registry, load/save)
-  L7051   Tool execution + text tool-call parsing
-  L7472   Remote workspace (executor client, /connect)
-  L9063   Context meter
-  L9158   Agent (turn loop, context mgmt, tool dispatch)
-  L14912  Slash-command handlers + dispatch table
-  L15049  REPL (interactive loop, session resume)
-  L15424  Worker agent (headless --agent-run)
-  L16036  Entry (CLI arg parsing, main)
+  L989    Lean-tools (plugin tools: discovery, manager)
+  L1339   MCP client (connection, manager, OAuth, discovery)
+  L1793   Providers (backend plugin registry)
+  L2015   Interactive pickers + menus (raw-mode UI engine)
+  L2364   Terminal styling (colors, formatting helpers)
+  L2563   Streaming + markdown render (model output)
+  L2919   Composer (pinned input line, editor, stdin)
+  L3769   Token accounting (calibrated context meter)
+  L3934   Config (dataclass, field registry, load/save)
+  L7108   Tool execution + text tool-call parsing
+  L7534   Remote workspace (executor client, /connect)
+  L9125   Context meter
+  L9220   Agent (turn loop, context mgmt, tool dispatch)
+  L15198  Slash-command handlers + dispatch table
+  L15335  REPL (interactive loop, session resume)
+  L15696  Worker agent (headless --agent-run)
+  L16308  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -111,7 +111,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.9.9"
+__version__ = "0.10.0"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -119,6 +119,21 @@ __version__ = "0.9.9"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.10.0": [
+        "smarter auto-compaction: the verbatim tail kept after a compaction is now",
+        "  sized by a TOKEN budget (not a fixed turn count), so a huge multi-day turn",
+        "  gets trimmed to fit instead of re-filling the window or being dropped whole.",
+        "  New `/compact_at [frac]` command is the one lever for the auto-compact zone,",
+        "  and `compact_keep` (now default 15) is a ceiling, not a target.",
+        "messages you type while the model is working now fold into ONE framed next",
+        "  turn (no more combine/separate/discard prompt); ^C mid-work exits cleanly",
+        "  and your queued input still lands.",
+        "safety: a runaway in-process tool (e.g. an unscoped search) can no longer",
+        "  hang the session - it trips a `tool_timeout` (default 60s) and hands control",
+        "  back with an actionable message. Write tools are never abandoned mid-edit.",
+        "drafts you paste back (a 'message to send') render bar-free so a copy-paste",
+        "  stays clean - including fenced commands nested inside a quote.",
+    ],
     "0.9.9": [
         "sessions and workers now share ONE on-disk format, so you can move work",
         "  between them: `/load <name> --worker [task]` spins up a background worker",
@@ -188,7 +203,7 @@ RELEASE_NOTES = {
     "0.9.4": [
         "context mgmt: /handover is now /compact (summarize + continue); the old",
         "  /compact (stub old tool output) is now /trim.",
-        "new knob compact_keep (default 3): verbatim turns kept after a compaction.",
+        "new knob compact_keep (default 15): CEILING on verbatim turns kept after a compaction (real bound is a token budget).",
         "/set compact_at <frac>: THE lever for when auto-compaction fires. Was",
         "  compact_hard; old configs still work.",
     ],
@@ -341,6 +356,14 @@ COMPACT_MARK = "===COMPACT==="     # the visible delimiter the model wraps its c
 COMPACT_EMERGENCY_KEEP = 1         # hardcoded backstop: on context OVERFLOW we trim to this many
                                    # turns. Not a preference (no /set) - it's a last-ditch rescue
                                    # that fires AT the overflow trigger; more would risk re-overflow.
+# Context-aware compaction keep (soft/hard/manual). After the summary is written we
+# know EXACTLY how big it is, so we compute how much verbatim recent thread can be kept
+# WITHOUT re-filling the window (that would defeat compaction + cost a fresh cache write).
+# keep_budget = min(headroom * frac, keep_cap); NO floor - if the summary itself already
+# eats the window (small local models), headroom<=0 and we keep NOTHING (summary only).
+KEEP_FRAC_LO = 0.2                 # fraction of headroom kept when there's lots of room (>threshold)
+KEEP_FRAC_HI = 0.5                 # fraction kept when headroom is small (keep a bigger share of little)
+KEEP_FRAC_THRESHOLD = 50_000       # headroom (tokens) above which we switch HI->LO so big windows don't hoard
 SELFPROMPT_MARK = "===NEXT==="      # the model wraps its post-compaction self-prompt in these
 PLAN_MARK = "===PLAN==="            # the model wraps its pinned goal + TODO in these
 BRIEF_MARK = "===BRIEF==="          # a worker's task (its first user turn) - see --agent-run
@@ -1035,6 +1058,16 @@ class LeanToolManager:
                     # worker brain runs on the driver). Never pushed to the executor,
                     # never routed remotely; see enabled_paths() + _run_tool routing.
                     entry["driver_only"] = bool(spec.get("driver_only"))
+                    # Wedge-cap opt-out (see Agent._dispatch). A tool that is
+                    # long-running BY DESIGN (spawns/awaits a process, drives a
+                    # browser, holds a REPL) sets TOOL["no_timeout"]=True to escape
+                    # the global tool_timeout tripwire; a tool that just needs a
+                    # DIFFERENT ceiling sets TOOL["timeout"]=<seconds>. Neither is
+                    # the norm - almost every tool is a fast in-process call and
+                    # wants the global default.
+                    entry["no_timeout"] = bool(spec.get("no_timeout"))
+                    _to = spec.get("timeout")
+                    entry["timeout"] = float(_to) if isinstance(_to, (int, float)) and _to > 0 else None
                     # Optional call-line icon: a lean-tool may set TOOL["glyph"] to a
                     # short display string (its own signature icon); it's registered so
                     # _tool_glyph can honour it over the derived category. No glyph = the
@@ -2492,8 +2525,11 @@ _MD_ITALIC = re.compile(r"(?<![\*\w])\*(?!\s)([^*\n]+?)(?<!\s)\*(?![\*\w])"
                         r"|(?<![_\w])_(?!\s)([^_\n]+?)(?<!\s)_(?![_\w])")
 # Blockquote: one or more leading '>' (nested), each optionally followed by a space.
 # The model emits these when it drafts "a message to send" - without handling, the
-# raw '> ' leaks on every line. We strip the markers and re-style as a dim, bar-led
-# quote so it reads as a set-apart block, not literal text.
+# raw '> ' leaks on every line. We STRIP the markers and render the remaining text as
+# plain dim prose. Deliberately NO left bar glyph here: a blockquote is copy-TARGETED
+# content (a message to paste), and a per-line bar prefix contaminates a terminal
+# drag-select. (The cyan/yellow userbars on worker notices + operator turns are a
+# different code path and keep their bar - those aren't copy targets.)
 _MD_QUOTE = re.compile(r"^\s{0,3}((?:>\s?)+)(.*)$")
 
 
@@ -2503,10 +2539,9 @@ def style_md_line(line: str) -> str:
     text pass through untouched."""
     q = _MD_QUOTE.match(line)
     if q:
-        # Strip the '>' marker(s); render the remaining text (still inline-styled) as a
-        # dim quote led by a bar glyph, so the block is visually set apart from prose.
-        inner = style_md_inline(q.group(2))
-        return dim(GLYPH["userbar"] + " ") + inner
+        # Strip the '>' marker(s); render the remaining text (still inline-styled) as
+        # plain dim prose - no bar prefix, so a copied "message to send" stays clean.
+        return dim(style_md_inline(q.group(2)))
     h = _MD_H.match(line)
     if h:
         inner = _MD_CODE.sub(lambda m: m.group(1), h.group(2))      # strip backticks
@@ -2600,13 +2635,22 @@ class MarkdownStream:
         self._fence = False
 
     def _emit(self, line, newline):
-        if line.lstrip().startswith("```"):
+        # A fence can be nested inside a blockquote ("> ```") - the model does this
+        # when it drafts "a message to send" containing commands to copy. Strip an
+        # optional leading blockquote prefix BEFORE fence detection, else the '> '
+        # defeats it and the code (git commands etc.) leaks out bar-prefixed and
+        # unformatted - exactly the lines you most need to copy clean.
+        stripped = _MD_QUOTE.match(line)
+        probe = stripped.group(2) if stripped else line
+        if probe.lstrip().startswith("```"):
             # toggle fence state but DON'T print the ``` delimiter itself - the
             # markers are noise on a terminal (consistent with stripping #, **).
             self._fence = not self._fence
             return
         elif self._fence:
-            out = dim(line)
+            # Inside a fence: emit the code VERBATIM (must stay exact + copyable) with
+            # any blockquote '> ' prefix stripped and no bar - just dimmed when colour.
+            out = dim(probe)
         else:
             out = style_md_line(line)
         self._write(out + ("\n" if newline else ""))
@@ -4065,10 +4109,16 @@ class Config:
     # thread for a voluntary compaction; hard is the middle ground when tight. A "turn"
     # = a user message + the assistant/tool run that answers it; the tail always starts
     # on a clean user boundary so a tool_result is never orphaned from its tool_call.
-    compact_keep: int = 3            # verbatim TURNS kept after any compaction (soft/hard/
-                                     # manual all share this; tail-trim stubs tool payloads
-                                     # so 3 turns of conversation is plenty). Emergency
-                                     # overflow uses a hardcoded backstop (COMPACT_EMERGENCY_KEEP).
+    compact_keep: int = 15           # CEILING on verbatim TURNS kept after a compaction (soft/
+                                     # hard/manual). Not a target: the real bound is a TOKEN budget
+                                     # (keep_cap + a fraction of post-summary headroom) so the kept
+                                     # tail never re-fills the window. Emergency overflow uses a
+                                     # hardcoded backstop (COMPACT_EMERGENCY_KEEP), ignoring the budget.
+    keep_cap: int = 25000            # absolute ceiling (TOKENS) on the verbatim tail kept after a
+                                     # compaction. The budget is min(headroom*frac, keep_cap): this
+                                     # cap stops a huge (1M) window from hoarding 100k+ of raw tail
+                                     # when the summary already carries the gist. NOT compact_-prefixed
+                                     # so /compact<TAB> stays clean; tune via /set keep_cap.
     compact_overrides: dict = field(default_factory=dict)  # per-model override of the
                                      # handover settings (models fill context at different
                                      # rates): model_id -> {auto, soft, hard, autostart}.
@@ -4122,6 +4172,11 @@ class Config:
                                      # Blank on a fresh install (first run shows nothing);
                                      # bumped after the "what's new" panel prints on startup.
     command_timeout: int = 300       # foreground run_command timeout (s); long tasks use the background tool
+    tool_timeout: int = 60           # wedge tripwire (s) for an in-process tool at _dispatch; a
+                                     # read/search that runs longer is declared wedged and control
+                                     # is handed back (narrow scope or use background). 0 = disabled.
+                                     # Long-by-design tools opt out (no_timeout); run_command has its
+                                     # own command_timeout tier. See _dispatch / UNBOUNDED_TOOLS.
     bg_max_concurrent: int = 5       # max background tasks at once (0 = unlimited)
     worker_max_concurrent: int = 10   # dispatch_worker: max worker agents alive at once (0 = unlimited)
     worker_idle_timeout: int = 1800  # dispatch_worker: worker lease secs; unattended self-kill
@@ -4388,7 +4443,8 @@ _SCALAR_FIELDS = (
     ("compact_emergency",         1.00,                False),
     ("compact_min_interval",      60.0,                False),
     ("autostart_after_compact",   True,                False),
-    ("compact_keep",              3,                   False),
+    ("compact_keep",              15,                  False),
+    ("keep_cap",                  25000,               False),
     ("auto_trim_interval",        0,                   False),
     ("auto_trim_hysteresis",      0.25,                False),
     ("auto_trim_keep",            TRIM_KEEP,           False),
@@ -4401,6 +4457,7 @@ _SCALAR_FIELDS = (
     ("ask_user_to_run",           True,                True),
     ("autosave",                  True,                True),
     ("command_timeout",           300,                 True),
+    ("tool_timeout",              60,                  False),
     ("bg_max_concurrent",         5,                   True),
     ("worker_max_concurrent",     10,                  True),
     ("worker_idle_timeout",       1800,                True),
@@ -7192,6 +7249,11 @@ _EXEC_TIER = tuple(n for n, t in _TIERS.items() if t == "exec")  # ask_user_to_r
 SAFE_TOOLS = tuple(n for n, t in _TIERS.items() if t == "read")
 # Every builtin name - the remote executor allowlist (no nested ssh; ssh is a lean-tool).
 EXEC_TOOLS = tuple(_TIERS)
+# Core tools that opt OUT of the _dispatch wedge tripwire (tool_timeout). run_command
+# enforces its OWN command_timeout (300s) + prompts-to-background; background spawns a
+# detached task and returns at once. Both are long-by-design at their own tier. (Lean-tool
+# long-runners opt out declaratively via TOOL["no_timeout"] instead - see lean_tools reg.)
+UNBOUNDED_TOOLS = frozenset({"run_command", "background"})
 
 
 def _emit_json(stream, obj):
@@ -10138,6 +10200,127 @@ class Agent:
                 return base + i
         return None
 
+    def _split_into_turns(self, msgs):
+        """Partition `msgs` (excluding a leading system message) into TURNS - each a list
+        starting on a user message and running up to the next user message. Any orphan
+        prefix before the first user message (rare: a hand-edited/loaded history) folds
+        into the first turn so nothing is lost. Returns [] when there's no user message.
+        Pure -> tested. The unit for compaction keep: a whole turn is the smallest slice
+        that never orphans a tool_result from its tool_call."""
+        head = 1 if (msgs and msgs[0].get("role") == "system") else 0
+        body = msgs[head:]
+        starts = [i for i, m in enumerate(body) if m.get("role") == "user"]
+        if not starts:
+            return []
+        # Fold any pre-first-user orphan into the first turn (start the first slice at 0).
+        starts[0] = 0
+        turns = []
+        for j, s in enumerate(starts):
+            e = starts[j + 1] if j + 1 < len(starts) else len(body)
+            turns.append(body[s:e])
+        return turns
+
+    def _keep_budget(self, summary_text):
+        """Token budget for the verbatim tail kept after a compaction, computed against the
+        REAL post-summary headroom (no guessing - the summary already exists here). NO floor:
+        if the summary itself eats the window (small local models) headroom<=0 -> budget 0 ->
+        keep nothing but the summary. keep_budget = min(headroom * frac, keep_cap), with a
+        bigger fraction kept when there's little room and a hard absolute cap so a huge window
+        never hoards raw tail the summary already distilled. Pure-ish (reads cfg + meter)."""
+        window     = self.cfg.ctx_window() or 0
+        compact_at = self.cfg.compact_for().get("hard", self.cfg.compact_at)
+        fixed = messages_tokens(
+            [{"role": "system", "content": self._system()}], self.tool_defs)
+        summary_tok = messages_tokens(
+            [{"role": "user", "content": summary_text}], None)
+        headroom = int(window * compact_at) - fixed - summary_tok
+        if headroom <= 0:
+            return 0
+        frac = KEEP_FRAC_LO if headroom > KEEP_FRAC_THRESHOLD else KEEP_FRAC_HI
+        return max(0, min(int(headroom * frac), int(getattr(self.cfg, "keep_cap", 25000))))
+
+    def _keep_tail_by_budget(self, pre, summary_text):
+        """The verbatim tail kept after a compaction, bounded by a TOKEN budget (not a
+        fixed turn count). Walk turns newest->oldest, at most compact_keep of them (a
+        CEILING): a turn that fits whole is kept; one that's too big is trimmed to fit
+        (drop oldest tool_call/result pairs, then stub tool bodies - see _trim_turn_to_budget)
+        and kept if a coherent remnant fits, else dropped. Stops when the budget is spent.
+        Returns the tail message list (possibly []). Never re-fills the window: the budget
+        is a fraction of post-summary headroom, hard-capped by keep_cap."""
+        budget = self._keep_budget(summary_text)
+        if budget <= 0:
+            return []
+        turns = self._split_into_turns(pre)
+        if not turns:
+            return []
+        remaining = budget
+        kept = []
+        for turn in reversed(turns[-int(self.cfg.compact_keep):] if self.cfg.compact_keep > 0 else []):
+            cost = messages_tokens(turn, None)
+            if cost <= remaining:
+                kept = turn + kept
+                remaining -= cost
+            else:
+                trimmed = self._trim_turn_to_budget(turn, remaining)
+                if trimmed:
+                    kept = trimmed + kept
+                    remaining -= messages_tokens(trimmed, None)
+                # else: this (older) turn won't fit coherently - drop it, keep newer ones
+            if remaining <= 0:
+                break
+        return kept
+
+    def _trim_turn_to_budget(self, turn, budget):
+        """Shrink a single over-budget TURN to fit `budget` tokens while staying coherent:
+        keep the first message (the user ask) + the last assistant message (latest state)
+        as non-negotiable anchors, then drop the OLDEST tool_call/tool_result pairs from the
+        middle until it fits, replacing the dropped span with one tiny marker so the model
+        isn't confused by the jump. If dropping the whole droppable middle still overflows
+        (giant final tool result), stub the remaining tool bodies (_trim_tool_indices-style).
+        Returns the trimmed message list, or None if even the anchors can't fit `budget`
+        (caller drops the whole turn). Never orphans a tool_result from its tool_call."""
+        if not turn:
+            return None
+        if messages_tokens(turn, None) <= budget:
+            return list(turn)
+        # Anchor indices: the user ask (0) + the latest assistant message. These are kept
+        # verbatim; everything between them is the droppable middle.
+        last_assist = next((i for i in range(len(turn) - 1, -1, -1)
+                            if turn[i].get("role") == "assistant"), None)
+        anchors = {0}
+        if last_assist is not None:
+            anchors.add(last_assist)
+        # Middle in chronological order; drop it oldest-first, whole messages at a time.
+        # (Dropping an assistant tool_call together with its tool answers is preserved
+        # naturally: we only ever KEEP anchors, and a tool_result whose tool_call was
+        # dropped is itself in the middle and dropped too - never kept orphaned.)
+        middle = [i for i in range(len(turn)) if i not in anchors]
+        for cut in range(len(middle) + 1):
+            # Drop the oldest `cut` middle messages; keep anchors + the rest of the middle.
+            dropped_set = set(middle[:cut])
+            kept_idx = [i for i in range(len(turn)) if i not in dropped_set]
+            marker = ([{"role": "user", "content": f"[{cut} intermediate step(s) omitted]"}]
+                      if cut else [])
+            cand = ([turn[kept_idx[0]]] + marker + [turn[i] for i in kept_idx[1:]])
+            if messages_tokens(cand, None) <= budget:
+                return cand
+        # Whole middle dropped and still over budget -> only anchors left, too big
+        # (a giant final tool/assistant message). Stub any tool bodies among the anchors.
+        kept_idx = sorted(anchors)
+        marker = ([{"role": "user", "content": f"[{len(middle)} intermediate step(s) omitted]"}]
+                  if middle else [])
+        anchor_msgs = [dict(turn[i]) for i in kept_idx]      # copy: we may stub in place
+        for m in anchor_msgs:
+            if m.get("role") == "tool" and isinstance(m.get("content"), str) \
+                    and not m["content"].startswith("[trimmed"):
+                n = len(m["content"].splitlines())
+                m["content"] = f"[trimmed {m.get('tool_name', 'tool')} result - {n} lines]"
+                m.pop("image_path", None)
+        cand = [anchor_msgs[0]] + marker + anchor_msgs[1:]
+        if messages_tokens(cand, None) <= budget:
+            return cand
+        return None
+
     # (_auto_evict removed - design decision 8. The universal ingestion cap
     # (_ingest_cap) supersedes continuous eviction; _trim_tool_indices still backs
     # the manual/emergency /trim path.)
@@ -10247,10 +10430,14 @@ class Agent:
             return None
         pre       = list(self.messages)                # capture BEFORE the compaction turn
         pre_plan  = getattr(self, "pinned_plan", "")   # for the recovery snapshot below
-        keep_turns = (COMPACT_EMERGENCY_KEEP if zone == "emergency"
-                      else self.cfg.compact_keep)
-        keep_from = self._keep_tail_turns(pre, keep_turns)
-        tail      = pre[keep_from:] if keep_from is not None else []
+        # Emergency keep is a fixed minimal backstop (fires AT overflow - no token math,
+        # just get small NOW). Soft/hard/manual defer the keep to AFTER the summary exists
+        # so we can budget against its ACTUAL size (see _keep_tail_by_budget below).
+        if zone == "emergency":
+            keep_from = self._keep_tail_turns(pre, COMPACT_EMERGENCY_KEEP)
+            tail = pre[keep_from:] if keep_from is not None else []
+        else:
+            tail = None                # computed post-summary
 
         saved = self.tool_defs
         # Shared retry-parse core: a turn to write the marked blocks, tolerant parse,
@@ -10284,11 +10471,17 @@ class Agent:
                          remote=rhost, pinned_plan=pre_plan, notes=getattr(self, "notes", None))
         except Exception:
             pass
+        # Now that the summary exists we know its exact token cost, so budget the verbatim
+        # keep against the REAL post-summary headroom (soft/hard/manual; emergency already
+        # set a fixed minimal tail above). No summary-size guess, no floor.
+        summary_prefix = "Earlier context (compacted summary):\n"
+        if tail is None:
+            tail = self._keep_tail_by_budget(pre, summary_prefix + block)
         # Consume the tolerant parse from the retry loop (NOT a second strict re-extract:
         # that would throw away plan/next salvaged from a degraded tier for exactly the
         # models the tolerant parser exists to rescue).
         return self._finish_compact(
-            parsed, summary_prefix="Earlier context (compacted summary):\n",
+            parsed, summary_prefix=summary_prefix,
             tail=tail, autostart=True, stamp_clock=not deliberate)
 
     def compact(self):
@@ -10476,7 +10669,61 @@ class Agent:
                            f"{self.cfg.ingest_cap_frac}, free {free:,} tok)")
         return text[:head] + notice + text[-tail:]
 
+    def _tool_timeout_for(self, name, plug):
+        """Seconds to allow this tool at _dispatch before declaring it wedged, or
+        None to run unbounded. None when: the global tool_timeout is disabled (0),
+        the tool is a core long-runner (UNBOUNDED_TOOLS), a WRITE-tier core tool
+        (never abandon a mutation - see below), or a lean-tool opts out (no_timeout).
+        A lean-tool may also OVERRIDE the global with its own timeout.
+
+        Why writes are never capped: abandoning a read/search is free (no side
+        effect, the orphan thread just dies), which is the cap's whole point. But
+        abandoning a WRITE is dangerous - the orphaned thread can still mutate the
+        file, so it may 'fail' the deadline yet land LATE and race the next edit
+        (observed corruption class). And a local-FS write doesn't truly wedge; a
+        slow one (e.g. rewriting a huge file) is slow, not hung - bounding it just
+        manufactures a false-positive with a corruption risk. So: writes run inline."""
+        base = getattr(self.cfg, "tool_timeout", 0) or 0
+        if base <= 0:
+            return None
+        if name in UNBOUNDED_TOOLS or name in _WRITE_TIER or name.startswith(MCP_NS):
+            return None   # run_command/background self-bound; writes never abandoned; MCP has its own timeout
+        if plug:
+            if plug.get("no_timeout"):
+                return None
+            if plug.get("timeout"):
+                return float(plug["timeout"])
+        return float(base)
+
     def _dispatch(self, name: str, args: dict) -> str:
+        """Wedge tripwire around the real dispatch: run the tool body on a daemon
+        thread and join with a deadline. On trip we can't kill an in-process tool
+        cleanly (no portable thread-abort), so the worker is left orphaned to finish
+        or die on its own and control is HANDED BACK with an actionable message -
+        the agent is unwedged, which is the whole point. Long-by-design tools opt
+        out (_tool_timeout_for -> None) and run inline with no thread overhead."""
+        secs = self._tool_timeout_for(name, self.lean_tools.get(name))
+        if secs is None:
+            return self._dispatch_inner(name, args)
+        result, done = [None], threading.Event()
+
+        def work():
+            try:
+                result[0] = self._dispatch_inner(name, args)
+            except Exception as e:                       # match inline behaviour: surface, never crash the joiner
+                result[0] = f"error in {name}: {e}"
+            finally:
+                done.set()
+
+        threading.Thread(target=work, daemon=True).start()
+        if done.wait(secs):
+            return result[0]
+        return (f"error: tool '{name}' exceeded the {int(secs)}s wedge timeout and was abandoned "
+                f"(it may still be running in the background). Narrow its scope (e.g. pass an "
+                f"explicit path/pattern, read a slice), or if it is legitimately long-running use "
+                f"the background tool. Raise the ceiling with /set tool_timeout <secs> if needed.")
+
+    def _dispatch_inner(self, name: str, args: dict) -> str:
         if name.startswith(MCP_NS):
             return self._ingest_cap(self.mcp.call(name, args), name)
         plug = self.lean_tools.get(name)
@@ -11451,7 +11698,7 @@ def _render_tool_call(entry: dict, cap: int = EXPAND_MAX_CHARS) -> str:
 # REPL
 # ----------------------------------------------------------------------------
 
-SLASH_COMMANDS = ["/clear", "/new", "/trim", "/compact", "/session", "/save", "/load",
+SLASH_COMMANDS = ["/clear", "/new", "/trim", "/compact", "/compact_at", "/session", "/save", "/load",
                   "/prompt", "/sh", "/connect", "/machines", "/local", "/disconnect", "/tools", "/reload",
                   "/model", "/provider", "/think", "/effort",
                   "/set", "/usage", "/approve", "/leash", "/autosave", "/incognito",
@@ -11643,6 +11890,7 @@ HELP_COMMANDS = [
     ("/new [name]", "start a separate session"),
     ("/trim [keep]", "programmatic: stub old tool outputs, keep newest [keep] (no LLM)"),
     ("/compact", "agentic: summarize + commit docs, replace history (the lever auto-compact pulls)"),
+    ("/compact_at [frac]", "set THE auto-compaction lever (fill fraction; no arg shows zones)"),
     ("/save [name]", "name the current session"),
     ("/load [name]", "resume a session (no arg = picker)"),
     ("/session", "list | delete <name>"),
@@ -11820,7 +12068,8 @@ _SETTINGS_FIELDS = [
     ("composer", "composer (pinned input)", "bool"),
     ("autosave", "autosave session (auto-load last on start)", "bool"),
     ("auto_update", "on launch, self-update to the latest published build (needs the 'update' lean-tool)", "bool"),
-    ("update_track", "which /update track to follow", ("stable", "beta")),
+    ("command_timeout", "run_command timeout (s)", "int"),
+    ("tool_timeout", "wedge tripwire (s) for an in-process tool; long-by-design tools opt out", "int"),
     ("command_timeout", "run_command timeout (s)", "int"),
     ("max_iterations", "max tool-call rounds per turn (0 = unlimited)", "int"),
     ("bg_max_concurrent", "max background tasks (0 = unlimited)", "int"),
@@ -11850,7 +12099,8 @@ _SETTINGS_FIELDS = [
     ("gen_idle_timeout", "ollama: max gap between tokens (s; blank = off)", "float"),
     ("compact_min_interval", "min seconds between compactions", "float"),
     ("autostart_after_compact", "auto-continue the turn after a compaction (on by default; 5s ^C to cancel)", "bool"),
-    ("compact_keep", "verbatim turns kept after a compaction (soft/hard/manual)", "int"),
+    ("compact_keep", "max verbatim turns kept after a compaction (CEILING; real bound is a token budget)", "int"),
+    ("keep_cap", "absolute token ceiling on the verbatim tail kept after a compaction (big windows won't hoard)", "int"),
     ("wake_on_bg_finish", "wake + react autonomously when a background task finishes (off by default)", "bool"),
     ("auto_trim_interval", "auto-trim: stub old tool outputs every N tokens (0 = off)", "int"),
     ("auto_trim_hysteresis", "auto-trim re-arm margin (fraction of interval)", "float"),
@@ -14108,13 +14358,29 @@ def _split_queued_commands(queued):
 def _drain_choice(raw):
     """Map a queue-drain keypress to combine / separate / discard. Pure -> tested.
     Default (Enter or anything unrecognized) is 'combine' - one turn carrying all the
-    queued lines, the least-surprising "I typed more while you worked, just take it"."""
+    queued lines, the least-surprising "I typed more while you worked, just take it".
+    (Legacy: the interactive 3-way prompt was retired in favour of always-combine;
+    kept for the unit tests + any caller that still wants the mapping.)"""
     r = (raw or "").strip().lower()
     if r in ("s", "separate", "split"):
         return "separate"
     if r in ("d", "n", "discard", "no", "drop"):
         return "discard"
     return "combine"
+
+
+def _coalesce_queued(msgs, interrupted=False):
+    """Fold banked mid-turn messages into ONE turn string. A single message passes
+    through bare (reads as a normal follow-up); >=2, or an interrupt, get a short
+    framing prefix so the model knows they landed WHILE it was working (not a fresh
+    turn). Pure -> tested."""
+    body = "\n".join(msgs)
+    if interrupted:
+        return ("[The user interrupted your previous turn to send this now:]\n" + body)
+    if len(msgs) > 1:
+        return ("[The user sent the following while you were working on the previous "
+                "turn - treat it as one message:]\n" + body)
+    return body
 
 
 def handle_clear_command(agent, cfg, arg):
@@ -14640,6 +14906,25 @@ def handle_trim_command(agent, cfg, arg):
     agent._print_ctx()
 
 
+def handle_compact_at_command(agent, cfg, arg):
+    """/compact_at [frac] - THE context lever: the fill fraction of the window at which
+    auto-compaction is forced (soft zone slides with it: soft = compact_at * soft_ratio).
+    No arg shows the current value + the derived soft/emergency zones. A shortcut for
+    `/set compact_at` (which still works); the other handover knobs (compact_soft,
+    compact_soft_ratio, compact_emergency, compact_min_interval) stay under /set."""
+    if not arg.strip():
+        c = cfg.compact_for()
+        print(bold(cyan("/compact_at")) + dim("  (the auto-compaction lever)"))
+        print(f"  compact_at   {cfg.compact_at:.2f}   " + dim(f"({cfg.compact_at:.0%} of the window)"))
+        print(dim(f"  soft zone    {c['soft']:.2f}   (model may electively hand over from here)"))
+        print(dim(f"  emergency    {cfg.compact_emergency:.2f}"))
+        print(dim("  usage: /compact_at <0-1>   ·   other knobs: /set compact_soft*, compact_emergency, ..."))
+        return
+    if _set_setting_field(agent, cfg, "compact_at", arg.strip()):
+        c = cfg.compact_for()
+        print(dim(f"compact_at -> {cfg.compact_at:.2f}  (soft zone {c['soft']:.2f})"))
+
+
 def handle_compact_command(agent, cfg, arg):
     """/compact - agentic compaction: the model saves+commits durable docs, writes
     the summary between the markers, and history is then replaced with that summary
@@ -14853,6 +15138,7 @@ _BUILTIN_COMMANDS_TABLE = {
     "/local": handle_local_command, "/disconnect": handle_local_command,
     "/trim": handle_trim_command,
     "/compact": handle_compact_command,
+    "/compact_at": handle_compact_at_command,
     "/session": handle_session_command,
     "/save": handle_save_command,
     "/load": handle_load_command,
@@ -14881,7 +15167,7 @@ _BUILTIN_COMMANDS_TABLE = {
 # Commands that persist a config change: the dispatch autosaves the config AFTER the
 # handler returns (these handlers have many early-return paths, so the autosave belongs
 # in the dispatch, exactly where the former chain ran it - not inside the handler).
-_CMD_AUTOSAVE = frozenset({"/provider", "/providers", "/set"})
+_CMD_AUTOSAVE = frozenset({"/provider", "/providers", "/set", "/compact_at"})
 
 # Single source of truth for shadow protection: every builtin command + alias, derived
 # from the dispatch table so the protected set can never drift from what's dispatched
@@ -15339,10 +15625,10 @@ def repl(cfg: Config, resume=None):
             if interrupted:
                 if queued:
                     # ^C WITH something typed = "stop this task and send what I typed
-                    # now" (steering): combine the typed lines into one redirect, drop
-                    # any older backlog (runaway can't outlive ^C).
+                    # now" (steering): fold the typed lines into one framed redirect,
+                    # drop any older backlog (runaway can't outlive ^C).
                     pending_inputs.clear()
-                    pending_inputs.append("\n".join(queued))
+                    pending_inputs.append(_coalesce_queued(queued, interrupted=True))
                     print(yellow("\n^C - stopped; sending your message now"
                                  + (f" ({len(queued)} lines combined)" if len(queued) > 1 else "")))
                 else:
@@ -15351,30 +15637,16 @@ def repl(cfg: Config, resume=None):
                     pending_inputs.clear()
                     print(yellow("\n^C - stopped"
                                  + (f"; cleared {dropped} queued message(s)" if dropped else "")))
-            elif len(queued) == 1:
-                # one typed-ahead message auto-runs next - tell the user so (no silent magic)
-                pending_inputs.extend(queued)
-                print(dim(f"  {GLYPH['dot']} 1 message queued -> sending as the next turn."))
             elif queued:
-                # several queued -> explicit 3-way (never a silent burst, never an
-                # ambiguous "send all now?"). Default (Enter) = combine into one turn.
-                print(dim(f"{len(queued)} messages queued while working:"))
-                for q in queued:
-                    print(dim(f"  {GLYPH['dot']} {q}"))
-                try:
-                    raw = input(_rl_safe(bold(
-                        "[c]ombine into 1 turn  ·  [s]eparate turns (one each)  ·  [d]iscard?  [c] ")))
-                except (EOFError, KeyboardInterrupt):
-                    raw = "d"
-                choice = _drain_choice(raw)
-                if choice == "combine":
-                    pending_inputs.append("\n".join(queued))
-                    print(dim(f"combined {len(queued)} into one turn."))
-                elif choice == "discard":
-                    print(dim("discarded queued messages."))
+                # Messages typed WHILE the model worked always coalesce into ONE next
+                # turn (framed when >1 so the model knows they arrived mid-turn) - no
+                # interactive prompt, no per-message turn-wedging. ^C sends them now.
+                pending_inputs.append(_coalesce_queued(queued))
+                if len(queued) == 1:
+                    print(dim(f"  {GLYPH['dot']} 1 message queued -> sending as the next turn."))
                 else:
-                    pending_inputs.extend(queued)
-                    print(dim(f"queued {len(queued)} as separate turns (one per turn)."))
+                    print(dim(f"  {GLYPH['dot']} {len(queued)} messages queued while working "
+                              f"-> combined into the next turn."))
             # queued commands run as commands, after any drained messages, in order typed
             if cmds:
                 pending_inputs.extend(cmds)

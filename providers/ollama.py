@@ -14,6 +14,18 @@
 # Transport config (host / hosts / machines / num_ctx / host_models) stays
 # top-level in config.toml and is read straight off cfg here - it is connection
 # infrastructure, not a flat per-provider knob.
+#
+# WHY NATIVE /api/chat, NOT /v1 (do not "simplify" this to the OpenAI-compat path):
+# Ollama exposes an OpenAI-compatible /v1 endpoint, but it is lossy for our needs.
+# Verified on real hardware (qwen3-class thinking models): ollama's /v1 does NOT
+# expose reasoning_content and does NOT honour chat_template_kwargs.enable_thinking,
+# so a thinking turn that spends its token budget on hidden reasoning returns EMPTY
+# content AND empty reasoning_content - the exact pure-text-turn failure the llamacpp
+# provider fixes via chat_template_kwargs. The native /api/chat path with the `think`
+# param round-trips reasoning + tool_call args correctly, so we use it exclusively.
+# (The /v1 trap is ollama-specific: the llamacpp provider's /v1 assumptions - reading
+# reasoning_content, sending chat_template_kwargs - are valid against stock
+# llama-server but must NEVER be pointed at ollama's /v1.)
 
 import json
 import urllib.request
