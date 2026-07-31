@@ -2409,8 +2409,8 @@ check("auto_compact defaults on", lc.Config().auto_compact is True)
 check("compact thresholds default 0.72/0.90 (soft = at*ratio 0.8) + emergency 1.0",
       lc.Config().compact_soft == 0.72 and lc.Config().compact_at == 0.90
       and lc.Config().compact_soft_ratio == 0.8 and lc.Config().compact_emergency == 1.00)
-check("compact_keep single knob defaults to 3; emergency backstop hardcoded 1",
-      lc.Config().compact_keep == 3 and lc.COMPACT_EMERGENCY_KEEP == 1)
+check("compact_keep single knob defaults to 15 (CEILING; token budget is real bound); emergency backstop hardcoded 1",
+      lc.Config().compact_keep == 15 and lc.COMPACT_EMERGENCY_KEEP == 1)
 
 # 12e2. per-model compaction overrides (models fill context differently)
 cmc = lc.Config(provider="testprov", compact_soft=0.40, compact_at=0.60,
