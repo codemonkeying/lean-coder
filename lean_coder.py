@@ -188,7 +188,7 @@ RELEASE_NOTES = {
     "0.9.4": [
         "context mgmt: /handover is now /compact (summarize + continue); the old",
         "  /compact (stub old tool output) is now /trim.",
-        "new knob compact_keep (default 3): verbatim turns kept after a compaction.",
+        "new knob compact_keep (default 15): CEILING on verbatim turns kept after a compaction (real bound is a token budget).",
         "/set compact_at <frac>: THE lever for when auto-compaction fires. Was",
         "  compact_hard; old configs still work.",
     ],
@@ -4073,7 +4073,7 @@ class Config:
     # thread for a voluntary compaction; hard is the middle ground when tight. A "turn"
     # = a user message + the assistant/tool run that answers it; the tail always starts
     # on a clean user boundary so a tool_result is never orphaned from its tool_call.
-    compact_keep: int = 3            # CEILING on verbatim TURNS kept after a compaction (soft/
+    compact_keep: int = 15           # CEILING on verbatim TURNS kept after a compaction (soft/
                                      # hard/manual). Not a target: the real bound is a TOKEN budget
                                      # (keep_cap + a fraction of post-summary headroom) so the kept
                                      # tail never re-fills the window. Emergency overflow uses a
@@ -4402,7 +4402,7 @@ _SCALAR_FIELDS = (
     ("compact_emergency",         1.00,                False),
     ("compact_min_interval",      60.0,                False),
     ("autostart_after_compact",   True,                False),
-    ("compact_keep",              3,                   False),
+    ("compact_keep",              15,                  False),
     ("keep_cap",                  25000,               False),
     ("auto_trim_interval",        0,                   False),
     ("auto_trim_hysteresis",      0.25,                False),
