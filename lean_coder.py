@@ -19,10 +19,10 @@ schemas, truncated tool results. See README.md.
   L7519   Remote workspace (executor client, /connect)
   L9110   Context meter
   L9205   Agent (turn loop, context mgmt, tool dispatch)
-  L15174  Slash-command handlers + dispatch table
-  L15311  REPL (interactive loop, session resume)
-  L15672  Worker agent (headless --agent-run)
-  L16284  Entry (CLI arg parsing, main)
+  L15183  Slash-command handlers + dispatch table
+  L15320  REPL (interactive loop, session resume)
+  L15681  Worker agent (headless --agent-run)
+  L16293  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -10657,13 +10657,22 @@ class Agent:
     def _tool_timeout_for(self, name, plug):
         """Seconds to allow this tool at _dispatch before declaring it wedged, or
         None to run unbounded. None when: the global tool_timeout is disabled (0),
-        the tool is a core long-runner (UNBOUNDED_TOOLS), or a lean-tool opts out
-        (no_timeout). A lean-tool may also OVERRIDE the global with its own timeout."""
+        the tool is a core long-runner (UNBOUNDED_TOOLS), a WRITE-tier core tool
+        (never abandon a mutation - see below), or a lean-tool opts out (no_timeout).
+        A lean-tool may also OVERRIDE the global with its own timeout.
+
+        Why writes are never capped: abandoning a read/search is free (no side
+        effect, the orphan thread just dies), which is the cap's whole point. But
+        abandoning a WRITE is dangerous - the orphaned thread can still mutate the
+        file, so it may 'fail' the deadline yet land LATE and race the next edit
+        (observed corruption class). And a local-FS write doesn't truly wedge; a
+        slow one (e.g. rewriting a huge file) is slow, not hung - bounding it just
+        manufactures a false-positive with a corruption risk. So: writes run inline."""
         base = getattr(self.cfg, "tool_timeout", 0) or 0
         if base <= 0:
             return None
-        if name in UNBOUNDED_TOOLS or name.startswith(MCP_NS):
-            return None   # run_command/background self-bound; MCP calls have their own transport timeout
+        if name in UNBOUNDED_TOOLS or name in _WRITE_TIER or name.startswith(MCP_NS):
+            return None   # run_command/background self-bound; writes never abandoned; MCP has its own timeout
         if plug:
             if plug.get("no_timeout"):
                 return None
