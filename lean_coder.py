@@ -14,15 +14,15 @@ schemas, truncated tool results. See README.md.
   L2571   Streaming + markdown render (model output)
   L2927   Composer (pinned input line, editor, stdin)
   L3777   Token accounting (calibrated context meter)
-  L3942   Config (dataclass, field registry, load/save)
-  L7116   Tool execution + text tool-call parsing
-  L7542   Remote workspace (executor client, /connect)
-  L9133   Context meter
-  L9228   Agent (turn loop, context mgmt, tool dispatch)
-  L15226  Slash-command handlers + dispatch table
-  L15363  REPL (interactive loop, session resume)
-  L15724  Worker agent (headless --agent-run)
-  L16336  Entry (CLI arg parsing, main)
+  L3951   Config (dataclass, field registry, load/save)
+  L7125   Tool execution + text tool-call parsing
+  L7551   Remote workspace (executor client, /connect)
+  L9142   Context meter
+  L9237   Agent (turn loop, context mgmt, tool dispatch)
+  L15235  Slash-command handlers + dispatch table
+  L15372  REPL (interactive loop, session resume)
+  L15733  Worker agent (headless --agent-run)
+  L16345  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -3897,24 +3897,27 @@ def messages_tokens(messages, tools) -> int:
 
 
 def repair_tool_pairs(messages):
-    """Guarantee every assistant tool_call is followed by a matching tool result.
+    """Guarantee every tool_call has a matching tool_result AND vice-versa.
 
-    An interrupted turn - ^C between tool calls, a crash, or a 400 mid-batch - can
-    leave an assistant message holding tool_calls with no `tool` messages after it
-    (the next thing appended is the user's next message). The API then rejects the
-    WHOLE history with 'tool_use ids were found without tool_result blocks', and an
-    autosave of that state bricks the session permanently (every resume replays it).
+    Two mirror-image ways a history gets poisoned; the API rejects the WHOLE send
+    (and an autosave of that state bricks the session - every resume replays it):
 
-    For any assistant whose tool_calls outnumber the tool messages immediately
-    following it, synthesize stub results (carrying the matching tool_call_id) for
-    the missing ones. Returns a NEW list; the input is untouched. Idempotent on
-    already-valid history (returns an equivalent list)."""
+      FORWARD orphan - an assistant holds tool_calls with no `tool` messages after
+        it (^C between tool calls, a crash, a 400 mid-batch). API: 'tool_use ids
+        were found without tool_result blocks'. Heal: synthesize stub results.
+
+      REVERSE orphan - a `tool` result whose matching tool_call isn't in the
+        immediately preceding assistant message (a compaction/window cut or a
+        hand-edit dropped the tool_call but kept the answer). API: 'unexpected
+        tool_use_id found in tool_result blocks'. Heal: drop the orphan result.
+
+    Returns a NEW list; the input is untouched. Idempotent on valid history."""
     out = []
     i, n = 0, len(messages)
     while i < n:
         m = messages[i]
-        out.append(m)
         if m.get("role") == "assistant" and m.get("tool_calls"):
+            out.append(m)
             calls = m.get("tool_calls") or []
             j, got = i + 1, 0
             while j < n and messages[j].get("role") == "tool":
@@ -3930,6 +3933,12 @@ def repair_tool_pairs(messages):
                 })
             i = j
             continue
+        # A `tool` result reached here has no assistant-with-tool_calls before it
+        # (that path consumes its own trailing tool msgs above): reverse orphan - drop it.
+        if m.get("role") == "tool":
+            i += 1
+            continue
+        out.append(m)
         i += 1
     return out
 
