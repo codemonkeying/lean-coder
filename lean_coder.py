@@ -19,10 +19,10 @@ schemas, truncated tool results. See README.md.
   L7534   Remote workspace (executor client, /connect)
   L9125   Context meter
   L9220   Agent (turn loop, context mgmt, tool dispatch)
-  L15198  Slash-command handlers + dispatch table
-  L15335  REPL (interactive loop, session resume)
-  L15696  Worker agent (headless --agent-run)
-  L16308  Entry (CLI arg parsing, main)
+  L15211  Slash-command handlers + dispatch table
+  L15348  REPL (interactive loop, session resume)
+  L15709  Worker agent (headless --agent-run)
+  L16321  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -14909,18 +14909,31 @@ def handle_trim_command(agent, cfg, arg):
 def handle_compact_at_command(agent, cfg, arg):
     """/compact_at [frac] - THE context lever: the fill fraction of the window at which
     auto-compaction is forced (soft zone slides with it: soft = compact_at * soft_ratio).
-    No arg shows the current value + the derived soft/emergency zones. A shortcut for
+    No arg shows the current value + the derived soft/emergency zones, then prompts for a
+    new fraction (Enter keeps it) - like `/set <key>` with a bare key. A shortcut for
     `/set compact_at` (which still works); the other handover knobs (compact_soft,
     compact_soft_ratio, compact_emergency, compact_min_interval) stay under /set."""
-    if not arg.strip():
+    raw = arg.strip()
+    if not raw:
         c = cfg.compact_for()
         print(bold(cyan("/compact_at")) + dim("  (the auto-compaction lever)"))
         print(f"  compact_at   {cfg.compact_at:.2f}   " + dim(f"({cfg.compact_at:.0%} of the window)"))
         print(dim(f"  soft zone    {c['soft']:.2f}   (model may electively hand over from here)"))
         print(dim(f"  emergency    {cfg.compact_emergency:.2f}"))
-        print(dim("  usage: /compact_at <0-1>   ·   other knobs: /set compact_soft*, compact_emergency, ..."))
-        return
-    if _set_setting_field(agent, cfg, "compact_at", arg.strip()):
+        print(dim("  other knobs: /set compact_soft*, compact_emergency, ..."))
+        # No-arg = interactive edit (contract §4): prompt for a value so the operator can
+        # just run `/compact_at` then type the fraction, instead of it going to the model.
+        if not (sys.stdin.isatty() and _TTY):
+            print(dim("  usage: /compact_at <0-1>"))
+            return
+        try:
+            raw = input(f"compact_at [{cfg.compact_at:.2f}]: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+        if not raw:            # Enter = keep current
+            return
+    if _set_setting_field(agent, cfg, "compact_at", raw):
         c = cfg.compact_for()
         print(dim(f"compact_at -> {cfg.compact_at:.2f}  (soft zone {c['soft']:.2f})"))
 
