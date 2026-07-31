@@ -114,6 +114,7 @@ TOOL = {
     # apt-install pip + playwright + a browser (~hundreds of MB) onto the user's
     # server just to screenshot a URL - which it can reach over the network anyway.
     "driver_only": True,
+    "no_timeout": True,   # headless browser launch + JS render is long-by-design (has its own TIMEOUT)
 }
 
 TIMEOUT = 30_000   # ms for playwright operations
