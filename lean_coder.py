@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L989    Lean-tools (plugin tools: discovery, manager)
-  L1339   MCP client (connection, manager, OAuth, discovery)
-  L1793   Providers (backend plugin registry)
-  L2015   Interactive pickers + menus (raw-mode UI engine)
-  L2364   Terminal styling (colors, formatting helpers)
-  L2563   Streaming + markdown render (model output)
-  L2919   Composer (pinned input line, editor, stdin)
-  L3769   Token accounting (calibrated context meter)
-  L3934   Config (dataclass, field registry, load/save)
-  L7108   Tool execution + text tool-call parsing
-  L7534   Remote workspace (executor client, /connect)
-  L9125   Context meter
-  L9220   Agent (turn loop, context mgmt, tool dispatch)
-  L15198  Slash-command handlers + dispatch table
-  L15335  REPL (interactive loop, session resume)
-  L15696  Worker agent (headless --agent-run)
-  L16308  Entry (CLI arg parsing, main)
+  L997    Lean-tools (plugin tools: discovery, manager)
+  L1347   MCP client (connection, manager, OAuth, discovery)
+  L1801   Providers (backend plugin registry)
+  L2023   Interactive pickers + menus (raw-mode UI engine)
+  L2372   Terminal styling (colors, formatting helpers)
+  L2571   Streaming + markdown render (model output)
+  L2927   Composer (pinned input line, editor, stdin)
+  L3777   Token accounting (calibrated context meter)
+  L3942   Config (dataclass, field registry, load/save)
+  L7116   Tool execution + text tool-call parsing
+  L7542   Remote workspace (executor client, /connect)
+  L9133   Context meter
+  L9228   Agent (turn loop, context mgmt, tool dispatch)
+  L15226  Slash-command handlers + dispatch table
+  L15363  REPL (interactive loop, session resume)
+  L15724  Worker agent (headless --agent-run)
+  L16336  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -111,7 +111,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.10.0"
+__version__ = "0.10.1"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -119,6 +119,14 @@ __version__ = "0.10.0"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.10.1": [
+        "fix: a compaction could leave a tool result with no matching tool call at the",
+        "  head of the kept history, which some providers reject on every following turn",
+        "  (the session would wedge in a retry loop). Compaction now never orphans a",
+        "  tool result. If you were stuck, this is the fix.",
+        "fix: bare `/compact_at` now shows the zones then prompts for a value, so you can",
+        "  run it and type the fraction - instead of the next line going to the model.",
+    ],
     "0.10.0": [
         "smarter auto-compaction: the verbatim tail kept after a compaction is now",
         "  sized by a TOKEN budget (not a fixed turn count), so a huge multi-day turn",
@@ -10291,11 +10299,18 @@ class Agent:
         if last_assist is not None:
             anchors.add(last_assist)
         # Middle in chronological order; drop it oldest-first, whole messages at a time.
-        # (Dropping an assistant tool_call together with its tool answers is preserved
-        # naturally: we only ever KEEP anchors, and a tool_result whose tool_call was
-        # dropped is itself in the middle and dropped too - never kept orphaned.)
+        # A cut must NOT split a tool_call from its tool_result: dropping an assistant
+        # tool_call while keeping its tool answer leaves an orphan tool_result at the head
+        # of the kept tail, which the API rejects (messages.N: unexpected tool_use_id in
+        # tool_result). So skip any cut whose first KEPT middle message is a tool result -
+        # advance the cut until the boundary lands on a non-tool message (or the middle is
+        # fully dropped). (Historically this was assumed impossible; it wedged a session.)
         middle = [i for i in range(len(turn)) if i not in anchors]
         for cut in range(len(middle) + 1):
+            # A boundary that keeps a tool_result whose tool_call was just dropped orphans
+            # it - not a coherent candidate. Skip (a larger cut will drop it too).
+            if cut < len(middle) and turn[middle[cut]].get("role") == "tool":
+                continue
             # Drop the oldest `cut` middle messages; keep anchors + the rest of the middle.
             dropped_set = set(middle[:cut])
             kept_idx = [i for i in range(len(turn)) if i not in dropped_set]
@@ -14909,18 +14924,31 @@ def handle_trim_command(agent, cfg, arg):
 def handle_compact_at_command(agent, cfg, arg):
     """/compact_at [frac] - THE context lever: the fill fraction of the window at which
     auto-compaction is forced (soft zone slides with it: soft = compact_at * soft_ratio).
-    No arg shows the current value + the derived soft/emergency zones. A shortcut for
+    No arg shows the current value + the derived soft/emergency zones, then prompts for a
+    new fraction (Enter keeps it) - like `/set <key>` with a bare key. A shortcut for
     `/set compact_at` (which still works); the other handover knobs (compact_soft,
     compact_soft_ratio, compact_emergency, compact_min_interval) stay under /set."""
-    if not arg.strip():
+    raw = arg.strip()
+    if not raw:
         c = cfg.compact_for()
         print(bold(cyan("/compact_at")) + dim("  (the auto-compaction lever)"))
         print(f"  compact_at   {cfg.compact_at:.2f}   " + dim(f"({cfg.compact_at:.0%} of the window)"))
         print(dim(f"  soft zone    {c['soft']:.2f}   (model may electively hand over from here)"))
         print(dim(f"  emergency    {cfg.compact_emergency:.2f}"))
-        print(dim("  usage: /compact_at <0-1>   ·   other knobs: /set compact_soft*, compact_emergency, ..."))
-        return
-    if _set_setting_field(agent, cfg, "compact_at", arg.strip()):
+        print(dim("  other knobs: /set compact_soft*, compact_emergency, ..."))
+        # No-arg = interactive edit (contract §4): prompt for a value so the operator can
+        # just run `/compact_at` then type the fraction, instead of it going to the model.
+        if not (sys.stdin.isatty() and _TTY):
+            print(dim("  usage: /compact_at <0-1>"))
+            return
+        try:
+            raw = input(f"compact_at [{cfg.compact_at:.2f}]: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+        if not raw:            # Enter = keep current
+            return
+    if _set_setting_field(agent, cfg, "compact_at", raw):
         c = cfg.compact_for()
         print(dim(f"compact_at -> {cfg.compact_at:.2f}  (soft zone {c['soft']:.2f})"))
 
