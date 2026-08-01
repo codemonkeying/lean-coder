@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L1004   Lean-tools (plugin tools: discovery, manager)
-  L1354   MCP client (connection, manager, OAuth, discovery)
-  L1808   Providers (backend plugin registry)
-  L2030   Interactive pickers + menus (raw-mode UI engine)
-  L2379   Terminal styling (colors, formatting helpers)
-  L2578   Streaming + markdown render (model output)
-  L2934   Composer (pinned input line, editor, stdin)
-  L3784   Token accounting (calibrated context meter)
-  L3958   Config (dataclass, field registry, load/save)
-  L7132   Tool execution + text tool-call parsing
-  L7558   Remote workspace (executor client, /connect)
-  L9149   Context meter
-  L9244   Agent (turn loop, context mgmt, tool dispatch)
-  L15242  Slash-command handlers + dispatch table
-  L15379  REPL (interactive loop, session resume)
-  L15740  Worker agent (headless --agent-run)
-  L16352  Entry (CLI arg parsing, main)
+  L1026   Lean-tools (plugin tools: discovery, manager)
+  L1376   MCP client (connection, manager, OAuth, discovery)
+  L1830   Providers (backend plugin registry)
+  L2052   Interactive pickers + menus (raw-mode UI engine)
+  L2401   Terminal styling (colors, formatting helpers)
+  L2600   Streaming + markdown render (model output)
+  L2956   Composer (pinned input line, editor, stdin)
+  L3806   Token accounting (calibrated context meter)
+  L3980   Config (dataclass, field registry, load/save)
+  L7154   Tool execution + text tool-call parsing
+  L7580   Remote workspace (executor client, /connect)
+  L9171   Context meter
+  L9266   Agent (turn loop, context mgmt, tool dispatch)
+  L15282  Slash-command handlers + dispatch table
+  L15419  REPL (interactive loop, session resume)
+  L15780  Worker agent (headless --agent-run)
+  L16392  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -367,6 +367,27 @@ SYSTEM_PROMPT = (
     "</batch_reads>"
 )
 
+# Chat-only system prompt (leash=chat OR a model that can't tool-call): NO tools are
+# attached, so the agentic scaffolding above - <decision_format>, <ask_operator>,
+# <batch_reads>, <reversibility>, the "tool result" framing - is all dangling
+# instruction with nothing to act on. On a small/quantised model that dead machinery is
+# actively harmful: it parrots the template ("DECISION 1/2", "enable the tools for
+# /leash rwe") instead of just answering. So chat mode gets its own lean prompt: a plain
+# "you have no tools, converse" instruction and nothing about calling them. (The
+# _session_env tail also carries a chat-only note, but a 3B model needs the SYSTEM block
+# itself free of tool framing - a short tail line can't out-shout ~1.5KB of it.)
+CHAT_SYSTEM_PROMPT = (
+    "You are a helpful, precise assistant having a conversation. Answer directly and "
+    "concisely; explain when it helps. "
+    "You are in CHAT-ONLY mode: you have NO tools this session - you cannot read files, "
+    "edit anything, run commands, or take any action in the world. Just answer "
+    "conversationally in plain prose. Do not emit tool calls, permission prompts, "
+    "option menus, or JSON/XML machinery - none of that applies here; simply reply. "
+    "If a request genuinely needs tools (reading a file, running a command), say so in "
+    "one sentence and tell the user they can enable tools with /leash rwe (or switch to "
+    "a tool-capable model with /model) - then answer whatever you can without them."
+)
+
 COMPACT_MARK = "===COMPACT==="     # the visible delimiter the model wraps its compact summary in
 COMPACT_EMERGENCY_KEEP = 1         # hardcoded backstop: on context OVERFLOW we trim to this many
                                    # turns. Not a preference (no /set) - it's a last-ditch rescue
@@ -649,6 +670,7 @@ PROMPTS_DIR = CONFIG_PATH.parent / "prompts"
 SYSTEM_PROMPTS_DIR = PROMPTS_DIR / "system"
 BUILTIN_PROMPTS = {
     "system":         SYSTEM_PROMPT,
+    "chat_system":    CHAT_SYSTEM_PROMPT,  # lean prompt used when NO tools are attached (leash=chat)
     "compact":        COMPACT_INSTR,     # the ONE compaction prompt (manual + auto + elected)
     "compact_nudge": COMPACT_NUDGE,    # the gentle soft-zone "wrap up at a break" nudge
 }
@@ -9691,8 +9713,18 @@ class Agent:
         # rewrites the global system cache - a /leash toggle or a switch on/off a chat-only
         # model busts nothing, and cwd/shell (meaningless with no tools) is replaced by the
         # note rather than sitting alongside it.
+        # Chat-only (leash=chat OR a model that can't tool-call): NO tools are attached,
+        # so serve the lean chat prompt instead of the agentic one - the tool scaffolding
+        # (<decision_format>, <ask_operator>, ...) is dead machinery here and a small model
+        # parrots it. No tool addendum either (there's nothing to call). The chat-only note
+        # still rides the _session_env tail for good measure. Rebuilt live on /leash toggle
+        # and on a model swap (see _apply_leash / refresh_tools), so this tracks the surface.
+        if not self.tool_defs:
+            return read_prompt("chat_system") or CHAT_SYSTEM_PROMPT
         # Provider-supplied addendum for the active model (ollama: small-model
-        # tool-calling guidance). Cache-safe: only changes when the model changes.
+        # tool-calling guidance). Cache-safe: only changes when the model changes. Gated
+        # on tools actually being ATTACHED, not just model capability - in chat leash the
+        # model CAN tool-call but has no tools, so "CALL THE TOOL" would be dangling noise.
         addendum = ""
         spec = self.active_provider()
         if spec and spec.get("system_addendum") and self._model_tool_support():
@@ -11126,6 +11158,11 @@ class Agent:
         # a same-provider /model switch - or a 404 fallback - doesn't leave it stale
         # (e.g. switching off a chat-only model used to keep showing "0 tools").
         self.refresh_tools()
+        # Tools drive which system prompt is active (lean chat prompt when none attached,
+        # agentic otherwise), so refresh the cached system block too - switching to a
+        # chat-only model must drop the tool scaffolding, and back must restore it.
+        if self.messages and self.messages[0].get("role") == "system":
+            self.messages[0] = {"role": "system", "content": self._system()}
 
     def _offer_login_on_auth_error(self, err) -> bool:
         """First-class onboarding: when a turn fails because the active provider has no
@@ -11990,8 +12027,11 @@ _PROMPT_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 
 
 def _refresh_system_prompt(agent, name):
-    """If the live system prompt changed, rebuild messages[0] so it applies now."""
-    if name == "system" and agent.messages and agent.messages[0].get("role") == "system":
+    """If the live system prompt changed, rebuild messages[0] so it applies now. Either
+    the agentic 'system' prompt or the chat-only 'chat_system' prompt can be the active
+    one (depends on whether tools are attached), so an edit to either must refresh."""
+    if name in ("system", "chat_system") and agent.messages \
+            and agent.messages[0].get("role") == "system":
         agent.messages[0] = {"role": "system", "content": agent._system()}
 
 
@@ -13201,8 +13241,8 @@ def _restore_session_state(agent, cfg, meta):
         if LEASH_LEVELS.index(want) > LEASH_LEVELS.index(cfg.leash):
             escalated_from = cfg.leash                     # this load RAISES the ceiling
         cfg.leash = want                                   # runtime only (not autosaved)
+        agent.refresh_tools()                              # tools FIRST: _system() reads tool_defs
         agent.messages[0] = {"role": "system", "content": agent._system()}
-        agent.refresh_tools()
         agent._pending_ai_note = _leash_note(want)         # tell the model next turn
     return {
         "backend_note": note,
@@ -14330,8 +14370,8 @@ def _apply_leash(agent, cfg, want, persist=True):
     config.toml DEFAULT (the /leash command's behaviour); `persist=False` applies it
     live only (a /set session override records it in session_overrides itself)."""
     cfg.leash = want
-    agent.messages[0] = {"role": "system", "content": agent._system()}
-    agent.refresh_tools()
+    agent.refresh_tools()   # update the tool surface FIRST: _system() picks the chat vs
+    agent.messages[0] = {"role": "system", "content": agent._system()}  # agentic prompt off tool_defs
     agent._pending_ai_note = _leash_note(want)   # tell the model on its next turn (not via the cached prompt)
     if persist:
         cfg._defaults["leash"] = want
