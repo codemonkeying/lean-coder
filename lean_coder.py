@@ -10,19 +10,19 @@ schemas, truncated tool results. See README.md.
   L1393   MCP client (connection, manager, OAuth, discovery)
   L1847   Providers (backend plugin registry)
   L2069   Interactive pickers + menus (raw-mode UI engine)
-  L2418   Terminal styling (colors, formatting helpers)
-  L2617   Streaming + markdown render (model output)
-  L2985   Composer (pinned input line, editor, stdin)
-  L3835   Token accounting (calibrated context meter)
-  L4009   Config (dataclass, field registry, load/save)
-  L7183   Tool execution + text tool-call parsing
-  L7609   Remote workspace (executor client, /connect)
-  L9200   Context meter
-  L9295   Agent (turn loop, context mgmt, tool dispatch)
-  L15311  Slash-command handlers + dispatch table
-  L15448  REPL (interactive loop, session resume)
-  L15809  Worker agent (headless --agent-run)
-  L16421  Entry (CLI arg parsing, main)
+  L2432   Terminal styling (colors, formatting helpers)
+  L2631   Streaming + markdown render (model output)
+  L2999   Composer (pinned input line, editor, stdin)
+  L3849   Token accounting (calibrated context meter)
+  L4023   Config (dataclass, field registry, load/save)
+  L7206   Tool execution + text tool-call parsing
+  L7632   Remote workspace (executor client, /connect)
+  L9223   Context meter
+  L9318   Agent (turn loop, context mgmt, tool dispatch)
+  L15334  Slash-command handlers + dispatch table
+  L15471  REPL (interactive loop, session resume)
+  L15834  Worker agent (headless --agent-run)
+  L16446  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -2125,6 +2125,20 @@ def _term_cols():
         return os.get_terminal_size().columns or 80
     except OSError:
         return 80
+
+
+def _is_termux():
+    """Running under Termux on Android? Termux's terminal emulator snaps the viewport
+    to the cursor on any cursor-positioning escape, so the composer's per-token
+    scroll-region + absolute-cursor repaint yanks the user back to the bottom on every
+    streamed word - can't scroll up to read earlier output until the turn ends. We use
+    this to default the pinned-input composer OFF there (the classic streaming path has
+    no scroll region / absolute moves, so native scrollback just works). Detected via
+    Termux's env: PREFIX under /com.termux, or TERMUX_VERSION."""
+    if os.environ.get("TERMUX_VERSION"):
+        return True
+    pref = os.environ.get("PREFIX", "")
+    return "com.termux" in pref
 
 
 def _fit_line(s, width=None):
@@ -4678,6 +4692,15 @@ def load_config(args) -> Config:
     for key in _PERSISTED_SCALAR_KEYS + ("composer",):  # composer: read-only (see _EPHEMERAL_KEYS)
         if key in file_vals:
             setattr(cfg, key, file_vals[key])
+    # Termux default: its terminal snaps the viewport to the cursor on every
+    # cursor-positioning escape, so the composer's per-token scroll-region repaint
+    # yanks you back to the bottom mid-stream (can't scroll up to read earlier output
+    # until the turn ends). Default the composer OFF there so the classic streaming
+    # path (no scroll region / absolute moves) keeps native scrollback working. Only a
+    # DEFAULT: an explicit `composer` in config (or --no-composer / /set composer)
+    # still wins, so a user who prefers it can opt back in.
+    if "composer" not in file_vals and _is_termux():
+        cfg.composer = False
     # Derive compact_soft from the pair UNLESS the file pins it explicitly (a manual
     # override decouples, same rule as a live /set). Without this, a config that sets
     # only compact_at leaves compact_soft at its dataclass default - which can sit ABOVE
@@ -15517,7 +15540,9 @@ def repl(cfg: Config, resume=None):
         # Composer state: a broken input channel can't paste diagnostics back, so the
         # program self-reports WHY the pinned input is or isn't active.
         if not cfg.composer:
-            _comp_state = "off (composer=false / --no-composer)"
+            _comp_state = ("off (Termux default: keeps scrollback working; "
+                           "/set composer on to override)" if _is_termux()
+                           else "off (composer=false / --no-composer)")
         elif not (_TTY and sys.stdin.isatty()):
             _comp_state = "off (no tty: stdout/stdin not a terminal)"
         else:
