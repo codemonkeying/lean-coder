@@ -12872,7 +12872,7 @@ def _arg_completions(agent, cfg, cmd):
         return ["on", "off"]
     if cmd == "/leash":
         return list(LEASH_LEVELS)
-    if cmd == "/bg":
+    if cmd in ("/bg", "/background"):
         return ["kill"]
     if cmd == "/note":
         return ["recent", "grep", "range", "add", "clear"]
@@ -15246,7 +15246,7 @@ _BUILTIN_COMMANDS_TABLE = {
     "/session": handle_session_command,
     "/save": handle_save_command,
     "/load": handle_load_command,
-    "/bg": handle_bg_command,
+    "/bg": handle_bg_command, "/background": handle_bg_command,
     "/note": handle_note_command,
     "/plan": handle_plan_command,
     "/autosave": handle_autosave_command,
