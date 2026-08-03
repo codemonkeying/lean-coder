@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L1037   Lean-tools (plugin tools: discovery, manager)
-  L1387   MCP client (connection, manager, OAuth, discovery)
-  L1841   Providers (backend plugin registry)
-  L2063   Interactive pickers + menus (raw-mode UI engine)
-  L2412   Terminal styling (colors, formatting helpers)
-  L2611   Streaming + markdown render (model output)
-  L2967   Composer (pinned input line, editor, stdin)
-  L3817   Token accounting (calibrated context meter)
-  L3991   Config (dataclass, field registry, load/save)
-  L7165   Tool execution + text tool-call parsing
-  L7591   Remote workspace (executor client, /connect)
-  L9182   Context meter
-  L9277   Agent (turn loop, context mgmt, tool dispatch)
-  L15293  Slash-command handlers + dispatch table
-  L15430  REPL (interactive loop, session resume)
-  L15791  Worker agent (headless --agent-run)
-  L16403  Entry (CLI arg parsing, main)
+  L1043   Lean-tools (plugin tools: discovery, manager)
+  L1393   MCP client (connection, manager, OAuth, discovery)
+  L1847   Providers (backend plugin registry)
+  L2069   Interactive pickers + menus (raw-mode UI engine)
+  L2418   Terminal styling (colors, formatting helpers)
+  L2617   Streaming + markdown render (model output)
+  L2976   Composer (pinned input line, editor, stdin)
+  L3826   Token accounting (calibrated context meter)
+  L4000   Config (dataclass, field registry, load/save)
+  L7174   Tool execution + text tool-call parsing
+  L7600   Remote workspace (executor client, /connect)
+  L9191   Context meter
+  L9286   Agent (turn loop, context mgmt, tool dispatch)
+  L15302  Slash-command handlers + dispatch table
+  L15439  REPL (interactive loop, session resume)
+  L15800  Worker agent (headless --agent-run)
+  L16412  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -111,7 +111,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.10.4"
+__version__ = "0.10.5"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -119,6 +119,12 @@ __version__ = "0.10.4"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.10.5": [
+        "fix: a streaming reply that goes silent mid-flight on a flaky network no",
+        "  longer hangs the turn for minutes - a 90s inter-event idle deadline now",
+        "  bails to the existing bounded retry/backoff (matches the anthropic SDK's",
+        "  streaming idleTimeout). Ctrl-C also stays responsive during a stall.",
+    ],
     "0.10.4": [
         "docs: the README now frames the single-file design honestly - it's the CORE",
         "  that's one file (the distributable you can read end to end), a deliberate",
@@ -2642,18 +2648,21 @@ def _set_stream_read_timeout(resp, secs):
         pass
 
 
-def stream_tiered(resp, cfg, where=""):
+def stream_tiered(resp, cfg, where="", idle=None):
     """Wrap a streaming urllib response in the 3-tier timeout model and yield its
     raw lines. The provider opens the connection with `cfg.gen_connect_timeout`,
     then iterates THIS instead of `resp` directly; its own should_abort poll and
     line parsing are unchanged. We re-arm the socket to `gen_ttft_timeout` until the
-    first line arrives (a socket.timeout before then = "prefill" stall), then to
-    `gen_idle_timeout` for the decode phase (a timeout after = "decode" stall).
-    Prod defaults (ttft=600, idle=None) reproduce the old single 600s read timeout
-    exactly - idle=None leaves the ttft deadline in place, so a live-but-slow stream
-    is never tripped. Raises StreamStall (a ConnectionError) on a stall."""
+    first line arrives (a socket.timeout before then = "prefill" stall), then to the
+    decode-phase idle deadline (a timeout after = "decode" stall).
+    The decode idle deadline is `idle` when a caller passes one (e.g. the anthropic
+    providers arm 90s explicitly), else `cfg.gen_idle_timeout`. Prod defaults
+    (ttft=600, cfg idle=None) reproduce the old single 600s read timeout exactly -
+    idle=None leaves the ttft deadline in place, so a live-but-slow stream is never
+    tripped. Raises StreamStall (a ConnectionError) on a stall."""
     ttft = getattr(cfg, "gen_ttft_timeout", None) or 600
-    idle = getattr(cfg, "gen_idle_timeout", None)
+    if idle is None:
+        idle = getattr(cfg, "gen_idle_timeout", None)
     _set_stream_read_timeout(resp, ttft)
     it = iter(resp)
     got_first = False
