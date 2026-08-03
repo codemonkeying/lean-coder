@@ -12,17 +12,17 @@ schemas, truncated tool results. See README.md.
   L2069   Interactive pickers + menus (raw-mode UI engine)
   L2418   Terminal styling (colors, formatting helpers)
   L2617   Streaming + markdown render (model output)
-  L2976   Composer (pinned input line, editor, stdin)
-  L3826   Token accounting (calibrated context meter)
-  L4000   Config (dataclass, field registry, load/save)
-  L7174   Tool execution + text tool-call parsing
-  L7600   Remote workspace (executor client, /connect)
-  L9191   Context meter
-  L9286   Agent (turn loop, context mgmt, tool dispatch)
-  L15302  Slash-command handlers + dispatch table
-  L15439  REPL (interactive loop, session resume)
-  L15800  Worker agent (headless --agent-run)
-  L16412  Entry (CLI arg parsing, main)
+  L2985   Composer (pinned input line, editor, stdin)
+  L3835   Token accounting (calibrated context meter)
+  L4009   Config (dataclass, field registry, load/save)
+  L7183   Tool execution + text tool-call parsing
+  L7609   Remote workspace (executor client, /connect)
+  L9200   Context meter
+  L9295   Agent (turn loop, context mgmt, tool dispatch)
+  L15311  Slash-command handlers + dispatch table
+  L15448  REPL (interactive loop, session resume)
+  L15809  Worker agent (headless --agent-run)
+  L16421  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -2801,7 +2801,13 @@ class Spinner:
                 if self._stop.is_set():
                     break
                 lbl = _activity_label(self.label, time.monotonic() - self._t0, pid)
-                sys.stdout.write("\r\033[K" + self.color(f"{fr} {lbl}"))
+                # Clip to the terminal width FIRST: on a narrow screen (mobile/Termux)
+                # a long-running label grows an elapsed counter + '^C to stop' hint that
+                # would wrap onto a second physical line, and then '\r' can no longer
+                # overwrite the wrapped tail - so every repaint spams a new line. Clip
+                # the plain text to cols-1 (leave the last column free) before colour.
+                line = _fit_line(f"{fr} {lbl}", max(1, _term_cols() - 1))
+                sys.stdout.write("\r\033[K" + self.color(line))
                 sys.stdout.flush()
                 self._stop.wait(self.interval)
 
@@ -2845,7 +2851,10 @@ class Spinner:
                 if self._stop.is_set():
                     break
                 lbl = _activity_label(self.label, time.monotonic() - self._t0, pid)
-                sys.stdout.write("\r\033[K" + self.color(f"{fr} {lbl}"))
+                # Clip to width so a long label can't wrap + spam on a narrow screen
+                # (see the note in start()'s run()).
+                line = _fit_line(f"{fr} {lbl}", max(1, _term_cols() - 1))
+                sys.stdout.write("\r\033[K" + self.color(line))
                 sys.stdout.flush()
                 self._stop.wait(self.interval)
 
