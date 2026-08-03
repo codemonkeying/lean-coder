@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L1043   Lean-tools (plugin tools: discovery, manager)
-  L1393   MCP client (connection, manager, OAuth, discovery)
-  L1847   Providers (backend plugin registry)
-  L2069   Interactive pickers + menus (raw-mode UI engine)
-  L2418   Terminal styling (colors, formatting helpers)
-  L2617   Streaming + markdown render (model output)
-  L2976   Composer (pinned input line, editor, stdin)
-  L3826   Token accounting (calibrated context meter)
-  L4000   Config (dataclass, field registry, load/save)
-  L7174   Tool execution + text tool-call parsing
-  L7600   Remote workspace (executor client, /connect)
-  L9191   Context meter
-  L9286   Agent (turn loop, context mgmt, tool dispatch)
-  L15302  Slash-command handlers + dispatch table
-  L15439  REPL (interactive loop, session resume)
-  L15800  Worker agent (headless --agent-run)
-  L16412  Entry (CLI arg parsing, main)
+  L1049   Lean-tools (plugin tools: discovery, manager)
+  L1399   MCP client (connection, manager, OAuth, discovery)
+  L1853   Providers (backend plugin registry)
+  L2075   Interactive pickers + menus (raw-mode UI engine)
+  L2424   Terminal styling (colors, formatting helpers)
+  L2623   Streaming + markdown render (model output)
+  L2991   Composer (pinned input line, editor, stdin)
+  L3841   Token accounting (calibrated context meter)
+  L4015   Config (dataclass, field registry, load/save)
+  L7189   Tool execution + text tool-call parsing
+  L7615   Remote workspace (executor client, /connect)
+  L9206   Context meter
+  L9301   Agent (turn loop, context mgmt, tool dispatch)
+  L15317  Slash-command handlers + dispatch table
+  L15454  REPL (interactive loop, session resume)
+  L15815  Worker agent (headless --agent-run)
+  L16427  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -111,7 +111,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.10.5"
+__version__ = "0.10.6"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -119,6 +119,12 @@ __version__ = "0.10.5"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.10.6": [
+        "fix: a long-running spinner (e.g. a slow push on a flaky connection) no",
+        "  longer spams newlines on a narrow/mobile screen - the status line is now",
+        "  clipped to the terminal width so it can't wrap and defeat the in-place redraw.",
+        "add: /background as an alias for /bg (list/kill background tasks).",
+    ],
     "0.10.5": [
         "fix: a streaming reply that goes silent mid-flight on a flaky network no",
         "  longer hangs the turn for minutes - a 90s inter-event idle deadline now",
@@ -2801,7 +2807,13 @@ class Spinner:
                 if self._stop.is_set():
                     break
                 lbl = _activity_label(self.label, time.monotonic() - self._t0, pid)
-                sys.stdout.write("\r\033[K" + self.color(f"{fr} {lbl}"))
+                # Clip to the terminal width FIRST: on a narrow screen (mobile/Termux)
+                # a long-running label grows an elapsed counter + '^C to stop' hint that
+                # would wrap onto a second physical line, and then '\r' can no longer
+                # overwrite the wrapped tail - so every repaint spams a new line. Clip
+                # the plain text to cols-1 (leave the last column free) before colour.
+                line = _fit_line(f"{fr} {lbl}", max(1, _term_cols() - 1))
+                sys.stdout.write("\r\033[K" + self.color(line))
                 sys.stdout.flush()
                 self._stop.wait(self.interval)
 
@@ -2845,7 +2857,10 @@ class Spinner:
                 if self._stop.is_set():
                     break
                 lbl = _activity_label(self.label, time.monotonic() - self._t0, pid)
-                sys.stdout.write("\r\033[K" + self.color(f"{fr} {lbl}"))
+                # Clip to width so a long label can't wrap + spam on a narrow screen
+                # (see the note in start()'s run()).
+                line = _fit_line(f"{fr} {lbl}", max(1, _term_cols() - 1))
+                sys.stdout.write("\r\033[K" + self.color(line))
                 sys.stdout.flush()
                 self._stop.wait(self.interval)
 
@@ -12872,7 +12887,7 @@ def _arg_completions(agent, cfg, cmd):
         return ["on", "off"]
     if cmd == "/leash":
         return list(LEASH_LEVELS)
-    if cmd == "/bg":
+    if cmd in ("/bg", "/background"):
         return ["kill"]
     if cmd == "/note":
         return ["recent", "grep", "range", "add", "clear"]
@@ -15246,7 +15261,7 @@ _BUILTIN_COMMANDS_TABLE = {
     "/session": handle_session_command,
     "/save": handle_save_command,
     "/load": handle_load_command,
-    "/bg": handle_bg_command,
+    "/bg": handle_bg_command, "/background": handle_bg_command,
     "/note": handle_note_command,
     "/plan": handle_plan_command,
     "/autosave": handle_autosave_command,
