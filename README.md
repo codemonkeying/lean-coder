@@ -65,6 +65,17 @@ is one script (`lean_coder.py`); alongside it ship a required builtin-tools modu
 [Ollama](https://ollama.com) (bundled and default-enabled) and you get an interactive
 REPL that edits code, runs commands, and shows a diff before it touches anything.
 
+Keeping the **core** in one file is a **deliberate choice, not an accident**. The whole
+thing is still `curl`-and-run - stdlib only, nothing to package, vendor, or compile - so
+it drops onto a phone or an SSH box unchanged; the installer just lays down that core
+next to the builtin-tools module and the provider adapters. The core stays navigable
+because it's held to a firm bar: a generated section index maps the file, and every
+change has to pass three gates - an offline unit suite (which *enforces* the ~2.5k-token
+baseline budget), a scripted end-to-end suite, and a hygiene lint - before it ships. New
+capability is a drop-in plugin (a lean-tool or a provider adapter), not a core edit, so
+the core stays small on purpose. See [CONTRIBUTING.md](CONTRIBUTING.md) for the design
+bar and the gates.
+
 What a session looks like:
 
 ```
