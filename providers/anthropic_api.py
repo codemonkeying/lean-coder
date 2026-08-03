@@ -25,6 +25,13 @@ _lc         = {}     # display helpers injected by setup()
 _MAX_RETRIES = 3
 _MAX_WAIT    = 75   # seconds; cap a single wait so the REPL never hangs
 _RETRY_CODES = (500, 502, 503, 504, 529)   # 529 = Anthropic "Overloaded"
+# Max gap between stream events before the socket is treated as dead and we bail to
+# the retry path. A real overload is an explicit SSE error/HTTP 529 (handled above),
+# not a silent hang, and ping/thinking deltas arrive well inside this - so 90s of
+# TOTAL silence = a stalled connection. Matches the anthropic SDK streaming
+# idleTimeout default (90s; sdk-typescript issue #867). stream_tiered raises
+# StreamStall (a ConnectionError) on trip, caught by _send's transport-retry branch.
+_STREAM_IDLE_TIMEOUT = 90   # seconds
 
 # Privacy posture shown at the point of use (on connect + in /usage).
 _PRIVACY    = "commercial API - inputs & outputs are not used to train Anthropic's models"
@@ -435,7 +442,8 @@ class _ApiKeyClient:
 
         spin = _lc["Spinner"]("thinking", _lc["THINK_FRAMES"]).start()
         try:
-            for raw in _lc["stream_tiered"](resp, self.cfg):
+            for raw in _lc["stream_tiered"](resp, self.cfg, where="anthropic",
+                                            idle=_STREAM_IDLE_TIMEOUT):
                 if should_abort and should_abort():
                     aborted = True
                     break
