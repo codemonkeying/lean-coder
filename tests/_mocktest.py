@@ -257,12 +257,12 @@ class Handler(BaseHTTPRequestHandler):
                 self._emit({"message": {"role": "assistant",
                             "content": "GOAL: bind ollama. NEXT: restart svc."},
                             "done": False})
-            elif MODE == "handover":
-                # agentic /handover: write the three marked blocks as visible text and
+            elif MODE == "compact":
+                # agentic /compact: write the three marked blocks as visible text and
                 # STOP (no finalize tool - the turn ending is the trigger).
                 self._emit({"message": {"role": "assistant",
-                            "content": "Updated the docs.\n===HANDOVER===\nGOAL: bind ollama. "
-                                       "NEXT: restart svc.\n===HANDOVER===\n"
+                            "content": "Updated the docs.\n===COMPACT===\nGOAL: bind ollama. "
+                                       "NEXT: restart svc.\n===COMPACT===\n"
                                        "===NEXT===\nrestart the ollama service\n===NEXT===\n"
                                        "===PLAN===\nGOAL: bind ollama to labnet\nTODO:\n"
                                        "- [x] edit config\n- [ ] restart svc\n===PLAN==="},
@@ -461,33 +461,35 @@ check("[abort] returns only partial content (stopped early)",
       asst["content"].count("tok") < 5, repr(asst["content"]))
 check("[abort] no spurious tool_calls on abort", "tool_calls" not in asst)
 
-# --- /handover: summarize the session, then replace history with the summary -
-print("\n--- scenario: handover ---")
-MODE = "handover"; counter["n"] = 0; bodies.clear()
+# --- /compact: summarize the session, then replace history with the summary -
+print("\n--- scenario: compact ---")
+MODE = "compact"; counter["n"] = 0; bodies.clear()
 agent = mk_agent(cfg)
 agent.messages.append({"role": "user", "content": "bind ollama to labnet"})
 agent.messages.append({"role": "tool", "tool_name": "run_command",
                        "content": "\n".join(["log line"] * 80)})
-summary = agent.handover()
-check("[handover] returns the marked block", bool(summary) and "GOAL" in summary,
+summary = agent.compact()
+check("[compact] returns the marked block", bool(summary) and "GOAL" in summary,
       repr(summary))
-check("[handover] block extracted, not the surrounding prose",
+check("[compact] block extracted, not the surrounding prose",
       summary and "Updated the docs" not in summary)
-check("[handover] finalize_handover tool is NOT surfaced (dropped)",
-      bodies and not any(t["function"]["name"] == "finalize_handover"
+check("[compact] finalize_compact tool is NOT surfaced (dropped)",
+      bodies and not any(t["function"]["name"] == "finalize_compact"
                          for t in bodies[-1].get("tools", [])))
-check("[handover] history replaced with system + one summary turn",
-      [m["role"] for m in agent.messages] == ["system", "user"]
-      and "summarized" in agent.messages[1]["content"])
-check("[handover] old tool dump is gone from history",
-      not any("log line" in (m.get("content") or "") for m in agent.messages))
-check("[handover] stale token count cleared", agent.last_prompt_tokens is None)
+check("[compact] history rebuilt as system + summary head",
+      [m["role"] for m in agent.messages][:2] == ["system", "user"]
+      and "compacted summary" in agent.messages[1]["content"])
+check("[compact] old tool dump body no longer verbatim in history",
+      not any("log line" in (m.get("content") or "")
+              for m in agent.messages if m.get("role") == "tool"
+              and "[trimmed" not in (m.get("content") or "")))
+check("[compact] stale token count cleared", agent.last_prompt_tokens is None)
 
 # --- auto-compaction: summarize OLD, KEEP recent tail, queue autostart self-prompt -
-print("\n--- scenario: auto_handover ---")
-MODE = "handover"; counter["n"] = 0; bodies.clear()
+print("\n--- scenario: auto_compact ---")
+MODE = "compact"; counter["n"] = 0; bodies.clear()
 agent = mk_agent(cfg)
-agent.cfg.autostart_after_handover = True   # opt in (default is off) to test the queue path
+agent.cfg.autostart_after_compact = True   # opt in to test the queue path
 _saved_wm = agent.cfg.window_messages
 agent.cfg.window_messages = 4          # keep a small recent tail
 agent.messages.append({"role": "user", "content": "old goal"})
@@ -496,11 +498,11 @@ agent.messages.append({"role": "tool", "tool_name": "run_command",
 agent.messages.append({"role": "assistant", "content": "did old thing"})
 agent.messages.append({"role": "user", "content": "recent task"})
 agent.messages.append({"role": "assistant", "content": "working on recent"})
-block = agent.auto_handover("hard")
+block = agent.auto_compact("hard")
 check("[compact] returns summary block", bool(block) and "GOAL" in block, repr(block))
 check("[compact] keeps system + summary head", [m["role"] for m in agent.messages][:2] == ["system", "user"])
 check("[compact] summary carries the cache_boundary signal",
-      agent.messages[1].get("cache_boundary") is True and agent._handover_boundary == 2)
+      agent.messages[1].get("cache_boundary") is True and agent._compact_boundary == 2)
 check("[compact] recent tail kept verbatim",
       any(m.get("content") == "recent task" for m in agent.messages))
 check("[compact] old tool dump dropped",
@@ -515,12 +517,12 @@ check("[compact] pinned plan stays OUT of the system prompt (uncached)",
 check("[compact] pinned plan available via _plan_reminder",
       "bind ollama to labnet" in agent._plan_reminder())
 agent.cfg.window_messages = _saved_wm
-check("[handover] finalize tool never on the surface",
-      not any(t["function"]["name"] == "finalize_handover" for t in agent.tool_defs))
+check("[compact] finalize tool never on the surface",
+      not any(t["function"]["name"] == "finalize_compact" for t in agent.tool_defs))
 
-# handover on an empty session -> None (nothing to hand over)
-check("[handover] empty session -> None",
-      mk_agent(lc.Config(cwd=FIX, approval="auto", host=cfg.host)).handover() is None)
+# compaction on an empty session -> None (nothing to compact)
+check("[compact] empty session -> None",
+      mk_agent(lc.Config(cwd=FIX, approval="auto", host=cfg.host)).compact() is None)
 
 # --- tiered host failover: live probe against the mock + a dead port ---------
 print("\n--- scenario: host failover ---")
