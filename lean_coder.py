@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L1066   Lean-tools (plugin tools: discovery, manager)
-  L1416   MCP client (connection, manager, OAuth, discovery)
-  L1870   Providers (backend plugin registry)
-  L2092   Interactive pickers + menus (raw-mode UI engine)
-  L2441   Terminal styling (colors, formatting helpers)
-  L2640   Streaming + markdown render (model output)
-  L2999   Composer (pinned input line, editor, stdin)
-  L3849   Token accounting (calibrated context meter)
-  L4023   Config (dataclass, field registry, load/save)
-  L7206   Tool execution + text tool-call parsing
-  L7632   Remote workspace (executor client, /connect)
-  L9223   Context meter
-  L9318   Agent (turn loop, context mgmt, tool dispatch)
-  L15462  Slash-command handlers + dispatch table
-  L15599  REPL (interactive loop, session resume)
-  L15960  Worker agent (headless --agent-run)
-  L16572  Entry (CLI arg parsing, main)
+  L1071   Lean-tools (plugin tools: discovery, manager)
+  L1421   MCP client (connection, manager, OAuth, discovery)
+  L1875   Providers (backend plugin registry)
+  L2097   Interactive pickers + menus (raw-mode UI engine)
+  L2446   Terminal styling (colors, formatting helpers)
+  L2645   Streaming + markdown render (model output)
+  L3004   Composer (pinned input line, editor, stdin)
+  L3854   Token accounting (calibrated context meter)
+  L4028   Config (dataclass, field registry, load/save)
+  L7211   Tool execution + text tool-call parsing
+  L7637   Remote workspace (executor client, /connect)
+  L9228   Context meter
+  L9323   Agent (turn loop, context mgmt, tool dispatch)
+  L15472  Slash-command handlers + dispatch table
+  L15609  REPL (interactive loop, session resume)
+  L15970  Worker agent (headless --agent-run)
+  L16582  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -111,7 +111,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.10.8"
+__version__ = "0.10.9"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -119,6 +119,11 @@ __version__ = "0.10.8"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.10.9": [
+        "fix: training capture recorded the top-level config model (usually the ollama",
+        "  default) instead of the ACTIVE provider's model, so captured trajectories were",
+        "  mislabelled whenever the active backend differed. Now uses active_model().",
+    ],
     "0.10.8": [
         "add: opt-in training-data capture (capture_training, off by default) - writes",
         "  RAW per-turn trajectories (reasoning + tool calls + full results) to a JSONL",
@@ -11042,7 +11047,12 @@ class Agent:
                 "ts_start": time.time(), "ts_end": None,
                 "leancoder_version": __version__,
                 "leancoder_sha": self._cap_head_sha(),
-                "model": getattr(self.cfg, "model", "") or "",
+                # The ACTIVE model, not the bare cfg.model (which is the top-level
+                # config default - usually the ollama one). A capture must name the
+                # model that actually produced the trajectory, or the training data
+                # is mislabelled the moment you switch provider/account.
+                "model": (self.cfg.active_model() if hasattr(self.cfg, "active_model")
+                          else getattr(self.cfg, "model", "")) or "",
                 "provider": getattr(self.cfg, "provider", "") or "",
                 "segments": segs,
                 "finish_reason": "tool_calls" if assistant.get("tool_calls") else "stop",
