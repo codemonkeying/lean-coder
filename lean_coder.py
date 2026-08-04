@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L1049   Lean-tools (plugin tools: discovery, manager)
-  L1399   MCP client (connection, manager, OAuth, discovery)
-  L1853   Providers (backend plugin registry)
-  L2075   Interactive pickers + menus (raw-mode UI engine)
-  L2424   Terminal styling (colors, formatting helpers)
-  L2623   Streaming + markdown render (model output)
-  L2991   Composer (pinned input line, editor, stdin)
-  L3841   Token accounting (calibrated context meter)
-  L4015   Config (dataclass, field registry, load/save)
-  L7189   Tool execution + text tool-call parsing
-  L7615   Remote workspace (executor client, /connect)
-  L9206   Context meter
-  L9301   Agent (turn loop, context mgmt, tool dispatch)
-  L15317  Slash-command handlers + dispatch table
-  L15454  REPL (interactive loop, session resume)
-  L15815  Worker agent (headless --agent-run)
-  L16427  Entry (CLI arg parsing, main)
+  L1056   Lean-tools (plugin tools: discovery, manager)
+  L1406   MCP client (connection, manager, OAuth, discovery)
+  L1860   Providers (backend plugin registry)
+  L2082   Interactive pickers + menus (raw-mode UI engine)
+  L2431   Terminal styling (colors, formatting helpers)
+  L2630   Streaming + markdown render (model output)
+  L2989   Composer (pinned input line, editor, stdin)
+  L3839   Token accounting (calibrated context meter)
+  L4013   Config (dataclass, field registry, load/save)
+  L7186   Tool execution + text tool-call parsing
+  L7612   Remote workspace (executor client, /connect)
+  L9203   Context meter
+  L9298   Agent (turn loop, context mgmt, tool dispatch)
+  L15314  Slash-command handlers + dispatch table
+  L15451  REPL (interactive loop, session resume)
+  L15812  Worker agent (headless --agent-run)
+  L16424  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -76,22 +76,22 @@ HISTORY_PATH = CONFIG_DIR / "history"            # composer input history (one l
 HISTORY_MAX = 1000                               # trailing entries kept on disk
 AUTOSAVE_KEEP = 10               # rolling autosave sessions kept (oldest pruned)
 AUTOSAVE_PREFIX = "auto-"        # autosave session names; named snapshots have none
-# Pre-handover safety snapshots: written just before a handover REPLACES history, so
-# the full pre-handover conversation stays recoverable (via /load, and the grep-my-own-
+# Pre-compaction safety snapshots: written just before a compaction REPLACES history, so
+# the full pre-compaction conversation stays recoverable (via /load, and the grep-my-own-
 # context recall path). Named <origin-session>-precompact-<N> so the snapshot is tied
-# to WHAT it snapshots. (Historically mislabelled "pre-compact-*" - it's a handover, not
-# a compact: compact() only stubs tool results in place and takes no snapshot.)
-PRECOMPACT_MARK = "-precompact-"   # infix marking a pre-handover snapshot
+# to WHAT it snapshots. (Only compaction - the summarize-and-replace path - snapshots;
+# /trim stubs tool results in place, is reversible in spirit, and takes no snapshot.)
+PRECOMPACT_MARK = "-precompact-"   # infix marking a pre-compaction snapshot
 PRECOMPACT_KEEP = 3             # cap them: safety nets, not named saves - newest few suffice
 
 
 def _is_snapshot(name: str) -> bool:
-    """True for a rolling pre-handover safety snapshot (not a user/auto session)."""
+    """True for a rolling pre-compaction safety snapshot (not a user/auto session)."""
     return PRECOMPACT_MARK in name
 
 
 def _precompact_name(origin: str, existing) -> str:
-    """A pre-handover snapshot name tied to its origin session: <origin>-precompact-<N>,
+    """A pre-compaction snapshot name tied to its origin session: <origin>-precompact-<N>,
     N = the next free index for that origin among `existing` names. So a session's
     snapshots read origin-precompact-1, -2, ... and the recall path can find them by
     globbing '<origin>-precompact-*'."""
@@ -111,7 +111,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.10.6"
+__version__ = "0.10.7"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -119,6 +119,13 @@ __version__ = "0.10.6"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.10.7": [
+        "fix: revert the 0.10.6 spinner width-clip - it regressed the /connect feedback",
+        "  (green stage lines + push spinner) into a plain hanging terminal on some",
+        "  setups. The spinner paints exactly as it did in 0.10.5 again.",
+        "internal: finish the handover->compact rename (comments, docstrings, the",
+        "  private parse-result key, stale test refs); no behaviour change.",
+    ],
     "0.10.6": [
         "fix: a long-running spinner (e.g. a slow push on a flaky connection) no",
         "  longer spams newlines on a narrow/mobile screen - the status line is now",
@@ -472,9 +479,9 @@ def _extract_marked(text: str, mark: str):
     refuses to act, so a bad parse never nukes the session. Pure -> tested.
 
     Belt-and-braces fallback: a small model often opens with the fence but closes
-    with an XML-style tag derived from the mark (e.g. the HANDOVER fence, then the
-    body, then a </handover> close), leaving only ONE fence - so the strict pair
-    match misses a perfectly good block and the whole handover is silently
+    with an XML-style tag derived from the mark (e.g. the COMPACT fence, then the
+    body, then a </compact> close), leaving only ONE fence - so the strict pair
+    match misses a perfectly good block and the whole compaction is silently
     discarded. When there is exactly one fence, accept a matching close tag whose
     letters equal the mark's letters (case-insensitive). Only that XML-close case
     is rescued; we never greedily take everything after a lone fence (that would
@@ -501,7 +508,7 @@ def _extract_marked(text: str, mark: str):
 
 
 def _extract_compact_block(text: str):
-    """The handover block (between the last COMPACT_MARK pair)."""
+    """The compaction block (between the last COMPACT_MARK pair)."""
     return _extract_marked(text, COMPACT_MARK)
 
 
@@ -517,19 +524,19 @@ def _extract_selfprompt(text: str):
     return _extract_marked(text, SELFPROMPT_MARK)
 
 
-# --- tolerant handover parsing (research-backed, model-eval/) --------------------
-# A model under peak cognitive load (the handover turn is the highest-load turn in a
+# --- tolerant compaction parsing (research-backed, model-eval/) --------------------
+# A model under peak cognitive load (the compaction turn is the highest-load turn in a
 # session) frequently drops marker discipline: markdown headers instead of fences, a
 # JSON object, fuzzy field names, or just prose. The strict fence parser then finds
 # nothing and the OLD behaviour no-op'd - which on a FULL context leaves the model
-# stuck (can't compact, can't continue). The fix (per the research handover): try
-# tiers, and ACCEPT a degraded handover over a no-op. Only truly-empty output no-ops.
+# stuck (can't compact, can't continue). The fix (per the research compaction): try
+# tiers, and ACCEPT a degraded compaction over a no-op. Only truly-empty output no-ops.
 _COMPACT_MIN = 30    # a block shorter than this is treated as empty (parse failure)
-_COMPACT_MAX_TRIES = 3   # total handover-turn attempts before accepting what we have
+_COMPACT_MAX_TRIES = 3   # total compaction-turn attempts before accepting what we have
                           # (completeness retry; separate from _loop's send/429 recovery)
 
-# Escalating corrective retries for a handover the tolerant parser couldn't salvage
-# (research: accept a degraded handover over a no-op; only truly-empty output no-ops).
+# Escalating corrective retries for a compaction the tolerant parser couldn't salvage
+# (research: accept a degraded compaction over a no-op; only truly-empty output no-ops).
 # Retry 1 = terse "start with the marker"; retry 2 = the exact template to copy.
 COMPACT_RETRY_1 = (
     "Your summary blocks were not found. Start your reply with " + COMPACT_MARK +
@@ -592,10 +599,10 @@ def _json_field(text, names):
 
 
 def _parse_compact(text: str) -> dict:
-    """Tolerant multi-tier parse of a handover turn -> {handover, plan, next, tier}.
+    """Tolerant multi-tier parse of a compaction turn -> {compact, plan, next, tier}.
     Each field is a string or None. `tier` records the HIGHEST (most-degraded) tier
     any field needed, for observability. Tiers, tried per-field in order:
-      1 fences  - the canonical ===HANDOVER=== pair (also XML-close, via _extract_marked)
+      1 fences  - the canonical ===COMPACT=== pair (also XML-close, via _extract_marked)
       3 md      - a markdown header section
       4 json    - a fuzzy-named field in a JSON object
       5 prose   - last resort: split raw content into summary / plan-ish / last line
@@ -614,32 +621,32 @@ def _parse_compact(text: str) -> dict:
         if v:
             tier = max(tier, 4); return v
         return None
-    handover = _pick(COMPACT_MARK, _COMPACT_ALIASES, _COMPACT_ALIASES)
+    compact  = _pick(COMPACT_MARK, _COMPACT_ALIASES, _COMPACT_ALIASES)
     plan     = _pick(PLAN_MARK, _PLAN_ALIASES, _PLAN_ALIASES)
     nxt      = _pick(SELFPROMPT_MARK, _NEXT_ALIASES, _NEXT_ALIASES)
-    # Tier 5 (semantic): no handover block found at all, but there IS real prose - use
+    # Tier 5 (semantic): no compact block found at all, but there IS real prose - use
     # it wholesale as the summary so a full-context session is never left stuck.
-    if not handover:
+    if not compact:
         stripped = re.sub(r"(?m)^\s*(?:#{1,6}.*|=+.*=+)\s*$", "", text).strip()
         if len(stripped) >= _COMPACT_MIN:
-            handover = stripped
+            compact = stripped
             tier = max(tier, 5)
     # min-content guard: a too-short block is treated as absent (empty != usable).
-    if handover and len(handover) < _COMPACT_MIN:
-        handover = None
-    return {"handover": handover, "plan": plan, "next": nxt, "tier": tier}
+    if compact and len(compact) < _COMPACT_MIN:
+        compact = None
+    return {"compact": compact, "plan": plan, "next": nxt, "tier": tier}
 
 
 def _compact_missing(parsed) -> list:
-    """Which required handover blocks are still missing (in emit order). The model
+    """Which required compaction blocks are still missing (in emit order). The model
     writes all three as marked text; the turn ending is the trigger (no finalize
     tool), and any missing block is re-solicited before we accept what we have.
     This completeness retry recovers an incomplete-but-successful ANSWER - a
     DIFFERENT layer from the send-level overload/429 recovery inside _loop (which
     recovers a failed SEND). Separate budgets; they compose, never share a counter."""
     missing = []
-    if not parsed.get("handover"):
-        missing.append("handover")
+    if not parsed.get("compact"):
+        missing.append("compact")
     if not parsed.get("plan"):
         missing.append("plan")
     if not parsed.get("next"):
@@ -650,12 +657,12 @@ def _compact_missing(parsed) -> list:
 def _compact_nudge_missing(missing) -> str:
     """A corrective re-prompt naming exactly which block(s) to emit, and how."""
     how = {
-        "handover":  f"the SUMMARY between two {COMPACT_MARK} markers",
+        "compact":   f"the SUMMARY between two {COMPACT_MARK} markers",
         "plan":      f"the PLAN (GOAL + TODO) between two {PLAN_MARK} markers",
         "next-step": f"the NEXT-STEP self-prompt between two {SELFPROMPT_MARK} markers",
     }
     want = "; ".join(how[m] for m in missing)
-    return ("Your handover is incomplete - still missing " + want + ". Emit ONLY the "
+    return ("Your compaction summary is incomplete - still missing " + want + ". Emit ONLY the "
             "missing block(s) now as visible text between the exact markers - start with "
             "the marker, no preamble, no other tool.")
 
@@ -688,7 +695,7 @@ COMPACT_NUDGE = (
 # Reloaded on /reload (and read live by _system()/compact()).
 # prompts dir doesn't break them by accident; custom prompts live in the root.
 # read_prompt() returns the override file's text if present, else the baked default.
-# Reloaded on /reload (and read live by _system()/handover()).
+# Reloaded on /reload (and read live by _system()/compact()).
 PROMPTS_DIR = CONFIG_PATH.parent / "prompts"
 SYSTEM_PROMPTS_DIR = PROMPTS_DIR / "system"
 BUILTIN_PROMPTS = {
@@ -827,9 +834,9 @@ ASK_USER_TOOL = {"type": "function", "function": {
                        "reason": {"type": "string", "description": "Brief why this needs the operator (e.g. 'needs sudo')."}},
         "required": ["cmd"]}}}
 
-# Surfaced ONLY during /handover (added to the tool surface for that window, removed
+# Surfaced ONLY during /compact (added to the tool surface for that window, removed
 # after). Calling it is the explicit "I'm done preparing - finalize" trigger: core
-# extracts the @#! ... @#! block from the handover turn and replaces history with it.
+# extracts the @#! ... @#! block from the compaction turn and replaces history with it.
 UPDATE_PLAN_TOOL = {"type": "function", "function": {
     "name": "update_plan",
     "description": ("Set/replace your PINNED plan: a GOAL plus a TODO checklist that stays "
@@ -843,10 +850,10 @@ UPDATE_PLAN_TOOL = {"type": "function", "function": {
 
 
 # Surfaced ONLY in the soft context zone (the user has, via compact_soft, opened the
-# spend window). Lets the model ELECT a handover at a clean semantic boundary - a
+# spend window). Lets the model ELECT a compaction at a clean semantic boundary - a
 # finished task, before switching to an unrelated one - instead of being nagged with
 # no lever, or force-wiped mid-thought when context later hits the hard threshold.
-# Cost is NOT the model's call: it can never hand over before the soft zone (the
+# Cost is NOT the model's call: it can never compact before the soft zone (the
 # user's threshold), only pick the tidiest MOMENT inside the window the user opened.
 REQUEST_COMPACT_TOOL = {"type": "function", "function": {
     "name": "request_compact",
@@ -912,7 +919,7 @@ def active_tools(cfg, remote=False, lean_tool_schemas=(), model_tools=True,
     def _named(nm):
         return allow is None or nm in _META or nm in allow
     tools = [UPDATE_PLAN_TOOL, NOTE_TOOL]  # plan upkeep + session notebook: no fs/exec, every non-chat tier
-    if offer_compact:               # soft zone: let the model elect a handover at a break
+    if offer_compact:               # soft zone: let the model elect a compaction at a break
         tools.append(REQUEST_COMPACT_TOOL)
     for t in TOOLS:
         nm = t["function"]["name"]
@@ -2807,13 +2814,7 @@ class Spinner:
                 if self._stop.is_set():
                     break
                 lbl = _activity_label(self.label, time.monotonic() - self._t0, pid)
-                # Clip to the terminal width FIRST: on a narrow screen (mobile/Termux)
-                # a long-running label grows an elapsed counter + '^C to stop' hint that
-                # would wrap onto a second physical line, and then '\r' can no longer
-                # overwrite the wrapped tail - so every repaint spams a new line. Clip
-                # the plain text to cols-1 (leave the last column free) before colour.
-                line = _fit_line(f"{fr} {lbl}", max(1, _term_cols() - 1))
-                sys.stdout.write("\r\033[K" + self.color(line))
+                sys.stdout.write("\r\033[K" + self.color(f"{fr} {lbl}"))
                 sys.stdout.flush()
                 self._stop.wait(self.interval)
 
@@ -2857,10 +2858,7 @@ class Spinner:
                 if self._stop.is_set():
                     break
                 lbl = _activity_label(self.label, time.monotonic() - self._t0, pid)
-                # Clip to width so a long label can't wrap + spam on a narrow screen
-                # (see the note in start()'s run()).
-                line = _fit_line(f"{fr} {lbl}", max(1, _term_cols() - 1))
-                sys.stdout.write("\r\033[K" + self.color(line))
+                sys.stdout.write("\r\033[K" + self.color(f"{fr} {lbl}"))
                 sys.stdout.flush()
                 self._stop.wait(self.interval)
 
@@ -4124,7 +4122,7 @@ class Config:
                                      # messages (cut at a clean turn boundary) instead
                                      # of the full history. 0 = unbounded (OFF, the
                                      # default) - a loaded session is fully in play and
-                                     # the model sees all of it; auto-handover handles
+                                     # the model sees all of it; auto-compaction handles
                                      # the size. Set >0 to opt into a hard send-bound
                                      # (cuts tokens every turn, but the model then only
                                      # sees the last N messages of a long session).
@@ -4155,9 +4153,9 @@ class Config:
                                      #   0: OFF. Takes precedence over window_messages when on.
                                      # Non-destructive (shapes the send only).
     auto_compact: bool = True       # self-managing context: when on, the model is shown a
-                                     # ctx-budget line and may hand over at a natural break in
-                                     # the soft zone; a hard threshold force-hands-over (the
-                                     # model pulls the same lever /handover does, then its
+                                     # ctx-budget line and may compact at a natural break in
+                                     # the soft zone; a hard threshold force-compacts (the
+                                     # model pulls the same lever /compact does, then its
                                      # self-prompt is fed back to it). See cost-reduction-roadmap.
     compact_soft: float = 0.72       # soft zone start, as a fraction of the context window:
                                      # nudge the model to wrap up + compact at a clean break.
@@ -4201,10 +4199,10 @@ class Config:
                                      # when the summary already carries the gist. NOT compact_-prefixed
                                      # so /compact<TAB> stays clean; tune via /set keep_cap.
     compact_overrides: dict = field(default_factory=dict)  # per-model override of the
-                                     # handover settings (models fill context at different
+                                     # compaction settings (models fill context at different
                                      # rates): model_id -> {auto, soft, hard, autostart}.
                                      # Anything absent falls back to the global default above.
-    auto_trim_interval: int = 0   # auto-TRIM (distinct from auto-compact/handover): the
+    auto_trim_interval: int = 0   # auto-TRIM (distinct from auto-compaction): the
                                      # cheap programmatic strip (/trim - stub old tool
                                      # outputs) fired automatically each time context crosses
                                      # a k*interval TOKEN boundary going up. 0 = off (default).
@@ -4320,7 +4318,7 @@ class Config:
                                      # whose full args auto-print after the call line
                                      # (see /expand); default = none (diffs stay
                                      # collapsed to the call line; /expand shows them)
-    show_snapshots: bool = False     # show pre-handover safety snapshots in the /load
+    show_snapshots: bool = False     # show pre-compaction safety snapshots in the /load
                                      # picker + /session list (off = hidden so they don't
                                      # clog the menu; /load <exact-name> always works)
     providers_dir: str = ""             # "" -> ~/.config/leancoder/providers
@@ -4384,7 +4382,7 @@ class Config:
     def compact_for(self, model: "str | None" = None):
         """Resolve compaction settings for `model` (default: the active model).
         Precedence (uniform working-state layer): SESSION override > per-model
-        compact_overrides > global default. A /set of a handover_* key is a session
+        compact_overrides > global default. A /set of a compact_* key is a session
         override and must win over a per-model override; a /set --config writes the
         global default. Models fill context at different rates, so the per-model layer
         sits between. Returns {auto, soft, hard, autostart}."""
@@ -4698,10 +4696,9 @@ def load_config(args) -> Config:
     # cleared). CLI-flag overrides below are session-ish but pre-date this layer; they
     # DO update the live value only (not _defaults), matching prior behaviour.
     cfg._defaults = {k: getattr(cfg, k) for k in _PERSISTED_SCALAR_KEYS}
-    # The self-managing mechanism is a HANDOVER (the model pulls the same lever
-    # /handover does); "compact" now means only the programmatic /compact strip.
-    # The knobs are handover_* accordingly - no compact_* back-compat aliases (they'd
-    # be one more thing to track); a pre-rename config just falls back to defaults.
+    # The self-managing mechanism is COMPACTION (summarize + replace, the same lever
+    # /compact pulls); /trim is the separate programmatic tool-result strip. The knobs
+    # are compact_* accordingly; a pre-rename config just falls back to defaults.
     _ov = file_vals.get("compact_overrides")
     if isinstance(_ov, dict):
         cfg.compact_overrides = {k: dict(v) for k, v in _ov.items() if isinstance(v, dict)}
@@ -4942,12 +4939,12 @@ def save_config(cfg: Config, quiet: bool = False):
         lines.append("")
         lines.append("[models]")
         lines += [f'"{h}" = "{m}"' for h, m in cfg.host_models.items()]
-    # Per-model handover overrides: [compact_overrides.<model>] tables. Declared a
+    # Per-model compaction overrides: [compact_overrides.<model>] tables. Declared a
     # BESPOKE (own-serializer) key and READ back in load_config - but historically had
     # NO writer here, so every autosave_config() (fired by /model, /connect, and the
-    # flows around a handover) rewrote config.toml WITHOUT them: the overrides silently
+    # flows around a compaction) rewrote config.toml WITHOUT them: the overrides silently
     # vanished and the next load fell back to the global compact_soft/hard defaults
-    # (0.70/0.95), which the status line shows as "handover 95%". Write them back.
+    # (0.70/0.95), which the status line shows as "compaction 95%". Write them back.
     if cfg.compact_overrides:
         for _m, _ov in cfg.compact_overrides.items():
             if not (isinstance(_m, str) and _m.strip() and isinstance(_ov, dict) and _ov):
@@ -5176,7 +5173,7 @@ def _session_rows():
 
 def _auto_resume_pick(rows):
     """The session that auto-load resumes on launch: the most-recently-used one
-    that isn't a pre-handover safety snapshot. `rows` is _session_rows() output
+    that isn't a pre-compaction safety snapshot. `rows` is _session_rows() output
     (already most-recent first). Returns (name, meta, mtime) or None. Deliberately
     NOT cwd-scoped - scoping silently skipped the genuinely-most-recent session
     when it was last used from another dir. Pure -> unit-tested."""
@@ -5189,7 +5186,7 @@ _autosave_seq = 0
 def _new_autosave_name() -> str:
     """A unique rolling-autosave session id for this launch (or post-/clear). The
     sequence suffix keeps it distinct even when two are minted in the same second
-    (e.g. /clear then immediately /handover) so neither clobbers the other."""
+    (e.g. /clear then immediately /compact) so neither clobbers the other."""
     global _autosave_seq
     _autosave_seq += 1
     # Short + readable: auto-<MMDD-HHMMSS>-<seq>. No PID (the seq keeps two names minted
@@ -5322,7 +5319,7 @@ def autosave_session(agent, cfg):
 
 def _prune_autosaves(keep: int = AUTOSAVE_KEEP):
     """Keep only the newest `keep` autosave sessions, and separately cap the rolling
-    pre-handover safety snapshots (a handover writes one every fire) to
+    pre-compaction safety snapshots (a compaction writes one every fire) to
     PRECOMPACT_KEEP. Both are rolling/disposable; only USER-named sessions are kept
     forever. Without the snapshot cap they pile up unbounded and flood /load (a busy
     session can leave dozens)."""
@@ -9280,8 +9277,8 @@ class ContextMeter:
         used = self.used()
         window = self.cfg.ctx_window() or 1
         pct = used / window * 100
-        # Colour by the auto-handover zone (soft->yellow, hard/emergency->red) when it's
-        # on, matching the status-row meter; plain %-of-max colour when handover is off.
+        # Colour by the auto-compaction zone (soft->yellow, hard/emergency->red) when it's
+        # on, matching the status-row meter; plain %-of-max colour when compaction is off.
         if self.cfg.compact_for().get("auto"):
             zlabel = self.zone()[0]
             col = _zone_color(zlabel)
@@ -9332,10 +9329,10 @@ class Agent:
         self._last_provider = None       # last active provider, for '/provider on'
         self._abort = False
         self._compact_capture = None    # set by finalize_compact -> stops the loop
-        self.compactions = 0               # completed handovers this session (manual + auto)
-        self._compact_mark = 0          # index where the current /handover turn starts
+        self.compactions = 0               # completed compactions this session (manual + auto)
+        self._compact_mark = 0          # index where the current /compact turn starts
         self._elected_compact = False   # set by request_compact -> _maybe_compact runs it
-        self._last_compact_ts = 0.0      # time of last auto-handover (loop guard)
+        self._last_compact_ts = 0.0      # time of last auto-compaction (loop guard)
         self._autostart_pending = None   # self-prompt queued to run as the next turn
         self._queued_turns = []          # user turns queued by a command (e.g. /prompt use);
                                          # the REPL drains these as full turns before prompting
@@ -9347,7 +9344,7 @@ class Agent:
                                          # at; hysteresis re-arms it only after ctx drops back
                                          # under (boundary - hysteresis*interval). Schmitt state.
         self._compact_boundary = 0      # message index just past the cache-STABLE prefix left
-                                         # by the last handover (0 = none yet). A provider client
+                                         # by the last compaction (0 = none yet). A provider client
                                          # may pin a cache breakpoint here. See auto_compact().
         # permissions note for the model, injected into the next user turn (not the cached
         # system prompt). Seeded at startup only if the leash is restricted (rwe = full = no note).
@@ -9501,9 +9498,9 @@ class Agent:
 
     def _offer_compact(self) -> bool:
         """Whether to surface the elective request_compact tool this turn: only in the
-        soft context zone (auto-handover on), i.e. once context has crossed the user's
+        soft context zone (auto-compaction on), i.e. once context has crossed the user's
         compact_soft threshold - the point at which the user has decided spending on a
-        handover is acceptable. The model then picks the tidy MOMENT within that window;
+        compaction is acceptable. The model then picks the tidy MOMENT within that window;
         it can never elect one BELOW soft, so it never decides how much the user pays."""
         if not self.cfg.compact_for()["auto"]:
             return False
@@ -9620,7 +9617,7 @@ class Agent:
         """Route a tool call: to the remote executor when connected (with a
         local confirmation first, since the executor can't prompt), else local.
         The model is unaware of any of this - identical surface either way."""
-        if name == "request_compact":       # elective soft-zone handover (agent-internal)
+        if name == "request_compact":       # elective soft-zone compaction (agent-internal)
             return self._request_compact()
         if name == "update_plan":            # pinned-plan upkeep (local agent state, never remote)
             return self._update_plan(args.get("plan", ""))
@@ -9798,7 +9795,7 @@ class Agent:
     def _plan_goal_only(self, pinned: str) -> str:
         """Collapsed view for a FINISHED plan (no open '- [ ]' items): keep just the
         GOAL/FOCUS anchor lines, drop the fully-checked TODO list. The GOAL is the
-        long-horizon anchor that must survive compaction/handover, so we keep it -
+        long-horizon anchor that must survive compaction/compact, so we keep it -
         but the ticked-off checklist is dead-weight tokens on every send, so it goes.
         Returns "" if there is no GOAL/FOCUS line to anchor on."""
         keep = [ln for ln in pinned.splitlines()
@@ -10103,7 +10100,7 @@ class Agent:
             m = self.messages[i]
             # Content is normally a string, but a loaded/older/hand-edited session
             # could carry a non-string (or missing) tool content. Coerce defensively
-            # so compaction (which auto-fires under handover) can never crash the
+            # so compaction (which auto-fires under compaction) can never crash the
             # whole turn on one odd message.
             content = m.get("content")
             if not isinstance(content, str):
@@ -10196,7 +10193,7 @@ class Agent:
     def _window_by_tokens(self, msgs, budget):
         """System message + the largest clean-boundary TAIL of `msgs` that keeps the whole
         send at/under `budget` CALIBRATED tokens (messages_tokens - the same fixed meter the
-        ctx line/handover use, so the bound matches reality). ALWAYS kept + counted first:
+        ctx line/compact use, so the bound matches reality). ALWAYS kept + counted first:
         the system message, the tool schemas, and a reserve for the env/plan tail that
         _with_plan_reminder appends AFTER this (so the real send never blows past budget).
         The conversation tail is then grown one WHOLE turn at a time (each user boundary)
@@ -10424,17 +10421,17 @@ class Agent:
     # the manual/emergency /trim path.)
 
     def _compact_turn_text(self):
-        """All assistant content produced since the handover instruction was injected
+        """All assistant content produced since the compaction instruction was injected
         (the marked block lives here, possibly alongside the finalize tool call)."""
         return "\n".join(m.get("content") or "" for m in self.messages[self._compact_mark:]
                          if m.get("role") == "assistant")
 
     def _solicit_compact(self, instr):
-        """Shared core of both compaction paths: inject the handover instruction `instr`,
+        """Shared core of both compaction paths: inject the compaction instruction `instr`,
         give the model a turn to write the marked blocks (@#! summary + plan + next-step),
         and - since there is no finalize tool, the turn ENDING is the trigger - tolerantly
         parse it, re-soliciting any MISSING block BY NAME up to _COMPACT_MAX_TRIES.
-        Returns (parsed, missing, attempt, turn_text). ONE place so handover() and
+        Returns (parsed, missing, attempt, turn_text). ONE place so compact() and
         auto_compact() can't drift (they did: one used the tolerant parse, one a strict
         re-extract, silently dropping the salvaged plan/next). Callers decide what to do
         with the result (replace history now, snapshot first, autostart, etc.)."""
@@ -10443,7 +10440,7 @@ class Agent:
         self._compact_capture = None
         self._compact_mark = len(self.messages)
         parsed, turn_text = None, ""
-        missing = ["handover"]
+        missing = ["compact"]
         attempt = 0
         for attempt in range(_COMPACT_MAX_TRIES):
             if attempt > 0:
@@ -10475,9 +10472,9 @@ class Agent:
           - stamp_clock: bump the anti-thrash loop guard (auto only - a manual /compact
             is deliberate, so it shouldn't arm the min-interval guard).
         Returns the summary text block."""
-        block = parsed["handover"]
+        block = parsed["compact"]
         if parsed["plan"]:
-            self.pinned_plan = parsed["plan"]   # survives handover (uncached send-time reminder)
+            self.pinned_plan = parsed["plan"]   # survives compaction (uncached send-time reminder)
         self.messages = [
             {"role": "system", "content": self._system()},
             {"role": "user", "content": summary_prefix + block, "cache_boundary": True},
@@ -10493,7 +10490,7 @@ class Agent:
                         if self.messages[i].get("role") == "tool"]
             if tool_idx:
                 self._trim_tool_indices(tool_idx)
-        # Cache-boundary signal: after a handover the prefix [system][summary] is STABLE,
+        # Cache-boundary signal: after a compaction the prefix [system][summary] is STABLE,
         # so a client with a spare breakpoint can pin it and re-read the prefix at ~0.1x.
         # 2 = system + the one compacted-summary user message.
         self._compact_boundary = 2
@@ -10543,7 +10540,7 @@ class Agent:
         # DIFFERENT layer from the send-level overload/429 recovery inside _loop.
         instr = read_prompt("compact") or COMPACT_INSTR
         parsed, missing, attempt, _turn_text = self._solicit_compact(instr)
-        block = parsed["handover"]
+        block = parsed["compact"]
         self.tool_defs = saved
         if not block:                         # no usable summary -> don't nuke history
             self.messages = pre
@@ -10588,13 +10585,13 @@ class Agent:
         return self._compact(zone="hard", deliberate=True)
 
     def _request_compact(self):
-        """The request_compact tool body: the model elects a handover at a clean break.
+        """The request_compact tool body: the model elects a compaction at a clean break.
         We don't compact here (mid-turn, inside a tool batch) - we set a flag that
         _maybe_compact honours AFTER the turn, running the same auto_compact machinery.
         Guard: only honour it in the soft-or-higher zone. The tool is only offered in the
         soft zone, but a stale/replayed/hallucinated call could arrive below it - refuse
-        those so an elected handover can never happen before the user's threshold (the
-        model never gets to spend on a handover the user hasn't opened the window for)."""
+        those so an elected compaction can never happen before the user's threshold (the
+        model never gets to spend on a compaction the user hasn't opened the window for)."""
         if not self.cfg.compact_for()["auto"]:
             return "compaction is off (auto_compact disabled) - not compacting."
         if self._ctx_zone()[0] == "ok":
@@ -10614,7 +10611,7 @@ class Agent:
     def _update_plan(self, plan: str):
         """The update_plan tool body: replace the pinned GOAL + TODO and refresh the
         live system prompt so the change is visible from the very next turn (and rides
-        compaction/handover). Cheap + cache-stable: the plan only moves when rewritten."""
+        compaction/compact). Cheap + cache-stable: the plan only moves when rewritten."""
         plan = (plan or "").strip()
         self.pinned_plan = plan
         if self.messages and self.messages[0].get("role") == "system":
@@ -10904,7 +10901,7 @@ class Agent:
             user_input = user_input + "\n\n[" + bg_note + "]"
         self.messages.append({"role": "user", "content": user_input})
         self.tools.changed_files.clear()
-        self._compact_capture = None    # clear any prior /handover trigger (loop guard)
+        self._compact_capture = None    # clear any prior /compact trigger (loop guard)
         self._elected_compact = False   # clear any prior elective request (fires once)
         self.dirty = True                # conversation now has unsaved changes
         with self._sigint_guard():
@@ -10913,7 +10910,7 @@ class Agent:
         # it in place so the autosave + next turn aren't poisoned (see repair_tool_pairs).
         self.messages = repair_tool_pairs(self.messages)
         self._maybe_auto_trim()        # cheap programmatic strip at token intervals (first)
-        self._maybe_compact()            # then the agentic handover (hard/emergency)
+        self._maybe_compact()            # then the agentic compaction (hard/emergency)
 
     def record_tool_call(self, name, args):
         """Store a tool call's FULL args in the ring and return its monotonic id.
@@ -10937,7 +10934,7 @@ class Agent:
         """Attach a tool call's RESULT to its ring entry so `/expand` can re-show
         output the user scrolled past (a run_command's stdout, a status dump, ...).
         Stored in the ring ONLY - never in self.messages - so it costs zero model
-        context and compaction/handover never touch it. Capped at EXPAND_MAX_CHARS
+        context and compaction/compact never touch it. Capped at EXPAND_MAX_CHARS
         (head/tail) so a huge dump can't bloat local memory; the ring's own 100-entry
         cap bounds the total. `result` may be a str or the {text,image_path} dict a
         tool can return - we keep the text. Best-effort; never raises into the loop."""
@@ -10966,13 +10963,13 @@ class Agent:
 
     def _log_activity(self, kind, summary, detail=""):
         """Record one automatic-behaviour event for /activity. `kind` is a short
-        tag (auto-compact, handover, 429-fallback, token-refresh, ...), `summary`
+        tag (auto-compact, compaction, 429-fallback, token-refresh, ...), `summary`
         the one-line "what happened", `detail` any extra "why". These are the
         smart-but-invisible things the system does on the user's behalf; the log
         makes them scrollable after the fact instead of a scroll-past warning.
         Ring-buffered (cap 200) so it never grows unbounded. Lazily inits the
         buffer so a partially-built Agent (test doubles that skip __init__) can't
-        crash a compaction/handover path on it."""
+        crash a compaction/compact path on it."""
         if not hasattr(self, "_activity") or self._activity is None:
             self._activity = []
         self._activity.append({
@@ -11016,7 +11013,7 @@ class Agent:
                 f"context crossed {boundary:,} (at {used:,}); fires every {interval:,} tokens")
 
     def _maybe_compact(self):
-        """After a turn, run a handover when either (a) context is in the hard/emergency
+        """After a turn, run a compaction when either (a) context is in the hard/emergency
         zone - forced, threshold-driven; or (b) the model ELECTED one this turn via
         request_compact (soft zone, a clean semantic boundary). Then optionally AUTOSTART
         the model's queued self-prompt. The loop guard (compact_min_interval) caps a
@@ -12187,11 +12184,11 @@ _SETTINGS_FIELDS = [
     ("confirm_reads", "ask-on-read (confirm read tools too)", "bool"),
     ("auto_reconnect", "reconnect to a session's remote on load (off = ask)", "bool"),
     ("ephemeral", "/connect default: force embed runtime + wipe on teardown (zero-trace)", "bool"),
-    ("show_snapshots", "show pre-handover safety snapshots in the /load picker + /session list", "bool"),
+    ("show_snapshots", "show pre-compaction safety snapshots in the /load picker + /session list", "bool"),
     ("statusline", "status rows above the prompt", "bool"),
     ("statusline_every", "reprint status every N prompts (1 = every turn, 0 = only on change)", "int"),
     ("statusline_iter", "reprint status every N model iterations within a long turn (0 = off)", "int"),
-    # --- context management (send-window + auto-handover) ---
+    # --- context management (send-window + auto-compaction) ---
     ("window_messages", "send-window size in messages (0 = off, full history)", "int"),
     ("window_tokens", "send-window token cap: 'auto' (=ctx-reserve, default), an int (hard cap), or 0 (off)", "int_or_auto"),
     ("auto_compact", "auto-compact (self-managing context)", "bool"),
@@ -12585,7 +12582,7 @@ def handle_note_command(agent, cfg, arg):
 
 def handle_plan_command(agent, cfg, arg):
     """/plan - view or set the pinned GOAL + TODO plan the model otherwise maintains
-    via the update_plan tool. The plan rides compaction/handover and is saved + restored
+    via the update_plan tool. The plan rides compaction/compact and is saved + restored
     with the session, so /plan lets the operator steer it directly. Subcommands:
       /plan                 show the current plan
       /plan <text>          set the whole plan (multi-line ok; replaces it)
@@ -12747,15 +12744,15 @@ def _status_rows(agent, cfg):
     est = "~" if not getattr(agent, "last_prompt_tokens", 0) else ""
     # drop the 'ok' zone label - only surface a zone once it's noteworthy (soft/hard/emergency)
     zlabel = "" if zone == "ok" else f" {zone}"
-    # Colour by the auto-handover ZONE (what actually drives behaviour) when it's on -
+    # Colour by the auto-compaction ZONE (what actually drives behaviour) when it's on -
     # so the meter goes yellow/red at the soft/hard thresholds, not at a fixed % of the
-    # max window. Falls back to plain %-of-max colour when auto-handover is off.
+    # max window. Falls back to plain %-of-max colour when auto-compaction is off.
     col = _zone_color(zone) if c.get("auto") else _pct_color(pct)
     ctx = col(f"ctx {est}{_fmt_tokens(used)}/{_fmt_tokens(window)} ({pct:.0f}%{zlabel})")
     quota = _provider_usage_str(agent, cfg)     # leading separator already, or "" if none
-    # handovers is a live counter (row 3 reprints every turn); shown once any happened.
+    # compactions is a live counter (row 3 reprints every turn); shown once any happened.
     hov = (d + f"{agent.compactions} compactions") if agent.compactions else ""
-    # ctx -> handover count -> the backend quota meters (5h / wk) -> think / effort
+    # ctx -> compaction count -> the backend quota meters (5h / wk) -> think / effort
     rows.append("  " + ctx + hov + quota + d + d.join([f"think {think}", f"effort {effort}"]))
     return rows
 
@@ -13396,7 +13393,7 @@ def _load_session_into(agent, cfg, name):
 
 def _session_picker(prompt="load session:", show_snapshots=False):
     """Recent-first session picker (most-recently-used first, with a relative-age
-    column). Returns the chosen session name, or None if cancelled/empty. Pre-handover
+    column). Returns the chosen session name, or None if cancelled/empty. Pre-compaction
     safety snapshots are hidden unless `show_snapshots` (they clog the menu; /load
     <exact-name> reaches them regardless)."""
     rows = _session_rows()
@@ -13876,7 +13873,7 @@ def handle_provider_command(agent, cfg, arg):
       /provider set [key [val]] get/set a backend-specific knob (was /set)
     Switching the active MODEL (and its backend) is /model; bare /provider is the
     catalog (what's on/off), matching the old /provider list. App-config knobs
-    (handover gates, sampling, etc.) live in /set."""
+    (compaction gates, sampling, etc.) live in /set."""
     parts = arg.split()
     sub = parts[0] if parts else ""
     rest = parts[1] if len(parts) > 1 else ""
@@ -15017,14 +15014,14 @@ def handle_compact_at_command(agent, cfg, arg):
     auto-compaction is forced (soft zone slides with it: soft = compact_at * soft_ratio).
     No arg shows the current value + the derived soft/emergency zones, then prompts for a
     new fraction (Enter keeps it) - like `/set <key>` with a bare key. A shortcut for
-    `/set compact_at` (which still works); the other handover knobs (compact_soft,
+    `/set compact_at` (which still works); the other compaction knobs (compact_soft,
     compact_soft_ratio, compact_emergency, compact_min_interval) stay under /set."""
     raw = arg.strip()
     if not raw:
         c = cfg.compact_for()
         print(bold(cyan("/compact_at")) + dim("  (the auto-compaction lever)"))
         print(f"  compact_at   {cfg.compact_at:.2f}   " + dim(f"({cfg.compact_at:.0%} of the window)"))
-        print(dim(f"  soft zone    {c['soft']:.2f}   (model may electively hand over from here)"))
+        print(dim(f"  soft zone    {c['soft']:.2f}   (model may electively compact from here)"))
         print(dim(f"  emergency    {cfg.compact_emergency:.2f}"))
         print(dim("  other knobs: /set compact_soft*, compact_emergency, ..."))
         # No-arg = interactive edit (contract §4): prompt for a value so the operator can
@@ -15564,7 +15561,7 @@ def repl(cfg: Config, resume=None):
                          f"({type(e).__name__}; file may be corrupt) - starting fresh."))
     elif cfg.autosave and not cfg.incognito:
         # Auto-load the session you were last actually in: the most-recently-used one,
-        # EXCLUDING pre-handover snapshots (those are safety checkpoints, not the live
+        # EXCLUDING pre-compaction snapshots (those are safety checkpoints, not the live
         # thread). cwd is a HINT, not a hard filter - scoping auto-load by cwd silently
         # skipped the genuinely-most-recent session whenever it was last used from a
         # different dir (e.g. a session worked over a remote connection, or a synced
@@ -15861,7 +15858,7 @@ def run_agent_brief(args) -> int:
     cfg.approval = "auto"                 # headless: no operator to confirm
     cfg.composer = False
     cfg.autosave = False                  # a worker doesn't autosave/auto-load sessions
-    cfg.auto_compact = False             # one brief, no self-compaction handover
+    cfg.auto_compact = False             # one brief, no self-compaction compaction
     # Mark this process a headless worker: no human is watching, so a provider that
     # would fast-fail an interactive turn on a transient throttle should instead wait
     # it out (see anthropic_plan _send_with_retry - it backs off 429 in worker mode).
