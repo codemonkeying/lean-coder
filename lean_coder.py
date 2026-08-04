@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L1056   Lean-tools (plugin tools: discovery, manager)
-  L1406   MCP client (connection, manager, OAuth, discovery)
-  L1860   Providers (backend plugin registry)
-  L2082   Interactive pickers + menus (raw-mode UI engine)
-  L2431   Terminal styling (colors, formatting helpers)
-  L2630   Streaming + markdown render (model output)
-  L2989   Composer (pinned input line, editor, stdin)
-  L3839   Token accounting (calibrated context meter)
-  L4013   Config (dataclass, field registry, load/save)
-  L7186   Tool execution + text tool-call parsing
-  L7612   Remote workspace (executor client, /connect)
-  L9203   Context meter
-  L9298   Agent (turn loop, context mgmt, tool dispatch)
-  L15314  Slash-command handlers + dispatch table
-  L15451  REPL (interactive loop, session resume)
-  L15812  Worker agent (headless --agent-run)
-  L16424  Entry (CLI arg parsing, main)
+  L1066   Lean-tools (plugin tools: discovery, manager)
+  L1416   MCP client (connection, manager, OAuth, discovery)
+  L1870   Providers (backend plugin registry)
+  L2092   Interactive pickers + menus (raw-mode UI engine)
+  L2441   Terminal styling (colors, formatting helpers)
+  L2640   Streaming + markdown render (model output)
+  L2999   Composer (pinned input line, editor, stdin)
+  L3849   Token accounting (calibrated context meter)
+  L4023   Config (dataclass, field registry, load/save)
+  L7206   Tool execution + text tool-call parsing
+  L7632   Remote workspace (executor client, /connect)
+  L9223   Context meter
+  L9318   Agent (turn loop, context mgmt, tool dispatch)
+  L15462  Slash-command handlers + dispatch table
+  L15599  REPL (interactive loop, session resume)
+  L15960  Worker agent (headless --agent-run)
+  L16572  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -111,7 +111,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.10.7"
+__version__ = "0.10.8"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -119,6 +119,16 @@ __version__ = "0.10.7"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.10.8": [
+        "add: opt-in training-data capture (capture_training, off by default) - writes",
+        "  RAW per-turn trajectories (reasoning + tool calls + full results) to a JSONL",
+        "  sidecar for downstream model training. Personal-machine feature; never on for",
+        "  workers or incognito.",
+        "fix: session read-outs (resume line, /load list + picker, /save) said",
+        "  'N turns' but were really counting MESSAGES - so a session showed e.g.",
+        "  '227 turns' while the status line correctly said '26 turns'. Those",
+        "  read-outs now say 'N msgs'; 'turns' means your prompts everywhere.",
+    ],
     "0.10.7": [
         "fix: revert the 0.10.6 spinner width-clip - it regressed the /connect feedback",
         "  (green stage lines + push spinner) into a plain hanging terminal on some",
@@ -4118,6 +4128,14 @@ class Config:
     ingest_cap_floor: int = INGEST_CAP_FLOOR    # min truncation size (BUDGET floor, not
                                      # an output floor: a result < cap is shown whole)
     ingest_cap_ceil: int = INGEST_CAP_CEIL      # absolute char ceiling on a capped result
+    capture_training: bool = False   # opt-in: append RAW per-turn training trajectories
+                                     # (reasoning + tool calls + full pre-stub/pre-compact
+                                     # results) to a JSONL sidecar for downstream training
+                                     # (leangym). OFF by default. Personal-machine capture,
+                                     # no redaction on write; never captured for workers or
+                                     # incognito. See docs/design/training-capture.md.
+    capture_training_dir: str = ""   # override output dir for capture_training; default is
+                                     # CONFIG_DIR/training/. Sidecar = <dir>/<session_id>.jsonl.
     window_messages: int = 0         # bounded context window: send only the last N
                                      # messages (cut at a clean turn boundary) instead
                                      # of the full history. 0 = unbounded (OFF, the
@@ -4512,6 +4530,8 @@ _SCALAR_FIELDS = (
     ("ingest_cap_frac",           INGEST_CAP_FRAC,     False),
     ("ingest_cap_floor",          INGEST_CAP_FLOOR,    False),
     ("ingest_cap_ceil",           INGEST_CAP_CEIL,     False),
+    ("capture_training",          False,               False),
+    ("capture_training_dir",      "",                  False),
     ("max_iterations",            0,                   False),
     ("window_messages",           0,                   False),
     ("window_tokens",             "auto",              False),
@@ -9353,7 +9373,12 @@ class Agent:
                                          # (the note tool). Persisted in the session JSON, so it
                                          # travels with /load and a pushed session - resume 1:1.
         self.pinned_plan = ""            # goal + TODO the model maintains; rides an uncached
-                                         # prompt tail and survives compaction (===PLAN=== block)
+        self.autosave_name = _new_autosave_name()   # rolling autosave target this launch
+        self._cap_turn = None            # training-capture: the in-progress turn record
+                                         # (None unless capture_training is on). See
+                                         # docs/design/training-capture.md.
+        self._cap_turn_index = 0         # monotonic captured-turn counter (session-scoped)
+        self._cap_sha = None             # cached best-effort git HEAD short sha
         self._tool_calls = []            # ring (cap 100) of {id,name,args} for /expand:
                                          # the full args of recent tool calls, so the
                                          # operator can view what was truncated on-screen
@@ -9696,6 +9721,7 @@ class Agent:
             spin.stop()
         for (name, _args, cid, tcid), result in zip(parsed, results):
             self.record_tool_result(cid, result)
+            self._cap_add_result(name, tcid, result)   # training-capture
             if _TTY:
                 print(_tool_result_preview(name, result, cid))
             self.messages.append(_tool_result_msg(name, result, tool_call_id=tcid))
@@ -10949,7 +10975,122 @@ class Agent:
         for e in reversed(self._tool_calls):
             if e["id"] == call_id:
                 e["result"] = text
+                e["result"] = text
                 return
+
+    # ---- Training-data capture (opt-in; see docs/design/training-capture.md) ----
+    # RAW per-turn trajectory capture at the INGESTION seam (pre-stub/pre-compact).
+    # Every method is best-effort and MUST NOT raise into the turn loop.
+
+    def _cap_on(self) -> bool:
+        """True iff training capture is active for THIS agent right now. Off by
+        default; suppressed for incognito and for workers (never a real session)."""
+        return bool(getattr(self.cfg, "capture_training", False)
+                    and not getattr(self.cfg, "incognito", False)
+                    and not getattr(self.cfg, "worker_depth", 0))
+
+    def _cap_path(self):
+        """Sidecar path <dir>/<session_id>.jsonl (dir override or CONFIG_DIR/training/)."""
+        d = getattr(self.cfg, "capture_training_dir", "") or ""
+        base = Path(d).expanduser() if d else (CONFIG_DIR / "training")
+        return base / f"{self.autosave_name}.jsonl"
+
+    def _cap_head_sha(self) -> str:
+        """Best-effort short git sha of the running tree (cached; '' if unknown)."""
+        if self._cap_sha is not None:
+            return self._cap_sha
+        sha = ""
+        try:
+            out = subprocess.run(["git", "-C", str(Path(__file__).resolve().parent),
+                                  "rev-parse", "--short", "HEAD"],
+                                 capture_output=True, text=True, timeout=5)
+            if out.returncode == 0:
+                sha = out.stdout.strip()
+        except Exception:
+            sha = ""
+        self._cap_sha = sha
+        return sha
+
+    def _cap_begin_turn(self, assistant: dict):
+        """Open a per-turn capture record from the just-appended assistant message
+        (its reasoning + tool_calls). No-op when capture is off."""
+        if not self._cap_on():
+            self._cap_turn = None
+            return
+        try:
+            segs = []
+            text = assistant.get("content")
+            if isinstance(text, str) and text.strip():
+                segs.append({"role": "assistant", "kind": "reasoning", "text": text,
+                             "is_model_generated": True, "captured_at": "ingestion"})
+            for c in (assistant.get("tool_calls") or []):
+                fn = c.get("function", {}) or {}
+                args = fn.get("arguments", {})
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except json.JSONDecodeError:
+                        pass
+                segs.append({"role": "assistant", "kind": "tool_call",
+                             "tool": fn.get("name", ""), "args": args,
+                             "call_id": c.get("id", ""),
+                             "is_model_generated": True, "captured_at": "ingestion"})
+            self._cap_turn = {
+                "schema": "leancoder.training.v1",
+                "session_id": self.autosave_name,
+                "turn_index": self._cap_turn_index,
+                "ts_start": time.time(), "ts_end": None,
+                "leancoder_version": __version__,
+                "leancoder_sha": self._cap_head_sha(),
+                "model": getattr(self.cfg, "model", "") or "",
+                "provider": getattr(self.cfg, "provider", "") or "",
+                "segments": segs,
+                "finish_reason": "tool_calls" if assistant.get("tool_calls") else "stop",
+                "tokens": {"in": getattr(self, "last_prompt_tokens", 0) or 0,
+                           "out": getattr(self.client, "last_out_tokens", 0) or 0},
+                "outcome_hints": {"any_tool_error": False, "reverted_later": None},
+            }
+        except Exception:
+            self._cap_turn = None
+
+    def _cap_add_result(self, name, call_id, result):
+        """Add a tool_result segment with the FULL ingested body. No-op when off."""
+        if self._cap_turn is None:
+            return
+        try:
+            if isinstance(result, dict) and "text" in result:
+                content = str(result.get("text", ""))
+            else:
+                content = result if isinstance(result, str) else str(result)
+            exit_code = result.get("exit_code") if isinstance(result, dict) else None
+            error = result.get("error") if isinstance(result, dict) else None
+            err = bool(error) or (isinstance(exit_code, int) and exit_code != 0) \
+                or content[:64].lower().startswith("error")
+            if err:
+                self._cap_turn["outcome_hints"]["any_tool_error"] = True
+            self._cap_turn["segments"].append({
+                "role": "tool", "kind": "tool_result", "tool": name,
+                "call_id": call_id or "", "content": content,
+                "exit_code": exit_code, "error": error,
+                "is_model_generated": False, "captured_at": "ingestion"})
+        except Exception:
+            pass
+
+    def _cap_end_turn(self):
+        """Stamp ts_end and append the record as one JSONL line. No-op when off."""
+        if self._cap_turn is None:
+            return
+        rec = self._cap_turn
+        self._cap_turn = None
+        try:
+            rec["ts_end"] = time.time()
+            p = self._cap_path()
+            p.parent.mkdir(parents=True, exist_ok=True)
+            with p.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            self._cap_turn_index += 1
+        except Exception:
+            pass
 
     def _maybe_auto_expand(self, name, call_id):
         """Auto-print the full args right after the call line when `name` is in the
@@ -11329,8 +11470,10 @@ class Agent:
                 self.session_eval_tokens += _ev_tok
                 self.session_eval_ns += _ev_ns
             self.messages.append(assistant)
+            self._cap_begin_turn(assistant)   # training-capture: open turn record (no-op if off)
             calls = assistant.get("tool_calls")
             if not calls:
+                self._cap_end_turn()
                 self._end_of_turn()
                 return
             # Parallel fast-path: when the model batches several independent
@@ -11343,6 +11486,7 @@ class Agent:
             if (len(calls) > 1 and not self.remote
                     and all(self._parallel_safe(c) for c in calls)):
                 self._run_parallel(calls)
+                self._cap_end_turn()
                 if self._abort:
                     return
                 continue
@@ -11379,10 +11523,12 @@ class Agent:
                     finally:
                         spin.stop()
                 self.record_tool_result(cid, result)
+                self._cap_add_result(name, call.get("id", ""), result)  # training-capture
                 if _TTY:
                     print(_tool_result_preview(name, result, cid))
                 self.messages.append(_tool_result_msg(name, result,
                                                       tool_call_id=call.get("id", "")))
+            self._cap_end_turn()   # training-capture: flush the turn record (no-op if off)
         self._hit_iteration_cap = True    # stopped on the budget, not a natural finish
         print(yellow(f"\n{GLYPH['warn']} hit {cap}-iteration cap; stopping this turn. "
                      f"Refine your request or continue, or raise the limit: "
@@ -12212,6 +12358,8 @@ _SETTINGS_FIELDS = [
     ("ingest_cap_frac", "opaque tool result: max share of free window (0-1)", "float"),
     ("ingest_cap_floor", "opaque tool result: min truncation size (chars)", "int"),
     ("ingest_cap_ceil", "opaque tool result: hard char ceiling", "int"),
+    ("capture_training", "capture RAW per-turn training trajectories to a JSONL sidecar (off; personal machine)", "bool"),
+    ("capture_training_dir", "training-capture output dir (blank = CONFIG_DIR/training/)", "str"),
     ("keep_alive", "ollama: model keep-alive (e.g. 10m, -1, 0)", "str"),
     ("auto_num_ctx", "ollama: detect num_ctx at startup", "bool"),
 ]
@@ -12335,7 +12483,7 @@ def _settings_sessions_view(agent, cfg):
         when = meta.get("saved_at", "?")
         turns = meta.get("turns", "?")
         age = f"{_fmt_age(now - mtime)} ago" if mtime else "?"
-        print(f"  {bold(cyan(name))}  {dim(f'{when} {d} {age} {d} {turns} turns')}")
+        print(f"  {bold(cyan(name))}  {dim(f'{when} {d} {age} {d} {turns} msgs')}")
     name = _session_picker("load session (enter to skip):")
     if name:
         _load_session_into(agent, cfg, name)
@@ -13105,7 +13253,7 @@ def handle_save_command(agent, cfg, arg):
     # (To branch off an immutable checkpoint, /save under a new name.)
     if not cfg.incognito:
         agent.autosave_name = path.stem
-    print(green(f"saved session '{path.stem}' ({meta['turns']} turns) -> {path}"))
+    print(green(f"saved session '{path.stem}' ({meta['turns']} msgs) -> {path}"))
     if cfg.autosave and not cfg.incognito:
         print(dim(f"  now autosaving into '{path.stem}'"))
 
@@ -13380,7 +13528,7 @@ def _load_session_into(agent, cfg, name):
         _release_lock(agent.autosave_name)
         agent.autosave_name = _session_name_ok(name)
         _write_lock(agent.autosave_name)
-    print(green(f"resumed '{_session_name_ok(name)}'  {GLYPH['dot']}  {n} turns  "
+    print(green(f"resumed '{_session_name_ok(name)}'  {GLYPH['dot']}  {n} msgs  "
                 f"{GLYPH['dot']}  saved {meta.get('saved_at', '?')}"))
     _print_session_tail(msgs)
     _print_session_state(state)
@@ -13409,7 +13557,7 @@ def _session_picker(prompt="load session:", show_snapshots=False):
         age = f"{_fmt_age(now - mtime)} ago" if mtime else "?"
         tag = f" {d} ex-worker" if str(meta.get("origin") or "").startswith("worker:") else ""
         labels.append(f"{nm}  ({meta.get('saved_at', '?')} {d} "
-                      f"{meta.get('turns', '?')} turns{tag} {d} {age})")
+                      f"{meta.get('turns', '?')} msgs{tag} {d} {age})")
     choice = pick_one(prompt, labels)
     return rows[labels.index(choice)][0] if choice else None
 
@@ -13491,7 +13639,7 @@ def handle_session_command(agent, cfg, arg):
             turns = meta.get("turns", "?")
             title = meta.get("title", "")
             age = f"{_fmt_age(now - mtime)} ago" if mtime else "?"
-            print(f"  {bold(cyan(name))}  {dim(f'{when} {d} {age} {d} {turns} turns {d} {title}')}")
+            print(f"  {bold(cyan(name))}  {dim(f'{when} {d} {age} {d} {turns} msgs {d} {title}')}")
         if hidden:
             print(dim(f"  ({hidden} pre-compact snapshot(s) hidden; "
                       f"/set show_snapshots true to show)"))
@@ -15550,7 +15698,7 @@ def repl(cfg: Config, resume=None):
             if not _take_over_or_fork(resume):
                 raise FileNotFoundError  # decline -> fall through to a clean start
             n, _meta = _resume_into(agent, cfg, resume)
-            print(yellow(f"  resumed '{_session_name_ok(resume)}' ({n} turns) - "
+            print(yellow(f"  resumed '{_session_name_ok(resume)}' ({n} msgs) - "
                          f"/clear for a fresh one, /load to switch.") + "\n")
             resumed = True
         except FileNotFoundError:
@@ -15587,7 +15735,7 @@ def repl(cfg: Config, resume=None):
                 n, meta = _resume_into(agent, cfg, last)
                 other = meta.get("cwd")
                 cwd_note = f"  (last used in {other})" if other and other != here else ""
-                print(yellow(f"  resumed last session '{last}' ({n} turns) - "
+                print(yellow(f"  resumed last session '{last}' ({n} msgs) - "
                              f"/clear for a fresh one, /load to switch.") + dim(cwd_note) + "\n")
                 resumed = True
             except (FileNotFoundError, OSError, json.JSONDecodeError):
