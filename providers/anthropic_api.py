@@ -660,9 +660,9 @@ class _ApiKeyClient:
         cached_msgs = list(api_msgs)
         if len(cached_msgs) >= 2:
             cached_msgs[-2] = _mark_cache(cached_msgs[-2])   # rolling recent breakpoint
-        # 4th breakpoint: core tags the frozen post-handover summary message with
+        # 4th breakpoint: core tags the frozen post-compaction summary message with
         # cache_boundary=True. The [system][summary] prefix is stable until the next
-        # handover, so anchoring here caches the biggest static block at ~0.1x re-read.
+        # compaction, so anchoring here caches the biggest static block at ~0.1x re-read.
         # Only the LAST-flagged message gets it (the vendor caps at 4 breakpoints; a 5th
         # 400s), and we strip the internal flag from every message before send (it is not
         # part of the API schema).

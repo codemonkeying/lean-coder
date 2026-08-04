@@ -71,7 +71,7 @@ overhead = lc.messages_tokens([sys_msg], lc.active_tools(lc.Config()))
 check("fixed overhead < 2700 tokens (~2.5k README claim + headroom)", overhead < 2700, f"~{overhead} tokens")
 # the hot metering path must survive non-string content (int/None from a loaded or
 # synthesised history) and size a block LIST by its JSON length, not its element count
-# (a crash/skew here would feed a bad ctx meter into handover decisions).
+# (a crash/skew here would feed a bad ctx meter into compaction decisions).
 _mt_msgs = [{"role": "system", "content": "s"}, {"role": "user", "content": 42},
             {"role": "assistant", "content": None}]
 check("_raw_messages_tokens: non-string content doesn't crash the meter",
@@ -88,7 +88,7 @@ check("update_plan is on the surface at every non-chat tier",
       all("update_plan" in [t["function"]["name"] for t in lc.active_tools(lc.Config(leash=l))]
           for l in ("r", "rw", "rwe")))
 check("ssh is not a core tool", "ssh" not in [t["function"]["name"] for t in lc.TOOLS])
-# elective handover: request_compact is surfaced ONLY when offer_compact (soft zone)
+# elective compaction: request_compact is surfaced ONLY when offer_compact (soft zone)
 _no_ho = [t["function"]["name"] for t in lc.active_tools(lc.Config())]
 _yes_ho = [t["function"]["name"] for t in lc.active_tools(lc.Config(), offer_compact=True)]
 check("request_compact absent below the soft zone", "request_compact" not in _no_ho)
@@ -915,14 +915,14 @@ check("_extract_marked: lone fence, no close -> None (safe, no session nuke)",
 _ph1 = lc._parse_compact(f"{lc.COMPACT_MARK}\nfixed add() in calc.py, verified\n{lc.COMPACT_MARK}\n"
                           f"{lc.PLAN_MARK}\nGOAL: x\nTODO:\n- [ ] test\n{lc.PLAN_MARK}\n"
                           f"{lc.SELFPROMPT_MARK}\nwrite the test\n{lc.SELFPROMPT_MARK}")
-check("_parse_compact: tier1 canonical fences", _ph1["tier"] == 1 and _ph1["handover"] and _ph1["plan"] and _ph1["next"])
+check("_parse_compact: tier1 canonical fences", _ph1["tier"] == 1 and _ph1["compact"] and _ph1["plan"] and _ph1["next"])
 _ph3 = lc._parse_compact("## Handover\nfixed add() in calc.py and verified it prints 5\n## Plan\nGOAL: t\n## Next\nwrite unit test")
-check("_parse_compact: tier3 markdown headers", _ph3["tier"] == 3 and "calc.py" in _ph3["handover"] and _ph3["next"] == "write unit test")
+check("_parse_compact: tier3 markdown headers", _ph3["tier"] == 3 and "calc.py" in _ph3["compact"] and _ph3["next"] == "write unit test")
 _ph4 = lc._parse_compact('{"summary": "fixed the add bug in calc.py and verified output", "todo": ["write test"], "next": "add the unit test"}')
-check("_parse_compact: tier4 json fuzzy fields", _ph4["tier"] == 4 and "calc.py" in _ph4["handover"] and _ph4["next"] == "add the unit test")
+check("_parse_compact: tier4 json fuzzy fields", _ph4["tier"] == 4 and "calc.py" in _ph4["compact"] and _ph4["next"] == "add the unit test")
 _ph5 = lc._parse_compact("I fixed the subtraction bug in calc.py by changing minus to plus, ran it, got 5. Next add a test.")
-check("_parse_compact: tier5 prose salvage", _ph5["tier"] == 5 and _ph5["handover"])
-check("_parse_compact: empty content -> no handover (safe no-op)", lc._parse_compact("ok")["handover"] is None)
+check("_parse_compact: tier5 prose salvage", _ph5["tier"] == 5 and _ph5["compact"])
+check("_parse_compact: empty content -> no compact block (safe no-op)", lc._parse_compact("ok")["compact"] is None)
 
 # --- bg hooks for lean-tools (bg_launch/bg_status/bg_list on the lc dict) ------
 check("bg hooks: bg_launch is exposed", callable(lc.bg_launch))
@@ -2036,7 +2036,7 @@ finally:
 # compact_overrides + non-default global thresholds SURVIVE a save_config round-trip.
 # Regression: save_config had no serializer for compact_overrides (a BESPOKE key), so
 # every autosave_config() rewrote config.toml WITHOUT them - they vanished and the next
-# load fell back to the global defaults (0.70/0.95 -> the "handover 95%" reset). Model
+# load fell back to the global defaults (0.70/0.95 -> the "compaction 95%" reset). Model
 # names carry ':'/'.' so the table header MUST be quoted or the whole file won't parse.
 _hop2 = _plA.Path(_tfA.mkdtemp()) / "ho2.toml"
 _orig_cpC = lc.CONFIG_PATH
@@ -2079,7 +2079,7 @@ check("compact keeps last N in full", not tmsgs[-1]["content"].startswith("[trim
 check("compact frees tokens", freed > 0 and after < before, f"freed~{freed}")
 check("trim is idempotent (re-run trims 0)", ag.trim(keep=1)[0] == 0)
 # compact must survive a tool message with non-string content (an older/hand-edited
-# session, or an image-only result) - it auto-fires under handover, so a crash here
+# session, or an image-only result) - it auto-fires under compaction, so a crash here
 # would take down the whole turn.
 _ncx = lc.Agent.__new__(lc.Agent)
 _ncx.messages = [{"role": "system", "content": "s"},
@@ -2127,14 +2127,14 @@ _acu["used"] = 999999; _stripped["n"] = 0; _run_ac()
 check("auto_trim: off when interval is 0", _stripped["n"] == 0)
 check("Config default auto_trim_interval is 0 (off)", lc.Config().auto_trim_interval == 0)
 
-# 12b2. handover marks the stable-prefix summary message with a cache_boundary signal
+# 12b2. compaction marks the stable-prefix summary message with a cache_boundary signal
 _cb = lc.Agent.__new__(lc.Agent)
 _cb.cfg = lc.Config()
-_cb._handover_boundary = 0
+_cb._compact_boundary = 0
 _cb.messages = [{"role": "system", "content": "s"},
-                {"role": "user", "content": "Session handover (prior context summarized):\nX",
+                {"role": "user", "content": "Session compaction (prior context summarized):\nX",
                  "cache_boundary": True}]
-check("handover summary message carries cache_boundary + boundary index makes sense",
+check("compaction summary message carries cache_boundary + boundary index makes sense",
       _cb.messages[1].get("cache_boundary") is True)
 
 # 12c. (auto_evict removed - design decision 8; superseded by the ingestion cap)
@@ -2380,7 +2380,7 @@ pn.messages = [{"role": "system", "content": "S"}]
 pn.tool_defs = []; pn.cfg = lc.Config()
 pn._pending_ai_note = "Permissions changed: read-only"
 pn.tools = type("T", (), {"changed_files": set()})()
-pn._handover_capture = None; pn.dirty = False
+pn._compact_capture = None; pn.dirty = False
 pn._turn_count = 0
 pn._elected_compact = False
 pn._soft_nudge = lambda: ""       # isolate this test to the pending-note path
@@ -2599,7 +2599,7 @@ check("read_prompt('compact_nudge') returns the nudge template",
       lc.read_prompt("compact_nudge") == lc.COMPACT_NUDGE)
 check("read_prompt('compact') returns the compact instruction",
       lc.read_prompt("compact") == lc.COMPACT_INSTR)
-check("handover_nudge template has ctx placeholders",
+check("compact_nudge template has ctx placeholders",
       "{used}" in lc.COMPACT_NUDGE and "{pct}" in lc.COMPACT_NUDGE)
 import tomllib as _tae
 _aef = Path(tempfile.mktemp(suffix=".toml"))
@@ -2998,11 +2998,11 @@ lc.save_config(lc.Config(model="m", keep_alive="-1"))
 check("save_config writes a non-default keep_alive",
       _t.loads(nf.read_text()).get("keep_alive") == "-1")
 _kaf = pathlib.Path(tempfile.mktemp(suffix=".toml"))
-_kaf.write_text('model = "m"\nkeep_alive = "30m"\nauto_evict = true\nauto_evict_keep = 5\nhandover_soft = 0.5\ncompact_keep_hard = 99\ncompact_keep = 4\n')
+_kaf.write_text('model = "m"\nkeep_alive = "30m"\nauto_evict = true\nauto_evict_keep = 5\ncompact_soft = 0.5\ncompact_keep_hard = 99\ncompact_keep = 4\n')
 _orig_ka = lc.CONFIG_PATH; lc.CONFIG_PATH = _kaf
 _kac = lc.load_config(HArgs())
 check("load_config reads keep_alive", _kac.keep_alive == "30m")
-check("load_config: removed/renamed keys (auto_evict, handover_soft, compact_keep_hard) ignored, not crash (D2)",
+check("load_config: removed/renamed keys (auto_evict, compact_soft, compact_keep_hard) ignored, not crash (D2)",
       _kac.model == "m" and not hasattr(_kac, "auto_evict") and not hasattr(_kac, "compact_keep_hard") and _kac.compact_keep == 4)
 lc.CONFIG_PATH = _orig_ka; _kaf.unlink(missing_ok=True)
 
@@ -3559,7 +3559,7 @@ check("restore_prompt: nothing to restore -> False", lc.restore_prompt("system")
 (lc.PROMPTS_DIR / "research.txt").write_text("do research")
 _pb, _pc = lc.list_prompts()
 check("list_prompts: default hides un-overridden system prompts, lists custom",
-      "system" not in _pb and "handover" not in _pb and "research" in _pc)
+      "system" not in _pb and "compaction" not in _pb and "research" in _pc)
 _pba, _pca = lc.list_prompts(all_builtins=True)
 check("list_prompts(all_builtins=True): every system prompt listed",
       "system" in _pba and "compact" in _pba and "research" in _pca)
@@ -4465,18 +4465,18 @@ check("_prune_autosaves: keeps the newest, drops the oldest",
       and not (lc.SESSIONS_DIR / "auto-bulk-00.json").is_file())
 check("_prune_autosaves: never prunes a named snapshot",
       (lc.SESSIONS_DIR / "named-snapshot.json").is_file())
-# pre-handover safety snapshots are rolling too: capped to PRECOMPACT_KEEP, not kept
+# pre-compaction safety snapshots are rolling too: capped to PRECOMPACT_KEEP, not kept
 # forever (else a busy session floods /load with dozens). Newest kept, oldest dropped.
-# Named <origin>-prehandover-<N>; the origin here is a user session ("sess").
+# Named <origin>-precompact-<N>; the origin here is a user session ("sess").
 for _i in range(12):
     _pp, _ = lc.save_session([{"role": "user", "content": f"pc{_i}"}], _aag.cfg,
                              f"sess{lc.PRECOMPACT_MARK}{_i}")
     os.utime(_pp, (3000 + _i, 3000 + _i))
 lc._prune_autosaves(keep=10)
 _pc_left = sorted(p.name for p in lc.SESSIONS_DIR.glob(f"*{lc.PRECOMPACT_MARK}*.json"))
-check("_prune_autosaves: caps pre-handover snapshots to PRECOMPACT_KEEP",
+check("_prune_autosaves: caps pre-compaction snapshots to PRECOMPACT_KEEP",
       len(_pc_left) == lc.PRECOMPACT_KEEP, _pc_left)
-check("_prune_autosaves: keeps the NEWEST pre-handover snapshots, drops the oldest",
+check("_prune_autosaves: keeps the NEWEST pre-compaction snapshots, drops the oldest",
       (lc.SESSIONS_DIR / f"sess{lc.PRECOMPACT_MARK}11.json").is_file()
       and not (lc.SESSIONS_DIR / f"sess{lc.PRECOMPACT_MARK}0.json").is_file())
 check("_prune_autosaves: snapshot cap leaves named sessions + auto- count intact",
@@ -4619,7 +4619,7 @@ check("_status_rows hides compactions count when none have happened",
       "compactions" not in _plain)
 check("_status_rows shows the round-cap only in auto mode", "max 25 rounds" in _plain)
 check("_status_rows row1 shows the session name with a colon", "session: sess-x" in _plain)
-# window ON -> the size is shown; handovers count appears once any have happened.
+# window ON -> the size is shown; compactions count appears once any have happened.
 # window_tokens (default 'auto') takes precedence in the row, so turn it off to exercise
 # the message-count display.
 _srag.cfg.window_tokens = 0
@@ -5907,16 +5907,16 @@ try:
           lc._parse_toggle("", True) is False and lc._parse_toggle("", False) is True)
     check("_parse_toggle: invalid -> None", lc._parse_toggle("maybe", False) is None)
 
-    # /handover block parser (the @#! delimiters) - must never grab the wrong text
+    # /compaction block parser (the @#! delimiters) - must never grab the wrong text
     _M = lc.COMPACT_MARK
-    check("handover block: extracts between markers",
-          lc._extract_compact_block(f"prose\n{_M}\nthe handover\n{_M}\ntrailing") == "the handover")
-    check("handover block: LAST pair wins (ignores an echoed example)",
+    check("compaction block: extracts between markers",
+          lc._extract_compact_block(f"prose\n{_M}\nthe compaction\n{_M}\ntrailing") == "the compaction")
+    check("compaction block: LAST pair wins (ignores an echoed example)",
           lc._extract_compact_block(f"{_M}example{_M} then real {_M}real one{_M}") == "real one")
-    check("handover block: no markers -> None (history NOT nuked)",
+    check("compaction block: no markers -> None (history NOT nuked)",
           lc._extract_compact_block("just a summary, no markers") is None)
-    check("handover block: single marker -> None", lc._extract_compact_block(f"{_M} only one") is None)
-    check("handover block: empty between -> None", lc._extract_compact_block(f"{_M}{_M}") is None)
+    check("compaction block: single marker -> None", lc._extract_compact_block(f"{_M} only one") is None)
+    check("compaction block: empty between -> None", lc._extract_compact_block(f"{_M}{_M}") is None)
 
     # /leash capability ceiling: bounds the tool surface by level
     check("_norm_leash: aliases", lc._norm_leash("READ") == "r" and lc._norm_leash("exec") == "rwe"
@@ -6327,7 +6327,7 @@ check("same-provider switch: _apply_model rebuilds the surface (no stale 0 at rw
       len(_swag.tool_defs) >= 6, [t["function"]["name"] for t in _swag.tool_defs])
 
 # REGRESSION: _maybe_compact must SKIP when the model can't tool-call - it summarizes
-# via finalize_handover (a tool), so a chat-only model can never compact; attempting it
+# via finalize_compact (a tool), so a chat-only model can never compact; attempting it
 # burned a turn + a pre-compact snapshot EVERY turn (the /load flood).
 import io as _io_cc, contextlib as _ctx_cc
 _cc = lc.Agent(lc.Config(cwd=FIX, approval="auto"))
@@ -6351,13 +6351,13 @@ lc.SESSIONS_DIR = _ncd
 _nca = lc.Agent(lc.Config(cwd=FIX, approval="auto"))
 _nca.messages = [{"role": "system", "content": "S"},
                  {"role": "user", "content": "hi"}, {"role": "assistant", "content": "yo"}]
-_nca._loop = lambda: None              # summary turn yields nothing -> no handover block
+_nca._loop = lambda: None              # summary turn yields nothing -> no compaction block
 _nca._last_compact_ts = 0.0
 with _ctx_cc.redirect_stdout(_io_cc.StringIO()):
     _ncr = _nca.auto_compact("hard")
 check("failed compaction returns None, history untouched",
       _ncr is None and [m["content"] for m in _nca.messages if m["role"] != "system"] == ["hi", "yo"])
-check("failed compaction writes NO pre-handover snapshot (kills the /load flood)",
+check("failed compaction writes NO pre-compaction snapshot (kills the /load flood)",
       list(lc.SESSIONS_DIR.glob(f"*{lc.PRECOMPACT_MARK}*.json")) == [])
 check("failed compaction stamps the loop guard (no retry every turn)", _nca._last_compact_ts > 0)
 lc.SESSIONS_DIR = _sd_save; shutil.rmtree(_ncd, ignore_errors=True)
