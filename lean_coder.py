@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L1080   Lean-tools (plugin tools: discovery, manager)
-  L1430   MCP client (connection, manager, OAuth, discovery)
-  L1884   Providers (backend plugin registry)
-  L2106   Interactive pickers + menus (raw-mode UI engine)
-  L2455   Terminal styling (colors, formatting helpers)
-  L2654   Streaming + markdown render (model output)
-  L3013   Composer (pinned input line, editor, stdin)
-  L3863   Token accounting (calibrated context meter)
-  L4037   Config (dataclass, field registry, load/save)
-  L7220   Tool execution + text tool-call parsing
-  L7646   Remote workspace (executor client, /connect)
-  L9237   Context meter
-  L9332   Agent (turn loop, context mgmt, tool dispatch)
-  L15532  Slash-command handlers + dispatch table
-  L15669  REPL (interactive loop, session resume)
-  L16030  Worker agent (headless --agent-run)
-  L16642  Entry (CLI arg parsing, main)
+  L1085   Lean-tools (plugin tools: discovery, manager)
+  L1435   MCP client (connection, manager, OAuth, discovery)
+  L1889   Providers (backend plugin registry)
+  L2111   Interactive pickers + menus (raw-mode UI engine)
+  L2460   Terminal styling (colors, formatting helpers)
+  L2659   Streaming + markdown render (model output)
+  L3018   Composer (pinned input line, editor, stdin)
+  L3868   Token accounting (calibrated context meter)
+  L4042   Config (dataclass, field registry, load/save)
+  L7225   Tool execution + text tool-call parsing
+  L7651   Remote workspace (executor client, /connect)
+  L9242   Context meter
+  L9337   Agent (turn loop, context mgmt, tool dispatch)
+  L15538  Slash-command handlers + dispatch table
+  L15675  REPL (interactive loop, session resume)
+  L16036  Worker agent (headless --agent-run)
+  L16648  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -111,7 +111,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.10.10"
+__version__ = "0.10.11"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -119,6 +119,11 @@ __version__ = "0.10.10"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.10.11": [
+        "fix: command aliases (/exit /q /h /? /models /providers /background) now",
+        "  Tab-complete too - they were dispatchable but missing from the completion",
+        "  list, so only the canonical name completed.",
+    ],
     "0.10.10": [
         "add: training capture v2 (schema leancoder.training.v2) - each record now",
         "  carries the opening USER PROMPT as a {role:user, kind:user_prompt} segment",
@@ -12016,9 +12021,10 @@ def _render_tool_call(entry: dict, cap: int = EXPAND_MAX_CHARS) -> str:
 
 SLASH_COMMANDS = ["/clear", "/new", "/trim", "/compact", "/compact_at", "/session", "/save", "/load",
                   "/prompt", "/sh", "/connect", "/machines", "/local", "/disconnect", "/tools", "/reload",
-                  "/model", "/provider", "/think", "/effort",
+                  "/model", "/models", "/provider", "/providers", "/think", "/effort",
                   "/set", "/usage", "/approve", "/leash", "/autosave", "/incognito",
-                  "/askread", "/bg", "/note", "/plan", "/mcp", "/info", "/activity", "/expand", "/help", "/quit"]
+                  "/askread", "/bg", "/background", "/note", "/plan", "/mcp", "/info", "/activity", "/expand",
+                  "/help", "/h", "/?", "/quit", "/exit", "/q"]
 
 # Built-in command names are the shadow-protection set: lean-tool commands can't claim
 # any of them. It is DERIVED from _BUILTIN_COMMANDS_TABLE (every builtin command + alias)
