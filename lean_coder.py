@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L1071   Lean-tools (plugin tools: discovery, manager)
-  L1421   MCP client (connection, manager, OAuth, discovery)
-  L1875   Providers (backend plugin registry)
-  L2097   Interactive pickers + menus (raw-mode UI engine)
-  L2446   Terminal styling (colors, formatting helpers)
-  L2645   Streaming + markdown render (model output)
-  L3004   Composer (pinned input line, editor, stdin)
-  L3854   Token accounting (calibrated context meter)
-  L4028   Config (dataclass, field registry, load/save)
-  L7211   Tool execution + text tool-call parsing
-  L7637   Remote workspace (executor client, /connect)
-  L9228   Context meter
-  L9323   Agent (turn loop, context mgmt, tool dispatch)
-  L15472  Slash-command handlers + dispatch table
-  L15609  REPL (interactive loop, session resume)
-  L15970  Worker agent (headless --agent-run)
-  L16582  Entry (CLI arg parsing, main)
+  L1080   Lean-tools (plugin tools: discovery, manager)
+  L1430   MCP client (connection, manager, OAuth, discovery)
+  L1884   Providers (backend plugin registry)
+  L2106   Interactive pickers + menus (raw-mode UI engine)
+  L2455   Terminal styling (colors, formatting helpers)
+  L2654   Streaming + markdown render (model output)
+  L3013   Composer (pinned input line, editor, stdin)
+  L3863   Token accounting (calibrated context meter)
+  L4037   Config (dataclass, field registry, load/save)
+  L7220   Tool execution + text tool-call parsing
+  L7646   Remote workspace (executor client, /connect)
+  L9237   Context meter
+  L9332   Agent (turn loop, context mgmt, tool dispatch)
+  L15532  Slash-command handlers + dispatch table
+  L15669  REPL (interactive loop, session resume)
+  L16030  Worker agent (headless --agent-run)
+  L16642  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -111,7 +111,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.10.9"
+__version__ = "0.10.10"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -119,6 +119,15 @@ __version__ = "0.10.9"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.10.10": [
+        "add: training capture v2 (schema leancoder.training.v2) - each record now",
+        "  carries the opening USER PROMPT as a {role:user, kind:user_prompt} segment",
+        "  plus run_turn_id / run_turn_start boundary markers, so captured trajectories",
+        "  are directly trainable without hand-backfilling instructions. Additive: every",
+        "  v1 field is unchanged; old sidecars still parse.",
+        "change: the post-compaction line now shows the before->after size",
+        "  (e.g. 'compacted 234k -> 13.3k tokens'), not just the tokens kept.",
+    ],
     "0.10.9": [
         "fix: training capture recorded the top-level config model (usually the ollama",
         "  default) instead of the ACTIVE provider's model, so captured trajectories were",
@@ -9384,6 +9393,12 @@ class Agent:
                                          # docs/design/training-capture.md.
         self._cap_turn_index = 0         # monotonic captured-turn counter (session-scoped)
         self._cap_sha = None             # cached best-effort git HEAD short sha
+        # v2 run-turn boundary state: a run_turn_id stable per user REQUEST (stamped on
+        # every captured turn), plus a one-shot pending opening-user-prompt segment that
+        # the next _cap_begin_turn folds into the first turn of the request. See run_turn.
+        self._cap_run_turn_seq = 0       # monotonic per-request counter (session-scoped)
+        self._cap_run_turn_id = None     # current request's run_turn_id ('' until first turn)
+        self._cap_pending_user = None    # {text, is_model_generated} to inject once, or None
         self._tool_calls = []            # ring (cap 100) of {id,name,args} for /expand:
                                          # the full args of recent tool calls, so the
                                          # operator can view what was truncated on-screen
@@ -10911,7 +10926,14 @@ class Agent:
             # a user-edited nudge with a bad placeholder must not break the turn
             return tmpl
 
-    def run_turn(self, user_input: str):
+    def run_turn(self, user_input: str, is_model_generated: bool = False):
+        # training-capture v2: a run_turn call IS the start of a user request, so open a
+        # fresh run_turn boundary here and queue the opening user-prompt segment (the RAW
+        # instruction, before the notes/bg decoration below). is_model_generated=True marks
+        # synthetic self-prompts (autostart/===NEXT===) so the consumer can tell them from
+        # genuine operator input. No-op when capture is off. (Compaction re-solicits go
+        # through _loop directly, NOT run_turn, so they never open a spurious boundary.)
+        self._cap_new_run_turn(user_input, is_model_generated)
         self._turn_count += 1
         # Rebuild the surface so the elective request_compact tool appears/disappears
         # as context crosses the soft threshold (offer_compact tracks the zone). Cheap;
@@ -11016,6 +11038,24 @@ class Agent:
         self._cap_sha = sha
         return sha
 
+    def _cap_new_run_turn(self, user_text, is_model_generated: bool):
+        """v2: mark the start of a NEW user REQUEST. Allocates a fresh run_turn_id and
+        queues the opening user-prompt segment so the next _cap_begin_turn folds it into
+        the first turn of the request. Best-effort; no-op when capture is off. Called from
+        run_turn (real user turns + autostart self-prompts). `is_model_generated` is True
+        for synthetic self-prompts (autostart/===NEXT===), False for genuine user input."""
+        if not self._cap_on():
+            self._cap_pending_user = None
+            return
+        try:
+            self._cap_run_turn_seq += 1
+            self._cap_run_turn_id = f"{self.autosave_name}:{self._cap_run_turn_seq}"
+            text = user_text if isinstance(user_text, str) else str(user_text or "")
+            self._cap_pending_user = {"text": text,
+                                      "is_model_generated": bool(is_model_generated)}
+        except Exception:
+            self._cap_pending_user = None
+
     def _cap_begin_turn(self, assistant: dict):
         """Open a per-turn capture record from the just-appended assistant message
         (its reasoning + tool_calls). No-op when capture is off."""
@@ -11024,6 +11064,18 @@ class Agent:
             return
         try:
             segs = []
+            # v2: fold the opening user-prompt of a NEW request into its first turn.
+            # _cap_new_run_turn (called from run_turn) queues this; consumed once here so
+            # subsequent turns of the same request don't repeat it. Text is captured RAW,
+            # exactly like reasoning/tool_result below (core does no redaction on write -
+            # personal-machine capture; the leangym consumer re-redacts on ingest).
+            pend = self._cap_pending_user
+            if pend is not None:
+                self._cap_pending_user = None
+                segs.append({"role": "user", "kind": "user_prompt",
+                             "text": pend.get("text", ""),
+                             "is_model_generated": bool(pend.get("is_model_generated")),
+                             "captured_at": "ingestion"})
             text = assistant.get("content")
             if isinstance(text, str) and text.strip():
                 segs.append({"role": "assistant", "kind": "reasoning", "text": text,
@@ -11041,9 +11093,16 @@ class Agent:
                              "call_id": c.get("id", ""),
                              "is_model_generated": True, "captured_at": "ingestion"})
             self._cap_turn = {
-                "schema": "leancoder.training.v1",
+                "schema": "leancoder.training.v2",
                 "session_id": self.autosave_name,
                 "turn_index": self._cap_turn_index,
+                # v2: run_turn_id is stable per user REQUEST (set by _cap_new_run_turn),
+                # stamped on EVERY turn so the consumer splits tasks exactly instead of
+                # inferring from finish_reason. run_turn_start flags the request's first
+                # turn (the one carrying the user_prompt segment). '' id only if a turn is
+                # ever captured before any run_turn opened (shouldn't happen via run_turn).
+                "run_turn_id": self._cap_run_turn_id or "",
+                "run_turn_start": pend is not None,
                 "ts_start": time.time(), "ts_end": None,
                 "leancoder_version": __version__,
                 "leancoder_sha": self._cap_head_sha(),
@@ -11223,11 +11282,12 @@ class Agent:
                     "summary call failed and nothing left to strip",
                     "/clear or switch to a larger-window model")
             return
-        print(yellow(f"  {GLYPH['warn']} compaction done -> ~{self._ctx_used():,} tokens kept; "
-                     f"new cache boundary set on the summary"))
+        after = self._ctx_used()
+        print(yellow(f"  {GLYPH['warn']} compacted {_fmt_tokens(used)} -> {_fmt_tokens(after)} tokens "
+                     f"({kind}); new cache boundary set on the summary"))
         self._log_activity(
             "compact",
-            f"summarized the session -> ~{self._ctx_used():,} tokens kept",
+            f"summarized the session: ~{used:,} -> ~{after:,} tokens kept",
             f"{kind}; new cache boundary set on the summary")
         self._consume_autostart()
 
@@ -11249,7 +11309,7 @@ class Agent:
                 "[autostart skipped - context still full after compaction] planned next step:\n" + sp})
             return
         if self._autostart_countdown(sp):
-            self.run_turn(sp)
+            self.run_turn(sp, is_model_generated=True)   # synthetic self-prompt, not a user
         else:
             # cancelled: drop the self-prompt into history as a visible note, do NOT run it
             self.messages.append({"role": "user", "content":

@@ -2412,7 +2412,7 @@ mc.auto_compact = _fake_compact
 mc._autostart_pending = None
 mc._autostart_countdown = lambda sp, secs=5: True
 _ran = []
-mc.run_turn = lambda ui: _ran.append(ui)
+mc.run_turn = lambda ui, is_model_generated=False: _ran.append(ui)
 mc.messages = []
 with _ctx_mc.redirect_stdout(_io_mc.StringIO()):
     mc._maybe_compact()
