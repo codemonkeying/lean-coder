@@ -52,9 +52,9 @@ def setup(lc, cfg):
 
     # 1) note when a turn starts, ping if it ran long enough by the time it ends
     _orig_run = Agent.run_turn
-    def run_turn(self, user_input):
+    def run_turn(self, user_input, *args, **kwargs):
         _state["start"] = time.monotonic()
-        return _orig_run(self, user_input)
+        return _orig_run(self, user_input, *args, **kwargs)
     Agent.run_turn = run_turn
 
     _orig_end = Agent._end_of_turn

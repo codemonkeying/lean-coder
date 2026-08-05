@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L1085   Lean-tools (plugin tools: discovery, manager)
-  L1435   MCP client (connection, manager, OAuth, discovery)
-  L1889   Providers (backend plugin registry)
-  L2111   Interactive pickers + menus (raw-mode UI engine)
-  L2460   Terminal styling (colors, formatting helpers)
-  L2659   Streaming + markdown render (model output)
-  L3018   Composer (pinned input line, editor, stdin)
-  L3868   Token accounting (calibrated context meter)
-  L4042   Config (dataclass, field registry, load/save)
-  L7225   Tool execution + text tool-call parsing
-  L7651   Remote workspace (executor client, /connect)
-  L9242   Context meter
-  L9337   Agent (turn loop, context mgmt, tool dispatch)
-  L15538  Slash-command handlers + dispatch table
-  L15675  REPL (interactive loop, session resume)
-  L16036  Worker agent (headless --agent-run)
-  L16648  Entry (CLI arg parsing, main)
+  L1091   Lean-tools (plugin tools: discovery, manager)
+  L1441   MCP client (connection, manager, OAuth, discovery)
+  L1895   Providers (backend plugin registry)
+  L2117   Interactive pickers + menus (raw-mode UI engine)
+  L2466   Terminal styling (colors, formatting helpers)
+  L2665   Streaming + markdown render (model output)
+  L3024   Composer (pinned input line, editor, stdin)
+  L3874   Token accounting (calibrated context meter)
+  L4048   Config (dataclass, field registry, load/save)
+  L7231   Tool execution + text tool-call parsing
+  L7657   Remote workspace (executor client, /connect)
+  L9248   Context meter
+  L9343   Agent (turn loop, context mgmt, tool dispatch)
+  L15544  Slash-command handlers + dispatch table
+  L15681  REPL (interactive loop, session resume)
+  L16042  Worker agent (headless --agent-run)
+  L16654  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -111,7 +111,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.10.11"
+__version__ = "0.10.12"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -119,6 +119,12 @@ __version__ = "0.10.11"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.10.12": [
+        "fix: autostart-after-compact crashed with a TypeError when the notify or",
+        "  dispatch_worker lean-tools were loaded - their run_turn wrappers didn't",
+        "  forward the new is_model_generated kwarg (added in 0.10.10). Both wrappers",
+        "  now pass through *args/**kwargs; regression-tested.",
+    ],
     "0.10.11": [
         "fix: command aliases (/exit /q /h /? /models /providers /background) now",
         "  Tab-complete too - they were dispatchable but missing from the completion",

@@ -1738,14 +1738,14 @@ def setup(lc, cfg):
     Agent = lc["Agent"]
     _orig_run_turn = Agent.run_turn
 
-    def run_turn(self, user_input):
+    def run_turn(self, user_input, *args, **kwargs):
         try:
             notice = _finished_notice()
         except Exception:
             notice = ""
         if notice:
             user_input = user_input + "\n\n" + notice
-        return _orig_run_turn(self, user_input)
+        return _orig_run_turn(self, user_input, *args, **kwargs)
     Agent.run_turn = run_turn
 
     # AUTONOMY: also feed worker finishes into the event-driven WAKE path so a finished
