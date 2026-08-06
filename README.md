@@ -198,14 +198,15 @@ actual code. lean-coder treats context as the scarce resource it is:
 
   Most are tiny; `dispatch_worker` is the heavy one (it drives a whole background-worker
   subsystem, so its schema carries the most behaviour). Turn on **every** bundled
-  lean-tool at once and the total is about **~5.9k tokens**; enable only what a job needs
-  and it stays far lower. The meter always shows the real current figure.
+  lean-tool at once and the whole surface (core + all bundled lean-tools) is about
+  **~6k tokens**; enable only what a job needs and it stays far lower. The meter always
+  shows the real current figure.
 
-  **For scale:** a *single* MCP server's tool definitions are commonly
+  **For scale:** a *single* MCP server's tool definitions commonly cost
   [300-710 tokens **per tool**](https://dev.to/piotr_hajdas/mcp-token-limits-the-hidden-cost-of-tool-overload-2d5),
+  so a typical server
   [runs ~2,000 tokens](https://www.mindstudio.ai/blog/claude-code-mcp-server-token-overhead) -
-  as much as lean-coder's entire *always-on* surface. Connect a few and you can burn
-  as much as lean-coder's *entire* shipped surface. Connect a few and you can burn
+  about as much as lean-coder's entire *always-on* surface. Connect a few and you can burn
   [50k+ tokens before the first question](https://dev.to/kenimo49/your-mcp-server-eats-55000-tokens-before-your-agent-says-a-word-i-measured-the-real-cost-19l8).
   lean-coder is a generic MCP client too (see below). The difference is you pay that
   cost only for what you deliberately add.
