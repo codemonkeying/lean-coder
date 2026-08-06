@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L1091   Lean-tools (plugin tools: discovery, manager)
-  L1441   MCP client (connection, manager, OAuth, discovery)
-  L1895   Providers (backend plugin registry)
-  L2117   Interactive pickers + menus (raw-mode UI engine)
-  L2466   Terminal styling (colors, formatting helpers)
-  L2665   Streaming + markdown render (model output)
-  L3024   Composer (pinned input line, editor, stdin)
-  L3874   Token accounting (calibrated context meter)
-  L4048   Config (dataclass, field registry, load/save)
-  L7231   Tool execution + text tool-call parsing
-  L7657   Remote workspace (executor client, /connect)
-  L9248   Context meter
-  L9343   Agent (turn loop, context mgmt, tool dispatch)
-  L15544  Slash-command handlers + dispatch table
-  L15681  REPL (interactive loop, session resume)
-  L16042  Worker agent (headless --agent-run)
-  L16654  Entry (CLI arg parsing, main)
+  L1098   Lean-tools (plugin tools: discovery, manager)
+  L1448   MCP client (connection, manager, OAuth, discovery)
+  L1902   Providers (backend plugin registry)
+  L2124   Interactive pickers + menus (raw-mode UI engine)
+  L2473   Terminal styling (colors, formatting helpers)
+  L2672   Streaming + markdown render (model output)
+  L3031   Composer (pinned input line, editor, stdin)
+  L3881   Token accounting (calibrated context meter)
+  L4055   Config (dataclass, field registry, load/save)
+  L7238   Tool execution + text tool-call parsing
+  L7664   Remote workspace (executor client, /connect)
+  L9255   Context meter
+  L9350   Agent (turn loop, context mgmt, tool dispatch)
+  L15627  Slash-command handlers + dispatch table
+  L15764  REPL (interactive loop, session resume)
+  L16128  Worker agent (headless --agent-run)
+  L16740  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -111,7 +111,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.10.12"
+__version__ = "0.10.13"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -119,6 +119,13 @@ __version__ = "0.10.12"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.10.13": [
+        "add: training capture now emits a per-EXCHANGE outcome signal - a separate",
+        "  'exchange_outcome' record (keyed by run_turn_id) with final_exit_ok,",
+        "  exchange_had_error, and a coarse user_followup (correction/continuation/",
+        "  satisfied/none) classified from the next turn. Grounded accept/reject data",
+        "  for the training loop; the append-only turn stream is unchanged.",
+    ],
     "0.10.12": [
         "fix: autostart-after-compact crashed with a TypeError when the notify or",
         "  dispatch_worker lean-tools were loaded - their run_turn wrappers didn't",
@@ -9410,6 +9417,11 @@ class Agent:
         self._cap_run_turn_seq = 0       # monotonic per-request counter (session-scoped)
         self._cap_run_turn_id = None     # current request's run_turn_id ('' until first turn)
         self._cap_pending_user = None    # {text, is_model_generated} to inject once, or None
+        # per-EXCHANGE outcome accumulator (STaR accept/reject signal). Rolls up the tool
+        # results of the current run_turn_id; emitted as a separate 'exchange_outcome'
+        # sidecar record when the NEXT run_turn opens (so user_followup can be classified
+        # from the next turn) or at session exit. {run_turn_id, had_error, final_exit_ok}.
+        self._cap_exchange = None
         self._tool_calls = []            # ring (cap 100) of {id,name,args} for /expand:
                                          # the full args of recent tool calls, so the
                                          # operator can view what was truncated on-screen
@@ -11059,13 +11071,23 @@ class Agent:
             self._cap_pending_user = None
             return
         try:
+            text = user_text if isinstance(user_text, str) else str(user_text or "")
+            # close the PREVIOUS exchange first: this incoming user turn IS its followup,
+            # so classify + flush it now (unless the incoming turn is itself a synthetic
+            # self-prompt - an autostart/===NEXT=== is not operator feedback, treat as
+            # 'continuation' so it neither accepts nor rejects on false signal).
+            fu = "continuation" if is_model_generated else self._cap_classify_followup(text)
+            self._cap_flush_exchange(fu)
             self._cap_run_turn_seq += 1
             self._cap_run_turn_id = f"{self.autosave_name}:{self._cap_run_turn_seq}"
-            text = user_text if isinstance(user_text, str) else str(user_text or "")
             self._cap_pending_user = {"text": text,
                                       "is_model_generated": bool(is_model_generated)}
+            # open a fresh outcome accumulator for the exchange we're beginning
+            self._cap_exchange = {"run_turn_id": self._cap_run_turn_id,
+                                  "had_error": False, "final_exit_ok": None}
         except Exception:
             self._cap_pending_user = None
+            self._cap_exchange = None
 
     def _cap_begin_turn(self, assistant: dict):
         """Open a per-turn capture record from the just-appended assistant message
@@ -11148,6 +11170,14 @@ class Agent:
                 or content[:64].lower().startswith("error")
             if err:
                 self._cap_turn["outcome_hints"]["any_tool_error"] = True
+            # per-EXCHANGE roll-up: OR-in any tool error across the whole run_turn, and
+            # track the LAST exit-code-bearing command's success (final_exit_ok). A result
+            # with no exit_code (pure read / non-command tool) doesn't move final_exit_ok.
+            if self._cap_exchange is not None:
+                if err:
+                    self._cap_exchange["had_error"] = True
+                if isinstance(exit_code, int):
+                    self._cap_exchange["final_exit_ok"] = (exit_code == 0)
             self._cap_turn["segments"].append({
                 "role": "tool", "kind": "tool_result", "tool": name,
                 "call_id": call_id or "", "content": content,
@@ -11169,6 +11199,59 @@ class Agent:
             with p.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")
             self._cap_turn_index += 1
+        except Exception:
+            pass
+
+    # --- per-exchange OUTCOME signal (STaR accept/reject; see docs CORE_OUTCOME_SIGNAL) ---
+    # Coarse + grounded ONLY: exit-code roll-ups + a cheap next-turn keyword heuristic. No
+    # LLM judge here - the leangym loop owns any smarter scoring on top of these primitives.
+    _CAP_CORRECTION_RE = re.compile(
+        r"\b(no+|nope|wrong|incorrect|that'?s not|not what|didn'?t work|doesn'?t work|"
+        r"broke|broken|still (?:fail|error|broken)|revert|undo|redo|fix (?:it|that|this)|"
+        r"that'?s wrong|you (?:missed|broke|forgot)|actually,? no|not right|mistake)\b",
+        re.IGNORECASE)
+    _CAP_SATISFIED_RE = re.compile(
+        r"\b(thanks?|thank you|nice|perfect|great|awesome|lgtm|ship it|looks good|"
+        r"works?|working|cool|excellent|beautiful|love it|good job|well done)\b",
+        re.IGNORECASE)
+
+    def _cap_classify_followup(self, next_user_text: str) -> str:
+        """Classify the NEXT operator turn as the prior exchange's outcome signal:
+        correction | satisfied | continuation. Correction wins over satisfied (a mixed
+        'thanks but this is wrong' is a correction). Pure heuristic; leangym can refine."""
+        t = (next_user_text or "").strip()
+        if not t:
+            return "continuation"
+        if self._CAP_CORRECTION_RE.search(t):
+            return "correction"
+        if self._CAP_SATISFIED_RE.search(t) and len(t) < 80:
+            return "satisfied"
+        return "continuation"
+
+    def _cap_flush_exchange(self, user_followup: str):
+        """Emit the accumulated per-exchange outcome as a 'exchange_outcome' sidecar record
+        (keyed by run_turn_id) into the SAME JSONL. Called when the next run_turn opens
+        (followup known) or at session exit (followup='none'). No-op when off / nothing
+        accumulated. Separate record kind so the append-only turn stream is untouched."""
+        ex = self._cap_exchange
+        self._cap_exchange = None
+        if not self._cap_on() or ex is None:
+            return
+        try:
+            rec = {
+                "kind": "exchange_outcome",
+                "schema": "leancoder.training.outcome.v1",
+                "session_id": self.autosave_name,
+                "run_turn_id": ex.get("run_turn_id", ""),
+                "final_exit_ok": ex.get("final_exit_ok"),      # bool | null
+                "exchange_had_error": bool(ex.get("had_error")),
+                "user_followup": user_followup,                # correction|continuation|satisfied|none
+                "ts": time.time(),
+            }
+            p = self._cap_path()
+            p.parent.mkdir(parents=True, exist_ok=True)
+            with p.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
         except Exception:
             pass
 
@@ -15693,6 +15776,9 @@ def repl(cfg: Config, resume=None):
     # backstop. close_all_remotes is idempotent (empties the pool), so double-firing on a
     # graceful exit is harmless.
     atexit.register(agent.close_all_remotes)
+    # training-capture: flush the FINAL exchange's outcome record on exit (no next user
+    # turn to classify it, so user_followup='none'). Best-effort; no-op when capture off.
+    atexit.register(lambda: agent._cap_flush_exchange("none"))
     # Driver-only startup hooks: run each enabled lean-tool's setup() on the AGENT's
     # own manager instance (not a throwaway) - a tool that stashes hooks in its own
     # module globals (e.g. dispatch_worker's _H) needs the SAME module instance whose
