@@ -25,8 +25,9 @@ Mainstream coding agents spend a lot of your window on themselves before you typ
 word. The big ones run to tens of thousands of tokens of system prompt and built-in
 tool scaffolding per session, and that's *before* you connect any MCP servers, which
 add anywhere from hundreds to tens of thousands of tokens each on top. That's context
-that can't hold your actual code. lean-coder's *entire* shipped tool surface plus its
-system prompt costs about **~2.5k tokens**. It's just a different
+that can't hold your actual code. lean-coder's system prompt plus its entire
+*always-on* (core) tool surface costs about **~2.5k tokens** (the optional bundled
+lean-tools are off by default and add nothing until you enable them). It's just a different
 category: the platform stays out of the way so the window holds your work, and it's
 usable on small local models, not just frontier ones.
 
@@ -171,7 +172,7 @@ a bloated system prompt or a verbose tool schema is context that can't hold your
 actual code. lean-coder treats context as the scarce resource it is:
 
 - **Baseline overhead around ~2.5k tokens** for the system prompt *and* the entire
-  always-on tool surface combined (a test enforces the ceiling). The surface scales
+  *always-on* (core) tool surface combined (a test enforces the ceiling). The surface scales
   with the leash, so you only pay for what you've enabled:
 
   | tier | ~tokens | what's in it |
@@ -183,8 +184,8 @@ actual code. lean-coder treats context as the scarce resource it is:
 
   That **~2.3k** is the whole shipped agent: system prompt plus all eleven always-on
   builtin tools. On top, the **optional bundled lean-tools** are off by default and
-  cost nothing until you `/tools` them on. Roughly:
-  cost nothing until you `/tools` them on. Roughly:
+  cost nothing until you `/tools` them on (with every bundled lean-tool loaded the full
+  surface is ~6k - still less than a single typical MCP server). Roughly:
 
   | lean-tool | ~tokens | | lean-tool | ~tokens |
   |---|---|---|---|---|
@@ -202,8 +203,8 @@ actual code. lean-coder treats context as the scarce resource it is:
 
   **For scale:** a *single* MCP server's tool definitions are commonly
   [300-710 tokens **per tool**](https://dev.to/piotr_hajdas/mcp-token-limits-the-hidden-cost-of-tool-overload-2d5),
-  and a typical server (e.g. Slack, ~10-15 tools)
   [runs ~2,000 tokens](https://www.mindstudio.ai/blog/claude-code-mcp-server-token-overhead) -
+  as much as lean-coder's entire *always-on* surface. Connect a few and you can burn
   as much as lean-coder's *entire* shipped surface. Connect a few and you can burn
   [50k+ tokens before the first question](https://dev.to/kenimo49/your-mcp-server-eats-55000-tokens-before-your-agent-says-a-word-i-measured-the-real-cost-19l8).
   lean-coder is a generic MCP client too (see below). The difference is you pay that
