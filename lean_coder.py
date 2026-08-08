@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L1115   Lean-tools (plugin tools: discovery, manager)
-  L1465   MCP client (connection, manager, OAuth, discovery)
-  L1919   Providers (backend plugin registry)
-  L2141   Interactive pickers + menus (raw-mode UI engine)
-  L2490   Terminal styling (colors, formatting helpers)
-  L2689   Streaming + markdown render (model output)
-  L3048   Composer (pinned input line, editor, stdin)
-  L3898   Token accounting (calibrated context meter)
-  L4072   Config (dataclass, field registry, load/save)
-  L7255   Tool execution + text tool-call parsing
-  L7681   Remote workspace (executor client, /connect)
-  L9272   Context meter
-  L9367   Agent (turn loop, context mgmt, tool dispatch)
-  L15644  Slash-command handlers + dispatch table
-  L15781  REPL (interactive loop, session resume)
-  L16145  Worker agent (headless --agent-run)
-  L16757  Entry (CLI arg parsing, main)
+  L1127   Lean-tools (plugin tools: discovery, manager)
+  L1477   MCP client (connection, manager, OAuth, discovery)
+  L1931   Providers (backend plugin registry)
+  L2153   Interactive pickers + menus (raw-mode UI engine)
+  L2502   Terminal styling (colors, formatting helpers)
+  L2702   Streaming + markdown render (model output)
+  L3061   Composer (pinned input line, editor, stdin)
+  L3911   Token accounting (calibrated context meter)
+  L4085   Config (dataclass, field registry, load/save)
+  L7339   Tool execution + text tool-call parsing
+  L7765   Remote workspace (executor client, /connect)
+  L9356   Context meter
+  L9451   Agent (turn loop, context mgmt, tool dispatch)
+  L15769  Slash-command handlers + dispatch table
+  L15906  REPL (interactive loop, session resume)
+  L16280  Worker agent (headless --agent-run)
+  L16892  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -32,6 +32,10 @@ import datetime
 import hashlib
 import atexit
 import fnmatch
+try:
+    import fcntl                       # POSIX advisory file locks (taskboard mutation)
+except ImportError:                    # non-POSIX: cross-process board locking degrades to none
+    fcntl = None
 import inspect
 import itertools
 import json
@@ -111,7 +115,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.10.16"
+__version__ = "0.10.17"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -119,6 +123,14 @@ __version__ = "0.10.16"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.10.17": [
+        "sessions: launch and /load now open one unified session picker - a 'start a new",
+        "  session' row up top, the cursor pre-set on your most recent session (Enter",
+        "  resumes it), and an 'in use' tag on any session open in another instance. The",
+        "  list shows ~5 at a time; cursor down to reach older ones.",
+        "fix: task board mutations (add/assign/done/fail) are now serialized - concurrent",
+        "  calls no longer collide on an id or clobber each other's write.",
+    ],
     "0.10.16": [
         "docs: refactor the README to be shorter and to the point - cut it roughly in",
         "  half, state the context/overhead pitch once (a new 'What it is' section), drop",
@@ -2616,6 +2628,7 @@ GLYPH = {
     "no":       g("✗", "x"),
     "think":    g("💭", "..."),    # reasoning
     "ghost":    g("👻", "~"),       # incognito session marker (ASCII fallback ~)
+    "new":      g("✦", "+"),       # "start a new session" row in the session picker
     "dot":      g("·", "-"),       # inline separator
     "ellipsis": g("…", "..."),
     "ret":      g("⏎", "<"),       # newline shown inline
@@ -6506,6 +6519,76 @@ def _board_sweep(grace=3600):
 TASKBOARDS_DIR = CONFIG_DIR / "workers" / "taskboards"
 _TB_STATUSES = ("open", "assigned", "blocked", "done", "failed")
 
+# Per-board locks. Every board mutation is a load->mutate->save read-modify-write; without
+# serialization two concurrent mutations (threads within one turn - `board` is safe:True so a
+# batch runs concurrently - or separate sessions sharing the file) both read stale state, both
+# allocate the same tN, and the last save clobbers the first. _taskboard_locked() serializes
+# BOTH axes: a threading.Lock per board name (in-process) plus a POSIX flock on a sidecar
+# lockfile (cross-process). Use _taskboard_mutate() to run reload-under-lock -> mutate -> save.
+_TB_THREAD_LOCKS = {}
+_TB_THREAD_LOCKS_GUARD = threading.Lock()
+
+
+def _taskboard_thread_lock(name):
+    with _TB_THREAD_LOCKS_GUARD:
+        lk = _TB_THREAD_LOCKS.get(name)
+        if lk is None:
+            lk = _TB_THREAD_LOCKS[name] = threading.Lock()
+        return lk
+
+
+@contextmanager
+def _taskboard_locked(name):
+    """Serialize board mutations for `name` across threads AND processes. In-process via a
+    per-name threading.Lock; cross-process via an flock on <name>.lock (best-effort - if
+    fcntl is absent or the lock file can't be opened, the thread lock still holds within the
+    process). Always yields; never raises on a lock failure."""
+    tl = _taskboard_thread_lock(name)
+    tl.acquire()
+    fh = None
+    try:
+        if fcntl is not None:
+            p = _taskboard_path(name)
+            if p is not None:
+                try:
+                    TASKBOARDS_DIR.mkdir(parents=True, exist_ok=True)
+                    fh = open(str(p) + ".lock", "w")
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+                except OSError:
+                    if fh is not None:
+                        try:
+                            fh.close()
+                        except OSError:
+                            pass
+                    fh = None
+        yield
+    finally:
+        if fh is not None:
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+            try:
+                fh.close()
+            except OSError:
+                pass
+        tl.release()
+
+
+def _taskboard_mutate(name, fn):
+    """Run a mutation atomically: acquire the board lock, RELOAD the board fresh (so we mutate
+    the latest on-disk state, not a stale copy a concurrent writer already superseded), call
+    fn(board) -> (result, err), and save only when err is falsy. Returns (board, result, err);
+    board is None with err set when the board does not exist. fn must NOT save - this does."""
+    with _taskboard_locked(name):
+        board = _taskboard_load(name)
+        if board is None:
+            return None, None, f"no board named '{name}' (create it first with action='create')."
+        result, err = fn(board)
+        if not err:
+            _taskboard_save(name, board)
+        return board, result, err
+
 
 def _taskboard_path(name):
     """Path to a named taskboard, or None if the name sanitizes to nothing (reuses the
@@ -6563,14 +6646,15 @@ def _taskboard_create(name, title="", owner=""):
     p = _taskboard_path(name)
     if not p:
         return None, "invalid board name"
-    if p.is_file():
-        return None, f"a board named '{_session_name_ok(name)}' already exists"
-    board = {"meta": {"created_at": time.strftime("%Y-%m-%d %H:%M"),
-                      "updated_at": "", "owner": str(owner or ""), "title": title or "",
-                      "counts": {}},
-             "tasks": []}
-    _taskboard_save(name, board)
-    return board, ""
+    with _taskboard_locked(name):
+        if p.is_file():
+            return None, f"a board named '{_session_name_ok(name)}' already exists"
+        board = {"meta": {"created_at": time.strftime("%Y-%m-%d %H:%M"),
+                          "updated_at": "", "owner": str(owner or ""), "title": title or "",
+                          "counts": {}},
+                 "tasks": []}
+        _taskboard_save(name, board)
+        return board, ""
 
 
 def _tb_task(board, task_id):
@@ -13721,27 +13805,45 @@ def _load_session_into(agent, cfg, name):
         agent._print_ctx()
 
 
-def _session_picker(prompt="load session:", show_snapshots=False):
+_NEW_SESSION = object()   # _session_picker sentinel: the "start a new session" row was chosen
+
+
+def _session_picker(prompt="load session:", show_snapshots=False,
+                    include_new=False, preselect=None):
     """Recent-first session picker (most-recently-used first, with a relative-age
-    column). Returns the chosen session name, or None if cancelled/empty. Pre-compaction
+    column). Returns the chosen session name, the _NEW_SESSION sentinel (only when
+    `include_new` and that top row is picked), or None if cancelled/empty. Pre-compaction
     safety snapshots are hidden unless `show_snapshots` (they clog the menu; /load
-    <exact-name> reaches them regardless)."""
+    <exact-name> reaches them regardless).
+
+    include_new: prepend a clearly-marked 'start a new session' row at the top.
+    preselect:   session name to land the cursor on (Enter resumes it); ignored if absent.
+    A session held live by ANOTHER instance is tagged '(in use)' so it's obvious before
+    you pick it."""
     rows = _session_rows()
     if not show_snapshots:
         rows = [r for r in rows if not _is_snapshot(r[0])]
-    if not rows:
+    if not rows and not include_new:
         print(dim(f"no saved sessions (/save [name]).  dir: {SESSIONS_DIR}"))
         return None
     now = time.time()
     d = GLYPH["dot"]
-    labels = []
+    # choices carry the routing value (a name, or the _NEW_SESSION sentinel); labels are the
+    # pretty display strings parallel to them.
+    choices, labels = [], []
+    if include_new:
+        choices.append(_NEW_SESSION)
+        labels.append(green(f"{GLYPH['new']} start a new session"))
     for nm, meta, mtime in rows:
         age = f"{_fmt_age(now - mtime)} ago" if mtime else "?"
         tag = f" {d} ex-worker" if str(meta.get("origin") or "").startswith("worker:") else ""
+        busy = yellow(f"  {d} in use") if _lock_is_live(nm) else ""
+        choices.append(nm)
         labels.append(f"{nm}  ({meta.get('saved_at', '?')} {d} "
-                      f"{meta.get('turns', '?')} msgs{tag} {d} {age})")
-    choice = pick_one(prompt, labels)
-    return rows[labels.index(choice)][0] if choice else None
+                      f"{meta.get('turns', '?')} msgs{tag} {d} {age}){busy}")
+    current = preselect if (preselect is not None and preselect in choices) else None
+    # Show ~5 rows at a time; older sessions scroll into view (cursor down / more-below).
+    return pick_one(prompt, choices, current=current, labels=labels, max_visible=5)
 
 
 def handle_load_command(agent, cfg, arg):
@@ -13759,16 +13861,23 @@ def handle_load_command(agent, cfg, arg):
         if not name:
             name = _session_picker(prompt="load into worker:",
                                    show_snapshots=cfg.show_snapshots)
-        if not name:
+        if not name or name is _NEW_SESSION:   # worker must seed from a real session
             return
         out = agent._dispatch("dispatch_worker",
                               {"action": "dispatch", "task": task,
                                "from_session": name, "leash": cfg.leash})
         print(out)
         return
-    name = arg.strip() or _session_picker(show_snapshots=cfg.show_snapshots)
-    if name:
-        _load_session_into(agent, cfg, name)
+    if arg.strip():
+        _load_session_into(agent, cfg, arg.strip())
+        return
+    # No arg: the unified picker, with a 'start a new session' row up top.
+    choice = _session_picker(prompt="load session:", show_snapshots=cfg.show_snapshots,
+                             include_new=True, preselect=agent.autosave_name)
+    if choice is _NEW_SESSION:
+        _start_fresh_from_picker(agent, cfg)
+    elif choice:
+        _load_session_into(agent, cfg, choice)
 
 
 def start_new_session(agent, cfg, name=""):
@@ -13781,6 +13890,19 @@ def start_new_session(agent, cfg, name=""):
     agent.autosave_name = (_session_name_ok(name) if name.strip()
                            else _new_autosave_name())
     return agent.autosave_name
+
+
+def _start_fresh_from_picker(agent, cfg):
+    """The 'start a new session' row in the /load (and startup) picker: switch to a fresh
+    rolling auto- session, guarding an un-autosaved conversation the same way /new does."""
+    will_persist = cfg.autosave and not cfg.incognito
+    nonempty = any(m.get("role") != "system" for m in agent.messages)
+    if nonempty and not will_persist:
+        if not _ask("current conversation is NOT autosaved - start a new one and lose it?"):
+            print(dim("cancelled - /save [name] to keep it first."))
+            return
+    new = start_new_session(agent, cfg)
+    print(dim(f"started new session '{new}'."))
 
 
 def handle_session_command(agent, cfg, arg):
@@ -13885,7 +14007,7 @@ def _do_connect(agent, cfg, rhost, rpath=".", offer_save=False, ephemeral=False)
 _NO_TTY = object()   # _pick_one_tty sentinel: raw mode unavailable -> numbered fallback
 
 
-def _pick_one_tty(header, choices, current=None, labels=None):
+def _pick_one_tty(header, choices, current=None, labels=None, max_visible=None):
     """Inline arrow-key single-select picker (fzf/gum-style): up/down move, type to
     filter, enter selects, esc/^C cancels, with a SCROLLING VIEWPORT so a long list
     never overflows the screen. Drawn below the cursor, no alternate screen - degrades
@@ -13916,6 +14038,8 @@ def _pick_one_tty(header, choices, current=None, labels=None):
         if fi:
             st["cur"] %= len(fi)
         body = max(1, rows_avail - 2)              # 2 rows: header + filter line
+        if max_visible:                            # cap the window; the rest scrolls (more up/down)
+            body = min(body, max_visible)
         cur, top = st["cur"], st["top"]
         if not fi:
             top = 0
@@ -13990,7 +14114,7 @@ def _pick_one_tty(header, choices, current=None, labels=None):
     return res[1] if res[0] == "done" else None
 
 
-def pick_one(header, choices, current=None, prompt=input, labels=None):
+def pick_one(header, choices, current=None, prompt=input, labels=None, max_visible=None):
     """PUBLIC single-select picker (reusable by features + lean-tools via lc['pick_one']).
     Returns the chosen value or None (cancel). Rich inline picker on a real terminal
     (up/down + #-to-jump + type-to-filter + enter, scrolling, no-wrap); falls back to
@@ -14001,7 +14125,8 @@ def pick_one(header, choices, current=None, prompt=input, labels=None):
     current-match still key off `choices`."""
     disp = [str(l) for l in labels] if labels is not None else [str(c) for c in choices]
     if prompt is input:                              # only the default interactive path
-        chosen = _pick_one_tty(header, choices, current, labels=labels)
+        chosen = _pick_one_tty(header, choices, current, labels=labels,
+                               max_visible=max_visible)
         if chosen is not _NO_TTY:
             return chosen
     print(bold(header))
@@ -15893,38 +16018,48 @@ def repl(cfg: Config, resume=None):
             print(yellow(f"--resume: session '{resume}' is unreadable "
                          f"({type(e).__name__}; file may be corrupt) - starting fresh."))
     elif cfg.autosave and not cfg.incognito:
-        # Auto-load the session you were last actually in: the most-recently-used one,
-        # EXCLUDING pre-compaction snapshots (those are safety checkpoints, not the live
-        # thread). cwd is a HINT, not a hard filter - scoping auto-load by cwd silently
-        # skipped the genuinely-most-recent session whenever it was last used from a
-        # different dir (e.g. a session worked over a remote connection, or a synced
-        # one), resuming a stale same-cwd session instead. If the resumed session was
-        # last used in another cwd, we say so rather than hide it.
+        # Startup session choice. EXCLUDING pre-compaction snapshots (safety checkpoints,
+        # not the live thread). cwd is a HINT, not a hard filter - scoping by cwd silently
+        # skipped the genuinely-most-recent session whenever it was last used from another
+        # dir. A session held live in ANOTHER instance is never silently stolen.
         # (Incognito starts clean and leaves no trace, so it never auto-loads.)
         here = str(cfg.cwd)
-        # Most-recent-first, excluding snapshots. A session that's live in ANOTHER
-        # instance is skipped (never silently stolen) and we fall through to the next
-        # candidate - so restarting while an OLDER session is open elsewhere still
-        # resumes YOUR genuinely-most-recent one, not a fresh blank. Only start fresh
-        # when every candidate is either gone or locked.
         _rows = [r for r in _session_rows() if not _is_snapshot(r[0])]
         _busy = next((r for r in _rows if _lock_is_live(r[0])), None)
         cand = next((r for r in _rows if not _lock_is_live(r[0])), None)
-        if not cand and _busy:
-            # Nothing free to resume; the only candidate(s) are open elsewhere.
+
+        def _resume_named(name):
+            """Resume `name` at startup; returns True on success (prints the resume line)."""
+            try:
+                n, meta = _resume_into(agent, cfg, name)
+            except (FileNotFoundError, OSError, json.JSONDecodeError):
+                return False
+            other = meta.get("cwd")
+            cwd_note = f"  (last used in {other})" if other and other != here else ""
+            print(yellow(f"  resumed '{name}' ({n} msgs) - "
+                         f"/clear for a fresh one, /load to switch.") + dim(cwd_note) + "\n")
+            return True
+
+        if _rows and picker_capable():
+            # INTERACTIVE: show the unified picker (same code as /load), cursor pre-set on
+            # the most-recent FREE session so a bare Enter resumes it - but the user can pick
+            # another, start fresh, or see which sessions are '(in use)'. Cancel = fresh start.
+            choice = _session_picker(prompt="resume a session (Enter = most recent):",
+                                     show_snapshots=cfg.show_snapshots, include_new=True,
+                                     preselect=(cand[0] if cand else None))
+            if choice is _NEW_SESSION or choice is None:
+                pass                                     # fall through to a fresh start below
+            elif _lock_is_live(choice) and not _take_over_or_fork(choice):
+                pass                                     # declined to steal a live one
+            else:
+                resumed = _resume_named(choice)
+        elif not cand and _busy:
+            # HEADLESS, nothing free: the only candidate(s) are open elsewhere.
             print(dim(f"last session '{_busy[0]}' is open in another instance - "
                       f"starting fresh here (/load {_busy[0]} to take it over)."))
         elif cand:
-            last = cand[0]
-            try:
-                n, meta = _resume_into(agent, cfg, last)
-                other = meta.get("cwd")
-                cwd_note = f"  (last used in {other})" if other and other != here else ""
-                print(yellow(f"  resumed last session '{last}' ({n} msgs) - "
-                             f"/clear for a fresh one, /load to switch.") + dim(cwd_note) + "\n")
-                resumed = True
-            except (FileNotFoundError, OSError, json.JSONDecodeError):
-                pass
+            # HEADLESS: silently resume the genuinely-most-recent free session (old behaviour).
+            resumed = _resume_named(cand[0])
 
     if not resumed:                              # FRESH start: full orientation banner
         _print_full_banner()
