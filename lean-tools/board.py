@@ -81,7 +81,8 @@ def setup(lc, cfg):
     tool's run() gets no lc, so everything it needs is stashed on _H here."""
     for k in ("_taskboard_create", "_taskboard_load", "_taskboard_save", "_taskboard_add",
               "_taskboard_ready", "_taskboard_set_status", "_taskboard_reconcile",
-              "_taskboards_list", "_tb_task", "dim", "bold", "green", "cyan"):
+              "_taskboard_mutate", "_taskboards_list", "_tb_task", "dim", "bold",
+              "green", "cyan"):
         if k in lc:
             _H[k] = lc[k]
     _H["cfg"] = cfg
@@ -218,12 +219,17 @@ def run(args, cwd):
         if not task_name:
             return "error: action='add' needs a 'task' (its name/description)."
         deps = [str(d).strip() for d in (args.get("deps") or []) if str(d).strip()]
-        task, err = _H["_taskboard_add"](board, task_name, deps=deps,
-                                         note=(args.get("note") or "").strip())
+        note = (args.get("note") or "").strip()
+
+        def _do_add(bd):
+            # Mutate the FRESHLY-reloaded board under lock so a concurrent add can't hand us a
+            # stale id (the t1/t1 collision) or lose our task on save.
+            return _H["_taskboard_add"](bd, task_name, deps=deps, note=note)
+
+        board2, task, err = _H["_taskboard_mutate"](name, _do_add)
         if err:
             return f"error: {err}"
-        _H["_taskboard_save"](name, board)
-        ready, _ = _H["_taskboard_ready"](board)
+        ready, _ = _H["_taskboard_ready"](board2)
         rflag = "READY" if task["id"] in {t.get("id") for t in ready} else "blocked (deps not done)"
         return f"added {task['id']} '{task_name}'{(' deps=' + ','.join(deps)) if deps else ''} -> {rflag}."
 
@@ -234,43 +240,54 @@ def run(args, cwd):
         worker = (args.get("worker") or "").strip()
         if not tid or not worker:
             return "error: action='assign' needs a 'task' id and a 'worker'."
-        t = _H["_tb_task"](board, tid)
-        if not t:
-            return f"error: unknown task id '{tid}'."
-        ready, _ = _H["_taskboard_ready"](board)
-        if tid not in {r.get("id") for r in ready} and t.get("status") == "open":
-            # open but not ready = deps unmet; refuse (assigning it wastes a worker that
-            # would sit on unmet deps - the whole point of the DAG).
-            unmet = [d for d in t.get("deps", [])
-                     if (_H["_tb_task"](board, d) or {}).get("status") != "done"]
-            return (f"error: {tid} is not ready - it depends on {', '.join(unmet)} which "
-                    f"is not done. Assign a READY task (action='list' status='ready').")
         note = (args.get("note") or "").strip()
-        _H["_taskboard_set_status"](board, tid, "assigned", assignee=worker,
-                                    note=note or None)
-        _H["_taskboard_save"](name, board)
-        return f"assigned {tid} '{t.get('name','')}' to worker {worker}."
+
+        def _do_assign(bd):
+            t = _H["_tb_task"](bd, tid)
+            if not t:
+                return None, f"unknown task id '{tid}'."
+            ready, _ = _H["_taskboard_ready"](bd)
+            if tid not in {r.get("id") for r in ready} and t.get("status") == "open":
+                # open but not ready = deps unmet; refuse (assigning it wastes a worker that
+                # would sit on unmet deps - the whole point of the DAG).
+                unmet = [d for d in t.get("deps", [])
+                         if (_H["_tb_task"](bd, d) or {}).get("status") != "done"]
+                return None, (f"{tid} is not ready - it depends on {', '.join(unmet)} which "
+                              f"is not done. Assign a READY task (action='list' status='ready').")
+            _H["_taskboard_set_status"](bd, tid, "assigned", assignee=worker, note=note or None)
+            return t.get("name", ""), ""
+
+        board2, tname, err = _H["_taskboard_mutate"](name, _do_assign)
+        if err:
+            return f"error: {err}"
+        return f"assigned {tid} '{tname}' to worker {worker}."
 
     if action in ("done", "fail"):
         tid = (args.get("task") or "").strip()
         if not tid:
             return f"error: action='{action}' needs a 'task' id."
-        t = _H["_tb_task"](board, tid)
-        if not t:
-            return f"error: unknown task id '{tid}'."
         # done/fail: a worker may call for the task it was assigned (or the driver, for any).
         note = (args.get("note") or "").strip()
-        if action == "done":
-            _H["_taskboard_set_status"](board, tid, "done", note=note or None,
-                                        result_ref=(args.get("result_ref") or "").strip() or None)
-            msg = f"marked {tid} DONE."
-        else:  # fail
-            _H["_taskboard_set_status"](board, tid, "failed", note=note or None)
-            msg = f"marked {tid} FAILED."
-        _H["_taskboard_save"](name, board)
+        result_ref = (args.get("result_ref") or "").strip() or None
+
+        def _do_finish(bd):
+            t = _H["_tb_task"](bd, tid)
+            if not t:
+                return None, f"unknown task id '{tid}'."
+            if action == "done":
+                _H["_taskboard_set_status"](bd, tid, "done", note=note or None,
+                                            result_ref=result_ref)
+            else:  # fail
+                _H["_taskboard_set_status"](bd, tid, "failed", note=note or None)
+            return True, ""
+
+        board2, _ok, err = _H["_taskboard_mutate"](name, _do_finish)
+        if err:
+            return f"error: {err}"
+        msg = f"marked {tid} DONE." if action == "done" else f"marked {tid} FAILED."
         # On a done, surface what that unblocked so the driver knows what to assign next.
         if action == "done":
-            ready, _ = _H["_taskboard_ready"](board)
+            ready, _ = _H["_taskboard_ready"](board2)
             newly = sorted(r.get("id") for r in ready)
             if newly:
                 msg += f" ready now: {', '.join(newly)}."
