@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L1127   Lean-tools (plugin tools: discovery, manager)
-  L1477   MCP client (connection, manager, OAuth, discovery)
-  L1931   Providers (backend plugin registry)
-  L2153   Interactive pickers + menus (raw-mode UI engine)
-  L2502   Terminal styling (colors, formatting helpers)
-  L2702   Streaming + markdown render (model output)
-  L3061   Composer (pinned input line, editor, stdin)
-  L3911   Token accounting (calibrated context meter)
-  L4085   Config (dataclass, field registry, load/save)
-  L7339   Tool execution + text tool-call parsing
-  L7765   Remote workspace (executor client, /connect)
-  L9356   Context meter
-  L9451   Agent (turn loop, context mgmt, tool dispatch)
-  L15769  Slash-command handlers + dispatch table
-  L15906  REPL (interactive loop, session resume)
-  L16280  Worker agent (headless --agent-run)
-  L16892  Entry (CLI arg parsing, main)
+  L1133   Lean-tools (plugin tools: discovery, manager)
+  L1483   MCP client (connection, manager, OAuth, discovery)
+  L1937   Providers (backend plugin registry)
+  L2159   Interactive pickers + menus (raw-mode UI engine)
+  L2508   Terminal styling (colors, formatting helpers)
+  L2708   Streaming + markdown render (model output)
+  L3067   Composer (pinned input line, editor, stdin)
+  L3917   Token accounting (calibrated context meter)
+  L4091   Config (dataclass, field registry, load/save)
+  L7350   Tool execution + text tool-call parsing
+  L7776   Remote workspace (executor client, /connect)
+  L9367   Context meter
+  L9462   Agent (turn loop, context mgmt, tool dispatch)
+  L15780  Slash-command handlers + dispatch table
+  L15917  REPL (interactive loop, session resume)
+  L16291  Worker agent (headless --agent-run)
+  L16903  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -115,7 +115,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.10.17"
+__version__ = "0.10.18"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -123,6 +123,12 @@ __version__ = "0.10.17"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.10.18": [
+        "fix: apply_diff now tolerates INDENTED SEARCH/REPLACE markers - a model often",
+        "  indents the marker line to match the code it's editing, which used to fail with",
+        "  a spurious \"missing '>>>>>>> REPLACE'\" and force a whole-file rewrite. Leading",
+        "  whitespace on the markers is now accepted.",
+    ],
     "0.10.17": [
         "sessions: launch and /load now open one unified session picker - a 'start a new",
         "  session' row up top, the cursor pre-set on your most recent session (Enter",
@@ -6916,9 +6922,14 @@ def _bg_kill_session():
 # them near-perfectly zero-shot - unlike a bespoke syntax it must be taught.
 # Tradeoff: a file whose CONTENT literally contains these conflict markers can
 # confuse the parser; that is rare and accepted. This is the ONE format; no alias.
-_RE_OPEN = re.compile(r"^<{3,}\s*SEARCH\s*$")
-_RE_DIV = re.compile(r"^={3,}\s*$")
-_RE_CLOSE = re.compile(r"^>{3,}\s*REPLACE\s*$")
+# Leading \s* on each: a model very commonly INDENTS the marker line to match the code it's
+# editing (e.g. "    >>>>>>> REPLACE"), which used to fail to match and read as an unclosed
+# block -> "missing '>>>>>>> REPLACE'". Tolerating leading whitespace fixes the single most
+# common real apply_diff failure. (A body line that is wholly a marker is still an inherent
+# ambiguity of this format - see the note above - but that is far rarer.)
+_RE_OPEN = re.compile(r"^\s*<{3,}\s*SEARCH\s*$")
+_RE_DIV = re.compile(r"^\s*={3,}\s*$")
+_RE_CLOSE = re.compile(r"^\s*>{3,}\s*REPLACE\s*$")
 
 
 def _parse_search_replace(diff: str):
