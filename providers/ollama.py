@@ -49,7 +49,7 @@ _INJECT = (
     "_menu_index", "pick_model_menu", "model_available",
     "_norm_host", "resolve_host", "host_label", "valid_host",
     "_ask", "save_config", "_TTY",
-    "stream_tiered", "StreamStall",
+    "stream_tiered", "StreamStall", "open_tiered",
 )
 
 
@@ -431,11 +431,14 @@ class OllamaClient:
             payload["keep_alive"] = self.cfg.keep_alive
         return payload
 
-    def _stream_chat(self, model, messages, tools, should_abort, _cold_retried=False):
+    def _stream_chat(self, model, messages, tools, should_abort,
+                     _cold_retried=False, _stall_retried=False):
         """Stream one /api/chat request. Returns
         (content_parts, tool_calls, prompt_eval, aborted). Retries once without
-        `think` if the model reports it doesn't support thinking, and retries once
-        on a cold-load blank (see below)."""
+        `think` if the model reports it doesn't support thinking, retries once
+        on a cold-load blank (see below), and - as a single-shot safety net - retries
+        once on the SAME host after a pre-headers stall (warm-wait) before letting the
+        stall become a cross-host failover."""
         url = f"{self.cfg.host}/api/chat"
         payload = self._build_payload(model, messages, tools)
         data = json.dumps(payload).encode()
@@ -461,15 +464,18 @@ class OllamaClient:
         self.last_prompt_eval_tokens = None  # prefill tokens (prompt_eval_count)
         self.last_prompt_eval_ns = None   # prefill wall time (prompt_eval_duration)
         spin = Spinner("thinking", THINK_FRAMES).start()  # until first token
-        # 3-tier timeout (shared core helper): open with the connect deadline, then
-        # stream_tiered re-arms the socket to the TTFT deadline until the first line
-        # and to the inter-token idle deadline after, raising StreamStall (a
-        # ConnectionError, so core's next-model fallback still fires) on a stall.
+        # 3-tier timeout (shared core helpers): open_tiered bounds the TCP connect
+        # with gen_connect_timeout (fast dead-host detection) but re-arms the socket
+        # to gen_ttft_timeout BEFORE the HTTP status line is read, so a cold/loaded
+        # prefill on a healthy host rides the long TTFT tier instead of tripping the
+        # 10s connect deadline mid _read_status (which used to be misread as "host
+        # unreachable" -> spurious failover). stream_tiered then re-arms to TTFT until
+        # the first line and to the inter-token idle deadline after, raising StreamStall
+        # (a ConnectionError, so core's next-model fallback still fires) on a real stall.
         # should_abort semantics are untouched. Prod defaults (ttft=600, idle=None)
         # reproduce the old single 600s socket timeout.
-        connect_to = getattr(self.cfg, "gen_connect_timeout", None) or 600
         try:
-            with urllib.request.urlopen(req, timeout=connect_to) as resp:
+            with open_tiered(req, self.cfg) as resp:
                 for raw in stream_tiered(resp, self.cfg, self.cfg.host):
                     if should_abort and should_abort():
                         aborted = True
@@ -559,18 +565,30 @@ class OllamaClient:
                 f"Is it running? Try: curl {self.cfg.host}/api/tags") from None
         except TimeoutError as e:
             # A bare TimeoutError (== socket.timeout on py3.10+) escapes the URLError
-            # arm above (both are siblings under OSError, not sub/superclass). It fires
-            # when urlopen()'s connect deadline covers the HTTP status-line read and a
-            # host accepts the TCP connection but stalls BEFORE sending headers - e.g.
-            # cold/loaded prefill on `/model` switch, before the load-ack frame exists,
-            # so cold_blank/stream_tiered can't engage (resp isn't returned yet).
+            # arm above (both are siblings under OSError, not sub/superclass). With
+            # open_tiered it now means the host accepted the TCP connection but produced
+            # no status line within the full gen_ttft_timeout budget (not the old 10s
+            # connect deadline) - i.e. an honest "waited the whole TTFT window."
+            # Single-shot safety net (d): before surfacing this as a cross-host failover,
+            # try ONCE more on the SAME host - block on _preload to let a cold/loaded
+            # model finish becoming resident, then re-stream. Bounded to one attempt so a
+            # genuinely wedged host still fails over (core's next-model fallback) rather
+            # than retrying forever.
+            spin.stop()
+            if not _stall_retried:
+                try:
+                    self._preload(model)
+                except Exception:
+                    pass
+                return self._stream_chat(model, messages, tools, should_abort,
+                                         _cold_retried=_cold_retried, _stall_retried=True)
             # Map to ConnectionError so core's graceful next-model failover handles it
             # instead of the bare TimeoutError killing the REPL. Confirmed recurring
             # from the leangym harness side (pre-headers prefill stall @ ollama.py:472).
             raise ConnectionError(
                 f"Ollama at {self.cfg.host} accepted the connection but stalled "
-                f"before responding ({e}). Likely a cold/slow prefill; the host may "
-                f"still be loading the model. Retry, or raise gen_connect_timeout.") from None
+                f"before responding within gen_ttft_timeout ({e}). Host may be wedged, "
+                f"or a very slow prefill; raise gen_ttft_timeout if loads are legit.") from None
         finally:
             spin.stop()
         if md and not aborted:
@@ -591,7 +609,7 @@ class OllamaClient:
             # finished; block until the model is resident, then retry the stream once.
             self._preload(model)
             return self._stream_chat(model, messages, tools, should_abort,
-                                     _cold_retried=True)
+                                     _cold_retried=True, _stall_retried=_stall_retried)
         return content_parts, tool_calls, prompt_eval, aborted
 
 
