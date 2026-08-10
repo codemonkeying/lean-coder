@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L1140   Lean-tools (plugin tools: discovery, manager)
-  L1490   MCP client (connection, manager, OAuth, discovery)
-  L1944   Providers (backend plugin registry)
-  L2166   Interactive pickers + menus (raw-mode UI engine)
-  L2515   Terminal styling (colors, formatting helpers)
-  L2715   Streaming + markdown render (model output)
-  L3074   Composer (pinned input line, editor, stdin)
-  L3924   Token accounting (calibrated context meter)
-  L4098   Config (dataclass, field registry, load/save)
-  L7357   Tool execution + text tool-call parsing
-  L7783   Remote workspace (executor client, /connect)
-  L9374   Context meter
-  L9469   Agent (turn loop, context mgmt, tool dispatch)
-  L15787  Slash-command handlers + dispatch table
-  L15924  REPL (interactive loop, session resume)
-  L16298  Worker agent (headless --agent-run)
-  L16910  Entry (CLI arg parsing, main)
+  L1151   Lean-tools (plugin tools: discovery, manager)
+  L1501   MCP client (connection, manager, OAuth, discovery)
+  L1955   Providers (backend plugin registry)
+  L2177   Interactive pickers + menus (raw-mode UI engine)
+  L2526   Terminal styling (colors, formatting helpers)
+  L2726   Streaming + markdown render (model output)
+  L3170   Composer (pinned input line, editor, stdin)
+  L4020   Token accounting (calibrated context meter)
+  L4194   Config (dataclass, field registry, load/save)
+  L7453   Tool execution + text tool-call parsing
+  L7879   Remote workspace (executor client, /connect)
+  L9470   Context meter
+  L9565   Agent (turn loop, context mgmt, tool dispatch)
+  L15883  Slash-command handlers + dispatch table
+  L16020  REPL (interactive loop, session resume)
+  L16394  Worker agent (headless --agent-run)
+  L17006  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -42,6 +42,7 @@ import json
 import os
 import re
 import select
+import http.client
 import shlex
 import signal
 import socket
@@ -115,7 +116,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.10.19"
+__version__ = "0.10.20"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -123,6 +124,16 @@ __version__ = "0.10.19"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.10.20": [
+        "fix: ollama cold-load no longer causes a spurious failover off a healthy host.",
+        "  The initial request now splits its timeout honestly - the TCP connect phase is",
+        "  bounded by gen_connect_timeout (fast dead-host detection) while the wait for the",
+        "  first response byte rides gen_ttft_timeout (patient through a cold/loaded model",
+        "  prefill). Previously a single 10s connect deadline also covered the HTTP",
+        "  status-line read, so a cold big model on a healthy host was misread as",
+        "  'unreachable' and bounced you onto another host. Plus a single-shot same-host",
+        "  warm-wait retry on a stall before any failover.",
+    ],
     "0.10.19": [
         "fix: ollama provider no longer crashes the REPL on a pre-headers prefill stall.",
         "  A bare TimeoutError from the initial urlopen (host accepts the TCP connection",
@@ -2744,6 +2755,91 @@ def _set_stream_read_timeout(resp, secs):
         resp.fp.raw._sock.settimeout(secs)
     except Exception:
         pass
+
+class _TieredHTTPConnection(http.client.HTTPConnection):
+    """An HTTPConnection that arms the TCP-connect phase with a short `connect_to`
+    deadline, then re-arms the socket to a longer `read_to` BEFORE the HTTP status
+    line / headers are read. This splits the two questions a single urlopen timeout
+    wrongly conflates: "can I open a socket to this host?" (fast dead-host detection)
+    vs "has the server produced its first byte?" (patient wait through a cold/loaded
+    prefill). Plain urllib.urlopen(timeout=X) applies X to BOTH the connect and the
+    status-line read on one socket, so a cold model load blows the connect deadline
+    during _read_status - misreading "loading" as "host dead"."""
+    def __init__(self, *a, connect_to=None, read_to=None, **kw):
+        self._connect_to = connect_to
+        self._read_to = read_to
+        kw.pop("timeout", None)           # urllib passes req.timeout; connect_to wins
+        super().__init__(*a, timeout=connect_to, **kw)
+
+    def connect(self):
+        super().connect()                 # TCP (+ any tunnelling) under connect_to
+        if self._read_to:                 # now hand the status-line read the long tier
+            try:
+                self.sock.settimeout(self._read_to)
+            except Exception:
+                pass
+
+
+class _TieredHTTPSConnection(http.client.HTTPSConnection):
+    """TLS variant of _TieredHTTPConnection. TLS handshake rides connect_to (part of
+    establishing the connection); the socket is re-armed to read_to afterwards."""
+    def __init__(self, *a, connect_to=None, read_to=None, **kw):
+        self._connect_to = connect_to
+        self._read_to = read_to
+        kw.pop("timeout", None)           # urllib passes req.timeout; connect_to wins
+        super().__init__(*a, timeout=connect_to, **kw)
+
+    def connect(self):
+        super().connect()
+        if self._read_to:
+            try:
+                self.sock.settimeout(self._read_to)
+            except Exception:
+                pass
+
+
+class _TieredHTTPHandler(urllib.request.HTTPHandler):
+    def __init__(self, connect_to, read_to, debuglevel=0):
+        super().__init__(debuglevel=debuglevel)
+        self._connect_to, self._read_to = connect_to, read_to
+
+    def http_open(self, req):
+        return self.do_open(
+            lambda host, **kw: _TieredHTTPConnection(
+                host, connect_to=self._connect_to, read_to=self._read_to, **kw),
+            req)
+
+
+class _TieredHTTPSHandler(urllib.request.HTTPSHandler):
+    def __init__(self, connect_to, read_to, context=None, debuglevel=0):
+        super().__init__(debuglevel=debuglevel, context=context)
+        self._connect_to, self._read_to = connect_to, read_to
+
+    def https_open(self, req):
+        return self.do_open(
+            lambda host, **kw: _TieredHTTPSConnection(
+                host, connect_to=self._connect_to, read_to=self._read_to, **kw),
+            req)
+
+
+def open_tiered(req, cfg):
+    """urlopen() companion to stream_tiered: opens `req` with the TCP-connect phase
+    bounded by `cfg.gen_connect_timeout` (fast dead-host detection) but the HTTP
+    status-line / headers read bounded by `cfg.gen_ttft_timeout` (patient through a
+    cold/loaded prefill). Returns the same response object urlopen would; the caller
+    then iterates it via stream_tiered, which re-arms to the ttft (first line) then
+    idle (decode) tiers exactly as before. This is the honest connect/ttft split:
+    a genuinely dead/refusing host still fails fast at connect, while a healthy host
+    that stalls before headers (loading the model) is covered by the ttft tier instead
+    of being misclassified as unreachable and triggering a spurious failover.
+    On a stall it raises TimeoutError (mapped to ConnectionError by the provider) with
+    the ttft budget, not the connect budget - the honest "waited N s for first byte"."""
+    connect_to = getattr(cfg, "gen_connect_timeout", None) or 10
+    read_to = getattr(cfg, "gen_ttft_timeout", None) or 600
+    opener = urllib.request.build_opener(
+        _TieredHTTPHandler(connect_to, read_to),
+        _TieredHTTPSHandler(connect_to, read_to))
+    return opener.open(req)
 
 
 def stream_tiered(resp, cfg, where="", idle=None):
