@@ -557,6 +557,20 @@ class OllamaClient:
             raise ConnectionError(
                 f"can't reach Ollama at {self.cfg.host} ({e.reason}). "
                 f"Is it running? Try: curl {self.cfg.host}/api/tags") from None
+        except TimeoutError as e:
+            # A bare TimeoutError (== socket.timeout on py3.10+) escapes the URLError
+            # arm above (both are siblings under OSError, not sub/superclass). It fires
+            # when urlopen()'s connect deadline covers the HTTP status-line read and a
+            # host accepts the TCP connection but stalls BEFORE sending headers - e.g.
+            # cold/loaded prefill on `/model` switch, before the load-ack frame exists,
+            # so cold_blank/stream_tiered can't engage (resp isn't returned yet).
+            # Map to ConnectionError so core's graceful next-model failover handles it
+            # instead of the bare TimeoutError killing the REPL. Confirmed recurring
+            # from the leangym harness side (pre-headers prefill stall @ ollama.py:472).
+            raise ConnectionError(
+                f"Ollama at {self.cfg.host} accepted the connection but stalled "
+                f"before responding ({e}). Likely a cold/slow prefill; the host may "
+                f"still be loading the model. Retry, or raise gen_connect_timeout.") from None
         finally:
             spin.stop()
         if md and not aborted:

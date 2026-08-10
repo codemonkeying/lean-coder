@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L1133   Lean-tools (plugin tools: discovery, manager)
-  L1483   MCP client (connection, manager, OAuth, discovery)
-  L1937   Providers (backend plugin registry)
-  L2159   Interactive pickers + menus (raw-mode UI engine)
-  L2508   Terminal styling (colors, formatting helpers)
-  L2708   Streaming + markdown render (model output)
-  L3067   Composer (pinned input line, editor, stdin)
-  L3917   Token accounting (calibrated context meter)
-  L4091   Config (dataclass, field registry, load/save)
-  L7350   Tool execution + text tool-call parsing
-  L7776   Remote workspace (executor client, /connect)
-  L9367   Context meter
-  L9462   Agent (turn loop, context mgmt, tool dispatch)
-  L15780  Slash-command handlers + dispatch table
-  L15917  REPL (interactive loop, session resume)
-  L16291  Worker agent (headless --agent-run)
-  L16903  Entry (CLI arg parsing, main)
+  L1140   Lean-tools (plugin tools: discovery, manager)
+  L1490   MCP client (connection, manager, OAuth, discovery)
+  L1944   Providers (backend plugin registry)
+  L2166   Interactive pickers + menus (raw-mode UI engine)
+  L2515   Terminal styling (colors, formatting helpers)
+  L2715   Streaming + markdown render (model output)
+  L3074   Composer (pinned input line, editor, stdin)
+  L3924   Token accounting (calibrated context meter)
+  L4098   Config (dataclass, field registry, load/save)
+  L7357   Tool execution + text tool-call parsing
+  L7783   Remote workspace (executor client, /connect)
+  L9374   Context meter
+  L9469   Agent (turn loop, context mgmt, tool dispatch)
+  L15787  Slash-command handlers + dispatch table
+  L15924  REPL (interactive loop, session resume)
+  L16298  Worker agent (headless --agent-run)
+  L16910  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -115,7 +115,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.10.18"
+__version__ = "0.10.19"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -123,6 +123,13 @@ __version__ = "0.10.18"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.10.19": [
+        "fix: ollama provider no longer crashes the REPL on a pre-headers prefill stall.",
+        "  A bare TimeoutError from the initial urlopen (host accepts the TCP connection",
+        "  then stalls before sending HTTP headers - e.g. cold/loaded prefill after a",
+        "  /model switch) is now mapped to ConnectionError, so the normal next-model",
+        "  failover handles it gracefully instead of dying with an uncaught traceback.",
+    ],
     "0.10.18": [
         "fix: apply_diff now tolerates INDENTED SEARCH/REPLACE markers - a model often",
         "  indents the marker line to match the code it's editing, which used to fail with",
