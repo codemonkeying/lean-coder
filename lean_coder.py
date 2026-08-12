@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L1151   Lean-tools (plugin tools: discovery, manager)
-  L1501   MCP client (connection, manager, OAuth, discovery)
-  L1955   Providers (backend plugin registry)
-  L2177   Interactive pickers + menus (raw-mode UI engine)
-  L2526   Terminal styling (colors, formatting helpers)
-  L2726   Streaming + markdown render (model output)
-  L3170   Composer (pinned input line, editor, stdin)
-  L4020   Token accounting (calibrated context meter)
-  L4194   Config (dataclass, field registry, load/save)
-  L7453   Tool execution + text tool-call parsing
-  L7879   Remote workspace (executor client, /connect)
-  L9470   Context meter
-  L9565   Agent (turn loop, context mgmt, tool dispatch)
-  L15883  Slash-command handlers + dispatch table
-  L16020  REPL (interactive loop, session resume)
-  L16394  Worker agent (headless --agent-run)
-  L17006  Entry (CLI arg parsing, main)
+  L1158   Lean-tools (plugin tools: discovery, manager)
+  L1508   MCP client (connection, manager, OAuth, discovery)
+  L1962   Providers (backend plugin registry)
+  L2184   Interactive pickers + menus (raw-mode UI engine)
+  L2533   Terminal styling (colors, formatting helpers)
+  L2733   Streaming + markdown render (model output)
+  L3177   Composer (pinned input line, editor, stdin)
+  L4027   Token accounting (calibrated context meter)
+  L4201   Config (dataclass, field registry, load/save)
+  L7460   Tool execution + text tool-call parsing
+  L7886   Remote workspace (executor client, /connect)
+  L9481   Context meter
+  L9576   Agent (turn loop, context mgmt, tool dispatch)
+  L15894  Slash-command handlers + dispatch table
+  L16031  REPL (interactive loop, session resume)
+  L16405  Worker agent (headless --agent-run)
+  L17017  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -116,7 +116,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.10.20"
+__version__ = "0.10.21"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -124,6 +124,13 @@ __version__ = "0.10.20"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.10.21": [
+        "fix: /connect to a Windows host no longer fails with 'scp: Connection closed'",
+        "  while pushing the agent. OpenSSH 9+ made scp default to the SFTP protocol,",
+        "  which the Windows sshd drops when writing into a freshly-created subdir (the",
+        "  lean-tools/ push landed right after agent.py, so connect died there). The",
+        "  Windows scp push now forces the legacy scp protocol (-O), verified live.",
+    ],
     "0.10.20": [
         "fix: ollama cold-load no longer causes a spurious failover off a healthy host.",
         "  The initial request now splits its timeout honestly - the TCP connect phase is",
@@ -8348,11 +8355,15 @@ def _ctl_opts(ctl):
 def _scp_argv(host, ctl, local_path, remote_path):
     """scp a local file to `remote_path` on `host`. Reuses the ControlMaster socket
     when `ctl` is set (POSIX); on Windows (ctl falsy) it's a fresh key-auth transfer.
-    when `ctl` is set (POSIX); on Windows (ctl falsy) it's a fresh key-auth transfer.
     scp is the Windows push: it goes through the same sshd over its own channel and
     lands the agent byte-identical, replacing the slow, deadlock-prone chunked base64
-    path (Windows sshd DEADLOCKS on a stdin-piped `cat > path` exec channel)."""
-    return (["scp"] + _ctl_opts(ctl) + ["-o", "BatchMode=yes",
+    path (Windows sshd DEADLOCKS on a stdin-piped `cat > path` exec channel).
+    `-O` forces the LEGACY scp protocol: OpenSSH 9+ made scp default to the SFTP
+    protocol, which the Windows sshd drops mid-transfer ("scp: Connection closed")
+    when writing into a freshly-created subdir (e.g. the lean-tools/ push) - verified
+    live on a Win11 box where default scp failed and `scp -O` transferred cleanly.
+    Harmless on POSIX and on older OpenSSH (there it's just the pre-SFTP default)."""
+    return (["scp"] + _ctl_opts(ctl) + ["-O", "-o", "BatchMode=yes",
              "-o", "StrictHostKeyChecking=accept-new", "-o", "LogLevel=ERROR",
              "-p", local_path, f"{host}:{remote_path}"])
 
