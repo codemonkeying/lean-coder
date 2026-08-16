@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L1158   Lean-tools (plugin tools: discovery, manager)
-  L1508   MCP client (connection, manager, OAuth, discovery)
-  L1962   Providers (backend plugin registry)
-  L2184   Interactive pickers + menus (raw-mode UI engine)
-  L2533   Terminal styling (colors, formatting helpers)
-  L2733   Streaming + markdown render (model output)
-  L3177   Composer (pinned input line, editor, stdin)
-  L4027   Token accounting (calibrated context meter)
-  L4201   Config (dataclass, field registry, load/save)
-  L7460   Tool execution + text tool-call parsing
-  L7886   Remote workspace (executor client, /connect)
-  L9481   Context meter
-  L9576   Agent (turn loop, context mgmt, tool dispatch)
-  L15894  Slash-command handlers + dispatch table
-  L16031  REPL (interactive loop, session resume)
-  L16405  Worker agent (headless --agent-run)
-  L17017  Entry (CLI arg parsing, main)
+  L1166   Lean-tools (plugin tools: discovery, manager)
+  L1516   MCP client (connection, manager, OAuth, discovery)
+  L1970   Providers (backend plugin registry)
+  L2192   Interactive pickers + menus (raw-mode UI engine)
+  L2541   Terminal styling (colors, formatting helpers)
+  L2741   Streaming + markdown render (model output)
+  L3185   Composer (pinned input line, editor, stdin)
+  L4035   Token accounting (calibrated context meter)
+  L4209   Config (dataclass, field registry, load/save)
+  L7468   Tool execution + text tool-call parsing
+  L7894   Remote workspace (executor client, /connect)
+  L9489   Context meter
+  L9584   Agent (turn loop, context mgmt, tool dispatch)
+  L15902  Slash-command handlers + dispatch table
+  L16039  REPL (interactive loop, session resume)
+  L16413  Worker agent (headless --agent-run)
+  L17025  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -116,7 +116,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.10.21"
+__version__ = "0.10.22"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -124,6 +124,14 @@ __version__ = "0.10.21"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.10.22": [
+        "fix: an empty/refused Anthropic response no longer looks like a dropped",
+        "  connection. When the model declines it returns a normal 200 stream with a",
+        "  stop_reason of 'refusal' and no text - which used to render as a silent empty",
+        "  turn. The provider now captures stop_reason and prints a one-line reason ('the",
+        "  model REFUSED this request' / 'returned an EMPTY response - not a dropped",
+        "  connection'), pointing at /model to switch backend. Both stream paths.",
+    ],
     "0.10.21": [
         "fix: /connect to a Windows host no longer fails with 'scp: Connection closed'",
         "  while pushing the agent. OpenSSH 9+ made scp default to the SFTP protocol,",
