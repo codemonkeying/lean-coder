@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L1166   Lean-tools (plugin tools: discovery, manager)
-  L1516   MCP client (connection, manager, OAuth, discovery)
-  L1970   Providers (backend plugin registry)
-  L2192   Interactive pickers + menus (raw-mode UI engine)
-  L2541   Terminal styling (colors, formatting helpers)
-  L2741   Streaming + markdown render (model output)
-  L3185   Composer (pinned input line, editor, stdin)
-  L4035   Token accounting (calibrated context meter)
-  L4209   Config (dataclass, field registry, load/save)
-  L7468   Tool execution + text tool-call parsing
-  L7894   Remote workspace (executor client, /connect)
-  L9489   Context meter
-  L9584   Agent (turn loop, context mgmt, tool dispatch)
-  L15902  Slash-command handlers + dispatch table
-  L16039  REPL (interactive loop, session resume)
-  L16413  Worker agent (headless --agent-run)
-  L17025  Entry (CLI arg parsing, main)
+  L1176   Lean-tools (plugin tools: discovery, manager)
+  L1526   MCP client (connection, manager, OAuth, discovery)
+  L1980   Providers (backend plugin registry)
+  L2202   Interactive pickers + menus (raw-mode UI engine)
+  L2551   Terminal styling (colors, formatting helpers)
+  L2751   Streaming + markdown render (model output)
+  L3195   Composer (pinned input line, editor, stdin)
+  L4045   Token accounting (calibrated context meter)
+  L4219   Config (dataclass, field registry, load/save)
+  L7484   Tool execution + text tool-call parsing
+  L7910   Remote workspace (executor client, /connect)
+  L9505   Context meter
+  L9600   Agent (turn loop, context mgmt, tool dispatch)
+  L15919  Slash-command handlers + dispatch table
+  L16056  REPL (interactive loop, session resume)
+  L16430  Worker agent (headless --agent-run)
+  L17042  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -116,7 +116,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.10.22"
+__version__ = "0.10.23"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -124,6 +124,16 @@ __version__ = "0.10.22"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.10.23": [
+        "new: invisible-unicode scrubber. Model-supplied text is stripped of zero-width /",
+        "  format-control chars (ZWSP/ZWJ/BOM/bidi/variation-selectors/unicode-tag chars)",
+        "  before write_file/apply_diff/replace_lines put it on disk - defeats",
+        "  character-based fingerprint/watermark smuggling and copy-paste cruft. Visible",
+        "  unicode and tabs/newlines are untouched. On by default; /set scrub_invisible off",
+        "  to write bytes through verbatim. (Note: Anthropic's statistical text watermark is",
+        "  a token-choice bias, not a character - it cannot be stripped; for sensitive work",
+        "  use a local model. Anthropic themselves say code carries little-to-no watermark.)",
+    ],
     "0.10.22": [
         "fix: an empty/refused Anthropic response no longer looks like a dropped",
         "  connection. When the model declines it returns a normal 200 stream with a",
@@ -4434,6 +4444,11 @@ class Config:
                                      # context. /set notes_spool <n>.
     ask_user_to_run: bool = True     # expose the ask_user_to_run handoff tool
     composer: bool = True            # pinned bottom input line (type while it works)
+    scrub_invisible: bool = True     # strip invisible/zero-width/format-control unicode
+                                     # from model-supplied text before it's written to
+                                     # disk (write_file/apply_diff/replace_lines) - defeats
+                                     # character-based fingerprint/watermark smuggling and
+                                     # copy-paste cruft. Off = write bytes through untouched.
     statusline: bool = True          # status rows above each prompt (perms, context
                                      # mgmt, session, model/provider) - so the live
                                      # state is always visible. Auto-off on a non-TTY.
@@ -4722,6 +4737,7 @@ _SCALAR_FIELDS = (
     ("window_messages",           0,                   False),
     ("window_tokens",             "auto",              False),
     ("auto_compact",              True,                False),
+    ("scrub_invisible",           True,                False),
     ("compact_soft",              0.72,                False),
     ("compact_at",                0.90,                False),
     ("compact_soft_ratio",        0.8,                 False),
@@ -12737,6 +12753,7 @@ _SETTINGS_FIELDS = [
     ("window_messages", "send-window size in messages (0 = off, full history)", "int"),
     ("window_tokens", "send-window token cap: 'auto' (=ctx-reserve, default), an int (hard cap), or 0 (off)", "int_or_auto"),
     ("auto_compact", "auto-compact (self-managing context)", "bool"),
+    ("scrub_invisible", "strip invisible/zero-width/format-control unicode from model text before writing files (defeats fingerprint/watermark smuggling)", "bool"),
     ("compact_at", "compact at this fill fraction of ctx (THE lever; soft auto-follows)", "float"),
     ("compact_soft", "soft-zone start; auto-follows compact_at, or set it here to MANUALLY OVERRIDE (decouples until you set compact_at/soft_ratio again)", "float"),
     ("compact_soft_ratio", "where the soft zone opens as a fraction of the hard cap (soft = compact_at * ratio; 0.8 => 80% of the way to the cap)", "float"),
