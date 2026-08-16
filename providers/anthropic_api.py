@@ -78,6 +78,28 @@ def _raise_sse_error(err):
     raise RuntimeError(msg)
 
 
+def _note_empty_response(content, tool_calls, stop_reason):
+    """Surface an empty assistant turn so it can't be mistaken for a dropped
+    connection. Anthropic returns a NORMAL 200 stream (no error frame) when it
+    declines - a message_delta carrying stop_reason 'refusal' and zero text_deltas -
+    so content ends up "" with no exception. Print a one-line reason instead of
+    silent nothing. No-op when there's real content or a tool call."""
+    if content or tool_calls:
+        return
+    yellow = _lc.get("yellow") or _lc.get("dim") or (lambda s: s)
+    dim    = _lc.get("dim") or (lambda s: s)
+    warn   = (_lc.get("GLYPH") or {}).get("warn", "!")
+    if stop_reason == "refusal":
+        print(yellow(f"  {warn} the model REFUSED this request (stop_reason: refusal) - "
+                     f"no content returned.")
+              + dim("  switch backend with /model (a local ollama model has no content policy)."))
+    else:
+        sr = f" (stop_reason: {stop_reason})" if stop_reason else ""
+        print(yellow(f"  {warn} the model returned an EMPTY response{sr} - not a dropped "
+                     f"connection.")
+              + dim("  retry, or /model to switch backend."))
+
+
 def _interruptible_sleep(secs, should_abort):
     """Sleep in slices so should_abort()/Ctrl-C breaks the wait. False if aborted."""
     waited = 0.0
@@ -436,6 +458,7 @@ class _ApiKeyClient:
         cur_json      = []
         prompt_eval   = None
         output_eval   = None
+        stop_reason   = None
         printed       = False
         aborted       = False
         md            = _lc["MarkdownStream"](sys.stdout.write)
@@ -504,6 +527,9 @@ class _ApiKeyClient:
 
                 elif etype == "message_delta":
                     output_eval = obj.get("usage", {}).get("output_tokens")
+                    _sr = obj.get("delta", {}).get("stop_reason")
+                    if _sr:
+                        stop_reason = _sr
 
                 elif etype == "error":
                     _raise_sse_error(obj.get("error", {}))
@@ -519,6 +545,8 @@ class _ApiKeyClient:
         if output_eval:
             self.last_out_tokens = output_eval
         content   = "".join(content_parts)
+        if not aborted:
+            _note_empty_response(content, tool_calls, stop_reason)
         assistant = {"role": "assistant", "content": content}
         if tool_calls:
             assistant["tool_calls"] = tool_calls
