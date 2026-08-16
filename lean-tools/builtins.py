@@ -25,6 +25,35 @@ import time
 import subprocess
 from pathlib import Path
 
+# Invisible / zero-width / format-control chars that carry NO visible meaning but can
+# smuggle a fingerprint/watermark (or arrive as copy-paste cruft) into files the model
+# writes. We strip these from model-supplied text before it lands on disk. Deliberately
+# CONSERVATIVE: only chars with zero legitimate use in source (never NBSP U+00A0 or any
+# visible glyph), so code/strings/comments are untouched. \t \n \r are NOT in the set.
+_INVISIBLE_CHARS = (
+    "\u200b\u200c\u200d\u200e\u200f"   # ZWSP ZWNJ ZWJ LRM RLM
+    "\u2060\u2061\u2062\u2063\u2064"   # word joiner + invisible math ops
+    "\ufeff\u00ad\u061c\u180e"         # BOM/ZWNBSP, soft hyphen, ALM, mongolian vowel sep
+    "\u202a\u202b\u202c\u202d\u202e"   # bidi embeddings/overrides
+    "\u2066\u2067\u2068\u2069"         # bidi isolates
+)
+_INVISIBLE_CHARS += "".join(chr(c) for c in range(0xFE00, 0xFE10))   # variation selectors
+_INVISIBLE_CHARS += "".join(chr(c) for c in range(0xE0000, 0xE0080)) # unicode tag chars (tag smuggling)
+_INVISIBLE_RE = re.compile("[" + re.escape(_INVISIBLE_CHARS) + "]")
+
+
+def _scrub_invisible(text, cfg=None):
+    """Strip invisible/zero-width/format-control chars from model-supplied text before
+    it's written to disk - defeats character-based fingerprint/watermark smuggling and
+    stray copy-paste cruft. Returns (clean_text, n_removed). Opt-out via cfg flag
+    scrub_invisible=False (default on). Never touches visible chars or \\t \\n \\r."""
+    if text is None:
+        return text, 0
+    if cfg is not None and getattr(cfg, "scrub_invisible", True) is False:
+        return text, 0
+    clean, n = _INVISIBLE_RE.subn("", text)
+    return clean, n
+
 # --- injected by setup() from core (resolved as plain names below) -----------
 # Stable core helpers/constants this module's code reaches for. setup() copies each
 # from the core module globals so the moved code runs unchanged. Mutable state is
@@ -222,6 +251,7 @@ class Tools:
             start, end = int(start), int(end)
         except (TypeError, ValueError):
             return "error: start and end must be integers"
+        new_text, _scrubbed = _scrub_invisible(new_text, self.cfg)
         original = p.read_text(errors="replace")
         lines = original.splitlines(keepends=True)
         n = len(lines)
@@ -245,13 +275,15 @@ class Tools:
         self.changed_files.add(path)
         new_count = len(replacement.splitlines()) if replacement else 0
         old_count = end - start + 1
+        note = f"; stripped {_scrubbed} invisible char(s)" if _scrubbed else ""
         return (f"replaced lines {start}-{end} ({old_count} lines) with "
-                f"{new_count} lines in {path}")
+                f"{new_count} lines in {path}{note}")
 
     def apply_diff(self, path: str, diff: str) -> str:
         p = resolve_in_project(self.cfg, path)
         if not p.is_file():
             return f"error: no such file: {path} (use write_file for new files)"
+        diff, _scrubbed = _scrub_invisible(diff, self.cfg)
         blocks, perr = _parse_search_replace(diff)
         if perr:
             # Actionable failure: the block didn't PARSE (delimiter recognition),
@@ -294,10 +326,12 @@ class Tools:
             return "user declined the edit"
         p.write_text(new)
         self.changed_files.add(path)
-        return f"applied {applied} block(s) to {path}"
+        note = f"; stripped {_scrubbed} invisible char(s)" if _scrubbed else ""
+        return f"applied {applied} block(s) to {path}{note}"
 
     def write_file(self, path: str, content: str) -> str:
         p = resolve_in_project(self.cfg, path)
+        content, _scrubbed = _scrub_invisible(content, self.cfg)
         original = p.read_text(errors="replace") if p.is_file() else None
         if original == content:
             return "no changes (content identical)"
@@ -307,7 +341,8 @@ class Tools:
         p.write_text(content)
         self.changed_files.add(path)
         verb = "overwrote" if original is not None else "created"
-        return f"{verb} {path} ({len(content.splitlines())} lines)"
+        note = f"; stripped {_scrubbed} invisible char(s)" if _scrubbed else ""
+        return f"{verb} {path} ({len(content.splitlines())} lines){note}"
 
     def run_command(self, cmd: str) -> str:
         if not _confirm_action(self.cfg, "exec", cmd=cmd):
