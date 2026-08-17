@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L1176   Lean-tools (plugin tools: discovery, manager)
-  L1526   MCP client (connection, manager, OAuth, discovery)
-  L1980   Providers (backend plugin registry)
-  L2202   Interactive pickers + menus (raw-mode UI engine)
-  L2551   Terminal styling (colors, formatting helpers)
-  L2751   Streaming + markdown render (model output)
-  L3195   Composer (pinned input line, editor, stdin)
-  L4045   Token accounting (calibrated context meter)
-  L4219   Config (dataclass, field registry, load/save)
-  L7484   Tool execution + text tool-call parsing
-  L7910   Remote workspace (executor client, /connect)
-  L9505   Context meter
-  L9600   Agent (turn loop, context mgmt, tool dispatch)
-  L15919  Slash-command handlers + dispatch table
-  L16056  REPL (interactive loop, session resume)
-  L16430  Worker agent (headless --agent-run)
-  L17042  Entry (CLI arg parsing, main)
+  L1187   Lean-tools (plugin tools: discovery, manager)
+  L1537   MCP client (connection, manager, OAuth, discovery)
+  L1991   Providers (backend plugin registry)
+  L2213   Interactive pickers + menus (raw-mode UI engine)
+  L2562   Terminal styling (colors, formatting helpers)
+  L2762   Streaming + markdown render (model output)
+  L3206   Composer (pinned input line, editor, stdin)
+  L4056   Token accounting (calibrated context meter)
+  L4230   Config (dataclass, field registry, load/save)
+  L7495   Tool execution + text tool-call parsing
+  L7921   Remote workspace (executor client, /connect)
+  L9516   Context meter
+  L9611   Agent (turn loop, context mgmt, tool dispatch)
+  L16030  Slash-command handlers + dispatch table
+  L16167  REPL (interactive loop, session resume)
+  L16541  Worker agent (headless --agent-run)
+  L17153  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -116,7 +116,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.10.23"
+__version__ = "0.10.24"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -124,6 +124,17 @@ __version__ = "0.10.23"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.10.24": [
+        "new: /rewind [N] [prompt] - drop the last N user turns (default 1). The escape",
+        "  hatch for a model that refused, looped, or went down a wrong path: rewind past",
+        "  it and re-ask differently instead of /clear-ing the whole session. Trailing text",
+        "  makes it one step: `/rewind 1 explain it instead, no exploit code`. Cuts at a",
+        "  user-message boundary so whole assistant+tool spans drop atomically (tool_call /",
+        "  tool_result pairing stays valid). Tab completes the available turn depth.",
+        "  NOTE: conversation only - files already written and commands already run are NOT",
+        "  reverted (unlike Claude Code's same-named command), and the pinned plan +",
+        "  notebook deliberately survive.",
+    ],
     "0.10.23": [
         "new: invisible-unicode scrubber. Model-supplied text is stripped of zero-width /",
         "  format-control chars (ZWSP/ZWJ/BOM/bidi/variation-selectors/unicode-tag chars)",
@@ -10411,6 +10422,49 @@ class Agent:
         self._tool_calls, self._tool_call_seq = [], 0
         return len(body)
 
+    def user_turn_indices(self):
+        """Indices in self.messages of each user message, oldest first - the turn
+        boundaries. A 'turn' is a user message plus every assistant/tool message it
+        produced, up to the next user message."""
+        return [i for i, m in enumerate(self.messages)
+                if isinstance(m, dict) and m.get("role") == "user"]
+
+    def rewind(self, turns=1):
+        """Drop the last `turns` user turns from the conversation: truncate at a user
+        message boundary so whole assistant+tool sequences go atomically. Cutting only
+        at a boundary is what keeps tool_call/tool_result pairing intact - an orphaned
+        tool_call with no matching result is a hard 400 on Anthropic/OpenAI, and slicing
+        anywhere else would need hand-repair.
+
+        Returns (turns_removed, msgs_removed, tool_calls_removed, last_user_text).
+        Only conversation state moves: files already written and commands already run are
+        NOT reverted (the caller says so), and pinned_plan / the notebook are separate
+        agent state that deliberately survive. Rewinding more turns than exist clamps to
+        'all of them', leaving just the system prompt."""
+        starts = self.user_turn_indices()
+        if not starts or turns <= 0:
+            return 0, 0, 0, ""
+        turns = min(int(turns), len(starts))
+        cut = starts[-turns]
+        dropped = self.messages[cut:]
+        # Count only real assistant tool_calls in the dropped span - that's the
+        # "work the model did that you're about to forget" number worth surfacing.
+        tool_calls = sum(len(m.get("tool_calls") or [])
+                         for m in dropped if isinstance(m, dict))
+        last_user = ""
+        for m in dropped:
+            if isinstance(m, dict) and m.get("role") == "user":
+                c = m.get("content")
+                if isinstance(c, str):
+                    last_user = c
+                break
+        self.messages = self.messages[:cut]
+        # The token meter caches the last prompt size; after a truncation it's stale, so
+        # clear it and let the next turn re-estimate (same contract as restore()).
+        self.last_prompt_tokens = None
+        self.dirty = True
+        return turns, len(dropped), tool_calls, last_user
+
     def _trim_tool_indices(self, indices):
         """Stub the tool messages at `indices` to short placeholders. Skips any
         already-stubbed message. Returns (trimmed_count, tokens_freed)."""
@@ -12358,7 +12412,7 @@ def _render_tool_call(entry: dict, cap: int = EXPAND_MAX_CHARS) -> str:
 # REPL
 # ----------------------------------------------------------------------------
 
-SLASH_COMMANDS = ["/clear", "/new", "/trim", "/compact", "/compact_at", "/session", "/save", "/load",
+SLASH_COMMANDS = ["/clear", "/new", "/rewind", "/trim", "/compact", "/compact_at", "/session", "/save", "/load",
                   "/prompt", "/sh", "/connect", "/machines", "/local", "/disconnect", "/tools", "/reload",
                   "/model", "/models", "/provider", "/providers", "/think", "/effort",
                   "/set", "/usage", "/approve", "/leash", "/autosave", "/incognito",
@@ -12549,6 +12603,7 @@ def register_command(cmd, handler, help_line="", completer=None):
 HELP_COMMANDS = [
     ("/clear", "wipe conversation, stay in this session"),
     ("/new [name]", "start a separate session"),
+    ("/rewind [N] [prompt]", "drop the last N user turns (refusal/derail escape); does NOT revert files"),
     ("/trim [keep]", "programmatic: stub old tool outputs, keep newest [keep] (no LLM)"),
     ("/compact", "agentic: summarize + commit docs, replace history (the lever auto-compact pulls)"),
     ("/compact_at [frac]", "set THE auto-compaction lever (fill fraction; no arg shows zones)"),
@@ -13450,6 +13505,14 @@ def _arg_completions(agent, cfg, cmd):
         return list(LEASH_LEVELS)
     if cmd in ("/bg", "/background"):
         return ["kill"]
+    if cmd == "/rewind":
+        # Offer the turn counts that actually exist, so Tab shows the depth available
+        # (bare /rewind = 1). Capped: past a handful you want /clear, not a long list.
+        try:
+            n = len(agent.user_turn_indices())
+        except Exception:
+            n = 0
+        return [str(i) for i in range(1, min(n, 9) + 1)]
     if cmd == "/note":
         return ["recent", "grep", "range", "add", "clear"]
     if cmd == "/plan":
@@ -15614,6 +15677,53 @@ def handle_trim_command(agent, cfg, arg):
     agent._print_ctx()
 
 
+def handle_rewind_command(agent, cfg, arg):
+    """/rewind [N] [new prompt] - drop the last N user turns (default 1) from the
+    conversation. The lever for a model that refused, looped, or went down a wrong
+    path: rewind past it and re-ask differently, instead of /clear-ing the whole
+    session. Your old lines are still in line history (Up-arrow) to edit and resend.
+
+    With trailing text, the rewind and the re-ask are one step:
+      /rewind                  drop the last turn
+      /rewind 2                drop the last two turns
+      /rewind 1 explain it instead, no exploit code
+                               drop one turn, then send that as the next turn
+
+    The leading token is read as N only when it's a plain integer, so a message that
+    starts with a number needs the two-step form (rewind, then type it).
+
+    Conversation only: files already written and commands already run are NOT reverted,
+    and the pinned plan + notebook deliberately survive."""
+    arg = (arg or "").strip()
+    turns, text = 1, ""
+    if arg:
+        head, _, rest = arg.partition(" ")
+        if head.isdigit():
+            turns, text = int(head), rest.strip()
+        else:
+            text = arg
+    if turns <= 0:
+        print(yellow("usage: /rewind [N] [new prompt]   (N must be 1 or more)"))
+        return
+    available = len(agent.user_turn_indices())
+    if not available:
+        print(dim("nothing to rewind - no turns in this conversation yet."))
+        return
+    if turns > available:
+        print(dim(f"only {available} turn(s) in this conversation - rewinding all of them."))
+    n, msgs, calls, _last = agent.rewind(turns)
+    bits = [f"rewound {n} turn(s)", f"{msgs} message(s) dropped"]
+    if calls:
+        # The honest caveat: context forgets these, the filesystem does not.
+        bits.append(f"{calls} tool call(s) dropped from context - "
+                    f"files/commands already run are NOT reverted")
+    print(dim("; ".join(bits) + "."))
+    if text:
+        agent._queued_turns.append(text)
+        print(dim(f"-> sending your new prompt as the next turn."))
+    agent._print_ctx()
+
+
 def handle_compact_at_command(agent, cfg, arg):
     """/compact_at [frac] - THE context lever: the fill fraction of the window at which
     auto-compaction is forced (soft zone slides with it: soft = compact_at * soft_ratio).
@@ -15858,6 +15968,7 @@ _BUILTIN_COMMANDS_TABLE = {
     "/reload": handle_reload_command,
     "/local": handle_local_command, "/disconnect": handle_local_command,
     "/trim": handle_trim_command,
+    "/rewind": handle_rewind_command,
     "/compact": handle_compact_command,
     "/compact_at": handle_compact_at_command,
     "/session": handle_session_command,

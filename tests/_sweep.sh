@@ -50,6 +50,13 @@ report "dash-like unicode (use ASCII -)" \
 report "unicode arrows (use ASCII -> )" \
   "$(grep -rnP "[\x{2190}-\x{21FF}\x{2794}\x{27A1}]" "${FILES[@]}" | nosweep)"
 
+# Invisible / zero-width / format-control / bidi / variation-selector / unicode-tag
+# chars: zero legit use in source, and the exact vector for a fingerprint/watermark
+# smuggled into tracked source. Keep this set in sync with _scrub_invisible() in
+# lean-tools/builtins.py (which strips the same class from model-written files).
+report "invisible / zero-width / control unicode (watermark/smuggle vector)" \
+  "$(grep -rnP "[\x{200b}-\x{200f}\x{2060}-\x{2064}\x{feff}\x{00ad}\x{061c}\x{180e}\x{202a}-\x{202e}\x{2066}-\x{2069}\x{fe00}-\x{fe0f}\x{E0000}-\x{E007f}]" "${FILES[@]}" | nosweep)"
+
 # --- likely secrets / PII --------------------------------------------------
 # Any dotted-quad that is NOT localhost, 0.0.0.0, or an RFC 5737 doc range
 # (192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24). Use the doc ranges in examples.
