@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L1196   Lean-tools (plugin tools: discovery, manager)
-  L1546   MCP client (connection, manager, OAuth, discovery)
-  L2000   Providers (backend plugin registry)
-  L2222   Interactive pickers + menus (raw-mode UI engine)
-  L2571   Terminal styling (colors, formatting helpers)
-  L2771   Streaming + markdown render (model output)
-  L3215   Composer (pinned input line, editor, stdin)
-  L4065   Token accounting (calibrated context meter)
-  L4239   Config (dataclass, field registry, load/save)
-  L7504   Tool execution + text tool-call parsing
-  L7930   Remote workspace (executor client, /connect)
-  L9525   Context meter
-  L9620   Agent (turn loop, context mgmt, tool dispatch)
-  L16039  Slash-command handlers + dispatch table
-  L16176  REPL (interactive loop, session resume)
-  L16550  Worker agent (headless --agent-run)
-  L17162  Entry (CLI arg parsing, main)
+  L1205   Lean-tools (plugin tools: discovery, manager)
+  L1555   MCP client (connection, manager, OAuth, discovery)
+  L2009   Providers (backend plugin registry)
+  L2231   Interactive pickers + menus (raw-mode UI engine)
+  L2580   Terminal styling (colors, formatting helpers)
+  L2780   Streaming + markdown render (model output)
+  L3224   Composer (pinned input line, editor, stdin)
+  L4074   Token accounting (calibrated context meter)
+  L4248   Config (dataclass, field registry, load/save)
+  L7513   Tool execution + text tool-call parsing
+  L7939   Remote workspace (executor client, /connect)
+  L9534   Context meter
+  L9629   Agent (turn loop, context mgmt, tool dispatch)
+  L16137  Slash-command handlers + dispatch table
+  L16274  REPL (interactive loop, session resume)
+  L16648  Worker agent (headless --agent-run)
+  L17260  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -116,7 +116,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.10.25"
+__version__ = "0.10.26"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -124,6 +124,15 @@ __version__ = "0.10.25"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.10.26": [
+        "new: /board - inspect the model's task boards read-only, straight from the",
+        "  prompt. A board is just a JSON doc under the config dir, so this reads it",
+        "  directly: no need to enable the `board` tool (whose ~500-token schema would",
+        "  then ride in every request for the rest of the session) and no model turn spent",
+        "  just to look. `/board` lists them, `/board <name>` shows one's tasks + which are",
+        "  ready, `/board delete <name>` prunes one. Creating/assigning stays the model's",
+        "  job. Tab-completes board names.",
+    ],
     "0.10.25": [
         "fix: the `board` tool now works while /connect'd to a remote. It was routed to",
         "  the remote executor (it's a safe tool), where setup() never runs - so its core",
@@ -12425,7 +12434,7 @@ SLASH_COMMANDS = ["/clear", "/new", "/rewind", "/trim", "/compact", "/compact_at
                   "/prompt", "/sh", "/connect", "/machines", "/local", "/disconnect", "/tools", "/reload",
                   "/model", "/models", "/provider", "/providers", "/think", "/effort",
                   "/set", "/usage", "/approve", "/leash", "/autosave", "/incognito",
-                  "/askread", "/bg", "/background", "/note", "/plan", "/mcp", "/info", "/activity", "/expand",
+                  "/askread", "/bg", "/background", "/note", "/plan", "/board", "/mcp", "/info", "/activity", "/expand",
                   "/help", "/h", "/?", "/quit", "/exit", "/q"]
 
 # Built-in command names are the shadow-protection set: lean-tool commands can't claim
@@ -12641,6 +12650,7 @@ HELP_COMMANDS = [
     ("/bg [kill <pid>]", "list/kill background tasks"),
     ("/note [grep|range|add|clear]", "the session notebook (episodic memory); no arg = recent"),
     ("/plan [set|goal|add|done|clear]", "view/steer the pinned GOAL+TODO; no arg = show"),
+    ("/board [name|delete <name>]", "inspect task boards read-only (no tool schema, no model turn)"),
     ("/info", "live session read-out"),
     ("/activity [n|all]", "what the system did automatically (compaction, trim, fallback, ...)"),
     ("/expand [N]", "show a tool call's full args + captured output; bare = newest, N = the #id"),
@@ -13281,6 +13291,89 @@ def handle_plan_command(agent, cfg, arg):
     print(agent._update_plan(body))
 
 
+def _fmt_board_task(t, ready_ids):
+    """One task as a compact status line (mirrors board.py's _fmt_task, kept here so the
+    /board command has zero dependency on the lean-tool being enabled/loaded)."""
+    tid = t.get("id", "?")
+    st = t.get("status", "?")
+    flag = " READY" if tid in ready_ids else ""
+    who = f" @{t['assignee']}" if t.get("assignee") not in (None, "") else ""
+    deps = t.get("deps") or []
+    dep = f" deps={','.join(deps)}" if deps else ""
+    note = f"  - {t['note']}" if t.get("note") else ""
+    rr = f"  ->{t['result_ref']}" if t.get("result_ref") else ""
+    return f"  {tid} [{st}{flag}]{who}{dep} {t.get('name', '')}{rr}{note}"
+
+
+def handle_board_command(agent, cfg, arg):
+    """/board - inspect the task boards (the model's `board` tool coordination surface),
+    read-only and WITHOUT enabling the tool: a board is just a JSON doc under the config
+    dir, so this reads it directly - no ~500-token tool schema in context, no model turn.
+      /board            list every saved board (name, task counts, when updated)
+      /board <name>     show one board's tasks + which are ready to assign
+      /board delete <n> remove a saved board (they otherwise accumulate forever)
+    Creating/adding/assigning stays the model's job (driver-orchestration) - letting the
+    operator hand-edit task state would desync it from what the model believes is there."""
+    arg = (arg or "").strip()
+
+    if not arg:
+        rows = _taskboards_list()
+        if not rows:
+            print(dim("no task boards. The model creates one with the `board` tool "
+                      "(or a worker assigned to a named board)."))
+            return
+        print(bold("task boards") + dim(f"  ({len(rows)})"))
+        for name, meta in rows:
+            counts = meta.get("counts", {})
+            csum = ", ".join(f"{k}:{v}" for k, v in counts.items() if v) or "empty"
+            when = meta.get("updated_at", "")
+            when = dim(f"  {when}") if when else ""
+            print(f"  {cyan(name)}  " + dim(f"({csum})") + when)
+        print(dim("`/board <name>` to view one."))
+        return
+
+    parts = arg.split(maxsplit=1)
+    if parts[0].lower() == "delete":
+        if len(parts) < 2 or not parts[1].strip():
+            print("error: `/board delete <name>` needs a board name.")
+            return
+        target = parts[1].strip()
+        p = _taskboard_path(target)
+        if not p or not p.is_file():
+            print(dim(f"no board named '{_session_name_ok(target)}'."))
+            return
+        if not _ask(f"delete board '{p.stem}'? (the model can no longer reconcile it)"):
+            print(dim("delete cancelled."))
+            return
+        try:
+            p.unlink()
+            print(dim(f"deleted board '{p.stem}'."))
+        except OSError as e:
+            print(yellow(f"could not delete: {e}"))
+        return
+
+    # /board <name> - show it
+    board = _taskboard_load(arg)
+    if board is None:
+        print(dim(f"no board named '{_session_name_ok(arg)}'. `/board` lists them."))
+        return
+    ready, _blocked = _taskboard_ready(board)
+    ready_ids = {t.get("id") for t in ready}
+    counts = board.get("meta", {}).get("counts", {})
+    csum = ", ".join(f"{k}:{v}" for k, v in counts.items() if v) or "empty"
+    print(bold(f"board '{board.get('meta', {}).get('name', _session_name_ok(arg))}'")
+          + dim(f"  ({csum})"))
+    tasks = board.get("tasks", [])
+    if not tasks:
+        print(dim("  (no tasks)"))
+    for t in tasks:
+        print(_fmt_board_task(t, ready_ids))
+    if ready_ids:
+        print(green(f"ready to assign: {', '.join(sorted(ready_ids))}"))
+    else:
+        print(dim("ready to assign: (none)"))
+
+
 def _provider_usage_str(agent, cfg, verbose=False) -> str:
     """The active backend's usage/quota tail (e.g. the '5h .. wk ..' meters), already
     styled, or '' if the backend reports none. Core does the rendering so every
@@ -13526,6 +13619,10 @@ def _arg_completions(agent, cfg, cmd):
         return ["recent", "grep", "range", "add", "clear"]
     if cmd == "/plan":
         return ["set", "goal", "add", "done", "clear"]
+    if cmd == "/board":
+        return ["delete"] + [n for n, _ in _taskboards_list()]
+    if cmd == "/board delete":
+        return [n for n, _ in _taskboards_list()]
     if cmd == "/plan done":                    # complete with the OPEN task texts
         cur = getattr(agent, "pinned_plan", "") or ""
         out = []
@@ -15986,6 +16083,7 @@ _BUILTIN_COMMANDS_TABLE = {
     "/bg": handle_bg_command, "/background": handle_bg_command,
     "/note": handle_note_command,
     "/plan": handle_plan_command,
+    "/board": handle_board_command,
     "/autosave": handle_autosave_command,
     "/incognito": handle_incognito_command,
     "/leash": handle_leash_command,
