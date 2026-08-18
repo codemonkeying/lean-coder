@@ -73,6 +73,14 @@ TOOL = {
         "required": ["action", "board"],
     },
     "safe": True,
+    # driver_only: the board is pure driver-orchestration state - a JSON doc under the
+    # DRIVER's config dir (workers/taskboards/<name>.json) that reconcile + any peer
+    # session read from THERE. It has no dependency on a connected workspace. Without
+    # this flag a /connect routes the tool to the remote --tool-exec executor, which (a)
+    # never runs setup() so the tool's core hooks (_H) are unset -> "board tool is not
+    # initialised", and (b) would write the JSON to the REMOTE box, invisible to the
+    # driver's reconcile. Pin it to the driver, like brave_search and dispatch_worker.
+    "driver_only": True,
 }
 
 

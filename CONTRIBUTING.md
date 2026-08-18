@@ -35,6 +35,23 @@ flagged token can be exempted by ending it with a `# sweep-ok` marker - use spar
 
 A change is ready when all three are green.
 
+### Let the hook run them for you
+
+The repo ships git hooks in `.githooks/`. Enable them once per clone:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+`pre-push` then runs all three gates (plus a `VERSION` / `__version__` match check)
+and refuses the push if any fail - it stays quiet when they pass, and takes about
+half a minute. `pre-commit` blocks the never-ship/local-only trees.
+
+This exists because the gates only work if something actually runs them. `_sweep.sh`
+sat uninvoked long enough for a real internal IP to ship, and `_mocktest.py` was
+crashing on a stale stub through six releases for the same reason. In a real
+emergency, `git push --no-verify` bypasses it.
+
 ## Versioning
 
 Releases follow [SemVer](https://semver.org/): `MAJOR.MINOR.PATCH`.
