@@ -89,8 +89,8 @@ def setup(lc, cfg):
     tool's run() gets no lc, so everything it needs is stashed on _H here."""
     for k in ("_taskboard_create", "_taskboard_load", "_taskboard_save", "_taskboard_add",
               "_taskboard_ready", "_taskboard_set_status", "_taskboard_reconcile",
-              "_taskboard_mutate", "_taskboards_list", "_tb_task", "dim", "bold",
-              "green", "cyan"):
+              "_taskboard_mutate", "_taskboards_list", "_tb_task", "worker_inject",
+              "dim", "bold", "green", "cyan"):
         if k in lc:
             _H[k] = lc[k]
     _H["cfg"] = cfg
@@ -109,6 +109,19 @@ def _is_driver():
 def _driver_only(action):
     return (f"error: action='{action}' is driver-only - a worker cannot direct the board "
             f"(it may only list/find, and done/fail its own task).")
+
+
+def _push(worker, text):
+    """Best-effort ping to a live worker (assign/done auto-notify so it need not poll the
+    board). No-op unless dispatch_worker registered its inject bridge and `worker` is a
+    live pid. Returns True if delivered. Never raises."""
+    fn = _H.get("worker_inject")
+    if not fn or not worker:
+        return False
+    try:
+        return bool(fn(str(worker), text))
+    except Exception:
+        return False
 
 
 def _fmt_task(t, ready_ids):
@@ -268,7 +281,15 @@ def run(args, cwd):
         board2, tname, err = _H["_taskboard_mutate"](name, _do_assign)
         if err:
             return f"error: {err}"
-        return f"assigned {tid} '{tname}' to worker {worker}."
+        # 1a: push the task detail to the assigned worker inline, so it acts on this turn
+        # instead of spending one polling the board. Best-effort - if it's not a live pid
+        # (a label, a not-yet-spawned peer), the worker just reads the board itself.
+        ping = (f"[board '{name}'] You are assigned {tid}: {tname}."
+                + (f" Note: {note}" if note else "")
+                + " Do this task, then mark it done on the board (action='done').")
+        pushed = _push(worker, ping)
+        tail = " (worker pinged)" if pushed else ""
+        return f"assigned {tid} '{tname}' to worker {worker}.{tail}"
 
     if action in ("done", "fail"):
         tid = (args.get("task") or "").strip()

@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L1205   Lean-tools (plugin tools: discovery, manager)
-  L1555   MCP client (connection, manager, OAuth, discovery)
-  L2009   Providers (backend plugin registry)
-  L2231   Interactive pickers + menus (raw-mode UI engine)
-  L2580   Terminal styling (colors, formatting helpers)
-  L2780   Streaming + markdown render (model output)
-  L3224   Composer (pinned input line, editor, stdin)
-  L4074   Token accounting (calibrated context meter)
-  L4248   Config (dataclass, field registry, load/save)
-  L7513   Tool execution + text tool-call parsing
-  L7939   Remote workspace (executor client, /connect)
-  L9534   Context meter
-  L9629   Agent (turn loop, context mgmt, tool dispatch)
-  L16137  Slash-command handlers + dispatch table
-  L16274  REPL (interactive loop, session resume)
-  L16648  Worker agent (headless --agent-run)
-  L17260  Entry (CLI arg parsing, main)
+  L1219   Lean-tools (plugin tools: discovery, manager)
+  L1569   MCP client (connection, manager, OAuth, discovery)
+  L2023   Providers (backend plugin registry)
+  L2245   Interactive pickers + menus (raw-mode UI engine)
+  L2594   Terminal styling (colors, formatting helpers)
+  L2794   Streaming + markdown render (model output)
+  L3238   Composer (pinned input line, editor, stdin)
+  L4088   Token accounting (calibrated context meter)
+  L4262   Config (dataclass, field registry, load/save)
+  L7569   Tool execution + text tool-call parsing
+  L7995   Remote workspace (executor client, /connect)
+  L9590   Context meter
+  L9685   Agent (turn loop, context mgmt, tool dispatch)
+  L16193  Slash-command handlers + dispatch table
+  L16330  REPL (interactive loop, session resume)
+  L16704  Worker agent (headless --agent-run)
+  L17375  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -116,7 +116,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.10.26"
+__version__ = "0.10.27"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -124,6 +124,20 @@ __version__ = "0.10.26"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.10.27": [
+        "board: assigning a task to a LIVE worker now pushes the task detail to it inline,",
+        "  so it acts that turn instead of spending one polling the board (a new core",
+        "  worker_inject bridge lets the board tool reach dispatch_worker's live workers).",
+        "  Assigning to a plain label (a peer role, an unspawned worker) just falls back to",
+        "  no push, as before.",
+        "worker: a background job now keeps its worker alive. Previously a worker that",
+        "  launched a bg job and then finished its reasoning would exit - and on a remote",
+        "  executor that tears the executor (and the job) down to zero-trace, killing the",
+        "  work. Now the worker parks until the job finishes, feeds the result back for a",
+        "  final turn, then completes. If the job outlives worker_idle_timeout the worker",
+        "  reports INCOMPLETE (not a fake success), so the driver intervenes rather than",
+        "  waiting for work that never finished.",
+    ],
     "0.10.26": [
         "new: /board - inspect the model's task boards read-only, straight from the",
         "  prompt. A board is just a JSON doc under the config dir, so this reads it",
@@ -5861,6 +5875,35 @@ def register_wake_hook(fn):
     return fn
 
 
+# Board -> worker bridge. The board lean-tool (assign/done) wants to PING a live worker
+# it just scheduled ("you're on task t3" / "t2's done, you're unblocked"), but the live
+# workers dict lives in dispatch_worker's own _H, unreachable from board.py. dispatch_worker
+# registers its inject function here at setup(); board.py resolves it via lc["worker_inject"].
+# No-op (returns False) when dispatch_worker isn't enabled - the board still works, it just
+# can't push (the worker reads the board itself next turn, as before). Signature:
+#   fn(worker, text) -> bool   (worker = the pid/label the board assigned; True if delivered)
+_WORKER_INJECT_HOOK = [None]
+
+
+def register_worker_inject(fn):
+    """dispatch_worker calls this in setup() to expose its live-worker inject channel to
+    the board tool. fn(worker, text) -> bool. Last registration wins (one dispatcher)."""
+    _WORKER_INJECT_HOOK[0] = fn
+    return fn
+
+
+def worker_inject(worker, text):
+    """Board -> live-worker ping. Best-effort: True if a running worker with that pid got
+    the message, False otherwise (no dispatcher, bad/gone pid, non-int label). Never raises
+    - a failed push just means the worker learns from the board on its own next turn."""
+    fn = _WORKER_INJECT_HOOK[0]
+    if fn is None:
+        return False
+    try:
+        return bool(fn(worker, text))
+    except Exception:
+        return False
+
 def _bg_is_worker(rec) -> bool:
     """A dispatched-agent record (kind='worker'). Everything else - incl. records
     that predate the field - is a plain task. Plain-bg surfaces filter workers OUT
@@ -5931,6 +5974,19 @@ def _bg_finished_here(owner):
                     "notify_on_exit": bool(r.get("notify_on_exit"))})
     return out
 
+
+def _own_live_bg_jobs(owner=None):
+    """This process's own still-alive PLAIN bg tasks (kind='task'; workers excluded - a
+    worker's children notify via their own path). Used by the headless worker loop to
+    decide whether it may finish: a worker that launched a bg job must NOT exit while the
+    job is live - on a remote executor, exiting tears the executor (and the job) down to
+    zero-trace. Returns the live records; [] = safe to finish."""
+    if owner is None:
+        owner = os.getpid()
+    try:
+        return _bg_running(owner=owner, kind="task")
+    except Exception:
+        return []
 
 def _bg_finished_msg(items):
     """Format finished-task dicts (from _bg_finished_here / a BG_POLL reply) into
@@ -17232,6 +17288,65 @@ def run_agent_brief(args) -> int:
         except Exception as e:
             return _fail(f"worker result-rescue turn failed: {e}")
 
+    # pending-bg PARK: the worker reasoned to a natural stop, but it still has its own
+    # live background job(s). It must NOT exit yet - on a remote executor, this process
+    # ending tears the executor (and the job) down to zero-trace, killing the very work.
+    # So park until the job(s) finish, then feed the results back as one more turn so the
+    # worker can incorporate them before its final RESULT. Bounded by worker_idle_timeout
+    # so a hung job can't park forever - on timeout we DON'T harvest a normal RESULT (that
+    # signals success, and the driver would reconcile a task whose work never finished);
+    # instead we report INCOMPLETE + return 2, the honest "this needs intervention, don't
+    # wait for it" signal (same contract as the iteration-cap path). Best-effort: an error
+    # in the park itself just proceeds to normal harvest (never worse than exiting).
+    try:
+        _park_ceiling = int(getattr(cfg, "worker_idle_timeout", 0) or 0) or 1800
+        _park_deadline = time.time() + _park_ceiling
+        _parked_any = False
+        _park_timed_out = False
+        while _own_live_bg_jobs():
+            _parked_any = True
+            if time.time() > _park_deadline:
+                _park_timed_out = True
+                break
+            _bg_bump = getattr(agent, "_bg_bump_session", None)
+            if _bg_bump:
+                _bg_bump()                    # keep our own leased jobs alive while we park
+            time.sleep(3)
+        if _park_timed_out:
+            # A job outlived the park ceiling. Report INCOMPLETE (not a fake success) so the
+            # driver acts (check/kill the job, re-dispatch) rather than reconciling a task
+            # whose bg work never completed. The job keeps running - it's the parent's call.
+            _live = _own_live_bg_jobs()
+            _cmds = ", ".join(f"`{j.get('cmd', '?')}` (pid {j.get('pid')})" for j in _live) or "a bg job"
+            try:
+                Path(resultf).write_text(
+                    f"{RESULT_MARK}\nINCOMPLETE: the worker finished its reasoning but a "
+                    f"background job it launched was still running after the "
+                    f"{_park_ceiling}s park ceiling ({_cmds}). The worker did NOT complete - "
+                    f"do not treat this task as done. Check the job (it is still running), "
+                    f"kill it if stuck, and re-dispatch or raise worker_idle_timeout.\n"
+                    f"{RESULT_MARK}\n")
+            except OSError as e:
+                return _fail(f"cannot write result file: {e}")
+            print(dim(f"agent-run: incomplete (bg-park timed out, job still live) -> {resultf}"))
+            return 2
+        if _parked_any and not _own_live_bg_jobs():
+            # Job(s) done: surface their finish notice and let the worker react + finalise.
+            note = ""
+            try:
+                note = agent._bg_finished_note()
+            except Exception:
+                note = ""
+            steer = ((note + "\n\n") if note else "") + (
+                "Your background job(s) have finished (see above). Incorporate the outcome, "
+                f"then write your final answer between two {RESULT_MARK} markers as your "
+                "entire message (no tool call).")
+            try:
+                agent.run_turn(steer)
+            except Exception as e:
+                print(dim(f"agent-run: post-bg finalise turn failed ({e}); harvesting as-is."))
+    except Exception as e:
+        print(dim(f"agent-run: bg-park skipped ({e}); harvesting as-is."))
     # Harvest: the last assistant text -> its RESULT block, or the whole message.
     final = ""
     for m in reversed(agent.messages):

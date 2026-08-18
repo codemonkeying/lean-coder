@@ -1758,6 +1758,24 @@ def setup(lc, cfg):
     if _reg:
         _reg(lambda: _finished_notice() or "")
 
+    # BOARD -> WORKER ping. Expose a pid-targeted inject to the board tool (assign/done
+    # push a "you're on t3" / "t2 done, you're unblocked" nudge to the live worker so it
+    # need not poll the board). Board.py can't see our _H["workers"], so bridge via core.
+    # A board 'worker' label may be a pid (int) or a free label; only an int pid maps to a
+    # live worker here - anything else returns False (board falls back to no push).
+    _reg_inject = lc.get("register_worker_inject")
+    if _reg_inject:
+        def _board_push(worker, text):
+            try:
+                pid = int(str(worker).strip())
+            except (TypeError, ValueError):
+                return False
+            if pid not in _H["workers"]:
+                return False
+            out = _worker_inject(pid, text, source="board")
+            return isinstance(out, str) and out.startswith("injected")
+        _reg_inject(_board_push)
+
     # A small helper to list models available on this box (for validation), resolved
     # lazily so it reflects the live provider.
     def _available_models():
