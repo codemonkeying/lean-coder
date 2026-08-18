@@ -592,11 +592,11 @@ check("[clean] no tool_filter hook advertised (apply_diff kept for everyone)",
 _wcfg = lc.Config(cwd=FIX, host=cfg.host)
 _wagent = lc.Agent(_wcfg)
 # no finished task -> empty (no spurious wake)
-_wagent._bg_finished_note = lambda: ""
+_wagent._bg_finished_note = lambda **_kw: ""
 check("[wake] no finished task -> empty (agent stays asleep)", _wagent.bg_wake_turn() == "")
 # a finished task -> framed autonomous-wake turn carrying the notice
 _NOTICE = "background task finished: `eval run` exited 0\nlast output:\ndone 21/21"
-_wagent._bg_finished_note = lambda: _NOTICE
+_wagent._bg_finished_note = lambda **_kw: _NOTICE
 _w = _wagent.bg_wake_turn()
 check("[wake] finished task -> non-empty synthesised turn", bool(_w))
 check("[wake] wake turn carries the finish notice", _NOTICE in _w)
@@ -614,20 +614,20 @@ check("[wake] register_wake_hook exposed to lean-tools", callable(getattr(lc, "r
 _saved_hooks = list(lc._WAKE_HOOKS)
 lc._WAKE_HOOKS.clear()
 _wagent2 = lc.Agent(lc.Config(cwd=FIX, host=cfg.host))
-_wagent2._bg_finished_note = lambda: ""          # no plain-bg task finished
+_wagent2._bg_finished_note = lambda **_kw: ""          # no plain-bg task finished
 _WNOTE = "[worker 101 finished (r, devstral:24b) - task: scout\nresult:\nfound it]"
 lc.register_wake_hook(lambda: _WNOTE)            # a worker finished
 _wt = _wagent2.bg_wake_turn()
 check("[wake] worker-finish hook wakes the agent", bool(_wt) and _WNOTE in _wt)
 check("[wake] worker wake carries autonomous framing", "autonomous wake" in _wt.lower())
 # aggregation: both a plain task AND a worker in one wake turn
-_wagent2._bg_finished_note = lambda: "background task finished: `x` exited 0"
+_wagent2._bg_finished_note = lambda **_kw: "background task finished: `x` exited 0"
 _wt2 = _wagent2.bg_wake_turn()
 check("[wake] aggregates task + worker in one wake turn",
       "background task finished" in _wt2 and _WNOTE in _wt2)
 # a raising hook must not break the wake turn (best-effort)
 lc._WAKE_HOOKS.clear()
-_wagent2._bg_finished_note = lambda: ""
+_wagent2._bg_finished_note = lambda **_kw: ""
 lc.register_wake_hook(lambda: (_ for _ in ()).throw(RuntimeError("boom")))
 check("[wake] a raising hook is swallowed (no wake, no crash)", _wagent2.bg_wake_turn() == "")
 # register is idempotent

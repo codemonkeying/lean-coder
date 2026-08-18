@@ -1,0 +1,75 @@
+#!/bin/sh
+# Run the three gates before anything leaves this machine.
+#
+# Why a hook and not just discipline: the gates only work if they're actually run,
+# and twice now they weren't. tests/_sweep.sh existed for ages before anything
+# invoked it, and a real internal IP shipped as a result. Then tests/_mocktest.py
+# sat CRASHING on a stale stub through six releases (v0.10.19-v0.10.24) because the
+# release ritual only ever ran two of the three. A gate nobody runs is not a gate.
+# This makes the machine remember instead of a human.
+#
+# All three are offline, dependency-free and quick (no API keys, no network, no
+# model calls), so there is no good reason to skip them. Bypass in a genuine
+# emergency with:  git push --no-verify
+#
+# Enabled by:  git config core.hooksPath .githooks   (already set in this repo)
+set -eu
+
+# Hooks run from the repo root, but don't rely on it.
+cd "$(git rev-parse --show-toplevel)" || exit 1
+
+# Nothing to check on a branch deletion (refs pushed as all-zero sha).
+# Read stdin (<local ref> <local sha> <remote ref> <remote sha>) and bail out early
+# if every ref being pushed is a delete - no code is going anywhere.
+deleting_only=1
+while read -r _local_ref local_sha _remote_ref _remote_sha; do
+	case "$local_sha" in
+		*[!0]*) deleting_only=0 ;;
+	esac
+done
+[ "$deleting_only" = 1 ] && exit 0
+
+fail=0
+
+run_gate() {
+	name="$1"
+	shift
+	printf 'pre-push: %-24s' "$name"
+	# Capture output so a passing gate stays quiet; show it only on failure.
+	if out=$("$@" 2>&1); then
+		echo "ok"
+	else
+		echo "FAIL"
+		printf '%s\n' "$out" | tail -25 | sed 's/^/    /' >&2
+		fail=1
+	fi
+}
+
+# _smoketest.py and _mocktest.py print a final "ALL PASS" line AND exit non-zero on
+# failure, so the exit status is enough - no output parsing needed.
+run_gate "smoketest (unit)"   python3 tests/_smoketest.py
+run_gate "mocktest (e2e)"     python3 tests/_mocktest.py
+run_gate "sweep (hygiene)"    bash   tests/_sweep.sh
+
+# VERSION and __version__ must agree - a mismatch means a half-finished release
+# ritual, and /update probes VERSION to decide whether to pull. The smoketest also
+# asserts this; checked here too because it's the one that bites users directly.
+printf 'pre-push: %-24s' "version match"
+v_file=$(cat VERSION 2>/dev/null || echo "")
+v_src=$(sed -n 's/^__version__ = "\(.*\)"/\1/p' lean_coder.py | head -1)
+if [ -n "$v_file" ] && [ "$v_file" = "$v_src" ]; then
+	echo "ok ($v_file)"
+else
+	echo "FAIL"
+	echo "    VERSION='$v_file' but lean_coder.py __version__='$v_src'" >&2
+	fail=1
+fi
+
+if [ "$fail" != 0 ]; then
+	echo "" >&2
+	echo "pre-push: BLOCKED - fix the above, or bypass with: git push --no-verify" >&2
+	exit 1
+fi
+
+echo "pre-push: all gates green - pushing."
+exit 0

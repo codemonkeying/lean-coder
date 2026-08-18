@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L1187   Lean-tools (plugin tools: discovery, manager)
-  L1537   MCP client (connection, manager, OAuth, discovery)
-  L1991   Providers (backend plugin registry)
-  L2213   Interactive pickers + menus (raw-mode UI engine)
-  L2562   Terminal styling (colors, formatting helpers)
-  L2762   Streaming + markdown render (model output)
-  L3206   Composer (pinned input line, editor, stdin)
-  L4056   Token accounting (calibrated context meter)
-  L4230   Config (dataclass, field registry, load/save)
-  L7495   Tool execution + text tool-call parsing
-  L7921   Remote workspace (executor client, /connect)
-  L9516   Context meter
-  L9611   Agent (turn loop, context mgmt, tool dispatch)
-  L16030  Slash-command handlers + dispatch table
-  L16167  REPL (interactive loop, session resume)
-  L16541  Worker agent (headless --agent-run)
-  L17153  Entry (CLI arg parsing, main)
+  L1196   Lean-tools (plugin tools: discovery, manager)
+  L1546   MCP client (connection, manager, OAuth, discovery)
+  L2000   Providers (backend plugin registry)
+  L2222   Interactive pickers + menus (raw-mode UI engine)
+  L2571   Terminal styling (colors, formatting helpers)
+  L2771   Streaming + markdown render (model output)
+  L3215   Composer (pinned input line, editor, stdin)
+  L4065   Token accounting (calibrated context meter)
+  L4239   Config (dataclass, field registry, load/save)
+  L7504   Tool execution + text tool-call parsing
+  L7930   Remote workspace (executor client, /connect)
+  L9525   Context meter
+  L9620   Agent (turn loop, context mgmt, tool dispatch)
+  L16039  Slash-command handlers + dispatch table
+  L16176  REPL (interactive loop, session resume)
+  L16550  Worker agent (headless --agent-run)
+  L17162  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -116,7 +116,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.10.24"
+__version__ = "0.10.25"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -124,6 +124,15 @@ __version__ = "0.10.24"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.10.25": [
+        "fix: the `board` tool now works while /connect'd to a remote. It was routed to",
+        "  the remote executor (it's a safe tool), where setup() never runs - so its core",
+        "  hooks were unset and every call failed with 'board tool is not initialised'. The",
+        "  board is driver-orchestration state (a JSON doc under the DRIVER's config dir",
+        "  that reconcile + peer sessions read from there), so it's now driver_only: it",
+        "  always runs on the driver regardless of /connect, like brave_search and",
+        "  dispatch_worker. Workaround on older versions: /local before using the board.",
+    ],
     "0.10.24": [
         "new: /rewind [N] [prompt] - drop the last N user turns (default 1). The escape",
         "  hatch for a model that refused, looped, or went down a wrong path: rewind past",
