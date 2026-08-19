@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L1230   Lean-tools (plugin tools: discovery, manager)
-  L1580   MCP client (connection, manager, OAuth, discovery)
-  L2034   Providers (backend plugin registry)
-  L2256   Interactive pickers + menus (raw-mode UI engine)
-  L2605   Terminal styling (colors, formatting helpers)
-  L2805   Streaming + markdown render (model output)
-  L3249   Composer (pinned input line, editor, stdin)
-  L4099   Token accounting (calibrated context meter)
-  L4273   Config (dataclass, field registry, load/save)
-  L7691   Tool execution + text tool-call parsing
-  L8117   Remote workspace (executor client, /connect)
-  L9712   Context meter
-  L9807   Agent (turn loop, context mgmt, tool dispatch)
-  L16315  Slash-command handlers + dispatch table
-  L16452  REPL (interactive loop, session resume)
-  L16826  Worker agent (headless --agent-run)
-  L17497  Entry (CLI arg parsing, main)
+  L1237   Lean-tools (plugin tools: discovery, manager)
+  L1587   MCP client (connection, manager, OAuth, discovery)
+  L2041   Providers (backend plugin registry)
+  L2263   Interactive pickers + menus (raw-mode UI engine)
+  L2612   Terminal styling (colors, formatting helpers)
+  L2812   Streaming + markdown render (model output)
+  L3256   Composer (pinned input line, editor, stdin)
+  L4119   Token accounting (calibrated context meter)
+  L4293   Config (dataclass, field registry, load/save)
+  L7711   Tool execution + text tool-call parsing
+  L8137   Remote workspace (executor client, /connect)
+  L9732   Context meter
+  L9827   Agent (turn loop, context mgmt, tool dispatch)
+  L16335  Slash-command handlers + dispatch table
+  L16472  REPL (interactive loop, session resume)
+  L16846  Worker agent (headless --agent-run)
+  L17517  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -116,7 +116,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.10.28"
+__version__ = "0.10.29"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -124,6 +124,13 @@ __version__ = "0.10.28"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.10.29": [
+        "fix: resizing the terminal while sitting at the idle prompt no longer leaves the",
+        "  input line desynced (every keystroke spawning a fresh full-width rule). The",
+        "  resize handler was only armed during a running turn, not while idle - now it",
+        "  follows the composer's ownership of the terminal for both, so a resize repaints",
+        "  the pinned input box cleanly whenever it's on screen.",
+    ],
     "0.10.28": [
         "board: peer sessions can now be woken to work a task. Register a peer with the",
         "  board's new `participant` action (a durable identity-only record: name, role,",
@@ -3294,6 +3301,9 @@ class Composer:
                                          # signals you're not local (like root's # vs $)
         self._resize_pending = False     # SIGWINCH sets this; the reader thread does
                                          # the actual resize (see on_resize / _reader)
+        self._old_winch = None           # prior SIGWINCH handler, saved by start_tty
+                                         # and restored by stop_tty (routed while we
+                                         # own the TTY, for BOTH idle and turn paths)
 
     def armed(self) -> bool:
         """A pending confirm is answerable only when the buffer is empty."""
@@ -3729,6 +3739,19 @@ class Composer:
             self._thread.start()
             self._redraw_locked()
             self._out.flush()
+            # Route SIGWINCH here so a live resize repaints (via _reader ->
+            # _apply_resize) for BOTH the idle prompt (read_line) and a running
+            # turn (composer_session). Must run on the main thread - all three
+            # start_tty callers do. Guarded for platforms without SIGWINCH
+            # (Windows) and swallowed if it can't install (degrades to no live
+            # resize, the pre-fix idle behaviour). stop_tty restores the prior.
+            self._old_winch = None
+            if hasattr(signal, "SIGWINCH"):
+                try:
+                    self._old_winch = signal.getsignal(signal.SIGWINCH)
+                    signal.signal(signal.SIGWINCH, self.on_resize)
+                except (ValueError, OSError):
+                    self._old_winch = None
             return True
         except Exception as e:
             self.active = False
@@ -3752,6 +3775,14 @@ class Composer:
         self._running = False
         if self._thread:
             self._thread.join(timeout=0.4)
+        # Restore the SIGWINCH handler start_tty replaced, before we let go of
+        # the TTY - so resize routing follows composer ownership exactly.
+        if self._old_winch is not None and hasattr(signal, "SIGWINCH"):
+            try:
+                signal.signal(signal.SIGWINCH, self._old_winch)
+            except (ValueError, OSError):
+                pass
+        self._old_winch = None
         try:
             self._out.write("\033[?2004l")                         # bracketed paste off
             self._out.write("\033[r")                              # reset region
@@ -3994,8 +4025,9 @@ class Composer:
 @contextmanager
 def composer_session(composer):
     """Run a turn with the composer owning the terminal. Redirects stdout through
-    it, routes SIGWINCH to it, and restores everything on exit (including on
-    exceptions / ^C). Yields True if it engaged, False if it fell back."""
+    it and restores everything on exit (including on exceptions / ^C). Yields True
+    if it engaged, False if it fell back. SIGWINCH routing lives in start_tty/
+    stop_tty (shared with the idle read_line path), so this only owns stdout."""
     global _active_composer
     if not composer.start_tty():
         yield False
@@ -4003,23 +4035,11 @@ def composer_session(composer):
     _active_composer = composer
     old_stdout = sys.stdout
     sys.stdout = composer
-    old_winch = None
-    if hasattr(signal, "SIGWINCH"):
-        try:
-            old_winch = signal.getsignal(signal.SIGWINCH)
-            signal.signal(signal.SIGWINCH, composer.on_resize)
-        except (ValueError, OSError):
-            old_winch = None
     try:
         yield True
     finally:
         sys.stdout = old_stdout
         _active_composer = None
-        if old_winch is not None:
-            try:
-                signal.signal(signal.SIGWINCH, old_winch)
-            except (ValueError, OSError):
-                pass
         composer.stop_tty()
 
 
