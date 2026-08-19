@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L1237   Lean-tools (plugin tools: discovery, manager)
-  L1587   MCP client (connection, manager, OAuth, discovery)
-  L2041   Providers (backend plugin registry)
-  L2263   Interactive pickers + menus (raw-mode UI engine)
-  L2612   Terminal styling (colors, formatting helpers)
-  L2812   Streaming + markdown render (model output)
-  L3256   Composer (pinned input line, editor, stdin)
-  L4119   Token accounting (calibrated context meter)
-  L4293   Config (dataclass, field registry, load/save)
-  L7711   Tool execution + text tool-call parsing
-  L8137   Remote workspace (executor client, /connect)
-  L9732   Context meter
-  L9827   Agent (turn loop, context mgmt, tool dispatch)
-  L16335  Slash-command handlers + dispatch table
-  L16472  REPL (interactive loop, session resume)
-  L16846  Worker agent (headless --agent-run)
-  L17517  Entry (CLI arg parsing, main)
+  L1245   Lean-tools (plugin tools: discovery, manager)
+  L1595   MCP client (connection, manager, OAuth, discovery)
+  L2049   Providers (backend plugin registry)
+  L2271   Interactive pickers + menus (raw-mode UI engine)
+  L2620   Terminal styling (colors, formatting helpers)
+  L2820   Streaming + markdown render (model output)
+  L3264   Composer (pinned input line, editor, stdin)
+  L4127   Token accounting (calibrated context meter)
+  L4301   Config (dataclass, field registry, load/save)
+  L7719   Tool execution + text tool-call parsing
+  L8145   Remote workspace (executor client, /connect)
+  L9774   Context meter
+  L9869   Agent (turn loop, context mgmt, tool dispatch)
+  L16377  Slash-command handlers + dispatch table
+  L16514  REPL (interactive loop, session resume)
+  L16888  Worker agent (headless --agent-run)
+  L17559  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -116,7 +116,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.10.29"
+__version__ = "0.10.30"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -124,6 +124,14 @@ __version__ = "0.10.29"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.10.30": [
+        "fix: /connect now works with an ssh key that is a GPG subkey (SSH_AUTH_SOCK",
+        "  pointed at gpg-agent). Before opening the interactive connection it refreshes",
+        "  gpg-agent's terminal, so a cold/expired key cache can draw its pinentry prompt",
+        "  where you're looking instead of failing with 'agent refused operation'. No-op",
+        "  for anyone not using a gpg-agent-backed key (gpg-connect-agent absent -> skipped),",
+        "  and unchanged with no controlling terminal, so the security gate holds.",
+    ],
     "0.10.29": [
         "fix: resizing the terminal while sitting at the idle prompt no longer leaves the",
         "  input line desynced (every keystroke spawning a fresh full-width rule). The",
@@ -8537,6 +8545,37 @@ def _ctl_path(host: str) -> str:
     return str(_runtime_dir() / f"cm-{safe}-{os.getpid()}.sock")
 
 
+def _refresh_gpg_agent_tty():
+    """Point gpg-agent's pinentry at OUR controlling terminal, right before an
+    interactive ssh open. When an ssh key is a GPG subkey (SSH_AUTH_SOCK -> the
+    gpg-agent ssh socket), ssh asks gpg-agent to sign; a cold/expired cache needs
+    a pinentry prompt, which pinentry-curses can only draw on the tty that was
+    last registered via `updatestartuptty`. A long-lived process (this one) never
+    ran that, so signing fails with 'agent refused operation' even though ssh owns
+    the terminal. Mirror the shell's `export GPG_TTY=$(tty); updatestartuptty` so
+    the prompt lands where the user is looking.
+
+    Best-effort and fully gated: only meaningful with a gpg-agent-backed key, a
+    no-op (skipped) when gpg-connect-agent is absent or there is no real tty, and
+    never raises. Security-neutral: with no tty there is nothing to register, so
+    pinentry still cannot draw (a pseudo-shell/worker gains nothing). Returns the
+    env dict to pass to the ssh subprocess (GPG_TTY set when we found a tty)."""
+    env = os.environ.copy()
+    try:
+        if not sys.stdin.isatty():
+            return env                       # no controlling tty: nothing to register
+        tty = os.ttyname(sys.stdin.fileno())
+        env["GPG_TTY"] = tty
+        gca = shutil.which("gpg-connect-agent")
+        if gca:                              # absent for non-gpg users -> pure no-op
+            subprocess.run([gca, "updatestartuptty", "/bye"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           timeout=5, env=env)
+    except Exception:
+        pass                                 # any failure -> degrade to prior behaviour
+    return env
+
+
 def _ssh_master_argv(host, ctl, connect_timeout=10, batch=False):
     # opens a backgrounded master; auth (key/password/passphrase) happens here,
     # interactively if needed (no BatchMode so the user can be prompted once).
@@ -8784,9 +8823,12 @@ class RemoteWorkspace:
             # So the interactive open runs PLAINLY (no capture, no spinner). This is the
             # fix for the b537592 regression where a password host looked hung then died
             # on Ctrl-C. ssh prints its own error to the tty; a nonzero rc suffices.
+            # Refresh gpg-agent's TTY first so a GPG-subkey ssh key can draw its
+            # pinentry prompt here (no-op without a gpg-agent-backed key).
+            _env = _refresh_gpg_agent_tty()
             print(dim("  opening ssh (you may be prompted for a password) ..."))
             try:
-                rc = subprocess.run(argv).returncode
+                rc = subprocess.run(argv, env=_env).returncode
             except KeyboardInterrupt:
                 _clear_master(self.host, self.ctl)
                 raise ConnectionError(f"ssh connection to {self.host} cancelled")
