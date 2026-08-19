@@ -41,13 +41,14 @@ TOOL = {
         "properties": {
             "action": {"type": "string",
                        "enum": ["create", "add", "assign", "done", "fail",
-                                "list", "reconcile"],
+                                "list", "reconcile", "participant"],
                        "description": "create=new board; add=append a task (deps=[...]); "
-                                      "assign=put a worker on a READY task; done/fail=record an "
-                                      "outcome; list=tasks (status= or query= filters); "
-                                      "reconcile=done results in dependency order. Driver-only: "
-                                      "create/add/assign. Workers: done/fail their task + list/"
-                                      "reconcile."},
+                                      "assign=put a worker/participant on a READY task; done/fail="
+                                      "record an outcome; list=tasks (status= or query= filters); "
+                                      "reconcile=done results in dependency order; participant="
+                                      "register/list peer agents (pre-declare an expected role, or "
+                                      "list who is registered). Driver-only: create/add/assign/"
+                                      "participant. Workers: done/fail their task + list/reconcile."},
             "board": {"type": "string",
                       "description": "Board name (like a session name). Required by every action."},
             "task": {"type": "string",
@@ -57,7 +58,15 @@ TOOL = {
                      "description": "add: task ids that must be 'done' before this is ready. Omit "
                                     "for none."},
             "worker": {"type": "string",
-                       "description": "assign: the worker pid (or label) to put on the task."},
+                       "description": "assign: the worker pid, OR a registered participant name/"
+                                      "role (a peer session). A live peer is pinged; a dormant one "
+                                      "is spawned from its session file; a peer live elsewhere gets "
+                                      "a board note. A bare label with no participant just records "
+                                      "the assignee."},
+            "role": {"type": "string",
+                     "description": "participant: the peer's role label (defaults to its name). "
+                                    "assign uses 'worker' as the participant name; this is only "
+                                    "for action='participant' registration."},
             "note": {"type": "string",
                      "description": "Optional free text: driver->worker context on assign, or "
                                     "worker->driver why on fail."},
@@ -90,6 +99,8 @@ def setup(lc, cfg):
     for k in ("_taskboard_create", "_taskboard_load", "_taskboard_save", "_taskboard_add",
               "_taskboard_ready", "_taskboard_set_status", "_taskboard_reconcile",
               "_taskboard_mutate", "_taskboards_list", "_tb_task", "worker_inject",
+              "_taskboard_participant_upsert", "_taskboard_participant",
+              "_participant_resolve", "spawn_peer",
               "dim", "bold", "green", "cyan"):
         if k in lc:
             _H[k] = lc[k]
@@ -233,6 +244,37 @@ def run(args, cwd):
             lines.append(_H["dim"]("note: " + "; ".join(tail) + "."))
         return "\n".join(lines)
 
+    if action == "participant":
+        # Register/refresh a peer, or list who's registered. Driver-only to WRITE (a driver
+        # pre-declares an expected role; a peer self-registers via the core hook). The LIST
+        # form (no name given) is open, like list/reconcile.
+        pname = (args.get("worker") or args.get("task") or "").strip()
+        role = (args.get("role") or "").strip() or None
+        if not pname:
+            parts = board.get("participants", [])
+            if not parts:
+                return f"board '{name}': no participants registered."
+            lines = [_H["bold"](f"board '{name}' participants:")]
+            for p in parts:
+                # Liveness is resolved on demand (never stored): live-here/elsewhere/dormant/missing.
+                res = _H["_participant_resolve"](p.get("name", ""))
+                note = f"  - {p['note']}" if p.get("note") else ""
+                lines.append(f"  {p.get('name')} role={p.get('role')} "
+                             f"({res.get('state', '?')}){note}")
+            return "\n".join(lines)
+        if not _is_driver():
+            return _driver_only(action)
+
+        def _do_reg(bd):
+            return _H["_taskboard_participant_upsert"](bd, pname, role=role,
+                                                       note=(args.get("note") or "").strip() or None)
+
+        board2, rec, err = _H["_taskboard_mutate"](name, _do_reg)
+        if err:
+            return f"error: {err}"
+        return (f"registered participant '{rec['name']}' (role={rec['role']}). "
+                f"Assign it work with action='assign' worker='{rec['name']}'.")
+
     if action == "add":
         if not _is_driver():
             return _driver_only(action)
@@ -277,16 +319,40 @@ def run(args, cwd):
                               f"is not done. Assign a READY task (action='list' status='ready').")
             _H["_taskboard_set_status"](bd, tid, "assigned", assignee=worker, note=note or None)
             return t.get("name", ""), ""
-
         board2, tname, err = _H["_taskboard_mutate"](name, _do_assign)
         if err:
             return f"error: {err}"
-        # 1a: push the task detail to the assigned worker inline, so it acts on this turn
-        # instead of spending one polling the board. Best-effort - if it's not a live pid
-        # (a label, a not-yet-spawned peer), the worker just reads the board itself.
         ping = (f"[board '{name}'] You are assigned {tid}: {tname}."
                 + (f" Note: {note}" if note else "")
                 + " Do this task, then mark it done on the board (action='done').")
+        # If 'worker' names a registered PARTICIPANT (a peer session), resolve its live
+        # address and act on the peer's lifecycle; else fall back to the plain pid push (1a).
+        part = _H.get("_taskboard_participant")
+        prec = part(board2, worker) if part else None
+        if prec:
+            handle = prec.get("name")
+            res = _H["_participant_resolve"](handle)
+            state = res.get("state")
+            if state == "live-here":
+                pushed = _push(res.get("pid"), ping)
+                tail = " (peer pinged)" if pushed else " (peer live but push failed; it will read the board)"
+            elif state == "live-elsewhere":
+                # Never spawn from a live session file (double-writer lobotomy) - leave a note.
+                tail = (f" (peer '{handle}' is live on {res.get('host')}; not spawned - it will "
+                        f"see the assignment on the board)")
+            elif state == "missing":
+                # Session file is gone (user deleted it). Keep the roster entry (a silent prune
+                # would confuse the model) but say plainly why the peer can't be reached.
+                tail = (f" (peer '{handle}' has no session file - deleted? cannot spawn it; "
+                        f"re-create the session or assign a different peer)")
+            else:  # dormant -> wake it by spawning a worker from its session file
+                spawn = _H.get("spawn_peer")
+                out = spawn(handle, ping) if spawn else ""
+                tail = (f" (peer '{handle}' was dormant; spawned from its session)"
+                        if out and "error" not in out.lower()
+                        else f" (peer '{handle}' is dormant; could not spawn - {out or 'dispatch_worker not enabled'})")
+            return f"assigned {tid} '{tname}' to {worker}.{tail}"
+        # Not a participant: plain worker pid push (1a).
         pushed = _push(worker, ping)
         tail = " (worker pinged)" if pushed else ""
         return f"assigned {tid} '{tname}' to worker {worker}.{tail}"

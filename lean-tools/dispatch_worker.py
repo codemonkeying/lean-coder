@@ -1776,6 +1776,24 @@ def setup(lc, cfg):
             return isinstance(out, str) and out.startswith("injected")
         _reg_inject(_board_push)
 
+    # BOARD -> DORMANT-PEER spawn. When the board assigns to a participant with no live
+    # process, wake it by dispatching a worker FROM its session file (from_session=), seeded
+    # with the task. Reuses the normal dispatch path (governor/concurrency/leash all apply).
+    # Returns the dispatch status line (which carries the new worker pid).
+    _reg_spawn = lc.get("register_peer_spawn")
+    if _reg_spawn:
+        def _board_spawn(session_name, task):
+            # A woken peer inherits the DRIVER's own leash (capped there, like any dispatch).
+            # Waking a peer to DO a task usually means editing/running, so the read-only
+            # dispatch default would block real work. A read-only driver still wakes only a
+            # read-only peer; the leash never widens beyond the driver's own.
+            return run({"action": "dispatch",
+                        "task": task or "Continue this session's work.",
+                        "from_session": session_name,
+                        "leash": _H["_norm_leash"](getattr(cfg, "leash", "r")) or "r"},
+                       str(getattr(cfg, "cwd", ".")))
+        _reg_spawn(_board_spawn)
+
     # A small helper to list models available on this box (for validation), resolved
     # lazily so it reflects the live provider.
     def _available_models():

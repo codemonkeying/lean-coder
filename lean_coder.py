@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L1219   Lean-tools (plugin tools: discovery, manager)
-  L1569   MCP client (connection, manager, OAuth, discovery)
-  L2023   Providers (backend plugin registry)
-  L2245   Interactive pickers + menus (raw-mode UI engine)
-  L2594   Terminal styling (colors, formatting helpers)
-  L2794   Streaming + markdown render (model output)
-  L3238   Composer (pinned input line, editor, stdin)
-  L4088   Token accounting (calibrated context meter)
-  L4262   Config (dataclass, field registry, load/save)
-  L7569   Tool execution + text tool-call parsing
-  L7995   Remote workspace (executor client, /connect)
-  L9590   Context meter
-  L9685   Agent (turn loop, context mgmt, tool dispatch)
-  L16193  Slash-command handlers + dispatch table
-  L16330  REPL (interactive loop, session resume)
-  L16704  Worker agent (headless --agent-run)
-  L17375  Entry (CLI arg parsing, main)
+  L1230   Lean-tools (plugin tools: discovery, manager)
+  L1580   MCP client (connection, manager, OAuth, discovery)
+  L2034   Providers (backend plugin registry)
+  L2256   Interactive pickers + menus (raw-mode UI engine)
+  L2605   Terminal styling (colors, formatting helpers)
+  L2805   Streaming + markdown render (model output)
+  L3249   Composer (pinned input line, editor, stdin)
+  L4099   Token accounting (calibrated context meter)
+  L4273   Config (dataclass, field registry, load/save)
+  L7691   Tool execution + text tool-call parsing
+  L8117   Remote workspace (executor client, /connect)
+  L9712   Context meter
+  L9807   Agent (turn loop, context mgmt, tool dispatch)
+  L16315  Slash-command handlers + dispatch table
+  L16452  REPL (interactive loop, session resume)
+  L16826  Worker agent (headless --agent-run)
+  L17497  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -116,7 +116,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.10.27"
+__version__ = "0.10.28"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -124,6 +124,17 @@ __version__ = "0.10.27"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.10.28": [
+        "board: peer sessions can now be woken to work a task. Register a peer with the",
+        "  board's new `participant` action (a durable identity-only record: name, role,",
+        "  note - no pid, no host, no liveness), then `assign` a task to it. The board",
+        "  resolves the peer on demand: if it's a live session here it gets the task pushed",
+        "  inline (as with workers); if it's a dormant saved session on disk it's spawned",
+        "  from that session to do the work, inheriting your leash; if it's live elsewhere",
+        "  it gets a passive board note (never double-spawned); if its session file was",
+        "  deleted you get a legible refusal (the roster entry is kept, not silently",
+        "  pruned). Lets a driver marshal a swarm of peers off one board, local or remote.",
+    ],
     "0.10.27": [
         "board: assigning a task to a LIVE worker now pushes the task detail to it inline,",
         "  so it acts that turn instead of spending one polling the board (a new core",
@@ -5904,6 +5915,33 @@ def worker_inject(worker, text):
     except Exception:
         return False
 
+
+# Board -> peer spawn bridge. When the board assigns a task to a DORMANT participant (a saved
+# session with no live process), it wakes it by spawning a worker FROM that session file
+# (from_session=), seeded with the task as its steer - the peer runs one task with its
+# accumulated context, marks the board, and exits (its file updated in place). dispatch_worker
+# registers the spawn fn here; board.py resolves it via lc["spawn_peer"]. No-op (returns "")
+# when dispatch_worker isn't enabled. Signature: fn(session_name, task) -> str status line.
+_PEER_SPAWN_HOOK = [None]
+
+
+def register_peer_spawn(fn):
+    """dispatch_worker calls this in setup() to expose its from_session spawn to the board."""
+    _PEER_SPAWN_HOOK[0] = fn
+    return fn
+
+
+def spawn_peer(session_name, task):
+    """Board -> spawn a worker from a dormant peer's session file. Returns a status line, or
+    "" if no dispatcher is registered / the spawn failed. Never raises."""
+    fn = _PEER_SPAWN_HOOK[0]
+    if fn is None:
+        return ""
+    try:
+        return fn(session_name, task) or ""
+    except Exception:
+        return ""
+
 def _bg_is_worker(rec) -> bool:
     """A dispatched-agent record (kind='worker'). Everything else - incl. records
     that predate the field - is a plain task. Plain-bg surfaces filter workers OUT
@@ -6984,6 +7022,90 @@ def _taskboard_set_status(board, task_id, status, assignee=None, note=None,
     if result_ref is not None:
         t["result_ref"] = result_ref
     return t, ""
+
+
+# --- board participants: durable IDENTITY (session-file name), ephemeral ADDRESS ----------
+# A participant is a peer agent (a session) the board can address by a STABLE handle - its
+# session-file name - not a pid (a pid dies with the process; the file + name survive). The
+# durable record is IDENTITY ONLY: {name, role, note}. It carries NO liveness (no status,
+# no last_seen, no pid, no host) - deliberately. A session is an equal-authority peer doing
+# its own work; the board does not track its presence or heartbeat it (that would churn every
+# board on every tick and duplicate the lock). Liveness is resolved ON DEMAND from the session
+# lock (_participant_resolve) only when someone wants to REACH a peer. ACTIVITY (what a peer is
+# doing) lives on the task/worker layer: a task's assignee links task -> peer, and when a
+# dormant session is spawned as a worker for a task, THAT incarnation is tracked the worker
+# way (.progress / worker status) - not on the participant record.
+
+
+def _taskboard_participant_upsert(board, name, role=None, note=None):
+    """Register/refresh a participant (a peer session) on the board - a driver pre-declaring an
+    expected role, or a session adding itself ONCE when it joins (never a per-tick heartbeat).
+    Identity only: {name, role, note}, no liveness. Keyed by name (the session-file handle).
+    Does NOT save (caller saves). Returns (record, err)."""
+    handle = _session_name_ok(name or "")
+    if not handle:
+        return None, "invalid participant name"
+    parts = board.setdefault("participants", [])
+    rec = next((p for p in parts if p.get("name") == handle), None)
+    if rec is None:
+        rec = {"name": handle, "role": role or handle, "note": note or ""}
+        parts.append(rec)
+    if role is not None:
+        rec["role"] = role
+    if note is not None:
+        rec["note"] = note
+    return rec, ""
+
+
+
+def _taskboard_participant(board, name):
+    """The participant record for a name/role, or None. Matches on the session-file handle
+    first, then falls back to a role match (so 'assign to plugin-dev' works whether that's
+    the file name or a declared role)."""
+    handle = _session_name_ok(name or "")
+    parts = board.get("participants", [])
+    return (next((p for p in parts if p.get("name") == handle), None)
+            or next((p for p in parts if p.get("role") == (name or "").strip()), None))
+
+
+def _participant_resolve(name):
+    """Resolve a participant's session-file NAME to a live ADDRESS, reading the session lock
+    (the authoritative liveness source, reused from the session loader). Returns a dict:
+      {'state': 'live-here', 'pid': N}    - a live process on THIS box (pushable via inject)
+      {'state': 'live-elsewhere', 'host': H, 'pid': N} - live on another box (passive-note only;
+                                            never from_session-spawn a live session = double-writer)
+      {'state': 'dormant'}                - session file EXISTS, no live holder (safe to spawn)
+      {'state': 'missing'}                - session file is GONE (user deleted it): not spawnable.
+                                            The roster entry is KEPT (a silent prune would confuse
+                                            the model - 'where did peerA go?'); this state makes the
+                                            reason legible instead.
+    Never raises (a missing/corrupt lock with a live file -> dormant)."""
+    handle = _session_name_ok(name or "")
+    if not handle:
+        return {"state": "missing"}
+    try:
+        info = _read_lock(handle)
+    except Exception:
+        info = None
+    if info:
+        pid, host = info.get("pid"), info.get("host")
+        if host == _HOSTNAME:
+            # Same box: pid is authoritative (mirrors _lock_is_live).
+            if isinstance(pid, int) and _pid_alive(pid) and pid != os.getpid():
+                return {"state": "live-here", "pid": pid}
+        else:
+            # Cross-host: can't probe the pid; trust heartbeat freshness ('ts' per autosave).
+            try:
+                if (time.time() - float(info.get("ts", 0))) <= _LOCK_STALE_SECS:
+                    return {"state": "live-elsewhere", "host": host, "pid": pid}
+            except (TypeError, ValueError):
+                pass
+    # No live holder. Distinguish a dormant (spawnable) session from a deleted one.
+    try:
+        exists = _session_path(handle).is_file()
+    except Exception:
+        exists = False
+    return {"state": "dormant"} if exists else {"state": "missing"}
 
 
 def _taskboard_reconcile(board):
