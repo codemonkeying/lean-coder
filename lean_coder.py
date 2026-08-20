@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L1245   Lean-tools (plugin tools: discovery, manager)
-  L1595   MCP client (connection, manager, OAuth, discovery)
-  L2049   Providers (backend plugin registry)
-  L2271   Interactive pickers + menus (raw-mode UI engine)
-  L2620   Terminal styling (colors, formatting helpers)
-  L2820   Streaming + markdown render (model output)
-  L3264   Composer (pinned input line, editor, stdin)
-  L4127   Token accounting (calibrated context meter)
-  L4301   Config (dataclass, field registry, load/save)
-  L7719   Tool execution + text tool-call parsing
-  L8145   Remote workspace (executor client, /connect)
-  L9774   Context meter
-  L9869   Agent (turn loop, context mgmt, tool dispatch)
-  L16377  Slash-command handlers + dispatch table
-  L16514  REPL (interactive loop, session resume)
-  L16888  Worker agent (headless --agent-run)
-  L17559  Entry (CLI arg parsing, main)
+  L1263   Lean-tools (plugin tools: discovery, manager)
+  L1613   MCP client (connection, manager, OAuth, discovery)
+  L2067   Providers (backend plugin registry)
+  L2289   Interactive pickers + menus (raw-mode UI engine)
+  L2638   Terminal styling (colors, formatting helpers)
+  L2838   Streaming + markdown render (model output)
+  L3282   Composer (pinned input line, editor, stdin)
+  L4145   Token accounting (calibrated context meter)
+  L4319   Config (dataclass, field registry, load/save)
+  L7827   Tool execution + text tool-call parsing
+  L8253   Remote workspace (executor client, /connect)
+  L9882   Context meter
+  L9977   Agent (turn loop, context mgmt, tool dispatch)
+  L16506  Slash-command handlers + dispatch table
+  L16643  REPL (interactive loop, session resume)
+  L17017  Worker agent (headless --agent-run)
+  L17688  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -116,7 +116,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.10.30"
+__version__ = "0.10.31"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -124,6 +124,24 @@ __version__ = "0.10.30"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.10.31": [
+        "fix: assigning a board task to a LIVE PEER session now actually reaches it. Before,",
+        "  a peer that was live on the same box was pinged through the worker channel - which",
+        "  only knows workers THIS session dispatched, not independent peer sessions - so the",
+        "  ping silently failed and the peer never noticed the assignment until it happened to",
+        "  re-read the board. Peers are now reached via a per-session inbox that their idle",
+        "  loop drains (the same wake path a finished background job uses), so an assign/ping",
+        "  wakes an idle peer with the task. Same-box only (the inbox is a local file); a peer",
+        "  live on another box still gets a passive board note, as before.",
+        "fix: a board task's completion now WAKES whoever assigned it. Each assign stamps",
+        "  'assigned_by' (the assigning session) as a return address; marking the task done or",
+        "  failed then pings that session back - peer-inject if it is live here, spawns it if it",
+        "  is dormant (to conduct the next step while you are AFK), or leaves a board note if it",
+        "  is live on another box. Before, a finished/failed subtask reached nobody unless the",
+        "  assigner happened to re-read the board, so a result that was one line of a report - or",
+        "  a silent failure that left a hole in one - could just never arrive. Peers no longer",
+        "  need to fake a task purely to notify each other.",
+    ],
     "0.10.30": [
         "fix: /connect now works with an ssh key that is a GPG subkey (SSH_AUTH_SOCK",
         "  pointed at gpg-agent). Before opening the interactive connection it refreshes",
@@ -5563,6 +5581,20 @@ def _own_lock(name: str) -> bool:
     return bool(info and info.get("pid") == os.getpid()
                 and info.get("host") == _HOSTNAME)
 
+def _my_session_name() -> str:
+    """This process's own session-file name, by reverse-lookup of the lock we hold (pid +
+    host match). "" if we hold none (incognito, or a not-yet-named autosave). The board uses
+    it to stamp who ASSIGNED a task (assigned_by), so a done/fail can wake that session back.
+    Reverse-lookup rather than the Agent because a lean-tool's run() gets no agent ref."""
+    if not SESSIONS_DIR.is_dir():
+        return ""
+    me, host = os.getpid(), _HOSTNAME
+    for lk in SESSIONS_DIR.glob("*.lock"):
+        info = _read_lock(lk.stem)
+        if info and info.get("pid") == me and info.get("host") == host:
+            return lk.stem
+    return ""
+
 def _release_lock(name: str):
     if _own_lock(name):
         try:
@@ -5942,6 +5974,60 @@ def worker_inject(worker, text):
         return bool(fn(worker, text))
     except Exception:
         return False
+
+
+# Board -> live-PEER bridge. A worker (worker_inject, above) is a child THIS session
+# dispatched and drives via a .inject sidecar its run-loop drains. A PEER is an
+# independent, equal-authority session with its OWN repl - unreachable that way. But an
+# idle peer polls a wake_check ~4x/s (read_line), so we wake it by dropping a message in
+# a per-session INBOX file (beside its lock, keyed by the session-file NAME the board
+# addresses it by) and letting its own wake hook (register_wake_hook, drained by
+# bg_wake_turn) turn that into a synthesised turn. Same-host only: the inbox is a shared
+# file on the driver's disk, so a live-ELSEWHERE peer can't be reached this way (the board
+# leaves it a passive note instead). Best-effort, never raises. NUL-separated appends so
+# two quick pings can't clobber.
+def _peer_inbox_path(name: str) -> Path:
+    return SESSIONS_DIR / f"{_session_name_ok(name)}.inbox"
+
+
+def peer_inject(name, text):
+    """Deliver `text` to another live session's inbox by its session-file name. Returns
+    True if the message was written for a peer that is live ON THIS HOST (so its wake hook
+    can pick it up), False otherwise (no such live-here peer, or a write error). Never the
+    caller's own session (a session does not ping itself)."""
+    handle = _session_name_ok(name or "")
+    msg = (text or "").strip()
+    if not handle or not msg:
+        return False
+    info = _read_lock(handle)
+    if not info or info.get("host") != _HOSTNAME:
+        return False                       # not live here (or no lock) -> not deliverable
+    pid = info.get("pid")
+    if not (isinstance(pid, int) and _pid_alive(pid) and pid != os.getpid()):
+        return False                       # dead, or it's us
+    try:
+        with _peer_inbox_path(handle).open("a") as f:
+            f.write(msg + "\0")
+        return True
+    except OSError:
+        return False
+
+
+def _drain_peer_inbox(name):
+    """Read + clear THIS session's inbox, returning the queued peer messages as one string
+    (or "" if none). Called from the session's own wake hook each idle tick. Best-effort:
+    a read/unlink race just yields "" that tick. NUL-separated (peer_inject's framing)."""
+    p = _peer_inbox_path(_session_name_ok(name or ""))
+    try:
+        raw = p.read_text()
+    except (OSError, ValueError):
+        return ""
+    try:
+        p.unlink()
+    except OSError:
+        pass
+    msgs = [m.strip() for m in raw.split("\0") if m.strip()]
+    return "\n\n".join(msgs)
 
 
 # Board -> peer spawn bridge. When the board assigns a task to a DORMANT participant (a saved
@@ -7034,9 +7120,11 @@ def _taskboard_ready(board):
 
 
 def _taskboard_set_status(board, task_id, status, assignee=None, note=None,
-                          result_ref=None):
-    """Mutate one task's status (+ optional assignee/note/result_ref). Returns (task, err):
-    err on an unknown id or an invalid status. Does NOT save (caller saves)."""
+                          result_ref=None, assigned_by=None):
+    """Mutate one task's status (+ optional assignee/note/result_ref/assigned_by). Returns
+    (task, err): err on an unknown id or an invalid status. Does NOT save (caller saves).
+    assigned_by stamps WHO assigned the task (a session name) so a later done/fail can wake
+    that session back - the return address for the completion ping."""
     if status not in _TB_STATUSES:
         return None, f"invalid status '{status}' (use {', '.join(_TB_STATUSES)})"
     t = _tb_task(board, task_id)
@@ -7049,6 +7137,8 @@ def _taskboard_set_status(board, task_id, status, assignee=None, note=None,
         t["note"] = note
     if result_ref is not None:
         t["result_ref"] = result_ref
+    if assigned_by is not None:
+        t["assigned_by"] = assigned_by
     return t, ""
 
 
@@ -7197,6 +7287,24 @@ def _taskboards_list():
         out.append((p.stem, meta))
     out.sort(key=lambda nm: nm[1].get("updated_at", ""), reverse=True)
     return out
+
+
+def _is_board_participant(session_name) -> bool:
+    """True if `session_name` is registered as a participant on ANY taskboard - i.e. a peer
+    or driver may ping it via peer_inject, so its idle wake path should be armed. Best-effort
+    scan (small dir, matches _taskboards_list). Matches on the participant NAME (the handle
+    peer_inject addresses), not role."""
+    handle = _session_name_ok(session_name or "")
+    if not handle or not TASKBOARDS_DIR.is_dir():
+        return False
+    for p in TASKBOARDS_DIR.glob("*.json"):
+        try:
+            parts = json.loads(p.read_text()).get("participants", [])
+        except (json.JSONDecodeError, OSError):
+            continue
+        if any(pp.get("name") == handle for pp in parts):
+            return True
+    return False
 
 
 
@@ -10585,6 +10693,15 @@ class Agent:
                     return True
         except Exception:
             pass
+        # A session registered as a board PARTICIPANT can be pinged by a peer/driver into
+        # its inbox; arm the idle wake so it picks that up (see bg_wake_turn's inbox drain).
+        try:
+            _sname = getattr(self, "autosave_name", "")
+            if _sname and not getattr(self.cfg, "incognito", False) \
+                    and _is_board_participant(_sname):
+                return True
+        except Exception:
+            pass
         return False
 
     def bg_wake_turn(self):
@@ -10626,11 +10743,23 @@ class Agent:
                 h = ""
             if h:
                 parts.append(h)
-        if not parts:
-            return ""
-        return ("[autonomous wake - a background job you started finished; no operator "
-                "input. React to the result now: inspect it, decide the next step, and "
-                "either act or hand back.]\n\n" + "\n\n".join(parts))
+        # A peer session may have pinged our inbox (a board assign/ping woke us). Drain
+        # it here so an idle session picks it up ~4x/s. Its own framing (a peer message,
+        # not our own finished bg job) - keep it distinct so the model reacts correctly.
+        peer = ""
+        _sname = getattr(self, "autosave_name", "")
+        if _sname and not getattr(self.cfg, "incognito", False):
+            peer = _drain_peer_inbox(_sname)
+        blocks = []
+        if peer:
+            blocks.append("[peer message - another session (a board driver or peer) pinged "
+                          "you; no operator input. Read it, do what it asks, and report back "
+                          "on the board if it named one.]\n\n" + peer)
+        if parts:
+            blocks.append("[autonomous wake - a background job you started finished; no "
+                          "operator input. React to the result now: inspect it, decide the "
+                          "next step, and either act or hand back.]\n\n" + "\n\n".join(parts))
+        return "\n\n".join(blocks)
 
     def decode_tok_s(self):
         """Honest session decode throughput (tokens/sec), or None when no provider
