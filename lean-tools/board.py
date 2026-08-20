@@ -100,7 +100,7 @@ def setup(lc, cfg):
               "_taskboard_ready", "_taskboard_set_status", "_taskboard_reconcile",
               "_taskboard_mutate", "_taskboards_list", "_tb_task", "worker_inject",
               "_taskboard_participant_upsert", "_taskboard_participant",
-              "_participant_resolve", "spawn_peer",
+              "_participant_resolve", "spawn_peer", "peer_inject", "_my_session_name",
               "dim", "bold", "green", "cyan"):
         if k in lc:
             _H[k] = lc[k]
@@ -135,29 +135,85 @@ def _push(worker, text):
         return False
 
 
-def _fmt_task(t, ready_ids):
-    """One task as a compact line for list/find output."""
+def _notify_assigner(board_name, tid, action, note, assigned_by, task_name):
+    """Wake whoever assigned `tid` that it is now done/failed - the completion return leg
+    (mirrors assign's outbound wake). Returns a short tail describing what happened (for the
+    tool's reply), "" if there was nobody/nothing to do. Never raises. A spawned assigner is
+    a WORKER (worker_depth>0) and assign is driver-only, so waking a dormant assigner can
+    never cascade into a fresh round of auto-assigns - the driver-gate bounds it."""
+    handle = (assigned_by or "").strip()
+    if not handle:
+        return ""                              # no return address recorded (pre-0.10.31 task)
+    me = (_H.get("_my_session_name") or (lambda: ""))()
+    if handle == me:
+        return ""                              # finisher IS the assigner - don't wake yourself
+    verb = "done" if action == "done" else "FAILED"
+    ping = (f"[board '{board_name}'] task {tid} ({task_name}) you assigned is now {verb}."
+            + (f" Note: {note}" if note else "")
+            + " React: fold it into your report / decide the next step (action='list' to see the board).")
+    resolve = _H.get("_participant_resolve")
+    res = resolve(handle) if resolve else {"state": "missing"}
+    state = res.get("state")
+    if state == "live-here":
+        pinj = _H.get("peer_inject")
+        ok = bool(pinj and pinj(handle, ping)) or _push(res.get("pid"), ping)
+        return f" (assigner '{handle}' pinged)" if ok else f" (assigner '{handle}' live but push failed; it will read the board)"
+    if state == "live-elsewhere":
+        return f" (assigner '{handle}' is live on {res.get('host')}; not woken - it will see it on the board)"
+    if state == "missing":
+        return f" (assigner '{handle}' has no session file; cannot notify - it will see it on the board if reopened)"
+    # dormant: spawn it to conduct (the AFK relay - the assigner wakes, fields the result,
+    # drives the next step). Bounded by the driver-gate as noted above.
+    spawn = _H.get("spawn_peer")
+    out = spawn(handle, ping) if spawn else ""
+    return (f" (assigner '{handle}' was dormant; spawned to conduct)"
+            if out and "error" not in out.lower()
+            else f" (assigner '{handle}' is dormant; could not spawn - {out or 'dispatch_worker not enabled'})")
+
+
+# Status -> checkbox glyph, so a board reads like the pinned PLAN (GOAL + a '- [ ]' list):
+#   [ ] not started (open)   [~] in flight (assigned)   [x] done   [!] failed
+# A blocked task (open but deps unmet) keeps [ ] and is tagged '(blocked: ...)'.
+_BOX = {"done": "[x]", "assigned": "[~]", "failed": "[!]", "open": "[ ]", "blocked": "[ ]"}
+
+
+def _fmt_task(t, ready_ids, blocked_ids=frozenset()):
+    """One task as a plan-style checkbox line for list/find output:
+        - [x] t1  <name>  @annota (by unity)  -> ref   - note
+    """
     tid = t.get("id", "?")
     st = t.get("status", "?")
-    flag = " READY" if tid in ready_ids else ""
-    who = f" @{t['assignee']}" if t.get("assignee") not in (None, "") else ""
+    box = _BOX.get(st, "[ ]")
+    who = f"  @{t['assignee']}" if t.get("assignee") not in (None, "") else ""
+    by = f" (by {t['assigned_by']})" if t.get("assigned_by") else ""
     deps = t.get("deps") or []
-    dep = f" deps={','.join(deps)}" if deps else ""
-    note = f"  - {t['note']}" if t.get("note") else ""
-    rr = f"  ->{t['result_ref']}" if t.get("result_ref") else ""
-    return f"  {tid} [{st}{flag}]{who}{dep} {t.get('name','')}{rr}{note}"
+    if tid in blocked_ids and deps:
+        state = f"  (blocked: deps {','.join(deps)})"
+    elif deps:
+        state = f"  (deps {','.join(deps)})"
+    else:
+        state = ""
+    if tid in ready_ids:
+        state += "  READY"
+    rr = f"  -> {t['result_ref']}" if t.get("result_ref") else ""
+    note = f"\n        - {t['note']}" if t.get("note") else ""
+    return f"  - {box} {tid}  {t.get('name','')}{who}{by}{state}{rr}{note}"
 
 
 def _render(name, board):
-    """A board's full task list with computed ready/blocked, newest concerns first."""
+    """A board's full task list, plan-style (checkbox lines + GOAL/counts header)."""
     ready, blocked = _H["_taskboard_ready"](board)
     ready_ids = {t.get("id") for t in ready}
-    counts = board.get("meta", {}).get("counts", {})
+    blocked_ids = {t.get("id") for t in blocked}
+    meta = board.get("meta", {})
+    counts = meta.get("counts", {})
     head = _H["bold"](f"board '{name}'") + _H["dim"](
         f"  ({', '.join(f'{k}:{v}' for k, v in counts.items() if v)})" if counts else "  (empty)")
     lines = [head]
+    if meta.get("title"):
+        lines.append(_H["bold"](f"GOAL: {meta['title']}"))
     for t in board.get("tasks", []):
-        lines.append(_fmt_task(t, ready_ids))
+        lines.append(_fmt_task(t, ready_ids, blocked_ids))
     if ready:
         lines.append(_H["green"](f"ready to assign: {', '.join(sorted(ready_ids))}"))
     else:
@@ -304,6 +360,7 @@ def run(args, cwd):
         if not tid or not worker:
             return "error: action='assign' needs a 'task' id and a 'worker'."
         note = (args.get("note") or "").strip()
+        me = (_H.get("_my_session_name") or (lambda: ""))()
 
         def _do_assign(bd):
             t = _H["_tb_task"](bd, tid)
@@ -317,7 +374,10 @@ def run(args, cwd):
                          if (_H["_tb_task"](bd, d) or {}).get("status") != "done"]
                 return None, (f"{tid} is not ready - it depends on {', '.join(unmet)} which "
                               f"is not done. Assign a READY task (action='list' status='ready').")
-            _H["_taskboard_set_status"](bd, tid, "assigned", assignee=worker, note=note or None)
+            # Stamp assigned_by = the session doing the assigning (our own lock name), the
+            # return address a later done/fail wakes back. "" (incognito/unnamed) -> no stamp.
+            _H["_taskboard_set_status"](bd, tid, "assigned", assignee=worker,
+                                        note=note or None, assigned_by=me or None)
             return t.get("name", ""), ""
         board2, tname, err = _H["_taskboard_mutate"](name, _do_assign)
         if err:
@@ -334,7 +394,12 @@ def run(args, cwd):
             res = _H["_participant_resolve"](handle)
             state = res.get("state")
             if state == "live-here":
-                pushed = _push(res.get("pid"), ping)
+                # A live-here participant is an independent PEER session, not a worker we
+                # dispatched - so reach it via its inbox (peer_inject -> its wake hook),
+                # NOT worker_inject (which only knows THIS session's workers). Fall back to
+                # a worker push in case the handle happens to name one of our own workers.
+                pinj = _H.get("peer_inject")
+                pushed = bool(pinj and pinj(handle, ping)) or _push(res.get("pid"), ping)
                 tail = " (peer pinged)" if pushed else " (peer live but push failed; it will read the board)"
             elif state == "live-elsewhere":
                 # Never spawn from a live session file (double-writer lobotomy) - leave a note.
@@ -374,9 +439,11 @@ def run(args, cwd):
                                             result_ref=result_ref)
             else:  # fail
                 _H["_taskboard_set_status"](bd, tid, "failed", note=note or None)
-            return True, ""
+            # Hand back what the notify-back needs: who assigned it + the task name.
+            return {"assigned_by": t.get("assigned_by") or "",
+                    "name": t.get("name", "")}, ""
 
-        board2, _ok, err = _H["_taskboard_mutate"](name, _do_finish)
+        board2, meta, err = _H["_taskboard_mutate"](name, _do_finish)
         if err:
             return f"error: {err}"
         msg = f"marked {tid} DONE." if action == "done" else f"marked {tid} FAILED."
@@ -386,6 +453,15 @@ def run(args, cwd):
             newly = sorted(r.get("id") for r in ready)
             if newly:
                 msg += f" ready now: {', '.join(newly)}."
+        # Notify-back: a status change MUST reach whoever assigned the task - they're busy
+        # doing other work and need it to assemble their report (a done that's one line of a
+        # report, or a fail that leaves a hole, is worthless if it never wakes them). Wake the
+        # assigner the same way an assign wakes an assignee: peer_inject if live-here, spawn if
+        # dormant, passive board note if live-elsewhere/missing. Skip if the finisher IS the
+        # assigner (don't wake yourself), or if nobody was recorded.
+        msg += _notify_assigner(name, tid, action, note,
+                                (meta or {}).get("assigned_by", ""),
+                                (meta or {}).get("name", ""))
         return msg
 
     return f"error: unknown action '{action}'."
