@@ -48,6 +48,7 @@ PROVIDER = {                       # module-level; the ProviderManager reads + r
     "warm_models":    lambda: ["m1"],                  # loaded/instant models (green dot in /model, /usage)
     "model_status":   lambda model: None,              # install/availability hint in /model (e.g. "pull")
     "endpoints":      lambda: ["http://host:11434"],   # multi-endpoint failover (Ollama uses this)
+    "restore_settings": lambda agent, cfg: ...,        # re-sync provider-HELD settings after a session load (below)
 }
 
 def setup(lc, cfg):               # OPTIONAL, helpers-only - do NOT register_provider here
@@ -165,6 +166,16 @@ At launch, core activates a provider if `cfg.provider` names a registered +
 the client via `make_client`, swaps it in (re-running ctx detection), applies
 `thinking` / `effort` against `capabilities`, and calls `on_activate`. Switching away
 (or `/provider off`) calls `on_deactivate` and falls back to Ollama.
+
+**Session-scoped settings (`restore_settings`).** A provider setting stored in
+`cfg.provider_settings[name]` (via `cfg.set_setting`) rides the session meta and is
+restored on `/load` like `thinking` / `effort`. If your provider reads that setting
+LIVE from cfg each turn, that's all you need. But if you cache it in your own module
+state (e.g. the Anthropic provider keeps the active *account* label in a module global,
+seeded once at `setup`), a load updating cfg won't reach that state - so core calls
+`restore_settings(agent, cfg)` after a load to let you re-sync from cfg and rebuild
+(re-auth, refetch usage). It MUST be session-scoped: do NOT persist to `config.toml`
+there, so two windows on one box can hold different accounts. Absent -> nothing.
 
 ## Commands core provides
 

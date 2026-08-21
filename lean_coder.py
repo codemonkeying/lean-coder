@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L1263   Lean-tools (plugin tools: discovery, manager)
-  L1613   MCP client (connection, manager, OAuth, discovery)
-  L2067   Providers (backend plugin registry)
-  L2289   Interactive pickers + menus (raw-mode UI engine)
-  L2638   Terminal styling (colors, formatting helpers)
-  L2838   Streaming + markdown render (model output)
-  L3282   Composer (pinned input line, editor, stdin)
-  L4145   Token accounting (calibrated context meter)
-  L4319   Config (dataclass, field registry, load/save)
-  L7827   Tool execution + text tool-call parsing
-  L8253   Remote workspace (executor client, /connect)
-  L9882   Context meter
-  L9977   Agent (turn loop, context mgmt, tool dispatch)
-  L16506  Slash-command handlers + dispatch table
-  L16643  REPL (interactive loop, session resume)
-  L17017  Worker agent (headless --agent-run)
-  L17688  Entry (CLI arg parsing, main)
+  L1279   Lean-tools (plugin tools: discovery, manager)
+  L1629   MCP client (connection, manager, OAuth, discovery)
+  L2083   Providers (backend plugin registry)
+  L2305   Interactive pickers + menus (raw-mode UI engine)
+  L2654   Terminal styling (colors, formatting helpers)
+  L2854   Streaming + markdown render (model output)
+  L3298   Composer (pinned input line, editor, stdin)
+  L4161   Token accounting (calibrated context meter)
+  L4335   Config (dataclass, field registry, load/save)
+  L7844   Tool execution + text tool-call parsing
+  L8270   Remote workspace (executor client, /connect)
+  L9899   Context meter
+  L9994   Agent (turn loop, context mgmt, tool dispatch)
+  L16561  Slash-command handlers + dispatch table
+  L16698  REPL (interactive loop, session resume)
+  L17081  Worker agent (headless --agent-run)
+  L17753  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -116,7 +116,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.10.31"
+__version__ = "0.10.32"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -124,6 +124,22 @@ __version__ = "0.10.31"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.10.32": [
+        "polish: task boards now read like the pinned plan - a '- [ ]' checkbox list. Each",
+        "  task shows [ ] not-started, [~] in-flight (assigned), [x] done, [!] failed, with its",
+        "  assignee, who assigned it, deps, READY flag and result. Applies to both the `board`",
+        "  tool's list and the read-only /board command (they share the shape). Display only -",
+        "  no board data changes, so existing boards render the new way with nothing to migrate.",
+        "fix: the active claude.ai account is now remembered PER SESSION. Saving/loading a",
+        "  session records the account it ran on and restores it, like thinking/effort - so a",
+        "  reloaded chat comes back on the right account, and two windows can hold different",
+        "  accounts without one clobbering the other. /ant_account still sets the global default",
+        "  for fresh sessions. (New optional provider hook restore_settings makes this general.)",
+        "fix: changing a setting (/model, /ant_account, /think, ...) and then quitting without",
+        "  sending a message now persists it - the live session is flushed to disk on any clean",
+        "  exit, not only after a chat turn. So settings you set right before closing survive",
+        "  the reopen instead of silently reverting.",
+    ],
     "0.10.31": [
         "fix: assigning a board task to a LIVE PEER session now actually reaches it. Before,",
         "  a peer that was live on the same box was pinged through the worker channel - which",
@@ -5424,6 +5440,7 @@ def save_session(messages, cfg, name: str, remote=None, pinned_plan="", notes=No
         "approval": cfg.approval,            # confirm cadence
         "thinking": cfg.setting("thinking"),  # provider-scoped; None on ollama / unset
         "effort": cfg.setting("effort"),
+        "account": cfg.setting("account"),    # provider-scoped account label; None if unset
         "remote": remote,                    # ssh host tools ran on, or None (local)
         "title": _session_title(messages),
         "turns": len(body),
@@ -12856,6 +12873,7 @@ def register_provider(spec):
       login           (agent, cfg) -> bool  auth flow; enables /provider login
       clear           (agent, cfg) -> None  wipe credentials; enables /provider clear
       detail          (agent, cfg) -> str   full usage view for /usage
+      restore_settings (agent, cfg) -> None  re-sync provider-held settings after a load
       tag             str   short label for the unified /model row (default: name)
 
     Returns the normalized spec. Re-registering a name replaces it."""
@@ -12914,6 +12932,13 @@ def register_provider(spec):
         # that can't produce byte-exact diffs - they use write_file instead).
         # Absent -> tools unchanged. Must return a list.
         "tool_filter": spec.get("tool_filter"),
+        # restore_settings(agent, cfg) -> None: re-sync provider-scoped settings that the
+        # provider holds in its OWN state (not read live from cfg each turn) after a session
+        # LOAD - e.g. the anthropic account label lives in a module-global, so core setting
+        # cfg's value isn't enough. Called by _restore_session_state AFTER the backend is
+        # activated + settings copied onto cfg. Must NOT persist to config.toml (session-
+        # scoped). Absent -> nothing (a provider reading settings live per-turn needs none).
+        "restore_settings": spec.get("restore_settings"),
     }
     _providers[name] = norm
     return norm
@@ -13660,18 +13685,33 @@ def handle_plan_command(agent, cfg, arg):
     print(agent._update_plan(body))
 
 
-def _fmt_board_task(t, ready_ids):
-    """One task as a compact status line (mirrors board.py's _fmt_task, kept here so the
-    /board command has zero dependency on the lean-tool being enabled/loaded)."""
+# Status -> checkbox glyph, so /board reads like the pinned PLAN (GOAL + a '- [ ]' list).
+# Mirrors board.py's _BOX, kept here so /board has zero dependency on the lean-tool.
+_BOARD_BOX = {"done": "[x]", "assigned": "[~]", "failed": "[!]", "open": "[ ]", "blocked": "[ ]"}
+
+
+def _fmt_board_task(t, ready_ids, blocked_ids=frozenset()):
+    """One task as a plan-style checkbox line (mirrors board.py's _fmt_task, kept here so the
+    /board command has zero dependency on the lean-tool being enabled/loaded):
+        - [x] t1  <name>  @annota (by unity)  -> ref   - note
+    """
     tid = t.get("id", "?")
     st = t.get("status", "?")
-    flag = " READY" if tid in ready_ids else ""
-    who = f" @{t['assignee']}" if t.get("assignee") not in (None, "") else ""
+    box = _BOARD_BOX.get(st, "[ ]")
+    who = f"  @{t['assignee']}" if t.get("assignee") not in (None, "") else ""
+    by = f" (by {t['assigned_by']})" if t.get("assigned_by") else ""
     deps = t.get("deps") or []
-    dep = f" deps={','.join(deps)}" if deps else ""
-    note = f"  - {t['note']}" if t.get("note") else ""
-    rr = f"  ->{t['result_ref']}" if t.get("result_ref") else ""
-    return f"  {tid} [{st}{flag}]{who}{dep} {t.get('name', '')}{rr}{note}"
+    if tid in blocked_ids and deps:
+        state = f"  (blocked: deps {','.join(deps)})"
+    elif deps:
+        state = f"  (deps {','.join(deps)})"
+    else:
+        state = ""
+    if tid in ready_ids:
+        state += "  READY"
+    rr = f"  -> {t['result_ref']}" if t.get("result_ref") else ""
+    note = f"\n        - {t['note']}" if t.get("note") else ""
+    return f"  - {box} {tid}  {t.get('name', '')}{who}{by}{state}{rr}{note}"
 
 
 def handle_board_command(agent, cfg, arg):
@@ -13728,15 +13768,18 @@ def handle_board_command(agent, cfg, arg):
         return
     ready, _blocked = _taskboard_ready(board)
     ready_ids = {t.get("id") for t in ready}
-    counts = board.get("meta", {}).get("counts", {})
+    blocked_ids = {t.get("id") for t in _blocked}
+    meta = board.get("meta", {})
+    counts = meta.get("counts", {})
     csum = ", ".join(f"{k}:{v}" for k, v in counts.items() if v) or "empty"
-    print(bold(f"board '{board.get('meta', {}).get('name', _session_name_ok(arg))}'")
-          + dim(f"  ({csum})"))
+    print(bold(f"board '{meta.get('name', _session_name_ok(arg))}'") + dim(f"  ({csum})"))
+    if meta.get("title"):
+        print(bold(f"GOAL: {meta['title']}"))
     tasks = board.get("tasks", [])
     if not tasks:
         print(dim("  (no tasks)"))
     for t in tasks:
-        print(_fmt_board_task(t, ready_ids))
+        print(_fmt_board_task(t, ready_ids, blocked_ids))
     if ready_ids:
         print(green(f"ready to assign: {', '.join(sorted(ready_ids))}"))
     else:
@@ -14340,10 +14383,22 @@ def _restore_session_state(agent, cfg, meta):
     if tf is not None:
         set_tok_factor(tf)
 
-    for key in ("thinking", "effort"):                     # provider-scoped settings
+    for key in ("thinking", "effort", "account"):         # provider-scoped settings
         val = meta.get(key)
         if val is not None and val != cfg.setting(key):
             cfg.set_setting(key, val)
+    # A provider-scoped setting like `account` is read by the provider from its own
+    # module state (seeded once at setup), not live from cfg each turn - so a plain
+    # cfg.set_setting isn't enough to make it take effect. Give the live backend a hook
+    # to re-sync from cfg + rebuild (re-auth, refetch usage) WITHOUT persisting to
+    # config.toml (session-scoped: two windows can hold different accounts). Optional;
+    # a provider that reads settings live per-turn need not declare it.
+    try:
+        spec = agent.active_provider()
+        if spec and spec.get("restore_settings"):
+            spec["restore_settings"](agent, cfg)
+    except Exception:
+        pass
 
     # Per-key SESSION OVERRIDES (the uniform working-state layer): re-apply the loaded
     # session's overrides onto the LIVE cfg at RUNTIME only - never save_config here, so
@@ -16671,6 +16726,15 @@ def repl(cfg: Config, resume=None):
     # Release our session lock on exit so another instance doesn't see a stale
     # "live elsewhere" and prompt to take over a session nobody is holding.
     atexit.register(lambda: _release_lock(getattr(agent, "autosave_name", "")))
+    # Flush the live session to disk on ANY clean exit (/quit, ^D, ^C^C, an uncaught
+    # error). Every chat turn already autosaves, but a user who only changes SETTINGS
+    # (/model, /ant_account, /think, ...) and then quits without sending a message would
+    # otherwise lose those changes - the session file was last written before the change.
+    # autosave_session is a no-op on incognito/autosave-off/empty and never raises, so
+    # this is safe to fire unconditionally. Registered LAST so it runs FIRST (atexit is
+    # LIFO): before _release_lock (lock still ours) and before close_all_remotes (so the
+    # remote host is still readable for the saved meta).
+    atexit.register(lambda: autosave_session(agent, cfg))
 
     # The active backend is ALWAYS a provider now. Any pre-activation transport
     # setup (e.g. the ollama provider's tiered host failover + per-host default
@@ -17450,6 +17514,7 @@ def run_agent_brief(args) -> int:
                 "approval": cfg.approval,
                 "thinking": cfg.setting("thinking"),
                 "effort": cfg.setting("effort"),
+                "account": cfg.setting("account"),
                 "remote": None,
                 "title": "",
                 "turns": len([m for m in agent.messages if m.get("role") != "system"]),
