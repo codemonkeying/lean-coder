@@ -393,16 +393,17 @@ them.
 
 ## Autonomous wake on background finish (`wake_on_bg_finish`)
 
-By default a finished background job (a plain `background` task **or** a dispatched worker)
-surfaces **passively**: its notice rides the *next turn you type*. If you never type,
-the agent never sees it. That's fine when you're driving, but it means a long job
-that finishes while you're away just waits.
+**On by default.** A finished background job (a plain `background` task **or** a dispatched
+worker) **wakes the agent itself** - it synthesises a turn carrying the result and an
+instruction to react, with **no operator input**. The agent inspects the result, decides
+the next step, and either acts or hands back. So a long job that finishes while you're away
+is acted on immediately, not left waiting for your next keystroke.
 
-Turn on **`wake_on_bg_finish`** (config, or `/set wake_on_bg_finish
-true`) and a finish **wakes the agent itself** - it synthesises a turn carrying the
-result and an instruction to react, with **no operator input**. The agent inspects
-the result, decides the next step, and either acts or hands back. Off by default: an
-idle-wake loop changes REPL semantics and can burn quota unattended, so it's opt-in.
+Set **`wake_on_bg_finish = false`** (config, or `/set wake_on_bg_finish false`) to make the
+finish surface **passively** instead: its notice then rides the *next turn you type*, and if
+you never type the agent never sees it. Even with the global setting off, a single job can
+opt back in via `run_command`'s `notify_on_exit` / `heartbeat_timeout` / `max_runtime` args.
+The wake only ever fires at an **idle prompt** - it never interrupts a turn in progress.
 
 How it works:
 

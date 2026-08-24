@@ -603,8 +603,8 @@ check("[wake] wake turn carries the finish notice", _NOTICE in _w)
 check("[wake] wake turn is flagged autonomous (no operator input)",
       "autonomous wake" in _w.lower())
 check("[wake] wake turn instructs the agent to react", "react" in _w.lower())
-# opt-in gate is OFF by default (autonomy never fires unless explicitly enabled)
-check("[wake] wake_on_bg_finish defaults OFF", lc.Config(cwd=FIX, host=cfg.host).wake_on_bg_finish is False)
+# autonomy is ON by default now (a finished bg job wakes + reacts with no operator input)
+check("[wake] wake_on_bg_finish defaults ON", lc.Config(cwd=FIX, host=cfg.host).wake_on_bg_finish is True)
 # read_line accepts the wake_check kwarg (the idle-poll hook)
 import inspect as _insp
 check("[wake] Composer.read_line exposes wake_check hook",

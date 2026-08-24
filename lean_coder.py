@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L1279   Lean-tools (plugin tools: discovery, manager)
-  L1629   MCP client (connection, manager, OAuth, discovery)
-  L2083   Providers (backend plugin registry)
-  L2305   Interactive pickers + menus (raw-mode UI engine)
-  L2654   Terminal styling (colors, formatting helpers)
-  L2854   Streaming + markdown render (model output)
-  L3298   Composer (pinned input line, editor, stdin)
-  L4161   Token accounting (calibrated context meter)
-  L4335   Config (dataclass, field registry, load/save)
-  L7844   Tool execution + text tool-call parsing
-  L8270   Remote workspace (executor client, /connect)
-  L9899   Context meter
-  L9994   Agent (turn loop, context mgmt, tool dispatch)
-  L16561  Slash-command handlers + dispatch table
-  L16698  REPL (interactive loop, session resume)
-  L17081  Worker agent (headless --agent-run)
-  L17753  Entry (CLI arg parsing, main)
+  L1307   Lean-tools (plugin tools: discovery, manager)
+  L1657   MCP client (connection, manager, OAuth, discovery)
+  L2111   Providers (backend plugin registry)
+  L2333   Interactive pickers + menus (raw-mode UI engine)
+  L2682   Terminal styling (colors, formatting helpers)
+  L2918   Streaming + markdown render (model output)
+  L3392   Composer (pinned input line, editor, stdin)
+  L4255   Token accounting (calibrated context meter)
+  L4429   Config (dataclass, field registry, load/save)
+  L7954   Tool execution + text tool-call parsing
+  L8380   Remote workspace (executor client, /connect)
+  L10009  Context meter
+  L10104  Agent (turn loop, context mgmt, tool dispatch)
+  L16679  Slash-command handlers + dispatch table
+  L16816  REPL (interactive loop, session resume)
+  L17200  Worker agent (headless --agent-run)
+  L17872  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -116,7 +116,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.10.32"
+__version__ = "0.10.33"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -124,6 +124,34 @@ __version__ = "0.10.32"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.10.33": [
+        "change: autonomous wake on background finish is now ON by default. When a background",
+        "  task or worker THIS session started finishes, the agent wakes itself and reacts with",
+        "  no operator input, instead of the notice waiting for your next keystroke. The wake",
+        "  only fires at an idle prompt and never interrupts a turn in progress. Set",
+        "  'wake_on_bg_finish false' to restore the old passive behaviour (notice rides your",
+        "  next turn).",
+        "change: approval mode now defaults to 'session' (approve a command once, then it's",
+        "  trusted for the rest of the session) instead of 'ask' (confirm every time). Smoother",
+        "  daily driving now that lean-coder is stable; set 'approval ask' for the old per-call",
+        "  prompt, or 'approval auto' to never prompt.",
+        "docs: clarified that capture_training writes ONLY a local sidecar for your own",
+        "  debugging/RL use - it stays on your machine and is never uploaded or phoned home",
+        "  (lean-coder has no telemetry).",
+        "feature: 'output_wrap' - opt-in word-wrapping of the model's prose so a copy-paste",
+        "  keeps whole words on terminals (Termux, some emulators) that turn each visual",
+        "  soft-wrap into a real newline mid-word. OFF by default (no change): set",
+        "  'output_wrap auto' to wrap to the terminal width, or an integer for a fixed column",
+        "  count. Never wraps code fences (kept verbatim) and never splits a long URL/token.",
+        "change: the anthropic usage banner/status no longer claims 'throttling Sonnet/Opus'",
+        "  at a percentage - a % meter does not throttle (the real limit is a 429 at the wall).",
+        "  It now states proximity honestly: 'approaching limit' / 'near limit' / 'AT LIMIT (X%)'",
+        "  by the account's own severity.",
+        "polish: the 5-hour meter on the status line now surfaces its reset time inline once it",
+        "  goes amber (>=60%), so you can see WHEN headroom returns without opening /usage; and a",
+        "  reset over an hour out reads '>1hr' rather than a misleading rounded-down '1h', with",
+        "  minutes ('32m') shown once inside the last hour.",
+    ],
     "0.10.32": [
         "polish: task boards now read like the pinned plan - a '- [ ]' checkbox list. Each",
         "  task shows [ ] not-started, [~] in-flight (assigned), [x] done, [!] failed, with its",
@@ -2850,6 +2878,42 @@ def style_md_inline(line: str) -> str:
     return line
 
 
+def _resolve_wrap_width(setting) -> int:
+    """Map the output_wrap setting to a column count, or 0 for 'no wrap'.
+    "0"/""/"off"/"none"/False -> 0; "auto" -> current terminal width; an int (or
+    numeric string) -> that many columns. Anything unparseable -> 0 (safe: no wrap)."""
+    if setting is None:
+        return 0
+    s = str(setting).strip().lower()
+    if s in ("", "0", "off", "no", "none", "false"):
+        return 0
+    if s == "auto":
+        return max(20, _term_cols())
+    try:
+        n = int(s)
+    except ValueError:
+        return 0
+    return n if n >= 20 else 0        # too-narrow / negative -> treat as off
+
+
+def _wrap_prose(line: str, width: int) -> "list[str]":
+    """Word-wrap ONE RAW prose line to `width` VISIBLE columns, never splitting a
+    long unbroken token (a URL/path stays whole and just overflows its line). A blank
+    line stays blank (paragraph spacing preserved). Returns the raw wrapped pieces;
+    the caller styles each piece AFTER wrapping so invisible ANSI escapes don't count
+    toward the width (which would make lines wrap short of the terminal edge)."""
+    if width <= 0 or not line.strip():
+        return [line]
+    return textwrap.wrap(
+        line, width=width,
+        break_long_words=False,      # never chop a URL/long token mid-word
+        break_on_hyphens=False,      # don't split hyphenated words either
+        replace_whitespace=False,    # keep the text as-is
+        drop_whitespace=True,
+    ) or [line]
+
+
+
 # ==========================================================================
 # SECTION: Streaming + markdown render (model output)
 # ==========================================================================
@@ -3001,6 +3065,19 @@ def stream_tiered(resp, cfg, where="", idle=None):
         yield raw
 
 
+_OUTPUT_WRAP_WIDTH = 0     # live prose-wrap width; core refreshes it from cfg.output_wrap
+                           # each turn (0 = off). MarkdownStream reads it so every provider's
+                           # MarkdownStream(sys.stdout.write) picks up the setting for free.
+
+
+def _refresh_output_wrap(cfg):
+    """Recompute the live prose-wrap width from cfg.output_wrap (called each turn so
+    'auto' tracks a resized terminal). Returns the resolved width."""
+    global _OUTPUT_WRAP_WIDTH
+    _OUTPUT_WRAP_WIDTH = _resolve_wrap_width(getattr(cfg, "output_wrap", "0"))
+    return _OUTPUT_WRAP_WIDTH
+
+
 class MarkdownStream:
     """Line-buffered styler for streamed output: feed() chunks, it writes styled
     complete lines and holds the partial tail until flush(). The ``` fence
@@ -3008,10 +3085,15 @@ class MarkdownStream:
     (code must stay exact) - dimmed when colour is on.
     Always de-noises markers; tiny terminals just don't get the ANSI."""
 
-    def __init__(self, write):
+    def __init__(self, write, wrap_width=None):
         self._write = write
         self._buf = ""
         self._fence = False
+        # >0 = hard-wrap PROSE lines at word boundaries (opt-in via cfg.output_wrap);
+        # 0 = leave the terminal to soft-wrap (default). Code fences are never wrapped.
+        # wrap_width=None (the usual provider call) reads the live module setting that
+        # core refreshes from cfg each turn - so providers need no change to opt in.
+        self._wrap = int(_OUTPUT_WRAP_WIDTH if wrap_width is None else wrap_width or 0)
 
     def _emit(self, line, newline):
         # A fence can be nested inside a blockquote ("> ```") - the model does this
@@ -3029,10 +3111,22 @@ class MarkdownStream:
         elif self._fence:
             # Inside a fence: emit the code VERBATIM (must stay exact + copyable) with
             # any blockquote '> ' prefix stripped and no bar - just dimmed when colour.
-            out = dim(probe)
-        else:
-            out = style_md_line(line)
-        self._write(out + ("\n" if newline else ""))
+            # NEVER wrapped: code layout must survive intact.
+            self._write(dim(probe) + ("\n" if newline else ""))
+            return
+        # Prose: optionally hard-wrap at word boundaries so a copy stays word-clean on
+        # terminals that turn a soft-wrap into a real newline. Wrap the RAW text to
+        # VISIBLE width FIRST, then style each piece - so the invisible ANSI colour
+        # codes don't count toward the width (which was making lines wrap short of the
+        # terminal edge). Each wrapped piece gets its own newline; the trailing piece
+        # honours the caller's `newline` flag.
+        if self._wrap > 0:
+            pieces = _wrap_prose(line, self._wrap)
+            for i, p in enumerate(pieces):
+                last = (i == len(pieces) - 1)
+                self._write(style_md_line(p) + ("\n" if (not last or newline) else ""))
+            return
+        self._write(style_md_line(line) + ("\n" if newline else ""))
 
     def feed(self, text):
         self._buf += text
@@ -4407,7 +4501,7 @@ class Config:
                                      # autonomous runs. This is a power tool - the cap is
                                      # a guardrail, not a wall.
     cwd: Path = field(default_factory=Path.cwd)
-    approval: str = "ask"            # ask (confirm each) | session (ask once) | auto (never)
+    approval: str = "session"        # ask (confirm each) | session (ask once) | auto (never)
     temperature: float = 0.7
     top_p: float = 0.8
     top_k: int = 20
@@ -4442,10 +4536,13 @@ class Config:
     ingest_cap_ceil: int = INGEST_CAP_CEIL      # absolute char ceiling on a capped result
     capture_training: bool = False   # opt-in: append RAW per-turn training trajectories
                                      # (reasoning + tool calls + full pre-stub/pre-compact
-                                     # results) to a JSONL sidecar for downstream training
-                                     # (leangym). OFF by default. Personal-machine capture,
-                                     # no redaction on write; never captured for workers or
-                                     # incognito. See docs/design/training-capture.md.
+                                     # results) to a LOCAL JSONL sidecar - for YOUR OWN use
+                                     # (debugging what the agent did, or building an RL/SFT
+                                     # dataset e.g. with leangym). OFF by default. It stays on
+                                     # this machine and is NEVER uploaded or phoned home
+                                     # anywhere - lean-coder has no telemetry. No redaction on
+                                     # write; never captured for workers or incognito.
+                                     # See docs/design/training-capture.md.
     capture_training_dir: str = ""   # override output dir for capture_training; default is
                                      # CONFIG_DIR/training/. Sidecar = <dir>/<session_id>.jsonl.
     window_messages: int = 0         # bounded context window: send only the last N
@@ -4546,12 +4643,15 @@ class Config:
                                      # context drops below B - hysteresis*interval (so a strip
                                      # to just under B can't retrigger next turn). Schmitt trigger.
     auto_trim_keep: int = TRIM_KEEP  # tool results kept in full by an auto-trim strip
-    wake_on_bg_finish: bool = False  # AUTONOMY: when a background task THIS session started
+    wake_on_bg_finish: bool = True   # AUTONOMY: when a background task THIS session started
                                      # finishes, WAKE the agent with a synthesised turn (react
                                      # to the result with NO operator input) instead of only
-                                     # surfacing the notice on the next human turn. OFF by
-                                     # default: an idle-wake loop changes REPL semantics and can
-                                     # burn quota unattended. Composer (idle-poll) path only.
+                                     # surfacing the notice on the next human turn. ON by
+                                     # default so a job that finishes while you're away is acted
+                                     # on, not left waiting for your next keystroke. Set false to
+                                     # keep the notice passive (rides your next turn). The wake
+                                     # only fires at an IDLE prompt (composer idle-poll path);
+                                     # it never interrupts a turn in progress.
     notes_spool: int = 2000          # session-scoped notes (the note tool) are kept like a
                                      # spooling log: append DTG-stamped entries, trim to the
                                      # newest N LINES on write. ~2000 lines ~= 760KB ~= one full
@@ -4575,6 +4675,15 @@ class Config:
     statusline_iter: int = 0         # reprint the status block every N model iterations
                                      # WITHIN a single long turn (so a constantly-iterating
                                      # model still surfaces ctx/quota/perms). 0 = off (default).
+    output_wrap: str = "0"           # hard-wrap streamed model PROSE at word boundaries so a
+                                     # copy-paste keeps whole words even on terminals (Termux,
+                                     # some emulators) that bake each visual soft-wrap into a
+                                     # real newline mid-word. "0"/"off" = no wrap (default, the
+                                     # terminal soft-wraps as before); "auto" = wrap to the
+                                     # terminal width; an int = wrap to that many columns.
+                                     # NEVER wraps code-fence lines (kept verbatim/copyable) and
+                                     # NEVER splits a long unbroken token like a URL (it overflows
+                                     # its line intact rather than being chopped).
     autosave: bool = True            # autosave the session each turn; auto-load last on start
     auto_update: bool = False        # on launch, the /update lean-tool checks the published
                                      # VERSION and self-updates if newer. OFF by default;
@@ -4865,7 +4974,7 @@ _SCALAR_FIELDS = (
     ("auto_trim_interval",        0,                   False),
     ("auto_trim_hysteresis",      0.25,                False),
     ("auto_trim_keep",            TRIM_KEEP,           False),
-    ("wake_on_bg_finish",         False,               False),
+    ("wake_on_bg_finish",         True,                False),
     ("notes_spool",               2000,                False),
     ("temperature",               0.7,                 True),
     ("top_p",                     0.8,                 True),
@@ -4882,12 +4991,13 @@ _SCALAR_FIELDS = (
     ("worker_max_depth",          1,                   True),
     ("worker_max_children",       0,                   True),
     ("worker_checkpoint",         False,               True),
-    ("approval",                  "ask",               False),
+    ("approval",                  "session",           False),
     ("confirm_reads",             False,               False),
     ("auto_reconnect",            False,               False),
     ("ephemeral",                 False,               False),
     ("statusline",                True,                False),
     ("statusline_every",          1,                   False),
+    ("output_wrap",               "0",                 False),
     ("statusline_iter",           0,                   False),
     ("auto_update",               False,               False),
     ("update_track",              "stable",            False),
@@ -12448,9 +12558,11 @@ class Agent:
 
 def _fmt_reset(iso) -> str:
     """ISO timestamp -> short local reset with a countdown so a bare clock time
-    can't be misread as a number: 'HH:MM(Nh)' within a day, else 'ddMon(Nd)'
-    (e.g. '15:00(18h)', '05Jul(3d)'). Under an hour reads 'HH:MM(Nm)'. Core owns
-    this so every provider's reset times read the same way."""
+    can't be misread as a number. Under an hour reads 'HH:MM(Nm)' (e.g.
+    '15:29(32m)'); over an hour but within a day reads 'HH:MM(>1hr)' rather than
+    a rounded-down '(1h)' that misleads when the real wait is 1h45m; a day or
+    more reads 'ddMon(Nd)' (e.g. '05Jul(3d)'). Core owns this so every provider's
+    reset times read the same way."""
     if not iso:
         return ""
     try:
@@ -12461,19 +12573,19 @@ def _fmt_reset(iso) -> str:
     if secs < 0:
         return dt.strftime("%H:%M(now)")
     if secs < 86400:
-        cd = f"{int(secs // 3600)}h" if secs >= 3600 else f"{int(secs // 60)}m"
+        cd = ">1hr" if secs >= 3600 else f"{int(secs // 60)}m"
         return dt.strftime("%H:%M") + f"({cd})"
     return dt.strftime("%d%b") + f"({int(secs // 86400)}d)"
 
 
 def render_usage_meters(usage, verbose=False) -> str:
     """Render a provider's usage dict into a status suffix, with core's own colour
-    ramp / reset formatting (the provider supplies only numbers). Shape:
     {"meters": [{"label": "5h", "pct": 12, "resets_at": iso, "day": "D6",
-    "tag": {...}}, ...], "note": ""}.
+    "tag": {...}, "reset_on_warn": True}, ...], "note": ""}.
     The status line stays TIDY: reset time/countdown is shown only when verbose
-    (i.e. /info), never on the row-3 meter. Returns "" for an empty/None usage so
-    the caller can fall back to the plain ctx line."""
+    (i.e. /info) OR when a meter sets reset_on_warn and has gone amber (pct>=60),
+    so a near-limit window surfaces WHEN it resets without opening /usage. Returns
+    "" for an empty/None usage so the caller can fall back to the plain ctx line."""
     if not usage:
         return ""
     parts = []
@@ -12484,7 +12596,12 @@ def render_usage_meters(usage, verbose=False) -> str:
             continue
         label = str(m.get("label", "")).strip()
         body = (f"{label} FULL" if pct >= 100 else f"{label} {pct:.0f}%")
-        if verbose:                      # reset lives in /info, not the tidy status line
+        # Reset time normally lives in /info (verbose), keeping the status line tidy.
+        # But a meter may opt to surface its reset inline once it goes amber (pct>=60,
+        # the yellow threshold) - e.g. the 5h window, so you can see WHEN headroom
+        # returns exactly when it starts to matter, without opening /usage.
+        show_reset = verbose or (m.get("reset_on_warn") and pct >= 60)
+        if show_reset:
             rst = _fmt_reset(m.get("resets_at", ""))
             if rst:
                 body += f" {rst}"
@@ -13217,6 +13334,7 @@ _SETTINGS_FIELDS = [
     ("statusline", "status rows above the prompt", "bool"),
     ("statusline_every", "reprint status every N prompts (1 = every turn, 0 = only on change)", "int"),
     ("statusline_iter", "reprint status every N model iterations within a long turn (0 = off)", "int"),
+    ("output_wrap", "hard-wrap model prose so copy-paste keeps whole words: 0/off (default), 'auto' (terminal width), or an int (columns). Never wraps code or URLs", "str"),
     # --- context management (send-window + auto-compaction) ---
     ("window_messages", "send-window size in messages (0 = off, full history)", "int"),
     ("window_tokens", "send-window token cap: 'auto' (=ctx-reserve, default), an int (hard cap), or 0 (off)", "int_or_auto"),
@@ -13234,12 +13352,12 @@ _SETTINGS_FIELDS = [
     ("autostart_after_compact", "auto-continue the turn after a compaction (on by default; 5s ^C to cancel)", "bool"),
     ("compact_keep", "max verbatim turns kept after a compaction (CEILING; real bound is a token budget)", "int"),
     ("keep_cap", "absolute token ceiling on the verbatim tail kept after a compaction (big windows won't hoard)", "int"),
-    ("wake_on_bg_finish", "wake + react autonomously when a background task finishes (off by default)", "bool"),
+    ("wake_on_bg_finish", "wake + react autonomously when a background task finishes (on by default)", "bool"),
     ("auto_trim_interval", "auto-trim: stub old tool outputs every N tokens (0 = off)", "int"),
     ("auto_trim_hysteresis", "auto-trim re-arm margin (fraction of interval)", "float"),
     ("auto_trim_keep", "tool results kept in full by an auto-trim strip", "int"),
     ("notes_spool", "note memory: keep the newest N lines (spooling log; default 2000)", "int"),
-    ("ingest_cap_frac", "opaque tool result: max share of free window (0-1)", "float"),
+    ("capture_training", "capture RAW per-turn trajectories to a LOCAL JSONL sidecar for your own debugging/RL - stays on-box, never uploaded (off)", "bool"),
     ("ingest_cap_floor", "opaque tool result: min truncation size (chars)", "int"),
     ("ingest_cap_ceil", "opaque tool result: hard char ceiling", "int"),
     ("capture_training", "capture RAW per-turn training trajectories to a JSONL sidecar (off; personal machine)", "bool"),
@@ -16903,6 +17021,7 @@ def repl(cfg: Config, resume=None):
         # (settings/model/tools/plan - the ctx row's per-turn token drift is excluded from
         # the signature) ALWAYS reprints regardless of cadence. /info and /usage show it too.
         prompt_no += 1
+        _refresh_output_wrap(cfg)   # recompute prose-wrap width (tracks 'auto' terminal resize)
         _rows = _status_rows(agent, cfg)
         _key = _status_key(_rows)
         _every = getattr(cfg, "statusline_every", 1)
