@@ -96,13 +96,16 @@ check("backend._fmt_reset: handles bad input without raising",
 _sample_usage_throttled = {
     "five_hour": {"utilization": 5.0, "resets_at": "2026-06-26T15:00:00Z"},
     "seven_day": {"utilization": 56.0, "resets_at": "2026-06-27T22:00:00Z"},
-    "limits": [{"kind": "weekly_all", "percent": 56, "is_active": True}],
+    "limits": [{"kind": "weekly_all", "percent": 56, "severity": "critical", "is_active": True}],
 }
 _banner_throttled = be._fmt_usage_banner(_sample_usage_throttled)
 check("backend._fmt_usage_banner: shows 5h pct", "5%" in _banner_throttled)
 check("backend._fmt_usage_banner: shows 7d pct", "56%" in _banner_throttled)
+# honest wording: we do NOT throttle at a % (real throttle is a 429 at the wall);
+# banner states proximity to the cap by severity, not a false 'throttled' claim.
 check("backend._fmt_usage_banner: shows active limit warning",
-      "weekly_all" in _banner_throttled and "throttled" in _banner_throttled)
+      "weekly_all" in _banner_throttled and "near limit" in _banner_throttled
+      and "throttl" not in _banner_throttled)
 
 _sample_usage_ok = {
     "five_hour": {"utilization": 10.0, "resets_at": "2026-06-26T15:00:00Z"},

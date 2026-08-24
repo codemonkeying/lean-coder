@@ -341,11 +341,12 @@ the fill fraction at which it compacts; the soft-nudge zone auto-follows below i
 `auto_compact`, `autostart_after_compact`, `compact_emergency`, and the prompts
 themselves are all tunable per model.
 
-- **Autonomous wake on background finish (off by default).** With `wake_on_bg_finish =
-  true`, a finished background task or worker wakes the agent with a synthesised turn so
-  it reacts with no operator input; otherwise the notice waits for your next turn. A
-  single job can opt in via `run_command`'s `notify_on_exit` / `heartbeat_timeout` /
-  `max_runtime` args even when the global setting is off.
+- **Autonomous wake on background finish (on by default).** A finished background task or
+  worker wakes the agent with a synthesised turn so it reacts with no operator input,
+  instead of the notice waiting for your next turn. The wake only fires at an idle prompt
+  and never interrupts a turn in progress. Set `wake_on_bg_finish = false` to keep the
+  notice passive (it then rides your next turn); a single job can still opt back in via
+  `run_command`'s `notify_on_exit` / `heartbeat_timeout` / `max_runtime` args.
 - **Bounded send-window (off by default).** For a very small local model, even the
   compaction flow can be too much history. `window_messages = N` caps each request to the
   last N messages, cut at a *whole-turn boundary* so the current task is never truncated -
