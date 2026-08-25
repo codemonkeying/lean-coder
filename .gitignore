@@ -30,7 +30,8 @@ NOTES.md
 /tests/fixtures/*
 !/tests/_smoketest.py
 !/tests/_mocktest.py
-!/tests/_smoketest_local.py
+# _smoketest_local.py is deliberately NOT published: it tests private providers
+# (anthropic_plan) that ship with canon only. _smoketest.py exec()s it when present.
 !/tests/_sweep.sh
 !/tests/fixtures/
 !/tests/fixtures/echo_mcp_server.py
