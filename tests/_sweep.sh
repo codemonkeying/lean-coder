@@ -77,6 +77,17 @@ report "private keys / public-key material" \
 report "MAC addresses" \
   "$(grep -rniE '\b([0-9a-f]{2}:){5}[0-9a-f]{2}\b' "${FILES[@]}" | nosweep)"
 
+# --- private-file leak guard ----------------------------------------------
+# A file that declares itself NOT for the public repo (e.g. tests/_smoketest_local.py,
+# which tests private canon-only providers) must never be git-TRACKED. If it is, a
+# publish push would leak it. We match the self-declaration marker in any TRACKED
+# file and fail so it is caught before it ships. Fix: keep the file, untrack it
+# ('git rm --cached <f>') and ensure .gitignore does NOT force-include it.
+# The marker is written EXACT (no space in the parens) so this guard line and the
+# sweep script itself don't self-trip.
+_PRIVATE_MARKER='NEVER-PUBLISH'   # sweep-ok
+report "private file is git-tracked (would leak on publish)" \
+  "$(grep -rnl "Never committed to public\|$_PRIVATE_MARKER" "${FILES[@]}" | nosweep)"
 echo
 if [ "$fails" -eq 0 ]; then
   echo "SWEEP CLEAN"
