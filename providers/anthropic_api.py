@@ -438,10 +438,6 @@ class _ApiKeyClient:
     def _model(self):
         return self.cfg.active_model()
 
-    def _haiku_model(self):
-        haikus = [m for m in _list_models() if "haiku" in m]  # sweep-ok
-        return haikus[0] if haikus else None
-
     def list_models(self):
         return _list_models()
 
@@ -619,32 +615,16 @@ class _ApiKeyClient:
                 ) from None
 
     def _on_error(self, key, payload, should_abort):
-        """429 fallback: swap to Haiku, strip params the fallback can't use, retry once."""
-        haiku = self._haiku_model()
-        orig  = payload["model"]
-        if not haiku or orig == haiku:
-            print(_lc["red"]("[!] rate limited on all models - check your API key limits"))
-            raise RuntimeError("rate limited") from None
-
+        """429 handler: report the rate limit + retry-after and raise. We do NOT
+        downgrade to Haiku - a silent model swap mid-conversation is confusing, and
+        Haiku's max_tokens ceiling (64k) is below what an Opus/Sonnet turn requests, so
+        the retry 400'd anyway. The turn stops cleanly; wait out the retry-after or
+        check your API key's rate limits."""
+        orig    = payload["model"]
         retry_s = self._last_rl.get("retry-after", "")  # sweep-ok
         retry_note = f" (retry after {retry_s}s)" if retry_s else ""
-        print(_lc["red"](f"[!] {orig} rate limited{retry_note} - retrying with Haiku"))  # sweep-ok
-
-        hinfo = _ensure_models().get(haiku, {})
-        payload = dict(payload)
-        payload["model"] = haiku
-        if not hinfo.get("can_think", False):
-            payload.pop("thinking", None)
-            payload.pop("context_management", None)
-        if not hinfo.get("can_effort", False):
-            payload.pop("output_config", None)
-        try:
-            return self._send(key, payload, should_abort)
-        except RuntimeError as e2:
-            if "429" in str(e2):
-                print(_lc["red"]("[!] rate limited on all models - check your API key limits"))
-                raise RuntimeError("rate limited") from None
-            raise
+        print(_lc["red"](f"[!] {orig} rate limited{retry_note} - wait or check your API key limits"))  # sweep-ok
+        raise RuntimeError("rate limited") from None
 
     def chat(self, messages, tools, should_abort=None):
         key = _api_key()
