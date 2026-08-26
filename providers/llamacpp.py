@@ -47,15 +47,23 @@ import urllib.error
 import urllib.request
 
 _PROVIDER    = "llamacpp"
-_API_BASE    = os.environ.get("LLAMACPP_HOST", "http://127.0.0.1:8080")
+_DEFAULT_HOST = "http://127.0.0.1:8080"
+_API_BASE    = os.environ.get("LLAMACPP_HOST", _DEFAULT_HOST)
 _CTX_DEFAULT = 32_768        # llama-server's -c; we can't read it back reliably, so default
 _OUT_CAP     = 4096
 
 _lc = {}
+# Active base URL, resolved at setup() from (in precedence order) the provider-scoped
+# 'host' setting (config.toml [providers.llamacpp].host, or a session override), then
+# the LLAMACPP_HOST env, then the default. /llamacpp host updates this + persists.
+_HOST = None
 
 
 def _base():
-    return os.environ.get("LLAMACPP_HOST", _API_BASE).rstrip("/")
+    """Active llama-server base URL. Precedence: the /llamacpp-set host (module state,
+    seeded from cfg at setup) -> LLAMACPP_HOST env -> the compiled default. rstrip so
+    '{base}/v1/...' never doubles a slash."""
+    return (_HOST or os.environ.get("LLAMACPP_HOST") or _DEFAULT_HOST).rstrip("/")
 
 
 def _api_key():
@@ -313,8 +321,145 @@ PROVIDER = {
 }
 
 
+# ----------------------------------------------------------------------------
+# /llamacpp host command
+# ----------------------------------------------------------------------------
+
+def _host_alive(base, timeout=2.0):
+    """Quick reachability probe: HTTP 200 from {base}/v1/models (the endpoint the
+    client itself uses to enumerate the loaded model). False on any error/timeout."""
+    try:
+        req = urllib.request.Request(f"{base.rstrip('/')}/v1/models",
+                                     headers=_headers(), method="GET")
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status == 200
+    except (urllib.error.URLError, OSError, ValueError):
+        return False
+
+
+def _norm_url(s):
+    """Normalize a user-typed host into a base URL: add http:// if no scheme, strip a
+    trailing slash. A bare 'box:8080' or 'http://box:8080' both become a usable base.
+    Returns '' for empty/whitespace."""
+    s = (s or "").strip()
+    if not s:
+        return ""
+    if "://" not in s:
+        s = "http://" + s
+    return s.rstrip("/")
+
+
+def _set_host(agent, cfg, url, persist=True):
+    """Commit `url` as the active llama-server base: update module state so _base()
+    (and thus the live client) uses it immediately, record it as the provider-scoped
+    'host' setting, and persist to config.toml. Clears the client's cached model list
+    so the next read re-resolves against the new host."""
+    global _HOST
+    _HOST = url
+    try:
+        cfg.set_setting("host", url)
+    except Exception:
+        pass
+    # Drop any cached model list on the live client so /model re-reads the new host.
+    client = getattr(agent, "client", None)
+    if client is not None and getattr(client, "_models", None) is not None:
+        client._models = None
+    if persist:
+        save = _lc.get("save_config") or _lc.get("autosave_config")
+        if save:
+            try:
+                save(cfg)
+            except Exception:
+                pass
+    print(_lc["green"](f"llama-server host -> {url}"))
+
+
+def _switch_host(agent, cfg, arg):
+    """Set the active llama-server base URL. With no arg, show the current host and
+    prompt for a new one. Probes the target BEFORE committing so a typo or a dead box
+    isn't silently adopted: an unreachable host asks 'use anyway?' (it may just not be
+    up yet), otherwise the host is left unchanged."""
+    ask = _lc.get("_ask")
+    if not arg:
+        print(_lc["dim"](f"current llama-server host: {_base()}"))
+        if not ask:
+            print(_lc["dim"]("usage: /llamacpp host <url>"))
+            return
+        arg = ask("new host (blank = keep current)?", default="") if _accepts_default(ask) \
+            else ask("new host (blank = keep current)?")
+        if not (arg or "").strip():
+            print(_lc["dim"]("host unchanged."))
+            return
+    url = _norm_url(arg)
+    if not url:
+        print(_lc["red"](f"'{arg}' is not a usable host (need a name, host:port, or URL)."))
+        return
+    if url.rstrip("/") == _base():
+        print(_lc["dim"](f"already on {url}."))
+        return
+    if not _host_alive(url):
+        print(_lc["yellow"](f"{url} isn't responding (no /v1/models)."))
+        if not (ask and ask("use it anyway (e.g. it's not up yet)?")):
+            print(_lc["dim"]("host unchanged."))
+            return
+    _set_host(agent, cfg, url)
+
+
+def _accepts_default(fn):
+    """True if the injected _ask supports a default= kwarg (varies by core version)."""
+    try:
+        import inspect
+        return "default" in inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+def _handle_llamacpp(agent, cfg, arg):
+    """/llamacpp [host [url]] - manage the llama-server connection.
+
+    bare /llamacpp        -> show current host, prompt for a new one
+    /llamacpp host        -> same (explicit)
+    /llamacpp host <url>  -> set the active base URL (probed, persisted)
+    /llamacpp <url>       -> shorthand: treat a bare URL/name as a host set
+    """
+    arg = (arg or "").strip()
+    parts = arg.split(maxsplit=1)
+    sub = parts[0].lower() if parts else ""
+    rest = parts[1] if len(parts) > 1 else ""
+    if sub == "host":
+        _switch_host(agent, cfg, rest)
+    elif not arg:
+        _switch_host(agent, cfg, "")
+    else:
+        # no recognised subcommand -> treat the whole arg as a host (URL/name), so
+        # `/llamacpp gpu-box:8080` and `/llamacpp http://...` Just Work.
+        _switch_host(agent, cfg, arg)
+
+
+def _llamacpp_completer(agent, cfg):
+    """Tab targets for /llamacpp: the 'host' verb (the only subcommand for now)."""
+    return ["host"]
+
+
 def setup(lc, cfg):
-    """Helpers-only hook; stash core namespace + cfg. Manager registers PROVIDER."""
-    global _lc
+    """Helpers-only hook: stash the core namespace + cfg, seed the active host from the
+    provider-scoped 'host' setting (falls back to LLAMACPP_HOST env / default via
+    _base), and register the /llamacpp command. The manager registers PROVIDER."""
+    global _lc, _HOST
     _lc = dict(lc)
     _lc["_cfg"] = cfg
+    try:
+        # Read the llamacpp bucket BY NAME, not cfg.setting() (which reads the
+        # active provider's bucket): setup() runs for every enabled provider, so if
+        # llamacpp is enabled but not active at launch, cfg.setting would read the
+        # wrong provider's 'host'.
+        stored = (cfg.provider_settings.get("llamacpp", {}).get("host") or "").strip()
+    except Exception:
+        stored = ""
+    if stored:
+        _HOST = _norm_url(stored)
+    reg = lc.get("register_command")
+    if reg:
+        reg("/llamacpp", _handle_llamacpp,
+            "llama-server: host [url] (no arg = show/set the base URL)",
+            completer=_llamacpp_completer)
