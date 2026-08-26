@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L1307   Lean-tools (plugin tools: discovery, manager)
-  L1657   MCP client (connection, manager, OAuth, discovery)
-  L2111   Providers (backend plugin registry)
-  L2333   Interactive pickers + menus (raw-mode UI engine)
-  L2682   Terminal styling (colors, formatting helpers)
-  L2918   Streaming + markdown render (model output)
-  L3392   Composer (pinned input line, editor, stdin)
-  L4255   Token accounting (calibrated context meter)
-  L4429   Config (dataclass, field registry, load/save)
-  L7954   Tool execution + text tool-call parsing
-  L8380   Remote workspace (executor client, /connect)
-  L10009  Context meter
-  L10104  Agent (turn loop, context mgmt, tool dispatch)
-  L16679  Slash-command handlers + dispatch table
-  L16816  REPL (interactive loop, session resume)
-  L17200  Worker agent (headless --agent-run)
-  L17872  Entry (CLI arg parsing, main)
+  L1323   Lean-tools (plugin tools: discovery, manager)
+  L1673   MCP client (connection, manager, OAuth, discovery)
+  L2127   Providers (backend plugin registry)
+  L2349   Interactive pickers + menus (raw-mode UI engine)
+  L2698   Terminal styling (colors, formatting helpers)
+  L2934   Streaming + markdown render (model output)
+  L3408   Composer (pinned input line, editor, stdin)
+  L4271   Token accounting (calibrated context meter)
+  L4445   Config (dataclass, field registry, load/save)
+  L7970   Tool execution + text tool-call parsing
+  L8396   Remote workspace (executor client, /connect)
+  L10025  Context meter
+  L10120  Agent (turn loop, context mgmt, tool dispatch)
+  L16695  Slash-command handlers + dispatch table
+  L16832  REPL (interactive loop, session resume)
+  L17216  Worker agent (headless --agent-run)
+  L17888  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -116,7 +116,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.10.33"
+__version__ = "0.10.34"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -124,6 +124,22 @@ __version__ = "0.10.33"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.10.34": [
+        "polish: a plan-limit reset that's over an hour out now reads '>Nh' with the whole",
+        "  hours remaining (e.g. '>1h', '>2h', '>3h') instead of a flat '>1hr' for anything",
+        "  past an hour - so a 3-hour wait no longer looks the same as a 65-minute one. Under",
+        "  an hour still reads exact minutes ('32m'). Applies to the status-line 5h meter and",
+        "  the quota-wall message alike.",
+        "change: hitting the plan's rate limit (429) no longer silently retries the turn on",
+        "  Haiku. The downgrade was confusing mid-conversation AND broke outright (Haiku's",
+        "  max-tokens ceiling is below what an Opus/Sonnet turn requests, so the retry just",
+        "  400'd). The turn now stops cleanly with the model + reset time; wait for the reset",
+        "  or check /ant_usage.",
+        "fix: when an auth-token refresh fails because the machine is OFFLINE (the auth",
+        "  endpoint is unreachable), the error now says so and tells you to reconnect and",
+        "  retry - instead of the misleading 'not authenticated - use /provider login', which",
+        "  wrongly implied your credentials were bad when the network was simply down.",
+    ],
     "0.10.33": [
         "change: autonomous wake on background finish is now ON by default. When a background",
         "  task or worker THIS session started finishes, the agent wakes itself and reacts with",
@@ -12559,10 +12575,10 @@ class Agent:
 def _fmt_reset(iso) -> str:
     """ISO timestamp -> short local reset with a countdown so a bare clock time
     can't be misread as a number. Under an hour reads 'HH:MM(Nm)' (e.g.
-    '15:29(32m)'); over an hour but within a day reads 'HH:MM(>1hr)' rather than
-    a rounded-down '(1h)' that misleads when the real wait is 1h45m; a day or
-    more reads 'ddMon(Nd)' (e.g. '05Jul(3d)'). Core owns this so every provider's
-    reset times read the same way."""
+    '15:29(32m)'); over an hour but within a day reads 'HH:MM(>Nh)' with N the
+    whole hours remaining floored ('>1h' at 1h45m, '>3h' at 3h05m) so it never
+    overstates how soon headroom returns; a day or more reads 'ddMon(Nd)' (e.g.
+    '05Jul(3d)'). Core owns this so every provider's reset times read the same way."""
     if not iso:
         return ""
     try:
@@ -12573,7 +12589,7 @@ def _fmt_reset(iso) -> str:
     if secs < 0:
         return dt.strftime("%H:%M(now)")
     if secs < 86400:
-        cd = ">1hr" if secs >= 3600 else f"{int(secs // 60)}m"
+        cd = f">{int(secs // 3600)}h" if secs >= 3600 else f"{int(secs // 60)}m"
         return dt.strftime("%H:%M") + f"({cd})"
     return dt.strftime("%d%b") + f"({int(secs // 86400)}d)"
 

@@ -56,7 +56,7 @@ def check(name, cond, extra=""):
 _tbl = set(lc._BUILTIN_COMMANDS_TABLE)
 _slash = set(lc.SLASH_COMMANDS)
 _help = set(c.split()[0] for c, _ in lc.HELP_COMMANDS)
-_aliases = {"/exit", "/q", "/h", "/?", "/models", "/providers", "/disconnect"}
+_aliases = {"/exit", "/q", "/h", "/?", "/models", "/providers", "/disconnect", "/background"}
 check("every SLASH_COMMAND is dispatchable", not (_slash - _tbl - set(lc._lean_tool_commands)))
 check("every HELP command is dispatchable", not (_help - _tbl))
 check("every canonical command is in HELP",
@@ -1218,7 +1218,7 @@ with _bctx.redirect_stdout(_bout):
     lc.handle_board_command(object(), lc.Config(), _bd_name)
 _btxt = _bout.getvalue()
 check("/board <name> shows tasks + computed ready set",
-      "alpha" in _btxt and "beta" in _btxt and "deps=t1" in _btxt and "ready to assign: t1" in _btxt)
+      "alpha" in _btxt and "beta" in _btxt and "deps t1" in _btxt and "ready to assign: t1" in _btxt)
 _lout = _bio.StringIO()
 with _bctx.redirect_stdout(_lout):
     lc.handle_board_command(object(), lc.Config(), "")
@@ -5903,15 +5903,15 @@ if _be:
                             + lc.datetime.timedelta(days=6, hours=3)).isoformat())
     check("_wk_daily: earlier day has NO reset clock", "reset@" not in _d1["text"])
 check("render_usage_meters: tidy HIDES the reset time/countdown", "(5h)" not in _tidy and ":" not in _tidy)
-check("render_usage_meters: verbose SHOWS the reset countdown", ("hr)" in _verb or "m)" in _verb) and ":" in _verb)
+check("render_usage_meters: verbose SHOWS the reset countdown", ("h)" in _verb or "m)" in _verb) and ":" in _verb)
 check("_fmt_reset: bad input -> ''", lc._fmt_reset("") == "" and lc._fmt_reset("garbage") == "")
 # countdown suffix so a bare clock time can't be misread as a number. Over an hour
-# out reads '(>1hr)' (an honest '>' beats a rounded-down '1h' when it's really 1h45m);
-# under an hour reads minutes '(Nm)'.
+# out reads '(>Nh)' with N the whole hours remaining, floored (an honest floored '>'
+# beats a rounded-down '1h' when it's really 1h45m); under an hour reads minutes '(Nm)'.
 _r_soon = lc._fmt_reset((lc.datetime.datetime.now(lc.datetime.timezone.utc)
-                         + lc.datetime.timedelta(hours=18)).isoformat())
-check("_fmt_reset: over an hour shows HH:MM(>1hr)",
-      ":" in _r_soon and _r_soon.endswith("(>1hr)"))
+                         + lc.datetime.timedelta(hours=18, minutes=30)).isoformat())
+check("_fmt_reset: over an hour shows HH:MM(>Nh)",
+      ":" in _r_soon and _r_soon.endswith("(>18h)"))
 _r_mins = lc._fmt_reset((lc.datetime.datetime.now(lc.datetime.timezone.utc)
                          + lc.datetime.timedelta(minutes=31)).isoformat())
 check("_fmt_reset: under an hour shows HH:MM(Nm)",
