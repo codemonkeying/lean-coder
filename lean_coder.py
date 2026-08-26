@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L1323   Lean-tools (plugin tools: discovery, manager)
-  L1673   MCP client (connection, manager, OAuth, discovery)
-  L2127   Providers (backend plugin registry)
-  L2349   Interactive pickers + menus (raw-mode UI engine)
-  L2698   Terminal styling (colors, formatting helpers)
-  L2934   Streaming + markdown render (model output)
-  L3408   Composer (pinned input line, editor, stdin)
-  L4271   Token accounting (calibrated context meter)
-  L4445   Config (dataclass, field registry, load/save)
-  L7970   Tool execution + text tool-call parsing
-  L8396   Remote workspace (executor client, /connect)
-  L10025  Context meter
-  L10120  Agent (turn loop, context mgmt, tool dispatch)
-  L16695  Slash-command handlers + dispatch table
-  L16832  REPL (interactive loop, session resume)
-  L17216  Worker agent (headless --agent-run)
-  L17888  Entry (CLI arg parsing, main)
+  L1330   Lean-tools (plugin tools: discovery, manager)
+  L1680   MCP client (connection, manager, OAuth, discovery)
+  L2134   Providers (backend plugin registry)
+  L2356   Interactive pickers + menus (raw-mode UI engine)
+  L2705   Terminal styling (colors, formatting helpers)
+  L2941   Streaming + markdown render (model output)
+  L3415   Composer (pinned input line, editor, stdin)
+  L4278   Token accounting (calibrated context meter)
+  L4452   Config (dataclass, field registry, load/save)
+  L7977   Tool execution + text tool-call parsing
+  L8403   Remote workspace (executor client, /connect)
+  L10032  Context meter
+  L10127  Agent (turn loop, context mgmt, tool dispatch)
+  L16702  Slash-command handlers + dispatch table
+  L16839  REPL (interactive loop, session resume)
+  L17223  Worker agent (headless --agent-run)
+  L17895  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -116,7 +116,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.10.34"
+__version__ = "0.10.35"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -124,6 +124,13 @@ __version__ = "0.10.34"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.10.35": [
+        "change: the direct Anthropic API-key provider no longer silently retries a",
+        "  rate-limited (429) turn on Haiku - same fix as the plan provider in 0.10.34. The",
+        "  swap kept the turn's max-tokens above Haiku's 64k ceiling so the retry 400'd, and",
+        "  a silent mid-conversation downgrade is confusing anyway. The turn now stops cleanly",
+        "  with the model + any retry-after; wait it out or check your API key's limits.",
+    ],
     "0.10.34": [
         "polish: a plan-limit reset that's over an hour out now reads '>Nh' with the whole",
         "  hours remaining (e.g. '>1h', '>2h', '>3h') instead of a flat '>1hr' for anything",
