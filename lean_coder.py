@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L1330   Lean-tools (plugin tools: discovery, manager)
-  L1680   MCP client (connection, manager, OAuth, discovery)
-  L2134   Providers (backend plugin registry)
-  L2356   Interactive pickers + menus (raw-mode UI engine)
-  L2705   Terminal styling (colors, formatting helpers)
-  L2941   Streaming + markdown render (model output)
-  L3415   Composer (pinned input line, editor, stdin)
-  L4278   Token accounting (calibrated context meter)
-  L4452   Config (dataclass, field registry, load/save)
-  L7977   Tool execution + text tool-call parsing
-  L8403   Remote workspace (executor client, /connect)
-  L10032  Context meter
-  L10127  Agent (turn loop, context mgmt, tool dispatch)
-  L16702  Slash-command handlers + dispatch table
-  L16839  REPL (interactive loop, session resume)
-  L17223  Worker agent (headless --agent-run)
-  L17895  Entry (CLI arg parsing, main)
+  L1343   Lean-tools (plugin tools: discovery, manager)
+  L1693   MCP client (connection, manager, OAuth, discovery)
+  L2147   Providers (backend plugin registry)
+  L2369   Interactive pickers + menus (raw-mode UI engine)
+  L2718   Terminal styling (colors, formatting helpers)
+  L2954   Streaming + markdown render (model output)
+  L3428   Composer (pinned input line, editor, stdin)
+  L4291   Token accounting (calibrated context meter)
+  L4476   Config (dataclass, field registry, load/save)
+  L8001   Tool execution + text tool-call parsing
+  L8427   Remote workspace (executor client, /connect)
+  L10056  Context meter
+  L10151  Agent (turn loop, context mgmt, tool dispatch)
+  L16830  Slash-command handlers + dispatch table
+  L16967  REPL (interactive loop, session resume)
+  L17351  Worker agent (headless --agent-run)
+  L18023  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -116,7 +116,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.10.35"
+__version__ = "0.10.36"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -124,6 +124,19 @@ __version__ = "0.10.35"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.10.36": [
+        "fix: a malformed tool_calls entry from a provider (a bare list, a string, or a",
+        "  dict without a 'function') no longer crashes the whole turn with",
+        "  'AttributeError: list object has no attribute get'. Both the run loop and the",
+        "  tool-pair repair now filter to well-formed calls, so one junk entry is dropped",
+        "  cleanly and a session that already has one baked in self-heals on load instead",
+        "  of bricking every resume.",
+        "change: 'curl | bash' installs are more honest about prerequisites. The README now",
+        "  lists a per-distro one-liner for python3 + curl (Debian/WSL, Fedora, Arch, Alpine,",
+        "  Termux, macOS), and install.sh accepts curl OR wget, checks for tar, and prints the",
+        "  exact package-manager command for THIS platform when a prerequisite is missing -",
+        "  instead of a bare 'command not found' on a minimal image.",
+    ],
     "0.10.35": [
         "change: the direct Anthropic API-key provider no longer silently retries a",
         "  rate-limited (429) turn on Haiku - same fix as the plan provider in 0.10.34. The",
@@ -4417,6 +4430,17 @@ def repair_tool_pairs(messages):
     i, n = 0, len(messages)
     while i < n:
         m = messages[i]
+        # A provider (or a poisoned autosave) can leave a malformed tool_calls
+        # entry - a bare list, a string, a dict without "function". Filter to
+        # well-formed calls so the healing below (and the API send) never chokes
+        # on c.get(...); an all-junk tool_calls collapses to a plain assistant msg.
+        raw_tc = m.get("tool_calls") if m.get("role") == "assistant" else None
+        if raw_tc:
+            good = [c for c in raw_tc
+                    if isinstance(c, dict) and isinstance(c.get("function"), dict)]
+            if good != raw_tc:
+                m = {**m, "tool_calls": good} if good else {
+                    k: v for k, v in m.items() if k != "tool_calls"}
         if m.get("role") == "assistant" and m.get("tool_calls"):
             out.append(m)
             calls = m.get("tool_calls") or []
@@ -12477,6 +12501,14 @@ class Agent:
             self.messages.append(assistant)
             self._cap_begin_turn(assistant)   # training-capture: open turn record (no-op if off)
             calls = assistant.get("tool_calls")
+            # Normalize: a provider (esp. a text-parsed / OpenAI-compatible one)
+            # can hand back a malformed tool_calls entry - a bare list, a string,
+            # or a dict missing "function". One bad element must not crash the whole
+            # turn in _parallel_safe / the run loop (both assume call.get(...)), so
+            # drop anything that isn't a well-formed {"function": {...}} dict here.
+            if calls:
+                calls = [c for c in calls
+                         if isinstance(c, dict) and isinstance(c.get("function"), dict)]
             if not calls:
                 self._cap_end_turn()
                 self._end_of_turn()
@@ -15877,6 +15909,97 @@ def handle_new_command(agent, cfg, arg):
     print(dim(f"started new session '{new}'."))
 
 
+# ssh client dependency for /connect. The one-liner install works on Linux/WSL/Termux,
+# but the ssh CLIENT is not always present (minimal WSL/container images, a fresh
+# Termux). /connect is dead without it, so detect + offer the platform-right install.
+_SSH_INSTALL = {
+    #  kind      (label,                   install command,                              auto_ok)
+    "termux":  ("Termux",             "pkg install -y openssh",                            True),
+    "debian":  ("Debian/Ubuntu/WSL",  "sudo apt update && sudo apt install -y openssh-client", True),
+    "fedora":  ("Fedora/RHEL",        "sudo dnf install -y openssh-clients",               True),
+    "arch":    ("Arch",               "sudo pacman -S --noconfirm openssh",                True),
+    "alpine":  ("Alpine",             "sudo apk add openssh-client",                       True),
+    "macos":   ("macOS",              "ssh ships with macOS - check your PATH",            False),
+    "linux":   ("Linux",              "install 'openssh-client' with your package manager", False),
+    "unknown": ("this system",        "install the OpenSSH client for your platform",       False),
+}
+
+
+def _host_platform_kind():
+    """Best-effort classification of the LOCAL host for an install hint: 'termux',
+    'wsl', 'debian', 'fedora', 'arch', 'alpine', 'macos', 'windows', 'linux', 'unknown'.
+    Termux and WSL both look like Linux to uname, so check those first."""
+    if ("com.termux" in (os.environ.get("PREFIX", "") + sys.prefix)) \
+            or os.path.isdir("/data/data/com.termux/files/usr"):
+        return "termux"
+    plat = sys.platform
+    if plat == "darwin":
+        return "macos"
+    if plat.startswith("win"):
+        return "windows"
+    if plat.startswith("linux"):
+        try:
+            if any(x in os.uname().release.lower() for x in ("microsoft", "wsl")):
+                return "wsl"
+        except Exception:
+            pass
+        try:
+            data = {}
+            with open("/etc/os-release") as fh:
+                for line in fh:
+                    if "=" in line:
+                        k, _, v = line.partition("=")
+                        data[k.strip()] = v.strip().strip('"').lower()
+            ident = data.get("ID", "") + " " + data.get("ID_LIKE", "")
+            if any(x in ident for x in ("debian", "ubuntu", "mint", "raspbian")):
+                return "debian"
+            if any(x in ident for x in ("fedora", "rhel", "centos", "rocky", "alma")):
+                return "fedora"
+            if any(x in ident for x in ("arch", "manjaro")):
+                return "arch"
+            if "alpine" in ident:
+                return "alpine"
+        except Exception:
+            pass
+        return "linux"
+    return "unknown"
+
+
+def _ssh_install_hint():
+    """(label, command, auto_ok) for installing the ssh client on the local host.
+    WSL maps to the debian recipe (its common base); a bare 'linux' stays generic."""
+    kind = _host_platform_kind()
+    if kind == "wsl":
+        kind = "debian"
+    return _SSH_INSTALL.get(kind, _SSH_INSTALL["unknown"])
+
+
+def _ensure_ssh_client():
+    """Return True if the local `ssh` client is available. If not, explain that /connect
+    needs it and OFFER to install it with the platform-right command (where we can auto-
+    install and a prompt is available). Returns False if ssh is still missing after."""
+    if shutil.which("ssh"):
+        return True
+    label, cmd, auto_ok = _ssh_install_hint()
+    print(yellow("  [!] /connect needs the OpenSSH client (`ssh`), which isn't installed."))
+    print(dim(f"      On {label}:  {cmd}"))
+    if not (auto_ok and shutil.which("sh")):
+        return False
+    if not _ask(f"Install it now with `{cmd}`?"):
+        return False
+    print(dim(f"  running: {cmd}"))
+    try:
+        rc = subprocess.run(cmd, shell=True).returncode
+    except Exception as e:
+        print(red(f"  install failed to launch: {e}"))
+        return False
+    if rc == 0 and shutil.which("ssh"):
+        print(green("  OpenSSH client installed - /connect is ready."))
+        return True
+    print(red(f"  install did not complete (exit {rc}); install ssh manually:\n    {cmd}"))
+    return False
+
+
 def handle_connect_command(agent, cfg, arg):
     """/connect <[user@]host> [remote-path] [--ephemeral] - enter/switch a remote
     workspace: all file/exec tools then run there, transparently to the model. Bare
@@ -15884,7 +16007,12 @@ def handle_connect_command(agent, cfg, arg):
     <name> forgets a saved target. --ephemeral (Windows) forces the embeddable-Python
     runtime and wipes it on teardown (zero-trace; also dogfoods the embed path). Any
     failure leaves you where you were."""
-    # Pull an --ephemeral / -e flag out of anywhere in the arg (order-agnostic). The
+    # /connect is dead without a local ssh client (a minimal WSL/container image or a
+    # fresh Termux often lacks it). Detect + offer the platform-right install before we
+    # try anything, including the picker - '/connect remove' is the only exception since
+    # it just edits config and needs no ssh.
+    if arg.split(maxsplit=1)[:1] != ["remove"] and not _ensure_ssh_client():
+        return
     # flag is a per-connect OVERRIDE of the cfg.ephemeral default (which a user can set
     # to always-wipe via /set ephemeral on); --no-ephemeral forces off for one connect.
     toks = arg.split()
