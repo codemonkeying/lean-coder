@@ -60,13 +60,26 @@ change has to pass three gates before it ships. See [CONTRIBUTING.md](CONTRIBUTI
 
 ## Install
 
-On Linux / WSL:
+**Prerequisites:** `python3` (3.11+, for stdlib `tomllib`) and `curl` **or** `git` to
+fetch the code. Python ships on most Linux/WSL images; a *minimal* one (fresh WSL Debian,
+slim containers) may lack curl/git - install them first with your package manager:
+
+| Platform | Prerequisite install |
+|---|---|
+| Debian / Ubuntu / **WSL** | `sudo apt update && sudo apt install -y python3 curl` |
+| Fedora / RHEL | `sudo dnf install -y python3 curl` |
+| Arch | `sudo pacman -S --noconfirm python curl` |
+| Alpine | `sudo apk add python3 curl` |
+| Android / Termux | `pkg install -y python curl` |
+| macOS | `python3` + `curl` ship with the OS (or `brew install python`) |
+
+Then, on Linux / WSL / macOS:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/codemonkeying/lean-coder/main/install.sh | bash
 ```
 
-On Android / Termux:
+On Android / Termux (prerequisite + install in one line):
 
 ```bash
 pkg install -y python curl && curl -fsSL https://raw.githubusercontent.com/codemonkeying/lean-coder/main/install.sh | bash
@@ -77,7 +90,7 @@ onto your `PATH`. On Termux there's no sudo/systemd, so it points you at a remot
 (`lean_coder --host http://HOST:11434`). For a local Ollama on Linux, add
 `--with-ollama --pull`. It's idempotent; `./uninstall.sh` does a full teardown.
 
-Prefer to inspect first? Clone and run it in place with no install at all:
+Prefer to inspect first? Clone and run it in place with no install at all (needs `git`):
 
 ```bash
 git clone https://github.com/codemonkeying/lean-coder
@@ -87,10 +100,13 @@ python3 lean_coder.py                            # or run in place: local Ollama
 python3 lean_coder.py --host http://box:11434 --model qwen3-coder:30b
 ```
 
-**Requirements:** Python 3.11+ (uses stdlib `tomllib`); no third-party packages for the
-core (a couple of opt-in lean-tools bring their own, e.g. `web_screenshot` needs
-Playwright, and say so). Plus a tool-calling model behind a provider - **Ollama** works
-out of the box, or a **hosted API** (Anthropic, Gemini, Groq, OpenAI, OpenRouter).
+**Runtime requirements:** Python 3.11+ and **no third-party Python packages** for the
+core - it's stdlib-only (a couple of opt-in lean-tools bring their own, e.g.
+`web_screenshot` needs Playwright, and say so). `/connect` to a remote also needs an
+`ssh` client (lean-coder prompts you to install it if missing). Plus a tool-calling model
+behind a provider - **Ollama** works out of the box, or a **hosted API** (Anthropic,
+Gemini, Groq, OpenAI, OpenRouter; the Anthropic *subscription* provider also needs `node`
+on PATH, and prompts to install it).
 
 **Updating:** re-run the one-liner (or `git pull && ./install.sh`) any time. Or enable
 the `update` lean-tool and run `/update` from the REPL: it pulls only a newer

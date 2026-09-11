@@ -61,6 +61,28 @@ IS_TERMUX=0
 case "${PREFIX:-}" in *com.termux*) IS_TERMUX=1;; esac
 [ -d /data/data/com.termux ] && IS_TERMUX=1
 
+# Distro-aware install hint for a missing prerequisite tool (curl/git/tar/python3),
+# so a fresh/minimal image (WSL Debian, slim containers) gets an ACTIONABLE error
+# instead of a bare 'not found'. Echoes the package-manager command for THIS platform.
+pkg_hint() {  # pkg_hint <pkg> -> prints the install command for the detected distro
+  local p="$1"
+  if [ "$IS_TERMUX" = 1 ]; then printf 'pkg install -y %s' "$p"; return; fi
+  local id="" like=""
+  if [ -r /etc/os-release ]; then
+    id="$(. /etc/os-release 2>/dev/null; printf '%s' "${ID:-}")"
+    like="$(. /etc/os-release 2>/dev/null; printf '%s' "${ID_LIKE:-}")"
+  fi
+  case "$id $like" in
+    *debian*|*ubuntu*|*mint*|*raspbian*) printf 'sudo apt update && sudo apt install -y %s' "$p";;
+    *fedora*|*rhel*|*centos*|*rocky*|*alma*) printf 'sudo dnf install -y %s' "$p";;
+    *arch*|*manjaro*)                    printf 'sudo pacman -S --noconfirm %s' "$p";;
+    *alpine*)                            printf 'sudo apk add %s' "$p";;
+    *)  case "$(uname -s)" in
+          Darwin) printf 'brew install %s' "$p";;
+          *)      printf "install '%s' with your package manager" "$p";;
+        esac;;
+  esac
+}
 # ---- pretty output ----------------------------------------------------------
 if [ -t 1 ]; then
   B=$'\e[1m'; DIM=$'\e[2m'; RED=$'\e[31m'; GRN=$'\e[32m'; YEL=$'\e[33m'; CYN=$'\e[36m'; Z=$'\e[0m'
@@ -256,15 +278,23 @@ done
 # and repoint SCRIPT_DIR at the extracted tree so the rest of the flow is a normal
 # local install. A remote install self-fetches on the remote, so skip it here.
 if [ -z "$REMOTE_HOST" ] && [ "$UNINSTALL" != 1 ] && [ ! -f "$SCRIPT_DIR/lean_coder.py" ]; then
-  command -v curl >/dev/null 2>&1 || die "curl not found - needed to fetch lean-coder."
-  command -v tar  >/dev/null 2>&1 || die "tar not found - needed to unpack lean-coder."
+  # Fetch with curl OR wget (a minimal image may ship only one). tar is required to
+  # unpack. Missing tools get an actionable, distro-specific install hint.
+  if command -v curl >/dev/null 2>&1; then
+    DL='curl -fsSL'
+  elif command -v wget >/dev/null 2>&1; then
+    DL='wget -qO-'
+  else
+    die "need curl or wget to fetch lean-coder. Install one:  $(pkg_hint curl)"
+  fi
+  command -v tar >/dev/null 2>&1 || die "tar not found - needed to unpack lean-coder.  $(pkg_hint tar)"
   say "Fetching lean-coder ($REPO@$BRANCH)"
   FETCH_TMP="$(mktemp -d "${TMPDIR:-/tmp}/lc-fetch.XXXXXX")"
   trap 'rm -rf "$FETCH_TMP"' EXIT
   if [ "$DRY" = 1 ]; then
-    printf '%s\n' "${DIM}  would: curl $TARBALL_URL | tar -xz -> use as source${Z}"
+    printf '%s\n' "${DIM}  would: $DL $TARBALL_URL | tar -xz -> use as source${Z}"
   else
-    curl -fsSL "$TARBALL_URL" | tar -xz -C "$FETCH_TMP" \
+    $DL "$TARBALL_URL" | tar -xz -C "$FETCH_TMP" \
       || die "download failed ($TARBALL_URL) - check network / branch name."
     SRC="$(find "$FETCH_TMP" -maxdepth 1 -type d -name 'lean-coder-*' | head -1)"
     [ -n "$SRC" ] && [ -f "$SRC/lean_coder.py" ] \
@@ -294,7 +324,7 @@ fi
 
 # ---- 1. Python 3.11+ --------------------------------------------------------
 say "Checking Python"
-command -v python3 >/dev/null 2>&1 || die "python3 not found - install Python 3.11+ first."
+command -v python3 >/dev/null 2>&1 || die "python3 not found - install Python 3.11+ first.  $(pkg_hint python3)"
 PYV="$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])')"
 python3 -c 'import sys; raise SystemExit(0 if sys.version_info[:2] >= (3,11) else 1)' \
   || die "Python $PYV found, but 3.11+ is required (needs tomllib)."

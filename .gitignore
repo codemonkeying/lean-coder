@@ -66,6 +66,9 @@ NOTES.md
 # Live providers working dir. Same pattern: ignore the contents, re-include the
 # bundled providers that ship enabled/available out of the box. Your own local
 # provider drop-ins (which may carry credentials) stay untracked automatically.
+# PRIVATE/NEVER-SHIP providers (anthropic_plan.py, simtheory.py, ...) are covered
+# by the /providers/* ignore below and are deliberately NOT on the re-include
+# allowlist - keep it that way so they can never be committed.
 /providers/*
 !/providers/README.md
 !/providers/ollama.py
