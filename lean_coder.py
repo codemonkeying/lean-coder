@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L1343   Lean-tools (plugin tools: discovery, manager)
-  L1693   MCP client (connection, manager, OAuth, discovery)
-  L2147   Providers (backend plugin registry)
-  L2369   Interactive pickers + menus (raw-mode UI engine)
-  L2718   Terminal styling (colors, formatting helpers)
-  L2954   Streaming + markdown render (model output)
-  L3428   Composer (pinned input line, editor, stdin)
-  L4291   Token accounting (calibrated context meter)
-  L4476   Config (dataclass, field registry, load/save)
-  L8001   Tool execution + text tool-call parsing
-  L8427   Remote workspace (executor client, /connect)
-  L10056  Context meter
-  L10151  Agent (turn loop, context mgmt, tool dispatch)
-  L16830  Slash-command handlers + dispatch table
-  L16967  REPL (interactive loop, session resume)
-  L17351  Worker agent (headless --agent-run)
-  L18023  Entry (CLI arg parsing, main)
+  L1350   Lean-tools (plugin tools: discovery, manager)
+  L1700   MCP client (connection, manager, OAuth, discovery)
+  L2154   Providers (backend plugin registry)
+  L2376   Interactive pickers + menus (raw-mode UI engine)
+  L2725   Terminal styling (colors, formatting helpers)
+  L2961   Streaming + markdown render (model output)
+  L3435   Composer (pinned input line, editor, stdin)
+  L4298   Token accounting (calibrated context meter)
+  L4483   Config (dataclass, field registry, load/save)
+  L8008   Tool execution + text tool-call parsing
+  L8434   Remote workspace (executor client, /connect)
+  L10063  Context meter
+  L10158  Agent (turn loop, context mgmt, tool dispatch)
+  L16837  Slash-command handlers + dispatch table
+  L16974  REPL (interactive loop, session resume)
+  L17358  Worker agent (headless --agent-run)
+  L18030  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -116,7 +116,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.10.36"
+__version__ = "0.10.37"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -124,6 +124,13 @@ __version__ = "0.10.36"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.10.37": [
+        "fix: shell_session now uses the same gpg-agent TTY refresh as /connect, so an",
+        "  ssh key that is a GPG subkey can draw its pinentry-curses prompt on your",
+        "  terminal instead of failing with 'agent refused operation' (or relying on a",
+        "  desktop GUI popup that a terminal-only box or Termux doesn't have). No-op",
+        "  without a gpg-agent-backed key or a real tty.",
+    ],
     "0.10.36": [
         "fix: a malformed tool_calls entry from a provider (a bare list, a string, or a",
         "  dict without a 'function') no longer crashes the whole turn with",

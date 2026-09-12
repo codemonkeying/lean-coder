@@ -318,10 +318,17 @@ def _start(args, cwd):
         child = [shell, "-i"]            # interactive so it shows a prompt + line-edits
         where = shell
     master, slave = pty.openpty()
+    # Base env: prefer the gpg-agent TTY refresh (mirrors /connect) so a GPG-subkey
+    # ssh key can draw pinentry-curses on the operator's terminal instead of failing
+    # with 'agent refused operation' (or relying on a GUI popup that a headless /
+    # Termux box doesn't have). It sets GPG_TTY + registers the tty; no-op without a
+    # gpg-agent-backed key or a real tty. Falls back to plain os.environ.
+    _grefresh = _H.get("_refresh_gpg_agent_tty")
+    base_env = _grefresh() if _grefresh else dict(os.environ)
     # TERM=dumb so interactive programs (python's pyrepl, bash's readline, etc.)
     # don't emit cursor-control / line-redraw escapes we'd only have to scrub back
     # out. Kills the noise at the source, so captured output reads like a plain log.
-    env = dict(os.environ, TERM="dumb")
+    env = dict(base_env, TERM="dumb")
     try:
         proc = subprocess.Popen(
             child, stdin=slave, stdout=slave, stderr=slave,
@@ -506,6 +513,11 @@ def setup(lc, cfg):
     # plain decode without it). setup runs driver-only = where run() also fires.
     if "_clean_captured" in lc:
         _H["_clean_captured"] = lc["_clean_captured"]
+    # Same gpg-agent TTY refresh /connect uses: a GPG-subkey ssh key can then draw
+    # its pinentry-curses prompt on the operator's terminal (works terminal-only +
+    # Termux), not just a GUI popup. Optional - degrade to prior behaviour without it.
+    if "_refresh_gpg_agent_tty" in lc:
+        _H["_refresh_gpg_agent_tty"] = lc["_refresh_gpg_agent_tty"]
     # Operator-facing listing; tidy up any live sessions at exit.
     reg = lc.get("register_command")
     if reg:
