@@ -40,15 +40,18 @@ TOOL = {
         "type": "object",
         "properties": {
             "action": {"type": "string",
-                       "enum": ["create", "add", "assign", "done", "fail",
+                       "enum": ["create", "add", "assign", "done", "fail", "cancel",
                                 "list", "reconcile", "participant"],
                        "description": "create=new board; add=append a task (deps=[...]); "
                                       "assign=put a worker/participant on a READY task; done/fail="
-                                      "record an outcome; list=tasks (status= or query= filters); "
+                                      "record an outcome; cancel=void a task that should not have "
+                                      "existed / is no longer wanted (NOT a failure, NOT a done - "
+                                      "excluded from reconcile, pings the current assignee to stop); "
+                                      "list=tasks (status= or query= filters); "
                                       "reconcile=done results in dependency order; participant="
                                       "register/list peer agents (pre-declare an expected role, or "
                                       "list who is registered). Driver-only: create/add/assign/"
-                                      "participant. Workers: done/fail their task + list/reconcile."},
+                                      "cancel/participant. Workers: done/fail their task + list/reconcile."},
             "board": {"type": "string",
                       "description": "Board name (like a session name). Required by every action."},
             "task": {"type": "string",
@@ -74,8 +77,8 @@ TOOL = {
                            "description": "done: pointer to the work product (e.g. the worker's "
                                           "result file). Collected by reconcile."},
             "status": {"type": "string",
-                       "description": "list: filter to one status (open|assigned|done|failed), or "
-                                      "'ready' for the assignable ones."},
+                       "description": "list: filter to one status (open|assigned|done|failed|"
+                                      "cancelled), or 'ready' for the assignable ones."},
             "query": {"type": "string",
                       "description": "list: only tasks whose id/name/note contains this text."},
         },
@@ -101,7 +104,8 @@ def setup(lc, cfg):
               "_taskboard_mutate", "_taskboards_list", "_tb_task", "worker_inject",
               "_taskboard_participant_upsert", "_taskboard_participant",
               "_participant_resolve", "spawn_peer", "peer_inject", "_my_session_name",
-              "dim", "bold", "green", "cyan"):
+              "_session_name_ok",
+              "dim", "bold", "green", "cyan", "red"):
         if k in lc:
             _H[k] = lc[k]
     _H["cfg"] = cfg
@@ -171,10 +175,47 @@ def _notify_assigner(board_name, tid, action, note, assigned_by, task_name):
             else f" (assigner '{handle}' is dormant; could not spawn - {out or 'dispatch_worker not enabled'})")
 
 
+def _notify_dead_dependents(board_name, board, dead_dep_id, dead_status):
+    """When a task goes cancelled/failed, its dependents can never run (DAG rule: a dep must
+    be 'done'). Wake the ASSIGNER of each such dependent (its recorded assigned_by - the
+    return address) so whoever owns that downstream task learns their branch just died and can
+    fix it (re-add the dep, cancel the dependent, reassign). Returns a short tail summarising
+    who was pinged, "" if nobody. Never raises. Same peer lifecycle as _notify_assigner, but
+    keyed on the DEPENDENT's assigner, not the finished task's."""
+    by_id = {t.get("id"): t for t in board.get("tasks", [])}
+    me = (_H.get("_my_session_name") or (lambda: ""))()
+    resolve = _H.get("_participant_resolve")
+    pinj = _H.get("peer_inject")
+    pinged = []
+    for t in board.get("tasks", []):
+        if t.get("status") not in ("open", "blocked"):
+            continue
+        if dead_dep_id not in (t.get("deps") or []):
+            continue
+        who = (t.get("assigned_by") or "").strip()
+        if not who or who == me:
+            continue                           # no return address, or it's us - skip
+        ping = (f"[board '{board_name}'] your task {t.get('id')} ({t.get('name','')}) is now "
+                f"DEAD - its dependency {dead_dep_id} is {dead_status}, so {t.get('id')} can "
+                f"never become ready. Fix it: re-add {dead_dep_id}, cancel {t.get('id')}, or "
+                f"reassign (action='list' to see the board).")
+        res = resolve(who) if resolve else {"state": "missing"}
+        if res.get("state") == "live-here":
+            if bool(pinj and pinj(who, ping)) or _push(res.get("pid"), ping):
+                pinged.append(who)
+        # dormant/elsewhere/missing: don't spawn a whole session just to warn; it's on the
+        # board (the [!] DEAD line in list) for when they next look.
+    if pinged:
+        uniq = ", ".join(sorted(set(pinged)))
+        return f" (warned dead-branch owner(s): {uniq})"
+    return ""
+
+
 # Status -> checkbox glyph, so a board reads like the pinned PLAN (GOAL + a '- [ ]' list):
 #   [ ] not started (open)   [~] in flight (assigned)   [x] done   [!] failed
 # A blocked task (open but deps unmet) keeps [ ] and is tagged '(blocked: ...)'.
-_BOX = {"done": "[x]", "assigned": "[~]", "failed": "[!]", "open": "[ ]", "blocked": "[ ]"}
+_BOX = {"done": "[x]", "assigned": "[~]", "failed": "[!]", "open": "[ ]", "blocked": "[ ]",
+        "cancelled": "[-]"}
 
 
 def _fmt_task(t, ready_ids, blocked_ids=frozenset()):
@@ -200,6 +241,25 @@ def _fmt_task(t, ready_ids, blocked_ids=frozenset()):
     return f"  - {box} {tid}  {t.get('name','')}{who}{by}{state}{rr}{note}"
 
 
+def _dead_branch(board):
+    """Tasks that can NEVER become ready because a dependency is cancelled or failed (not
+    'done', and never will be) - a dead branch. Returns a list of (task, [dead_dep_ids]).
+    The DAG rule (ready iff every dep is 'done') leaves these blocked forever with no active
+    signal, so list/reconcile surface them and the driver decides (re-add the dep, cancel the
+    dependents, or reassign). A task blocked only by an OPEN/ASSIGNED dep is NOT dead - that
+    dep may still complete; only cancelled/failed deps are terminal."""
+    by_id = {t.get("id"): t for t in board.get("tasks", [])}
+    out = []
+    for t in board.get("tasks", []):
+        if t.get("status") not in ("open", "blocked"):
+            continue
+        dead = [d for d in t.get("deps", [])
+                if (by_id.get(d) or {}).get("status") in ("cancelled", "failed")]
+        if dead:
+            out.append((t, dead))
+    return out
+
+
 def _render(name, board):
     """A board's full task list, plan-style (checkbox lines + GOAL/counts header)."""
     ready, blocked = _H["_taskboard_ready"](board)
@@ -218,6 +278,13 @@ def _render(name, board):
         lines.append(_H["green"](f"ready to assign: {', '.join(sorted(ready_ids))}"))
     else:
         lines.append(_H["dim"]("ready to assign: (none)"))
+    dead = _dead_branch(board)
+    if dead:
+        for t, deps in dead:
+            lines.append(_H["red"](
+                f"  [!] {t.get('id')} '{t.get('name','')}' is DEAD - blocked on "
+                f"{'/'.join(deps)} ({', '.join(_H['_tb_task'](board, d).get('status','?') for d in deps)}); "
+                f"it can never run. Re-add the dep, cancel this, or reassign."))
     return "\n".join(lines)
 
 
@@ -278,12 +345,19 @@ def run(args, cwd):
         tasks = board.get("tasks", [])
         done_no_ref = [t for t in tasks
                        if t.get("status") == "done" and not t.get("result_ref")]
-        pending = [t for t in tasks if t.get("status") not in ("done", "failed")]
+        pending = [t for t in tasks if t.get("status") not in ("done", "failed", "cancelled")]
         failed = [t for t in tasks if t.get("status") == "failed"]
+        dead = _dead_branch(board)
+        dead_line = ""
+        if dead:
+            dead_line = _H["red"]("dead branch (blocked on a cancelled/failed dep, can never "
+                                  "run): " + ", ".join(t.get("id") for t, _ in dead))
         if not pairs:
             base = f"board '{name}': nothing to reconcile - no done task has a result_ref yet."
             if pending:
                 base += f" ({len(pending)} task(s) still unfinished.)"
+            if dead_line:
+                base += "\n" + dead_line
             return base
         lines = [_H["bold"](f"board '{name}' reconcile (dependency order):")]
         for i, (t, rr) in enumerate(pairs, 1):
@@ -298,6 +372,8 @@ def run(args, cwd):
             tail.append(f"{len(failed)} failed")
         if tail:
             lines.append(_H["dim"]("note: " + "; ".join(tail) + "."))
+        if dead_line:
+            lines.append(dead_line)
         return "\n".join(lines)
 
     if action == "participant":
@@ -386,9 +462,35 @@ def run(args, cwd):
                 + (f" Note: {note}" if note else "")
                 + " Do this task, then mark it done on the board (action='done').")
         # If 'worker' names a registered PARTICIPANT (a peer session), resolve its live
-        # address and act on the peer's lifecycle; else fall back to the plain pid push (1a).
+        # address and act on the peer's lifecycle. A NON-NUMERIC handle that isn't yet a
+        # registered participant is still treated as a peer session name: we resolve it,
+        # and if a real session (live/dormant) backs it we auto-register + wake it rather
+        # than silently degrading to a dead pid-push (the old bug: assign to a bare label
+        # like 'unity' fell through to _push('unity', ...), which no-ops - the task got
+        # marked assigned but NOTHING was ever notified). Only a genuinely numeric handle
+        # takes the plain worker-pid path.
         part = _H.get("_taskboard_participant")
         prec = part(board2, worker) if part else None
+        if not prec and not worker.isdigit():
+            # A bare label, not a registered participant: try to resolve it as a peer
+            # session by name. If it backs a real session, adopt it as a participant.
+            res0 = _H["_participant_resolve"](worker)
+            if res0.get("state") in ("live-here", "live-elsewhere", "dormant"):
+                up = _H.get("_taskboard_participant_upsert")
+                if up:
+                    def _do_reg(bd):
+                        rec, e = up(bd, worker)
+                        return (rec, "") if not e else (None, e)
+                    _b, prec, _e = _H["_taskboard_mutate"](name, _do_reg)
+                if not prec:
+                    nok = _H.get("_session_name_ok")
+                    prec = {"name": (nok(worker) if nok else worker) or worker}
+            else:
+                # Non-numeric name that maps to no session at all - refuse loudly rather
+                # than pretend. The task IS marked assigned (above); say it can't be reached.
+                return (f"assigned {tid} '{tname}' to '{worker}', but '{worker}' is neither a "
+                        f"live worker pid nor a reachable session - NOT notified. Register it "
+                        f"first (action='participant'), or check the session name exists.")
         if prec:
             handle = prec.get("name")
             res = _H["_participant_resolve"](handle)
@@ -417,9 +519,9 @@ def run(args, cwd):
                         if out and "error" not in out.lower()
                         else f" (peer '{handle}' is dormant; could not spawn - {out or 'dispatch_worker not enabled'})")
             return f"assigned {tid} '{tname}' to {worker}.{tail}"
-        # Not a participant: plain worker pid push (1a).
+        # Numeric handle: plain worker pid push (1a).
         pushed = _push(worker, ping)
-        tail = " (worker pinged)" if pushed else ""
+        tail = " (worker pinged)" if pushed else " (worker pid not live; nothing pushed)"
         return f"assigned {tid} '{tname}' to worker {worker}.{tail}"
 
     if action in ("done", "fail"):
@@ -462,6 +564,80 @@ def run(args, cwd):
         msg += _notify_assigner(name, tid, action, note,
                                 (meta or {}).get("assigned_by", ""),
                                 (meta or {}).get("name", ""))
+        # A FAIL makes any dependent un-runnable (its dep will never be 'done'). Warn the
+        # owners of those now-dead dependents so a dead branch never goes unnoticed.
+        if action == "fail":
+            msg += _notify_dead_dependents(name, board2, tid, "failed")
+        return msg
+    if action == "cancel":
+        # Void a task that should not have existed / is no longer wanted. Distinct from
+        # done (a real result) and fail (attempted, couldn't) - a cancelled task is
+        # excluded from reconcile and never counts as work. Driver-only (it directs the
+        # board). The interested party here is the CURRENT ASSIGNEE (a worker/peer may be
+        # mid-task and should stop), not the assigner - so we ping them, not the return leg.
+        if not _is_driver():
+            return _driver_only(action)
+        tid = (args.get("task") or "").strip()
+        if not tid:
+            return "error: action='cancel' needs a 'task' id."
+        note = (args.get("note") or "").strip()
+
+        def _do_cancel(bd):
+            t = _H["_tb_task"](bd, tid)
+            if not t:
+                return None, f"unknown task id '{tid}'."
+            prev = t.get("status")
+            # Refuse to cancel a DONE task: other tasks may depend on it (cancelling flips
+            # its status off 'done', silently un-readying every dependent - a diamond-dep
+            # orphan), and reconcile would lose a real result. A finished task stays done;
+            # if the work must be undone, that's a new task, not a cancel.
+            if prev == "done":
+                return None, (f"{tid} is already done - refusing to cancel it (dependents "
+                              f"would be orphaned and its result lost). Cancel only open/"
+                              f"assigned tasks.")
+            if prev == "cancelled":
+                return None, f"{tid} is already cancelled."
+            _H["_taskboard_set_status"](bd, tid, "cancelled", note=note or None)
+            return {"assignee": t.get("assignee") or "", "name": t.get("name", ""),
+                    "prev": prev}, ""
+
+        board2, meta, err = _H["_taskboard_mutate"](name, _do_cancel)
+        if err:
+            return f"error: {err}"
+        meta = meta or {}
+        msg = f"cancelled {tid} '{meta.get('name','')}' (was {meta.get('prev','?')})."
+        # Ping the current assignee to stop, if there was a live one working it. Same peer
+        # lifecycle as assign/notify-back: peer_inject live-here, note elsewhere, skip if it
+        # was never assigned or the assignee is ourselves.
+        who = (meta.get("assignee") or "").strip()
+        me = (_H.get("_my_session_name") or (lambda: ""))()
+        if who and who != me:
+            ping = (f"[board '{name}'] task {tid} ({meta.get('name','')}) you were assigned "
+                    f"is CANCELLED - stop work on it." + (f" Note: {note}" if note else "")
+                    + " (action='list' to see the board).")
+            if who.isdigit():
+                # Assignee was a plain worker pid (assigned by pid, not a named peer):
+                # push straight to the live worker's inbox. Mirrors assign's pid path.
+                ok = _push(who, ping)
+                msg += " (assignee worker pinged to stop)" if ok else \
+                       " (assignee worker pid not live; nothing to stop)"
+            else:
+                resolve = _H.get("_participant_resolve")
+                res = resolve(who) if resolve else {"state": "missing"}
+                state = res.get("state")
+                if state == "live-here":
+                    pinj = _H.get("peer_inject")
+                    ok = bool(pinj and pinj(who, ping)) or _push(res.get("pid"), ping)
+                    msg += f" (assignee '{who}' pinged to stop)" if ok else \
+                           f" (assignee '{who}' live but push failed; it will see the board)"
+                elif state == "live-elsewhere":
+                    msg += f" (assignee '{who}' is live on {res.get('host')}; not woken - it will see the board)"
+                else:
+                    # dormant/missing: don't SPAWN a session just to tell it to stop - pointless.
+                    msg += f" (assignee '{who}' not live; nothing to stop)"
+        # A CANCEL makes any dependent un-runnable (its dep will never be 'done'). Warn the
+        # owners of those now-dead dependents so a dead branch never goes unnoticed.
+        msg += _notify_dead_dependents(name, board2, tid, "cancelled")
         return msg
 
     return f"error: unknown action '{action}'."

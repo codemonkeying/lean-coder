@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L1350   Lean-tools (plugin tools: discovery, manager)
-  L1700   MCP client (connection, manager, OAuth, discovery)
-  L2154   Providers (backend plugin registry)
-  L2376   Interactive pickers + menus (raw-mode UI engine)
-  L2725   Terminal styling (colors, formatting helpers)
-  L2961   Streaming + markdown render (model output)
-  L3435   Composer (pinned input line, editor, stdin)
-  L4298   Token accounting (calibrated context meter)
-  L4483   Config (dataclass, field registry, load/save)
-  L8008   Tool execution + text tool-call parsing
-  L8434   Remote workspace (executor client, /connect)
-  L10063  Context meter
-  L10158  Agent (turn loop, context mgmt, tool dispatch)
-  L16837  Slash-command handlers + dispatch table
-  L16974  REPL (interactive loop, session resume)
-  L17358  Worker agent (headless --agent-run)
-  L18030  Entry (CLI arg parsing, main)
+  L1363   Lean-tools (plugin tools: discovery, manager)
+  L1713   MCP client (connection, manager, OAuth, discovery)
+  L2167   Providers (backend plugin registry)
+  L2389   Interactive pickers + menus (raw-mode UI engine)
+  L2738   Terminal styling (colors, formatting helpers)
+  L2974   Streaming + markdown render (model output)
+  L3448   Composer (pinned input line, editor, stdin)
+  L4311   Token accounting (calibrated context meter)
+  L4496   Config (dataclass, field registry, load/save)
+  L8021   Tool execution + text tool-call parsing
+  L8447   Remote workspace (executor client, /connect)
+  L10076  Context meter
+  L10171  Agent (turn loop, context mgmt, tool dispatch)
+  L16850  Slash-command handlers + dispatch table
+  L16987  REPL (interactive loop, session resume)
+  L17371  Worker agent (headless --agent-run)
+  L18043  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -116,7 +116,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.10.37"
+__version__ = "0.10.38"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -124,6 +124,19 @@ __version__ = "0.10.37"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.10.38": [
+        "board: new action='cancel' voids a task (status 'cancelled', glyph [-]) - excluded",
+        "  from reconcile/ready/unfinished and pings the current assignee to stop; refuses",
+        "  to cancel a done task (would orphan dependents) or double-cancel.",
+        "board: dead-branch detection - a task blocked on a cancelled/failed dependency can",
+        "  never run, so list/reconcile now flag it ([!] tN is DEAD) and cancel/fail ping",
+        "  the assigner of each newly-dead dependent so a stuck branch never goes unnoticed.",
+        "board: assign to a bare (non-pid) worker name now resolves it as a peer session and",
+        "  auto-registers/wakes it, instead of silently pushing to a dead pid (unity-notify",
+        "  bug); a name that maps to no session errors loudly.",
+        "fix: a harvested worker (action=result) is no longer re-reported as 'FAILED - exited",
+        "  without writing a result' after its sidecar is reaped.",
+    ],
     "0.10.37": [
         "fix: shell_session now uses the same gpg-agent TTY refresh as /connect, so an",
         "  ssh key that is a GPG subkey can draw its pinentry-curses prompt on your",
@@ -7075,7 +7088,7 @@ def _board_sweep(grace=3600):
 # `done` first (AND semantics). ready(t) := status==open AND every dep is done.
 
 TASKBOARDS_DIR = CONFIG_DIR / "workers" / "taskboards"
-_TB_STATUSES = ("open", "assigned", "blocked", "done", "failed")
+_TB_STATUSES = ("open", "assigned", "blocked", "done", "failed", "cancelled")
 
 # Per-board locks. Every board mutation is a load->mutate->save read-modify-write; without
 # serialization two concurrent mutations (threads within one turn - `board` is safe:True so a
