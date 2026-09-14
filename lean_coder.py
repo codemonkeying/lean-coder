@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L1363   Lean-tools (plugin tools: discovery, manager)
-  L1713   MCP client (connection, manager, OAuth, discovery)
-  L2167   Providers (backend plugin registry)
-  L2389   Interactive pickers + menus (raw-mode UI engine)
-  L2738   Terminal styling (colors, formatting helpers)
-  L2974   Streaming + markdown render (model output)
-  L3448   Composer (pinned input line, editor, stdin)
-  L4311   Token accounting (calibrated context meter)
-  L4496   Config (dataclass, field registry, load/save)
-  L8021   Tool execution + text tool-call parsing
-  L8447   Remote workspace (executor client, /connect)
-  L10076  Context meter
-  L10171  Agent (turn loop, context mgmt, tool dispatch)
-  L16850  Slash-command handlers + dispatch table
-  L16987  REPL (interactive loop, session resume)
-  L17371  Worker agent (headless --agent-run)
-  L18043  Entry (CLI arg parsing, main)
+  L1372   Lean-tools (plugin tools: discovery, manager)
+  L1722   MCP client (connection, manager, OAuth, discovery)
+  L2176   Providers (backend plugin registry)
+  L2398   Interactive pickers + menus (raw-mode UI engine)
+  L2747   Terminal styling (colors, formatting helpers)
+  L2983   Streaming + markdown render (model output)
+  L3457   Composer (pinned input line, editor, stdin)
+  L4320   Token accounting (calibrated context meter)
+  L4505   Config (dataclass, field registry, load/save)
+  L8044   Tool execution + text tool-call parsing
+  L8470   Remote workspace (executor client, /connect)
+  L10099  Context meter
+  L10194  Agent (turn loop, context mgmt, tool dispatch)
+  L16903  Slash-command handlers + dispatch table
+  L17040  REPL (interactive loop, session resume)
+  L17424  Worker agent (headless --agent-run)
+  L18096  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -116,7 +116,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.10.38"
+__version__ = "0.10.39"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -124,6 +124,15 @@ __version__ = "0.10.38"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.10.39": [
+        "fix: a provider-scoped setting a backend holds in its OWN state (not cfg) is no",
+        "  longer lost on save or leaked to the global config default on load. New",
+        "  capture_settings provider hook (save-side counterpart to restore_settings) folds",
+        "  the live value into the session's meta, and load applies it to the backend without",
+        "  persisting it to config.toml. Fixes the anthropic multi-account bug where a",
+        "  session-only account switch was dropped on reload, and loading a non-default-",
+        "  account session silently flipped every future session's default account.",
+    ],
     "0.10.38": [
         "board: new action='cancel' voids a task (status 'cancelled', glyph [-]) - excluded",
         "  from reconcile/ready/unfinished and pings the current assignee to stop; refuses",
@@ -5628,8 +5637,22 @@ def save_session(messages, cfg, name: str, remote=None, pinned_plan="", notes=No
         "origin": origin,                    # None for a normal save; else where it came from,
                                              # e.g. "worker:20250611-143022-84213-3" (promoted)
     }
+    # Let the active provider fold in any settings it holds in its OWN live state (not
+    # mirrored in cfg) - e.g. the anthropic account label after a session-only switch,
+    # which updates the module-global but deliberately not cfg. Without this the meta
+    # would capture the stale cfg value (above) and the switch would be lost on reload.
+    # Overrides the cfg-derived values set above. Best-effort; never breaks a save.
+    try:
+        spec = get_provider(cfg.provider) if cfg.provider else None
+        if spec and spec.get("capture_settings"):
+            captured = spec["capture_settings"](None, cfg) or {}
+            for k, v in captured.items():
+                meta[k] = v
+    except Exception:
+        pass
     path = _session_path(safe)
     _atomic_write_text(path, json.dumps(_session_envelope(messages, meta), indent=2))
+    return path, meta
     return path, meta
 
 
@@ -13131,6 +13154,13 @@ def register_provider(spec):
         # activated + settings copied onto cfg. Must NOT persist to config.toml (session-
         # scoped). Absent -> nothing (a provider reading settings live per-turn needs none).
         "restore_settings": spec.get("restore_settings"),
+        # capture_settings(agent, cfg) -> {key: value}: the SAVE-side counterpart of
+        # restore_settings. Returns provider-scoped values read from the provider's OWN live
+        # state (a module-global that cfg doesn't mirror) to fold into the session meta at
+        # save time. Needed when a session-only switch (e.g. /ant_account 0, persist=False)
+        # updates module state but deliberately NOT cfg - without this, save would capture the
+        # stale cfg value and the switch would be lost on reload. Absent -> nothing.
+        "capture_settings": spec.get("capture_settings"),
     }
     _providers[name] = norm
     return norm
@@ -14576,10 +14606,23 @@ def _restore_session_state(agent, cfg, meta):
     if tf is not None:
         set_tok_factor(tf)
 
-    for key in ("thinking", "effort", "account"):         # provider-scoped settings
+    for key in ("thinking", "effort"):                    # provider-scoped settings (cfg-held)
         val = meta.get(key)
         if val is not None and val != cfg.setting(key):
             cfg.set_setting(key, val)
+    # `account` is provider-scoped but must NOT persist to the global config.toml default:
+    # provider_settings is written LIVE by save_config (it bypasses the _defaults shield),
+    # so a plain cfg.set_setting("account", ...) here would make loading a non-default-account
+    # session silently flip EVERY future fresh session to that account on the next autosave.
+    # The account is session-scoped: it belongs in this session's meta (captured on save from
+    # the provider's live module state) and in the live module state, never in the global.
+    # So: stage it into cfg only long enough for restore_settings to read it, apply it to the
+    # module, then pop it back out so save_config never sees it.
+    acct = meta.get("account")
+    had_acct_key = cfg.provider and "account" in cfg.provider_settings.get(cfg.provider, {})
+    prev_acct = cfg.setting("account") if had_acct_key else None
+    if acct is not None:
+        cfg.set_setting("account", acct)
     # A provider-scoped setting like `account` is read by the provider from its own
     # module state (seeded once at setup), not live from cfg each turn - so a plain
     # cfg.set_setting isn't enough to make it take effect. Give the live backend a hook
@@ -14592,6 +14635,16 @@ def _restore_session_state(agent, cfg, meta):
             spec["restore_settings"](agent, cfg)
     except Exception:
         pass
+    # Un-stage account from cfg so it can't leak to the global config.toml default. The live
+    # account now lives in the provider module (set by restore_settings); the session meta
+    # keeps it via capture_settings on the next save. Restore cfg's prior account state
+    # exactly (a key we added -> remove it; a key that pre-existed -> put its old value back).
+    if acct is not None and cfg.provider:
+        ps = cfg.provider_settings.get(cfg.provider, {})
+        if had_acct_key:
+            ps["account"] = prev_acct
+        else:
+            ps.pop("account", None)
 
     # Per-key SESSION OVERRIDES (the uniform working-state layer): re-apply the loaded
     # session's overrides onto the LIVE cfg at RUNTIME only - never save_config here, so
