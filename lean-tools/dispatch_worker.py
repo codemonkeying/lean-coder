@@ -933,6 +933,13 @@ def _worker_result(pid):
     if res is None:
         return (f"worker {pid} has no result yet (still running or terminated before "
                 f"writing one). Use action='status' to check its state.")
+    # Collecting the result here counts as harvesting it: mark announced + accrue usage so
+    # a later _finished_notice() scan can't re-report this same worker as FAILED once its
+    # process exits and its result sidecar is reaped (the false 'exited without writing a
+    # result' notice - we already HAVE the result in hand right now).
+    if not meta.get("announced"):
+        meta["announced"] = True
+        _accrue_usage(meta)
     return f"worker {pid} result (task: {meta['task'][:100]}):\n{res.strip()}"
 
 
