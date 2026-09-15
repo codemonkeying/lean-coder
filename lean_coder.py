@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L1408   Lean-tools (plugin tools: discovery, manager)
-  L1758   MCP client (connection, manager, OAuth, discovery)
-  L2212   Providers (backend plugin registry)
-  L2434   Interactive pickers + menus (raw-mode UI engine)
-  L2783   Terminal styling (colors, formatting helpers)
-  L3019   Streaming + markdown render (model output)
-  L3493   Composer (pinned input line, editor, stdin)
-  L4356   Token accounting (calibrated context meter)
-  L4541   Config (dataclass, field registry, load/save)
-  L8117   Tool execution + text tool-call parsing
-  L8550   Remote workspace (executor client, /connect)
-  L10189  Context meter
-  L10284  Agent (turn loop, context mgmt, tool dispatch)
-  L17098  Slash-command handlers + dispatch table
-  L17235  REPL (interactive loop, session resume)
-  L17635  Worker agent (headless --agent-run)
-  L18307  Entry (CLI arg parsing, main)
+  L1413   Lean-tools (plugin tools: discovery, manager)
+  L1763   MCP client (connection, manager, OAuth, discovery)
+  L2217   Providers (backend plugin registry)
+  L2439   Interactive pickers + menus (raw-mode UI engine)
+  L2788   Terminal styling (colors, formatting helpers)
+  L3024   Streaming + markdown render (model output)
+  L3498   Composer (pinned input line, editor, stdin)
+  L4361   Token accounting (calibrated context meter)
+  L4546   Config (dataclass, field registry, load/save)
+  L8122   Tool execution + text tool-call parsing
+  L8555   Remote workspace (executor client, /connect)
+  L10194  Context meter
+  L10289  Agent (turn loop, context mgmt, tool dispatch)
+  L17103  Slash-command handlers + dispatch table
+  L17240  REPL (interactive loop, session resume)
+  L17640  Worker agent (headless --agent-run)
+  L18300  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -116,7 +116,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.10.43"
+__version__ = "0.10.44"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -124,6 +124,11 @@ __version__ = "0.10.43"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.10.44": [
+        "internal: removed a duplicate max_iterations application in the headless-worker",
+        "  setup path and folded the repetitive grant integer-field parsing into one helper",
+        "  (no behaviour change).",
+    ],
     "0.10.43": [
         "internal: code-shape cleanup from the periodic audit (no behaviour change) -",
         "  the turn loop's send path was de-duplicated into a single recovery helper and the",
@@ -17697,32 +17702,24 @@ def run_agent_brief(args) -> int:
         names = tuple(t.strip() for t in grant["tools"].split(",") if t.strip())
         if names:
             cfg.tool_allowlist = names
-    if grant.get("max_iterations"):
-        try:
-            cfg.max_iterations = int(grant["max_iterations"])
-        except ValueError:
-            pass
+    def _grant_int(key, attr):
+        # Apply an integer grant field onto cfg, ignoring a malformed value (keep default).
+        if grant.get(key):
+            try:
+                setattr(cfg, attr, int(grant[key]))
+            except ValueError:
+                pass
+
+    _grant_int("max_iterations", "max_iterations")
     # Safe-recursion governor: the grant carries this worker's DEPTH in the tree and the
     # CHILD BUDGET the parent granted it. The dispatch tool reads these back off cfg to
     # decide whether this worker may spawn (and how many). Absent -> depth 1, 0 children
     # (a plain fan-out worker that can't recurse - the safe default).
-    if grant.get("depth"):
-        try:
-            cfg.worker_depth = int(grant["depth"])
-        except ValueError:
-            pass
-    if grant.get("child_budget"):
-        try:
-            cfg.worker_child_budget = int(grant["child_budget"])
-        except ValueError:
-            pass
+    _grant_int("depth", "worker_depth")
+    _grant_int("child_budget", "worker_child_budget")
     # Shared swarm board: the driver's session id, so this worker's board claims land on
     # the SAME claims file its peers use. Absent -> 0 -> a lone worker with no board.
-    if grant.get("board"):
-        try:
-            cfg.worker_board_session = int(grant["board"])
-        except ValueError:
-            pass
+    _grant_int("board", "worker_board_session")
     # Named task DAG board (Phase 2b): the driver assigned this worker to a board by NAME.
     # Auto-load the `board` lean-tool so the worker can report its task done + read the
     # board - granting a worker a board IS the intent to let it coordinate, so requiring the
@@ -17748,11 +17745,7 @@ def run_agent_brief(args) -> int:
     remote_ctl = getattr(args, "remote_ctl", None)
     if grant.get("cwd") and not remote_host:
         cfg.cwd = Path(grant["cwd"]).expanduser()
-    if grant.get("max_iterations"):
-        try:
-            cfg.max_iterations = int(grant["max_iterations"])
-        except ValueError:
-            pass
+    # (max_iterations already applied above via _grant_int)
     if not cfg.cwd.is_dir():
         return _fail(f"cwd is not a directory: {cfg.cwd}")
 
