@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L1413   Lean-tools (plugin tools: discovery, manager)
-  L1763   MCP client (connection, manager, OAuth, discovery)
-  L2217   Providers (backend plugin registry)
-  L2439   Interactive pickers + menus (raw-mode UI engine)
-  L2788   Terminal styling (colors, formatting helpers)
-  L3024   Streaming + markdown render (model output)
-  L3498   Composer (pinned input line, editor, stdin)
-  L4361   Token accounting (calibrated context meter)
-  L4546   Config (dataclass, field registry, load/save)
-  L8122   Tool execution + text tool-call parsing
-  L8555   Remote workspace (executor client, /connect)
-  L10194  Context meter
-  L10289  Agent (turn loop, context mgmt, tool dispatch)
-  L17103  Slash-command handlers + dispatch table
-  L17240  REPL (interactive loop, session resume)
-  L17640  Worker agent (headless --agent-run)
-  L18300  Entry (CLI arg parsing, main)
+  L1418   Lean-tools (plugin tools: discovery, manager)
+  L1768   MCP client (connection, manager, OAuth, discovery)
+  L2222   Providers (backend plugin registry)
+  L2444   Interactive pickers + menus (raw-mode UI engine)
+  L2793   Terminal styling (colors, formatting helpers)
+  L3029   Streaming + markdown render (model output)
+  L3503   Composer (pinned input line, editor, stdin)
+  L4366   Token accounting (calibrated context meter)
+  L4551   Config (dataclass, field registry, load/save)
+  L8126   Tool execution + text tool-call parsing
+  L8559   Remote workspace (executor client, /connect)
+  L10198  Context meter
+  L10293  Agent (turn loop, context mgmt, tool dispatch)
+  L17107  Slash-command handlers + dispatch table
+  L17244  REPL (interactive loop, session resume)
+  L17644  Worker agent (headless --agent-run)
+  L18304  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -116,7 +116,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.10.44"
+__version__ = "0.10.45"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -124,6 +124,11 @@ __version__ = "0.10.44"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.10.45": [
+        "fix: the config file is now written atomically (temp + fsync + rename), like the",
+        "  session autosave already was - a crash mid-write can no longer truncate config.toml",
+        "  and break the next launch. Also dropped a dead duplicate return in save_session.",
+    ],
     "0.10.44": [
         "internal: removed a duplicate max_iterations application in the headless-worker",
         "  setup path and folded the repetitive grant integer-field parsing into one helper",
@@ -5555,7 +5560,7 @@ def save_config(cfg: Config, quiet: bool = False):
         lines.append("")
         lines.append(f"[providers.{name}]")
         lines += [f"{k} = {_toml_value(v)}" for k, v in saved.items()]
-    CONFIG_PATH.write_text("\n".join(lines) + "\n")
+    _atomic_write_text(CONFIG_PATH, "\n".join(lines) + "\n")
     if not quiet:
         print(green(f"saved config -> {CONFIG_PATH}"))
 
@@ -5705,7 +5710,6 @@ def save_session(messages, cfg, name: str, remote=None, pinned_plan="", notes=No
         pass
     path = _session_path(safe)
     _atomic_write_text(path, json.dumps(_session_envelope(messages, meta), indent=2))
-    return path, meta
     return path, meta
 
 
