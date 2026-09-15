@@ -181,7 +181,7 @@ Sessions are portable across providers (full history is re-sent each turn).
 
   The model is told its ceiling, so it says "I'm read-only; `/leash rw` to let me edit"
   rather than failing opaquely.
-- **`/approve` - confirm cadence** (`ask` | `session` | `auto`, default `ask`). *When* to
+- **`/approve` - confirm cadence** (`ask` | `session` | `auto`, default `session`). *When* to
   confirm within the ceiling:
   - `ask` - confirm every edit/command (you see a diff / the command first).
   - `session` - confirm once, then auto-approve the rest of this run.
@@ -379,7 +379,7 @@ Precedence: **CLI flag > env var > config file > default**.
 | Model           | `--model`              | `LEANCODER_MODEL` | `qwen3-coder:30b`         |
 | Context window  | `--num-ctx`            | -                 | auto-detect, capped 32768 |
 | Project dir     | `--cwd`                | -                 | current directory         |
-| Approval mode   | `--approval` / `--auto`| -                 | `ask` (confirm each)      |
+| Approval mode   | `--approval` / `--auto`| -                 | `session` (ask once)      |
 | Capability      | `--leash`              | -                 | `rwe`                     |
 | Resume session  | `--resume <name>`      | -                 | auto-load last for cwd    |
 
