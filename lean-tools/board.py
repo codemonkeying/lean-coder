@@ -49,9 +49,13 @@ TOOL = {
                                       "excluded from reconcile, pings the current assignee to stop); "
                                       "list=tasks (status= or query= filters); "
                                       "reconcile=done results in dependency order; participant="
-                                      "register/list peer agents (pre-declare an expected role, or "
-                                      "list who is registered). Driver-only: create/add/assign/"
-                                      "cancel/participant. Workers: done/fail their task + list/reconcile."},
+                                      "register a peer agent (pre-declare an expected role), OR - with "
+                                      "no worker= - LIST every registered peer with its LIVE/dormant "
+                                      "state (a read-only liveness check: call this BEFORE assign to see "
+                                      "whether a peer is live-here/live-elsewhere/dormant/missing, "
+                                      "instead of learning it as a side effect of assigning). Driver-only: "
+                                      "create/add/assign/cancel/participant-register. Workers: done/fail "
+                                      "their task + list/reconcile/participant-list."},
             "board": {"type": "string",
                       "description": "Board name (like a session name). Required by every action."},
             "task": {"type": "string",
@@ -69,7 +73,8 @@ TOOL = {
             "role": {"type": "string",
                      "description": "participant: the peer's role label (defaults to its name). "
                                     "assign uses 'worker' as the participant name; this is only "
-                                    "for action='participant' registration."},
+                                    "for action='participant' registration. (Omit worker= AND role= on "
+                                    "action='participant' to just LIST peers + their live/dormant state.)"},
             "note": {"type": "string",
                      "description": "Optional free text: driver->worker context on assign, or "
                                     "worker->driver why on fail."},
