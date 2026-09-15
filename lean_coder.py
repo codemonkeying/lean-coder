@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L1403   Lean-tools (plugin tools: discovery, manager)
-  L1753   MCP client (connection, manager, OAuth, discovery)
-  L2207   Providers (backend plugin registry)
-  L2429   Interactive pickers + menus (raw-mode UI engine)
-  L2778   Terminal styling (colors, formatting helpers)
-  L3014   Streaming + markdown render (model output)
-  L3488   Composer (pinned input line, editor, stdin)
-  L4351   Token accounting (calibrated context meter)
-  L4536   Config (dataclass, field registry, load/save)
-  L8112   Tool execution + text tool-call parsing
-  L8545   Remote workspace (executor client, /connect)
-  L10184  Context meter
-  L10279  Agent (turn loop, context mgmt, tool dispatch)
-  L17081  Slash-command handlers + dispatch table
-  L17218  REPL (interactive loop, session resume)
-  L17618  Worker agent (headless --agent-run)
-  L18290  Entry (CLI arg parsing, main)
+  L1408   Lean-tools (plugin tools: discovery, manager)
+  L1758   MCP client (connection, manager, OAuth, discovery)
+  L2212   Providers (backend plugin registry)
+  L2434   Interactive pickers + menus (raw-mode UI engine)
+  L2783   Terminal styling (colors, formatting helpers)
+  L3019   Streaming + markdown render (model output)
+  L3493   Composer (pinned input line, editor, stdin)
+  L4356   Token accounting (calibrated context meter)
+  L4541   Config (dataclass, field registry, load/save)
+  L8117   Tool execution + text tool-call parsing
+  L8550   Remote workspace (executor client, /connect)
+  L10189  Context meter
+  L10284  Agent (turn loop, context mgmt, tool dispatch)
+  L17098  Slash-command handlers + dispatch table
+  L17235  REPL (interactive loop, session resume)
+  L17635  Worker agent (headless --agent-run)
+  L18307  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -116,7 +116,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.10.42"
+__version__ = "0.10.43"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -124,6 +124,11 @@ __version__ = "0.10.42"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.10.43": [
+        "internal: code-shape cleanup from the periodic audit (no behaviour change) -",
+        "  the turn loop's send path was de-duplicated into a single recovery helper and the",
+        "  per-tool-call body lifted into its own method; the glyph helper got a real name.",
+    ],
     "0.10.42": [
         "fix: assigning a board task to a DORMANT peer no longer risks spawning DUPLICATE",
         "  concurrent copies of that session. A board-spawned worker holds no session lock,",
@@ -2869,7 +2874,7 @@ def _rl_safe(prompt: str) -> str:
 
 # ----------------------------------------------------------------------------
 # Glyphs - define a symbol ONCE with an ASCII fallback; callers use the constant
-# (or g()) and never repeat the "does this terminal support it?" check. We pick
+# (or glyph()) and never repeat the "does this terminal support it?" check. We pick
 # the Unicode form only when stdout's encoding is UTF-8 (Windows consoles and
 # minimal TERMs get the ASCII version instead of mojibake). One place to change.
 # ----------------------------------------------------------------------------
@@ -2877,38 +2882,38 @@ def _rl_safe(prompt: str) -> str:
 _UNICODE = "utf" in (getattr(sys.stdout, "encoding", "") or "").lower()
 
 
-def g(uni: str, alt: str) -> str:
+def glyph(uni: str, alt: str) -> str:
     """The Unicode glyph if the terminal can render it, else the ASCII fallback.
     Exposed for ad-hoc/lean-tool use; most code uses the GLYPH constants below."""
     return uni if _UNICODE else alt
 
 
 GLYPH = {
-    "prompt":   g("›", ">"),
-    "prompt_remote": g("»", ">>"),  # prompt glyph when tools run on a REMOTE (like root's $ vs #)
-    "bullet":   g("●", "*"),       # assistant message
-    "tool":     g("⚙", "*"),       # a tool call (uncategorised / fallback)
-    "bg":       g("⚡", "&"),       # a backgrounded (detached) run_command
-    "warn":     g("⚠", "!"),
-    "edit":     g("✎", "*"),       # files changed
+    "prompt":   glyph("›", ">"),
+    "prompt_remote": glyph("»", ">>"),  # prompt glyph when tools run on a REMOTE (like root's $ vs #)
+    "bullet":   glyph("●", "*"),       # assistant message
+    "tool":     glyph("⚙", "*"),       # a tool call (uncategorised / fallback)
+    "bg":       glyph("⚡", "&"),       # a backgrounded (detached) run_command
+    "warn":     glyph("⚠", "!"),
+    "edit":     glyph("✎", "*"),       # files changed
     # Per-CATEGORY call-line icons (derived from tool tiering, not per-tool): the eye
     # scans "read/write/run/net/mcp/meta" at a glance. Each has an ASCII fallback.
-    "cat_read": g("◎", "r"),       # read_file, list_files, search_files, safe lean-tools
-    "cat_write": g("✎", "w"),      # apply_diff, replace_lines, write_file
-    "cat_exec": g("»", "$"),       # run_command, shell_session, ask_user_to_run
-    "cat_net":  g("⇅", "@"),       # web_fetch, brave_search, ssh, web_screenshot  # sweep-ok
-    "cat_mcp":  g("⧉", "m"),       # any mcp__* tool
-    "cat_meta": g("◇", "-"),       # update_plan, note, request_compact
-    "userbar":  g("┃", "|"),       # left accent bar down the operator's own turn
-    "ok":       g("✓", "+"),
-    "no":       g("✗", "x"),
-    "think":    g("💭", "..."),    # reasoning
-    "ghost":    g("👻", "~"),       # incognito session marker (ASCII fallback ~)
-    "new":      g("✦", "+"),       # "start a new session" row in the session picker
-    "dot":      g("·", "-"),       # inline separator
-    "ellipsis": g("…", "..."),
-    "ret":      g("⏎", "<"),       # newline shown inline
-    "rule":     g(chr(0x2500), "-"),  # U+2500 box-draw; chr() keeps it out of the sweep
+    "cat_read": glyph("◎", "r"),       # read_file, list_files, search_files, safe lean-tools
+    "cat_write": glyph("✎", "w"),      # apply_diff, replace_lines, write_file
+    "cat_exec": glyph("»", "$"),       # run_command, shell_session, ask_user_to_run
+    "cat_net":  glyph("⇅", "@"),       # web_fetch, brave_search, ssh, web_screenshot  # sweep-ok
+    "cat_mcp":  glyph("⧉", "m"),       # any mcp__* tool
+    "cat_meta": glyph("◇", "-"),       # update_plan, note, request_compact
+    "userbar":  glyph("┃", "|"),       # left accent bar down the operator's own turn
+    "ok":       glyph("✓", "+"),
+    "no":       glyph("✗", "x"),
+    "think":    glyph("💭", "..."),    # reasoning
+    "ghost":    glyph("👻", "~"),       # incognito session marker (ASCII fallback ~)
+    "new":      glyph("✦", "+"),       # "start a new session" row in the session picker
+    "dot":      glyph("·", "-"),       # inline separator
+    "ellipsis": glyph("…", "..."),
+    "ret":      glyph("⏎", "<"),       # newline shown inline
+    "rule":     glyph(chr(0x2500), "-"),  # U+2500 box-draw; chr() keeps it out of the sweep
 }
 
 # precompiled once (GLYPH["dot"] is fixed at import): strips the volatile 'N turns'
@@ -2922,8 +2927,8 @@ _STATUS_TURNS_RE = re.compile(r"\s*" + re.escape(GLYPH["dot"]) + r"\s*\d+ turns"
 # spawns threads or writes control chars in non-interactive use.
 # ----------------------------------------------------------------------------
 
-THINK_FRAMES = g("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏", "|/-\\")   # braille when UTF-8, ASCII spinner otherwise
-TOOL_FRAMES = g("◐◓◑◒", "|/-\\")             # moon when UTF-8, ASCII otherwise
+THINK_FRAMES = glyph("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏", "|/-\\")   # braille when UTF-8, ASCII spinner otherwise
+TOOL_FRAMES = glyph("◐◓◑◒", "|/-\\")             # moon when UTF-8, ASCII otherwise
 
 # --- lightweight markdown styling for streamed model output --------------------
 # The markers are ALWAYS stripped (so a minimal terminal shows clean "Title", not
@@ -12581,23 +12586,10 @@ class Agent:
             # so a per-round stub pass is redundant. /trim (manual + emergency) + compact
             # cover the rest. auto_evict busted the cache mid-prefix every round for a
             # small win now that bodies are born-small.)
-            try:
-                assistant, prompt_eval, aborted = self._chat_with_model_fallback()
-            except (ConnectionError, RuntimeError) as e:
-                # A failed send gets ONE recovery attempt then a retry:
-                #  - transport recovery: a provider may fail over (ollama re-probes its
-                #    priority pool and jumps to the next live host), so a dropped LAN box
-                #    / roaming off wifi doesn't dead-end;
-                #  - auth recovery (OBE): a missing/invalid key (401/403) on a provider
-                #    that can log in offers the login flow inline instead of a red error.
-                if not self._recover_and_should_retry(e):
-                    print(red(f"\n{e}"))
-                    return
-                try:
-                    assistant, prompt_eval, aborted = self._chat_with_model_fallback()
-                except (ConnectionError, RuntimeError) as e2:
-                    print(red(f"\n{e2}"))
-                    return
+            sent = self._send_once()
+            if sent is None:      # send failed even after recovery; end the turn
+                return
+            assistant, prompt_eval, aborted = sent
             if aborted:
                 # Drop the half-streamed turn; history stays consistent.
                 print(yellow("\n^C - stopped mid-inference; back to prompt"))
@@ -12658,41 +12650,7 @@ class Agent:
             for call in calls:
                 if self._abort:                 # ^C between tool calls
                     return
-                fn = call.get("function", {})
-                name = fn.get("name", "")
-                args = fn.get("arguments", {})
-                if isinstance(args, str):
-                    try:
-                        args = json.loads(args)
-                    except json.JSONDecodeError:
-                        args = {}
-                cid = self.record_tool_call(name, args)
-                print(_tool_call_line(name, args, cid))
-                self._maybe_auto_expand(name, cid)
-                if name == "ask_user_to_run":
-                    # Interactive handoff: no spinner, operator runs it directly
-                    # (on the remote box when connected). Suspend the composer so
-                    # the editable prompt owns stdin/echo (no reader-thread race).
-                    with composer_suspended():
-                        result = run_direct_command(
-                            self.cfg, args.get("cmd", ""), args.get("reason"),
-                            remote=self.remote)
-                else:
-                    # Tool-running indicator (distinct from the model spinner),
-                    # labelled with the tool so you always see WHAT is running.
-                    # _ask() pauses it for confirmation prompts; in auto mode it
-                    # animates (with an elapsed counter) across the whole execution.
-                    spin = Spinner(name, TOOL_FRAMES, cyan, interval=0.12).start()
-                    try:
-                        result = self._run_tool(name, args)
-                    finally:
-                        spin.stop()
-                self.record_tool_result(cid, result)
-                self._cap_add_result(name, call.get("id", ""), result)  # training-capture
-                if _TTY:
-                    print(_tool_result_preview(name, result, cid))
-                self.messages.append(_tool_result_msg(name, result,
-                                                      tool_call_id=call.get("id", "")))
+                self._run_one_call(call)
             self._cap_end_turn()   # training-capture: flush the turn record (no-op if off)
         self._hit_iteration_cap = True    # stopped on the budget, not a natural finish
         print(yellow(f"\n{GLYPH['warn']} hit {cap}-iteration cap; stopping this turn. "
@@ -12700,6 +12658,65 @@ class Agent:
                      f"/set -> max_iterations (0 = unlimited), or set "
                      f"max_iterations in {CONFIG_PATH}."))
         self._end_of_turn()
+
+    def _send_once(self):
+        """One model send with ONE recovery attempt then a single retry. Returns
+        (assistant, prompt_eval, aborted) on success, or None if the send failed even
+        after recovery (caller ends the turn). Recovery covers: transport failover (a
+        provider re-probes its pool / jumps to the next live host, so a dropped LAN box
+        or roaming off wifi doesn't dead-end) and auth (a missing/invalid key on a
+        provider that can log in offers the login flow inline instead of a red error)."""
+        try:
+            return self._chat_with_model_fallback()
+        except (ConnectionError, RuntimeError) as e:
+            if not self._recover_and_should_retry(e):
+                print(red(f"\n{e}"))
+                return None
+            try:
+                return self._chat_with_model_fallback()
+            except (ConnectionError, RuntimeError) as e2:
+                print(red(f"\n{e2}"))
+                return None
+
+    def _run_one_call(self, call):
+        """Execute a single tool call: parse args, record + print the call, run it
+        (with the tool spinner, or the interactive handoff for ask_user_to_run),
+        then record + preview + append the result to the transcript."""
+        fn = call.get("function", {})
+        name = fn.get("name", "")
+        args = fn.get("arguments", {})
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except json.JSONDecodeError:
+                args = {}
+        cid = self.record_tool_call(name, args)
+        print(_tool_call_line(name, args, cid))
+        self._maybe_auto_expand(name, cid)
+        if name == "ask_user_to_run":
+            # Interactive handoff: no spinner, operator runs it directly
+            # (on the remote box when connected). Suspend the composer so
+            # the editable prompt owns stdin/echo (no reader-thread race).
+            with composer_suspended():
+                result = run_direct_command(
+                    self.cfg, args.get("cmd", ""), args.get("reason"),
+                    remote=self.remote)
+        else:
+            # Tool-running indicator (distinct from the model spinner),
+            # labelled with the tool so you always see WHAT is running.
+            # _ask() pauses it for confirmation prompts; in auto mode it
+            # animates (with an elapsed counter) across the whole execution.
+            spin = Spinner(name, TOOL_FRAMES, cyan, interval=0.12).start()
+            try:
+                result = self._run_tool(name, args)
+            finally:
+                spin.stop()
+        self.record_tool_result(cid, result)
+        self._cap_add_result(name, call.get("id", ""), result)  # training-capture
+        if _TTY:
+            print(_tool_result_preview(name, result, cid))
+        self.messages.append(_tool_result_msg(name, result,
+                                              tool_call_id=call.get("id", "")))
 
     def _end_of_turn(self):
         changed = sorted(self.tools.changed_files)

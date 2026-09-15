@@ -5416,9 +5416,9 @@ check("wrap_buffer: cols/max_rows floored at 1", len(_r) == 1 and _cr == 0)
 # glyph mechanism: one place, with ASCII fallback (no per-site capability checks)
 _usave = lc._UNICODE
 lc._UNICODE = True
-check("g(): picks the Unicode form when supported", lc.g("X", "Y") == "X")
+check("glyph(): picks the Unicode form when supported", lc.glyph("X", "Y") == "X")
 lc._UNICODE = False
-check("g(): falls back to ASCII when not", lc.g("X", "Y") == "Y")
+check("glyph(): falls back to ASCII when not", lc.glyph("X", "Y") == "Y")
 lc._UNICODE = _usave
 check("GLYPH: every entry has a value", all(v for v in lc.GLYPH.values()))
 check("GLYPH['rule'] is box-draw or ASCII dash", lc.GLYPH["rule"] in (chr(0x2500), "-"))
