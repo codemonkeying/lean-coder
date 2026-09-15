@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L1386   Lean-tools (plugin tools: discovery, manager)
-  L1736   MCP client (connection, manager, OAuth, discovery)
-  L2190   Providers (backend plugin registry)
-  L2412   Interactive pickers + menus (raw-mode UI engine)
-  L2761   Terminal styling (colors, formatting helpers)
-  L2997   Streaming + markdown render (model output)
-  L3471   Composer (pinned input line, editor, stdin)
-  L4334   Token accounting (calibrated context meter)
-  L4519   Config (dataclass, field registry, load/save)
-  L8070   Tool execution + text tool-call parsing
-  L8503   Remote workspace (executor client, /connect)
-  L10142  Context meter
-  L10237  Agent (turn loop, context mgmt, tool dispatch)
-  L17025  Slash-command handlers + dispatch table
-  L17162  REPL (interactive loop, session resume)
-  L17546  Worker agent (headless --agent-run)
-  L18218  Entry (CLI arg parsing, main)
+  L1394   Lean-tools (plugin tools: discovery, manager)
+  L1744   MCP client (connection, manager, OAuth, discovery)
+  L2198   Providers (backend plugin registry)
+  L2420   Interactive pickers + menus (raw-mode UI engine)
+  L2769   Terminal styling (colors, formatting helpers)
+  L3005   Streaming + markdown render (model output)
+  L3479   Composer (pinned input line, editor, stdin)
+  L4342   Token accounting (calibrated context meter)
+  L4527   Config (dataclass, field registry, load/save)
+  L8078   Tool execution + text tool-call parsing
+  L8511   Remote workspace (executor client, /connect)
+  L10150  Context meter
+  L10245  Agent (turn loop, context mgmt, tool dispatch)
+  L17036  Slash-command handlers + dispatch table
+  L17173  REPL (interactive loop, session resume)
+  L17562  Worker agent (headless --agent-run)
+  L18234  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -116,7 +116,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.10.40"
+__version__ = "0.10.41"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -124,6 +124,14 @@ __version__ = "0.10.40"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.10.41": [
+        "fix: a session that ran on a remote (/connect'd) now correctly resumes on that",
+        "  remote - it offers to reconnect (or auto-reconnects) instead of silently starting",
+        "  LOCAL. On quit, the exit paths (^C^C, Ctrl-D, /quit) were tearing down the remote",
+        "  BEFORE the final autosave, so the session recorded remote=None and had nothing to",
+        "  reconnect to; teardown is now left to the atexit handlers, which save first (remote",
+        "  still live) then close, in the right order.",
+    ],
     "0.10.40": [
         "notify: a board or peer message now renders in its own MAGENTA bar labelled",
         "  'board message'/'peer message', distinct from the cyan of your own background/",
@@ -16939,8 +16947,11 @@ REPL_EXIT = object()
 
 
 def handle_quit_command(agent, cfg, arg):
-    """/quit | /exit | /q - close any open remotes and leave the repl."""
-    agent.close_all_remotes()
+    """/quit | /exit | /q - leave the repl. Remote teardown + final autosave are left
+    to the atexit handlers, which run them in the RIGHT order: autosave first (remote
+    still live, so the session records the host it ran on and resumes reconnecting),
+    THEN close_all_remotes. Closing remotes here would null agent.remote before atexit's
+    autosave, so the final save recorded remote=None -> the session resumed LOCAL."""
     print("bye")
     return REPL_EXIT
 
@@ -17416,14 +17427,19 @@ def repl(cfg: Config, resume=None):
                         _rl_safe(bold(cyan(indicator + _pg + " "))), _wake)
                 pending_exit = False   # any input (even empty) disarms the exit
             except EOFError:           # Ctrl-D
-                agent.close_all_remotes()
+                # Don't tear down remotes here: the atexit handlers do it in the RIGHT
+                # order (autosave first - remote still live so the session records the
+                # host it ran on and resumes reconnecting - THEN close_all_remotes). A
+                # manual close_all_remotes() here nulls agent.remote before atexit's
+                # autosave runs, so the final save recorded remote=None -> resumed LOCAL.
                 if idle_comp is not None and not cfg.incognito:
                     idle_comp.save_history()   # incognito leaves no on-disk input trace
                 print("\nbye")
                 return
             except KeyboardInterrupt:  # ^C at the prompt: first cancels, second exits
                 if pending_exit:
-                    agent.close_all_remotes()
+                    # atexit handles autosave-then-close in order (see EOFError above);
+                    # closing remotes here would clobber the saved remote host to None.
                     if idle_comp is not None and not cfg.incognito:
                         idle_comp.save_history()   # incognito leaves no on-disk input trace
                     print("\nbye")
