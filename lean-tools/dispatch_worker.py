@@ -1632,8 +1632,6 @@ def _worker_cmd(agent, cfg, arg):
         pid = parts[1] if len(parts) > 1 else None
         if sub == "status":
             print(_worker_status(pid))
-        if sub == "status":
-            print(_worker_status(pid))
         elif sub == "result":
             print(_worker_result(pid))
         elif sub == "transcript":
