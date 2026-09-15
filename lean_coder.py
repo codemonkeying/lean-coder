@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L1372   Lean-tools (plugin tools: discovery, manager)
-  L1722   MCP client (connection, manager, OAuth, discovery)
-  L2176   Providers (backend plugin registry)
-  L2398   Interactive pickers + menus (raw-mode UI engine)
-  L2747   Terminal styling (colors, formatting helpers)
-  L2983   Streaming + markdown render (model output)
-  L3457   Composer (pinned input line, editor, stdin)
-  L4320   Token accounting (calibrated context meter)
-  L4505   Config (dataclass, field registry, load/save)
-  L8044   Tool execution + text tool-call parsing
-  L8470   Remote workspace (executor client, /connect)
-  L10099  Context meter
-  L10194  Agent (turn loop, context mgmt, tool dispatch)
-  L16903  Slash-command handlers + dispatch table
-  L17040  REPL (interactive loop, session resume)
-  L17424  Worker agent (headless --agent-run)
-  L18096  Entry (CLI arg parsing, main)
+  L1386   Lean-tools (plugin tools: discovery, manager)
+  L1736   MCP client (connection, manager, OAuth, discovery)
+  L2190   Providers (backend plugin registry)
+  L2412   Interactive pickers + menus (raw-mode UI engine)
+  L2761   Terminal styling (colors, formatting helpers)
+  L2997   Streaming + markdown render (model output)
+  L3471   Composer (pinned input line, editor, stdin)
+  L4334   Token accounting (calibrated context meter)
+  L4519   Config (dataclass, field registry, load/save)
+  L8070   Tool execution + text tool-call parsing
+  L8503   Remote workspace (executor client, /connect)
+  L10142  Context meter
+  L10237  Agent (turn loop, context mgmt, tool dispatch)
+  L17025  Slash-command handlers + dispatch table
+  L17162  REPL (interactive loop, session resume)
+  L17546  Worker agent (headless --agent-run)
+  L18218  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -116,7 +116,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.10.39"
+__version__ = "0.10.40"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -124,6 +124,20 @@ __version__ = "0.10.39"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.10.40": [
+        "notify: a board or peer message now renders in its own MAGENTA bar labelled",
+        "  'board message'/'peer message', distinct from the cyan of your own background/",
+        "  worker-finished notices and the yellow of operator-typed input - so an incoming",
+        "  cross-session message is obvious at a glance and never mistaken for your own turn.",
+        "fix: an operator-run LOCAL command (ask_user_to_run) now refreshes the gpg-agent",
+        "  TTY first, like /connect already does - so an ssh key that is a GPG subkey can",
+        "  draw its pinentry-curses prompt on your terminal instead of failing with 'agent",
+        "  refused operation'. Fully gated: a no-op without a real tty or gpg-connect-agent",
+        "  (every non-GPG user, Windows, headless/worker context), so it costs nothing there.",
+        "/connect: the bare menu now lists targets most-recently-used first (like /load),",
+        "  so the box you keep hopping to is at the top. A bare numeric arg (/connect 1)",
+        "  still selects exactly the row shown; with no history it stays in config order.",
+    ],
     "0.10.39": [
         "fix: a provider-scoped setting a backend holds in its OWN state (not cfg) is no",
         "  longer lost on save or leaked to the global config default on load. New",
@@ -4830,6 +4844,8 @@ class Config:
     model_explicit: bool = False     # model came from --model / env (skip per-host override)
     machines: dict = field(default_factory=dict)  # memorable name -> url alias map
     connect_hosts: dict = field(default_factory=dict)  # name -> ssh target for /connect
+    connect_used: dict = field(default_factory=dict)   # ssh target -> last-used epoch
+                                     # (drives the bare-/connect menu's MRU order, like /load)
     auto_reconnect: bool = False     # on /load of a session that ran remote, reconnect
                                      # to its host automatically (off = ask first)
     lean_tools_dir: str = ""            # "" -> ~/.config/leancoder/lean-tools
@@ -5126,7 +5142,7 @@ _EPHEMERAL_KEYS = frozenset((
 # DERIVED / bespoke: persisted, but via their own table serialisers (not scalar lines),
 # or reconstructed at load. Listed so the round-trip test can account for every field.
 _BESPOKE_KEYS = frozenset((
-    "host", "hosts", "machines", "connect_hosts", "host_models", "provider",
+    "host", "hosts", "machines", "connect_hosts", "connect_used", "host_models", "provider",
     "provider_settings", "providers_enabled", "lean_tools_enabled", "mcp_servers",
     "mcp_enabled", "always_expand", "show_snapshots", "compact_overrides",
 ))
@@ -5296,6 +5312,12 @@ def load_config(args) -> Config:
         cfg.connect_hosts = {n: t.strip() for n, t in file_vals["connect"].items()
                              if isinstance(t, str) and t.strip()}
 
+    # last-used timestamps for /connect targets (drives the bare-menu MRU order, like
+    # /load). [connect_used] table mapping ssh target -> epoch seconds. Kept separate
+    # from [connect] so an ad-hoc (unsaved) host can still be remembered as recent.
+    if isinstance(file_vals.get("connect_used"), dict):
+        cfg.connect_used = {t: v for t, v in file_vals["connect_used"].items()
+                            if isinstance(t, str) and isinstance(v, (int, float))}
     # Host resolution (precedence: --host > OLLAMA_HOST > config). Names resolve
     # via [machines]. cfg.hosts is ALWAYS the priority pool (config order, never
     # auto-reordered); cfg.host is the active pick within it. A lone `host = "..."`
@@ -5459,6 +5481,10 @@ def save_config(cfg: Config, quiet: bool = False):
         lines.append("")
         lines.append("[connect]")
         lines += [f'"{n}" = "{t}"' for n, t in cfg.connect_hosts.items()]
+    if cfg.connect_used:
+        lines.append("")
+        lines.append("[connect_used]")
+        lines += [f'"{t}" = {int(v)}' for t, v in cfg.connect_used.items()]
     if cfg.host_models:
         lines.append("")
         lines.append("[models]")
@@ -8069,14 +8095,19 @@ def menu_resolve(arg, ordered):
     idx = _menu_index(str(arg).strip(), len(ordered))
     return ordered[idx] if idx is not None else None
 
-
-def _connect_menu_items(connect_hosts, open_hosts=()):
+def _connect_menu_items(connect_hosts, open_hosts=(), used=None):
     """MENU CONTRACT: the ordered (name, target) list backing BOTH the bare-/connect
-    picker AND the `/connect <N>` numeric arg path - saved [connect] targets first (in
-    config order), then open-but-unsaved sessions. One source so the two can never
-    drift (a numeric arg must select exactly the row the menu renders). Pure."""
+    picker AND the `/connect <N>` numeric arg path. Most-recently-used first (like the
+    /load picker), then any never-used saved targets in config order, then open-but-
+    unsaved sessions. `used` maps ssh target -> last-used epoch (cfg.connect_used); with
+    no history it degrades to plain config order. One source so the two can never drift
+    (a numeric arg must select exactly the row the menu renders). Pure."""
+    used = used or {}
+    saved = list(connect_hosts.items())          # (name, target) in config order
+    # stable sort: recents (highest epoch) first; never-used keep config order (key 0)
+    saved.sort(key=lambda nt: used.get(nt[1], 0), reverse=True)
     items, seen = [], set()                       # (name, target)
-    for name, target in connect_hosts.items():
+    for name, target in saved:
         items.append((name, target)); seen.add(target)
     for host in open_hosts:                        # open-but-unsaved targets too
         if host not in seen:
@@ -8087,14 +8118,16 @@ def _connect_menu_items(connect_hosts, open_hosts=()):
 def _connect_menu_order(cfg, agent):
     """The list of ssh TARGETS in menu order (see _connect_menu_items) - what a bare
     integer /connect arg indexes into. Kept beside the picker so both share it."""
-    return [t for _n, t in _connect_menu_items(cfg.connect_hosts, list(agent.remotes))]
+    return [t for _n, t in _connect_menu_items(cfg.connect_hosts, list(agent.remotes),
+                                               getattr(cfg, "connect_used", None))]
 
 
-def pick_connect_menu(connect_hosts, open_hosts=(), active=None, prompt=input):
+def pick_connect_menu(connect_hosts, open_hosts=(), active=None, prompt=input, used=None):
     """Numbered picker over saved [connect] targets plus any currently-open
-    sessions (marked). Returns the chosen ssh target, or None on cancel/empty.
-    No liveness probe - SSH handles auth (passwordless straight in, else prompts)."""
-    items = _connect_menu_items(connect_hosts, open_hosts)
+    sessions (marked), most-recently-used first. Returns the chosen ssh target, or None
+    on cancel/empty. No liveness probe - SSH handles auth (passwordless straight in,
+    else prompts)."""
+    items = _connect_menu_items(connect_hosts, open_hosts, used)
     if not items:
         print(dim("no saved connect targets; use /connect <[user@]host>, or add a "
                   "[connect] section to the config."))
@@ -10010,6 +10043,16 @@ def run_direct_command(cfg, cmd: str, reason: str = None, remote=None,
     if remote is not None:
         argv = _ssh_run_argv(remote.host, remote.ctl, final, tty=True)
     else:
+        # Register our controlling TTY with gpg-agent before the local run, so an ssh
+        # key that is a GPG subkey can draw its pinentry-curses prompt HERE (this path
+        # has a real pty via _tee_capture) instead of failing with 'agent refused
+        # operation'. Same call /connect already makes on its interactive open; run for
+        # its SIDE EFFECT only - _tee_capture's pty.spawn takes no env, and the agent's
+        # registered TTY is process-global to gpg-agent, not per-child-env. Fully gated:
+        # a strict no-op without a real tty or without gpg-connect-agent (every non-GPG
+        # user, Windows, headless/worker context), so it never costs or changes anything
+        # for anyone but a gpg-subkey operator at a real terminal.
+        _refresh_gpg_agent_tty()
         argv = ["/bin/sh", "-c", f"cd {shlex.quote(str(cfg.cwd))} && {final}"]
     try:
         code, output = _tee_capture(argv)
@@ -12822,6 +12865,15 @@ def _is_wake_turn(text: str) -> bool:
     return (text or "").lstrip().startswith("[autonomous wake")
 
 
+def _is_peer_turn(text: str) -> bool:
+    """A synthesised turn from a PEER session pinging our inbox (a board assign/notify,
+    a dead-branch warning, a plain peer message) - not the operator, not our own bg job.
+    bg_wake_turn() frames it with this leading marker; the repl echoes it in its own
+    colour (magenta) so it never masquerades as an operator turn (yellow) or one of our
+    own finished jobs (cyan)."""
+    return (text or "").lstrip().startswith("[peer message")
+
+
 _WAKE_DISPLAY_CAP = 200   # chars of a wake/finish turn shown inline; full via /expand
 
 
@@ -12898,16 +12950,72 @@ def _wake_turn_lines(text: str, agent=None) -> str:
     return f"{head}\n{bar} {dim(shown)}"
 
 
+def _peer_display_body(text: str) -> str:
+    """The USER-facing body of a peer-message turn: strip the model-facing
+    '[peer message - ... report back on the board]' instruction preamble (that's an
+    instruction to the MODEL, not something the human needs to read), leaving just the
+    peer's actual message (e.g. the board notify text)."""
+    t = (text or "").lstrip()
+    if t.startswith("[peer message"):
+        end = t.find("]")
+        if end != -1:
+            t = t[end + 1:].lstrip()
+    return t
+
+
+def _peer_label(body: str) -> str:
+    """The accent-bar label for a peer turn - 'board' when the message is a board
+    assign/notify (the common case: it leads with a [board '<name>'] tag), else the
+    generic 'peer' for a plain session-to-session ping."""
+    head = body.lstrip().lower()
+    if head.startswith("[board") or head.startswith("board '") or "board" in head[:20]:
+        return "board"
+    return "peer"
+
+
+def _peer_turn_lines(text: str, agent=None) -> str:
+    """Echo a peer-message turn into scrollback with a magenta accent bar, labelled
+    'board' or 'peer' - visually distinct from an operator turn (yellow), an AI/tool
+    line (blue), and our own finished bg/worker jobs (cyan). The model-facing preamble
+    is stripped (the human just sees the peer's message), the body is truncated HARD
+    inline, and - when an agent is passed - the FULL text is stashed in the /expand ring
+    so `/expand N` shows all of it, exactly like a wake turn."""
+    body = _peer_display_body(text)
+    label = _peer_label(body)
+    cid = None
+    if agent is not None:
+        try:
+            cid = agent.record_tool_call(f"{label} message", {})
+            agent.record_tool_result(cid, body)
+        except Exception:
+            cid = None
+    first = body.splitlines()[0] if body.splitlines() else body
+    shown = first
+    if len(shown) > _WAKE_DISPLAY_CAP:
+        shown = shown[:_WAKE_DISPLAY_CAP].rstrip()
+    hidden = len(body) - len(shown)
+    if hidden > 0:
+        full_cmd = f"/expand {cid}" if cid else None
+        tail = f" …[+{hidden} chars; {full_cmd} for the full message]" if full_cmd \
+            else f" …[+{hidden} chars]"
+        shown = shown + tail
+    bar = magenta(GLYPH["userbar"])
+    tag = dim(f"  #{cid}") if cid else ""
+    head = f"{bar} {magenta(bold(label + ' message'))}{tag}"
+    return f"{head}\n{bar} {dim(shown)}"
+
 def _operator_turn_lines(name: str, text: str, agent=None) -> str:
     """Echo the operator's own submitted turn into scrollback with a yellow left
     accent bar + their name, so a human turn is easy to spot in a sea of AI (blue ●)
     and tool lines. The bar runs down every line of a multi-line paste. ASCII '|'
     fallback on a non-UTF terminal; colour is _TTY-gated by the yellow() helper.
-    A synthesised autonomous-wake turn is echoed distinctly (see _wake_turn_lines)
-    so it never masquerades as something the human typed; pass `agent` to make that
-    turn /expand-able."""
+    A synthesised autonomous-wake turn (cyan) or peer-message turn (magenta) is echoed
+    distinctly (see _wake_turn_lines / _peer_turn_lines) so neither masquerades as
+    something the human typed; pass `agent` to make those turns /expand-able."""
     if _is_wake_turn(text):
         return _wake_turn_lines(text, agent)
+    if _is_peer_turn(text):
+        return _peer_turn_lines(text, agent)
     bar = yellow(GLYPH["userbar"])
     head = f"{bar} {yellow(bold(name))}"
     body = "\n".join(f"{bar} {ln}" for ln in (text or "").splitlines()) or bar
@@ -14952,6 +15060,17 @@ def _remote_alive(ws) -> bool:
         return False
 
 
+def _mark_connect_used(cfg, rhost):
+    """Stamp `rhost` (an ssh target) as just-used so the bare-/connect menu can order
+    most-recently-used first, like /load. Persisted in [connect_used]; best-effort (a
+    save failure must never break a connect that already succeeded)."""
+    try:
+        cfg.connect_used[rhost] = int(time.time())
+        save_config(cfg)
+    except Exception:
+        pass
+
+
 def _do_connect(agent, cfg, rhost, rpath=".", offer_save=False, ephemeral=False):
     """Connect to / switch to `rhost`, routing tools there. Switching to an
     already-open box is instant (no re-push); a pooled box that died (reboot) is
@@ -14965,6 +15084,7 @@ def _do_connect(agent, cfg, rhost, rpath=".", offer_save=False, ephemeral=False)
     if pooled is not None and not ephemeral:
         if _remote_alive(pooled):
             agent.set_remote(pooled)              # instant switch
+            _mark_connect_used(cfg, rhost)
             print(green(f"switched to {rhost} (tools run there)."))
             return
         print(yellow(f"{rhost} had dropped (rebooted?) - reconnecting ..."))
@@ -14978,6 +15098,7 @@ def _do_connect(agent, cfg, rhost, rpath=".", offer_save=False, ephemeral=False)
         print(red(f"connect failed (staying {where}): {e}"))
         return
     agent.set_remote(ws)
+    _mark_connect_used(cfg, rhost)
     print(green(f"connected: tools now run on {rhost} (agent at {ws.remote_dir})"))
     # /sh drops into the box's LOGIN shell (its sshd DefaultShell), which on Windows is
     # cmd.exe unless an admin set PowerShell - distinct from run_command's shell. Say so
@@ -16076,10 +16197,10 @@ def _ensure_ssh_client():
 def handle_connect_command(agent, cfg, arg):
     """/connect <[user@]host> [remote-path] [--ephemeral] - enter/switch a remote
     workspace: all file/exec tools then run there, transparently to the model. Bare
-    /connect with saved [connect] hosts (or open ones) opens a menu. /connect remove
-    <name> forgets a saved target. --ephemeral (Windows) forces the embeddable-Python
-    runtime and wipes it on teardown (zero-trace; also dogfoods the embed path). Any
-    failure leaves you where you were."""
+    /connect with saved [connect] hosts (or open ones) opens a menu (most-recently-used
+    first, like /load). /connect remove <name> forgets a saved target. --ephemeral
+    (Windows) forces the embeddable-Python runtime and wipes it on teardown (zero-trace;
+    also dogfoods the embed path). Any failure leaves you where you were."""
     # /connect is dead without a local ssh client (a minimal WSL/container image or a
     # fresh Termux often lacks it). Detect + offer the platform-right install before we
     # try anything, including the picker - '/connect remove' is the only exception since
@@ -16101,7 +16222,8 @@ def handle_connect_command(agent, cfg, arg):
             active = agent.remote.host if agent.remote else None
             target = pick_connect_menu(cfg.connect_hosts,
                                        open_hosts=list(agent.remotes),
-                                       active=active)
+                                       active=active,
+                                       used=getattr(cfg, "connect_used", None))
             if target:
                 _do_connect(agent, cfg, target, ephemeral=ephemeral)
         else:
