@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L1394   Lean-tools (plugin tools: discovery, manager)
-  L1744   MCP client (connection, manager, OAuth, discovery)
-  L2198   Providers (backend plugin registry)
-  L2420   Interactive pickers + menus (raw-mode UI engine)
-  L2769   Terminal styling (colors, formatting helpers)
-  L3005   Streaming + markdown render (model output)
-  L3479   Composer (pinned input line, editor, stdin)
-  L4342   Token accounting (calibrated context meter)
-  L4527   Config (dataclass, field registry, load/save)
-  L8078   Tool execution + text tool-call parsing
-  L8511   Remote workspace (executor client, /connect)
-  L10150  Context meter
-  L10245  Agent (turn loop, context mgmt, tool dispatch)
-  L17036  Slash-command handlers + dispatch table
-  L17173  REPL (interactive loop, session resume)
-  L17562  Worker agent (headless --agent-run)
-  L18234  Entry (CLI arg parsing, main)
+  L1403   Lean-tools (plugin tools: discovery, manager)
+  L1753   MCP client (connection, manager, OAuth, discovery)
+  L2207   Providers (backend plugin registry)
+  L2429   Interactive pickers + menus (raw-mode UI engine)
+  L2778   Terminal styling (colors, formatting helpers)
+  L3014   Streaming + markdown render (model output)
+  L3488   Composer (pinned input line, editor, stdin)
+  L4351   Token accounting (calibrated context meter)
+  L4536   Config (dataclass, field registry, load/save)
+  L8112   Tool execution + text tool-call parsing
+  L8545   Remote workspace (executor client, /connect)
+  L10184  Context meter
+  L10279  Agent (turn loop, context mgmt, tool dispatch)
+  L17081  Slash-command handlers + dispatch table
+  L17218  REPL (interactive loop, session resume)
+  L17618  Worker agent (headless --agent-run)
+  L18290  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -116,7 +116,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.10.41"
+__version__ = "0.10.42"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -124,6 +124,15 @@ __version__ = "0.10.41"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.10.42": [
+        "fix: assigning a board task to a DORMANT peer no longer risks spawning DUPLICATE",
+        "  concurrent copies of that session. A board-spawned worker holds no session lock,",
+        "  so rapid repeat assigns kept re-resolving 'dormant' and each spawned another copy",
+        "  (two copies racing a migration could clobber each other's files). Now an assign",
+        "  first checks for a live worker already driving that session and pings it instead.",
+        "new: opening a session that a live board-worker is currently driving offers to take",
+        "  over (or fork) instead of silently colliding with it.",
+    ],
     "0.10.41": [
         "fix: a session that ran on a remote (/connect'd) now correctly resumes on that",
         "  remote - it offers to reconnect (or auto-reconnects) instead of silently starting",
@@ -5819,6 +5828,25 @@ def _lock_is_live(name: str) -> bool:
         return _pid_alive(info.get("pid", -1))
     return (time.time() - info.get("ts", 0)) <= _LOCK_STALE_SECS
 
+
+def _session_live_worker(name: str):
+    """The pid of a LIVE worker currently driving session `name` (spawned from its file
+    via the board's dormant-peer wake, from_session=<name>), or None. A worker doesn't
+    hold the session .lock (it runs headless with autosave off, writing only its own
+    checkpoint), so _lock_is_live can't see it - but opening the same session while a
+    worker mutates its world is still a soft collision worth a take-over prompt. Same-box
+    only (a worker always runs on the driver's box; its bg record lives there). Best-effort."""
+    handle = _session_name_ok(name or "")
+    if not handle:
+        return None
+    try:
+        for r in _bg_load():
+            if (r.get("kind") == "worker" and r.get("from_session") == handle
+                    and _bg_here(r) and _bg_alive(r) and r.get("pid") != os.getpid()):
+                return r.get("pid")
+    except Exception:
+        pass
+    return None
 def _write_lock(name: str):
     try:
         SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
@@ -5961,7 +5989,7 @@ def _bg_registry_path():
 
 def _bg_register(pid, cmd, log, kind="task", idle_timeout=None,
                  notify_on_exit=False, heartbeat_timeout=None,
-                 max_runtime=None, kill_on_max=True):
+                 max_runtime=None, kill_on_max=True, meta=None):
     """Record a backgrounded task (owner = this process's pid, host = this box).
     A bg task runs on whichever box the executor is on, so the registry lives on
     THAT box; the host field lets a reader tell 'my box' (pid is authoritative)
@@ -5990,6 +6018,12 @@ def _bg_register(pid, cmd, log, kind="task", idle_timeout=None,
                "max_runtime": max_runtime, "kill_on_max": kill_on_max,
                "started": time.strftime("%Y-%m-%d %H:%M:%S"),
                "started_at": time.time()}
+        if meta:
+            # Extra caller-supplied fields (e.g. from_session=<name> so a reader can
+            # tell a session is being driven by a live worker). Never clobbers the core
+            # keys above.
+            for k, v in meta.items():
+                rec.setdefault(k, v)
         with open(p, "a") as f:
             f.write(json.dumps(rec) + "\n")
         global _BG_LOAD_CACHE
@@ -6673,7 +6707,7 @@ def _bg_spawn_detached(cmd, log, exitf, leasef, logf=None, idle_timeout=None,
         f.close()
 
 def _bg_launch(cmd, cwd=None, kind="task", idle_timeout=None,
-               heartbeat_timeout=None, heartbeat_file=None):
+               heartbeat_timeout=None, heartbeat_file=None, meta=None):
     """Launch a detached background process on THIS box and register it, returning
     {pid, log, exitf, leasef} or {"error": msg}. The lean-tool-facing bg spawn hook
     (exposed as lc["bg_launch"]): a tool - e.g. dispatch_worker - can start + track a
@@ -6703,7 +6737,7 @@ def _bg_launch(cmd, cwd=None, kind="task", idle_timeout=None,
     except Exception as e:
         return {"error": f"launch failed: {e}"}
     _bg_register(p.pid, cmd, log, kind=kind, idle_timeout=idle_timeout,
-                 heartbeat_timeout=heartbeat_timeout)
+                 heartbeat_timeout=heartbeat_timeout, meta=meta)
     return {"pid": p.pid, "log": str(log), "exitf": exitf, "leasef": leasef}
 
 
@@ -14887,6 +14921,17 @@ def _load_session_into(agent, cfg, name):
                     f"take it over?"):
             print(dim("load cancelled - leaving the other instance alone."))
             return
+    # A board-spawned WORKER may be driving this session (from_session=): it holds no
+    # lock but is actively mutating its world, so opening the same session is a soft
+    # collision - warn + confirm (the worker keeps running; it just no longer 'owns' the
+    # narrative once you continue here).
+    elif not cfg.incognito:
+        _wpid = _session_live_worker(name)
+        if _wpid and not _ask(f"session '{_session_name_ok(name)}' is being driven by a "
+                              f"live worker (pid {_wpid}) - open it anyway?"):
+            print(dim("load cancelled - leaving the worker to it "
+                      "(/worker to inspect it)."))
+            return
     meta = data.get("meta", {})
     state = _restore_session_state(agent, cfg, meta)   # backend, model, leash, approve, think/effort
     msgs = data.get("messages", [])
@@ -17265,13 +17310,24 @@ def repl(cfg: Config, resume=None):
         """If `name` is held live by another instance, ask whether to take it over.
         Returns True to load it (the lock gets claimed by the first autosave),
         False to leave it alone and start a fresh auto- session here."""
-        if cfg.incognito or not _lock_is_live(name):
+        if cfg.incognito:
             return True
-        if _ask(f"session '{_session_name_ok(name)}' is live in another instance - "
-                f"take it over?"):
-            return True
-        print(dim("  starting a fresh session here instead."))
-        return False
+        if _lock_is_live(name):
+            if _ask(f"session '{_session_name_ok(name)}' is live in another instance - "
+                    f"take it over?"):
+                return True
+            print(dim("  starting a fresh session here instead."))
+            return False
+        # No lock, but a board-spawned worker may be driving it (from_session=): warn.
+        _wpid = _session_live_worker(name)
+        if _wpid:
+            if _ask(f"session '{_session_name_ok(name)}' is being driven by a live worker "
+                    f"(pid {_wpid}) - open it anyway?"):
+                return True
+            print(dim("  starting a fresh session here instead "
+                      "(/worker to inspect the worker)."))
+            return False
+        return True
 
     # A resumed session ENDS on the 'resumed …' instruction line (the last thing the
     # user is likely to read), then the always-on 3-row status bar carries model /
@@ -17325,8 +17381,8 @@ def repl(cfg: Config, resume=None):
                                      preselect=(cand[0] if cand else None))
             if choice is _NEW_SESSION or choice is None:
                 pass                                     # fall through to a fresh start below
-            elif _lock_is_live(choice) and not _take_over_or_fork(choice):
-                pass                                     # declined to steal a live one
+            elif not _take_over_or_fork(choice):
+                pass                                     # declined a live/worker-driven one
             else:
                 resumed = _resume_named(choice)
         elif not cand and _busy:
