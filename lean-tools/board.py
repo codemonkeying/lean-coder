@@ -104,7 +104,7 @@ def setup(lc, cfg):
               "_taskboard_mutate", "_taskboards_list", "_tb_task", "worker_inject",
               "_taskboard_participant_upsert", "_taskboard_participant",
               "_participant_resolve", "spawn_peer", "peer_inject", "_my_session_name",
-              "_session_name_ok",
+              "_session_name_ok", "_session_live_worker",
               "dim", "bold", "green", "cyan", "red"):
         if k in lc:
             _H[k] = lc[k]
@@ -167,7 +167,15 @@ def _notify_assigner(board_name, tid, action, note, assigned_by, task_name):
     if state == "missing":
         return f" (assigner '{handle}' has no session file; cannot notify - it will see it on the board if reopened)"
     # dormant: spawn it to conduct (the AFK relay - the assigner wakes, fields the result,
-    # drives the next step). Bounded by the driver-gate as noted above.
+    # drives the next step). Bounded by the driver-gate as noted above. DUPE GUARD: if a
+    # worker is ALREADY driving this session (a prior spawn - it holds no lock so resolve
+    # still reads 'dormant'), ping that one instead of launching a second copy.
+    live_wk = _H.get("_session_live_worker")
+    wpid = live_wk(handle) if live_wk else None
+    if wpid:
+        pushed = _push(wpid, ping)
+        return (f" (assigner '{handle}' already driven by worker pid {wpid}"
+                + ("; pinged it" if pushed else "; it will read the board") + " - not re-spawned)")
     spawn = _H.get("spawn_peer")
     out = spawn(handle, ping) if spawn else ""
     return (f" (assigner '{handle}' was dormant; spawned to conduct)"
@@ -513,11 +521,26 @@ def run(args, cwd):
                 tail = (f" (peer '{handle}' has no session file - deleted? cannot spawn it; "
                         f"re-create the session or assign a different peer)")
             else:  # dormant -> wake it by spawning a worker from its session file
-                spawn = _H.get("spawn_peer")
-                out = spawn(handle, ping) if spawn else ""
-                tail = (f" (peer '{handle}' was dormant; spawned from its session)"
-                        if out and "error" not in out.lower()
-                        else f" (peer '{handle}' is dormant; could not spawn - {out or 'dispatch_worker not enabled'})")
+                # DUPE GUARD: a prior assign may have ALREADY spawned a worker off this
+                # session file. A board-spawned worker holds no session .lock (it runs
+                # headless with autosave off), so _participant_resolve still says 'dormant'
+                # - spawning again would launch a SECOND concurrent copy of the same
+                # session (the courseloop race: two copies ran the migration and one's
+                # cleanup deleted the other's just-moved files). So first check for a live
+                # worker already driving this session and ping IT instead of re-spawning.
+                live_wk = _H.get("_session_live_worker")
+                wpid = live_wk(handle) if live_wk else None
+                if wpid:
+                    pushed = _push(wpid, ping)
+                    tail = (f" (peer '{handle}' is already being driven by worker pid {wpid}"
+                            + ("; pinged it" if pushed else "; it will see it on the board")
+                            + " - NOT re-spawned)")
+                else:
+                    spawn = _H.get("spawn_peer")
+                    out = spawn(handle, ping) if spawn else ""
+                    tail = (f" (peer '{handle}' was dormant; spawned from its session)"
+                            if out and "error" not in out.lower()
+                            else f" (peer '{handle}' is dormant; could not spawn - {out or 'dispatch_worker not enabled'})")
             return f"assigned {tid} '{tname}' to {worker}.{tail}"
         # Numeric handle: plain worker pid push (1a).
         pushed = _push(worker, ping)

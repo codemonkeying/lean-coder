@@ -376,6 +376,7 @@ def run(args, cwd):
     # run_agent_brief reloads that transcript, then runs `task` as a steer turn on top.
     seed_session = (args.get("from_session") or "").strip()
     seed_resume = ""
+    seed_session_name = ""     # the session-file STEM, if seeded from one under sessions/
     if seed_session:
         p = Path(seed_session)
         if not p.is_file():
@@ -386,6 +387,16 @@ def run(args, cwd):
             return (f"error: from_session {seed_session!r} not found "
                     f"(looked for a file and under CONFIG_DIR/sessions/).")
         seed_resume = str(p.resolve())
+        # If it's a real session file (under sessions/, .json), remember its NAME so the
+        # bg record carries from_session=<name> - lets a REPL that opens the same session
+        # detect it's being driven by this live worker and offer a take-over (no .lock is
+        # held: a worker runs headless with autosave off).
+        try:
+            sess_dir = (Path(_H["CONFIG_DIR"]) / "sessions").resolve()
+            if p.resolve().parent == sess_dir and p.suffix == ".json":
+                seed_session_name = p.stem
+        except Exception:
+            seed_session_name = ""
     # SAFE-RECURSION governor: is THIS process allowed to spawn a worker at all, and if
     # so how many? The driver (worker_depth 0) is governed only by max_concurrent. A
     # WORKER (depth >= 1) must pass two gates before it can spawn a child:
@@ -615,7 +626,9 @@ def run(args, cwd):
         cmd += f" --host {shlex.quote(brain_host)}"
     launched = _H["bg_launch"](cmd, cwd=launch_cwd, kind="worker", idle_timeout=idle_timeout,
                                heartbeat_timeout=hb_timeout,
-                               heartbeat_file=str(brief_file) + ".progress")
+                               heartbeat_file=str(brief_file) + ".progress",
+                               meta=({"from_session": seed_session_name}
+                                     if seed_session_name else None))
     if "error" in launched:
         return f"error: could not launch worker: {launched['error']}"
 
