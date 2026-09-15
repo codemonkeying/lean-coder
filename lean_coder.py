@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L1425   Lean-tools (plugin tools: discovery, manager)
-  L1775   MCP client (connection, manager, OAuth, discovery)
-  L2229   Providers (backend plugin registry)
-  L2451   Interactive pickers + menus (raw-mode UI engine)
-  L2800   Terminal styling (colors, formatting helpers)
-  L3036   Streaming + markdown render (model output)
-  L3510   Composer (pinned input line, editor, stdin)
-  L4373   Token accounting (calibrated context meter)
-  L4558   Config (dataclass, field registry, load/save)
-  L8133   Tool execution + text tool-call parsing
-  L8566   Remote workspace (executor client, /connect)
-  L10205  Context meter
-  L10300  Agent (turn loop, context mgmt, tool dispatch)
-  L17114  Slash-command handlers + dispatch table
-  L17251  REPL (interactive loop, session resume)
-  L17651  Worker agent (headless --agent-run)
-  L18311  Entry (CLI arg parsing, main)
+  L1430   Lean-tools (plugin tools: discovery, manager)
+  L1780   MCP client (connection, manager, OAuth, discovery)
+  L2234   Providers (backend plugin registry)
+  L2456   Interactive pickers + menus (raw-mode UI engine)
+  L2805   Terminal styling (colors, formatting helpers)
+  L3041   Streaming + markdown render (model output)
+  L3515   Composer (pinned input line, editor, stdin)
+  L4378   Token accounting (calibrated context meter)
+  L4563   Config (dataclass, field registry, load/save)
+  L8138   Tool execution + text tool-call parsing
+  L8571   Remote workspace (executor client, /connect)
+  L10210  Context meter
+  L10305  Agent (turn loop, context mgmt, tool dispatch)
+  L17119  Slash-command handlers + dispatch table
+  L17256  REPL (interactive loop, session resume)
+  L17656  Worker agent (headless --agent-run)
+  L18316  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -116,7 +116,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.10.46"
+__version__ = "0.10.47"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -124,6 +124,11 @@ __version__ = "0.10.46"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.10.47": [
+        "docs: corrected the approval-mode default in the README and --approval help - it's",
+        "  been 'session' (approve once, then auto for the run) for a while, but a few places",
+        "  still said 'ask'. No behaviour change; just the docs catching up to the code.",
+    ],
     "0.10.46": [
         "board: the participant action's LIST form (call it with no worker=) already reported",
         "  each peer's live-here/live-elsewhere/dormant/missing state - a read-only liveness",
@@ -8017,7 +8022,7 @@ def _ask(question: str) -> bool:
 
 
 # Approval mode: how writes/commands/non-safe tools are gated.
-#   ask     - confirm every action (default)
+#   ask     - confirm every action
 #   session - confirm once; a 'yes' then auto-approves the rest of this run
 #   auto    - never confirm (the old --yolo)
 _session_approved = False    # armed once the user approves under approval="session"
@@ -8044,7 +8049,7 @@ def ask_action(cfg, question: str) -> bool:
 
 
 def approval_badge(cfg) -> str:
-    """Styled indicator for the active approval mode; '' for the default 'ask'."""
+    """Styled indicator for the active approval mode; '' for the quietest 'ask' mode."""
     if cfg.approval == "auto":
         return red("AUTO")
     if cfg.approval == "session":
@@ -18330,7 +18335,7 @@ def main():
     ap.add_argument("-r", "--resume", metavar="NAME",
                     help="resume a saved session by name (see /load)")
     ap.add_argument("--approval", choices=APPROVAL_MODES,
-                    help="approval mode: ask (default) | session | auto")
+                    help="approval mode: ask | session (default) | auto")
     ap.add_argument("--auto", action="store_true",
                     help="auto-approve writes and commands (same as --approval auto)")
     ap.add_argument("--yolo", action="store_true", help=argparse.SUPPRESS)  # alias for --auto
