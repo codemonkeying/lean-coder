@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L1430   Lean-tools (plugin tools: discovery, manager)
-  L1780   MCP client (connection, manager, OAuth, discovery)
-  L2234   Providers (backend plugin registry)
-  L2456   Interactive pickers + menus (raw-mode UI engine)
-  L2805   Terminal styling (colors, formatting helpers)
-  L3041   Streaming + markdown render (model output)
-  L3515   Composer (pinned input line, editor, stdin)
-  L4378   Token accounting (calibrated context meter)
-  L4563   Config (dataclass, field registry, load/save)
-  L8138   Tool execution + text tool-call parsing
-  L8571   Remote workspace (executor client, /connect)
-  L10210  Context meter
-  L10305  Agent (turn loop, context mgmt, tool dispatch)
-  L17119  Slash-command handlers + dispatch table
-  L17256  REPL (interactive loop, session resume)
-  L17656  Worker agent (headless --agent-run)
-  L18316  Entry (CLI arg parsing, main)
+  L1436   Lean-tools (plugin tools: discovery, manager)
+  L1786   MCP client (connection, manager, OAuth, discovery)
+  L2240   Providers (backend plugin registry)
+  L2462   Interactive pickers + menus (raw-mode UI engine)
+  L2811   Terminal styling (colors, formatting helpers)
+  L3047   Streaming + markdown render (model output)
+  L3521   Composer (pinned input line, editor, stdin)
+  L4384   Token accounting (calibrated context meter)
+  L4569   Config (dataclass, field registry, load/save)
+  L8144   Tool execution + text tool-call parsing
+  L8577   Remote workspace (executor client, /connect)
+  L10216  Context meter
+  L10311  Agent (turn loop, context mgmt, tool dispatch)
+  L17127  Slash-command handlers + dispatch table
+  L17264  REPL (interactive loop, session resume)
+  L17669  Worker agent (headless --agent-run)
+  L18329  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -116,7 +116,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.10.47"
+__version__ = "0.10.48"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -124,6 +124,12 @@ __version__ = "0.10.47"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.10.48": [
+        "/prompt: a fired prompt now echoes into scrollback as a proper operator turn (the",
+        "  orange bar - it IS you injecting it) labelled with which prompt ran, e.g.",
+        "  'you (prompt: credman-ssh)', instead of a generic '(queued prompt)' line. The",
+        "  confirmation also says 'sending' rather than the misleading 'queued'.",
+    ],
     "0.10.47": [
         "docs: corrected the approval-mode default in the README and --approval help - it's",
         "  been 'session' (approve once, then auto for the run) for a while, but a few places",
@@ -13532,8 +13538,10 @@ def _use_prompt(agent, name):
             print(yellow(f"no prompt '{name}' to use (create it with /prompt {name}, "
                          f"or drop a {f.name} in {PROMPTS_DIR})."))
         return
-    agent._queued_turns.append(text.rstrip("\n"))
-    print(dim(f"queued prompt '{name}' ({len(text.split())} words) -> sending as the next turn."))
+    # Carry the prompt NAME alongside the text so the loop can echo it as an operator
+    # turn labelled with which prompt fired (a bare string stays a plain typed turn).
+    agent._queued_turns.append((name, text.rstrip("\n")))
+    print(dim(f"sending prompt '{name}' ({len(text.split())} words) as your next turn."))
 
 
 def handle_prompt_command(agent, cfg, arg):
@@ -17485,11 +17493,16 @@ def repl(cfg: Config, resume=None):
         # prompt shows the active location so you always know where you are
         indicator = f"[remote: {agent.remote.host}] " if agent.remote else ""
         _pg = GLYPH["prompt_remote"] if agent.remote else GLYPH["prompt"]
-        if idle_comp is not None:
-            idle_comp.remote = bool(agent.remote)   # swap the input-row glyph when remote
         if agent._queued_turns:    # a command queued a full turn (e.g. /prompt use) - run it
-            line = agent._queued_turns.pop(0)
-            print(bold(cyan(indicator + _pg + " ")) + dim("(queued prompt)"))
+            _q = agent._queued_turns.pop(0)
+            # /prompt queues a (name, text) tuple so we can label which prompt fired;
+            # other producers (e.g. /rewind) queue a bare string = a plain operator turn.
+            if isinstance(_q, tuple):
+                _pname, line = _q
+                print(_operator_turn_lines(f"{cfg.user_name}  (prompt: {_pname})", line, agent))
+            else:
+                line = _q
+                print(_operator_turn_lines(cfg.user_name, line, agent))
         elif pending_inputs:       # drain composer typeahead before prompting anew
             line = pending_inputs.pop(0).strip()
             if line:
