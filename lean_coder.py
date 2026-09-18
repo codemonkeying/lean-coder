@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L1450   Lean-tools (plugin tools: discovery, manager)
-  L1800   MCP client (connection, manager, OAuth, discovery)
-  L2254   Providers (backend plugin registry)
-  L2476   Interactive pickers + menus (raw-mode UI engine)
-  L2825   Terminal styling (colors, formatting helpers)
-  L3061   Streaming + markdown render (model output)
-  L3535   Composer (pinned input line, editor, stdin)
-  L4398   Token accounting (calibrated context meter)
-  L4583   Config (dataclass, field registry, load/save)
-  L8185   Tool execution + text tool-call parsing
-  L8618   Remote workspace (executor client, /connect)
-  L10257  Context meter
-  L10352  Agent (turn loop, context mgmt, tool dispatch)
-  L17174  Slash-command handlers + dispatch table
-  L17311  REPL (interactive loop, session resume)
-  L17742  Worker agent (headless --agent-run)
-  L18402  Entry (CLI arg parsing, main)
+  L1458   Lean-tools (plugin tools: discovery, manager)
+  L1808   MCP client (connection, manager, OAuth, discovery)
+  L2262   Providers (backend plugin registry)
+  L2484   Interactive pickers + menus (raw-mode UI engine)
+  L2833   Terminal styling (colors, formatting helpers)
+  L3069   Streaming + markdown render (model output)
+  L3543   Composer (pinned input line, editor, stdin)
+  L4425   Token accounting (calibrated context meter)
+  L4610   Config (dataclass, field registry, load/save)
+  L8212   Tool execution + text tool-call parsing
+  L8645   Remote workspace (executor client, /connect)
+  L10284  Context meter
+  L10379  Agent (turn loop, context mgmt, tool dispatch)
+  L17210  Slash-command handlers + dispatch table
+  L17347  REPL (interactive loop, session resume)
+  L17778  Worker agent (headless --agent-run)
+  L18438  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -116,7 +116,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.10.50"
+__version__ = "0.10.51"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -124,6 +124,14 @@ __version__ = "0.10.50"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.10.51": [
+        "fix: a LOCAL run_command that runs ssh/scp/sftp/rsync/git could, on a cold",
+        "  credential cache, make gpg-agent/ssh-agent pop a pinentry box on the terminal the",
+        "  composer was holding in raw mode - the two collided and left the terminal garbled",
+        "  (needing `stty sane`). Such commands now suspend the composer for that one run (as",
+        "  /connect and ask_user_to_run already do), so pinentry gets a clean terminal. Warm-",
+        "  cache runs never prompt so it costs nothing; remote/executor runs were never affected.",
+    ],
     "0.10.50": [
         "fix: the idle prompt now shows the remote glyph ('>>') when tools run on a remote",
         "  box, matching the mid-turn input row. The idle composer's location flag was never",
@@ -4348,6 +4356,25 @@ def composer_suspended():
         # if re-engage fails, stay on the real stdout: the turn degrades to the
         # classic (unpinned) output rather than losing the terminal entirely.
 
+
+# A LOCAL run_command whose child may trigger an interactive credential prompt
+# (ssh/scp/sftp/rsync-over-ssh, or git talking to an ssh remote) can make a DAEMON
+# (gpg-agent/ssh-agent) spawn pinentry on OUR terminal. If the composer owns the tty
+# in cbreak, pinentry collides with it -> raw-mode corruption needing `stty sane`. We
+# can't stop the daemon, but we CAN hand it a clean tty by suspending the composer for
+# that one execution (exactly what /connect and ask_user_to_run already do). Warm-cache
+# runs never prompt, so this costs nothing then; it only matters on a cold cache. Remote/
+# executor run_commands are immune (they run over a pipe with no local tty), so callers
+# gate this on `self.remote is None`.
+_SSH_CRED_RE = re.compile(r'(?:^|[|&;]|\s)(?:ssh|scp|sftp|rsync|git)\b')
+
+
+def _may_prompt_on_tty(cmd: str) -> bool:
+    """True if a LOCAL run_command may trigger a tty credential prompt (pinentry) that
+    would collide with the composer. Keyed off the command invoking ssh/scp/sftp/rsync
+    or git (which may talk to an ssh remote). Conservative: a false positive only costs
+    a brief composer suspend; a false negative brings back the raw-mode corruption."""
+    return bool(_SSH_CRED_RE.search(cmd or ""))
 
 def open_in_editor(path, cfg=None) -> bool:
     """Open `path` in an editor and block until it exits. Editor preference:
@@ -12769,6 +12796,15 @@ class Agent:
                 result = run_direct_command(
                     self.cfg, args.get("cmd", ""), args.get("reason"),
                     remote=self.remote)
+        elif (name == "run_command" and self.remote is None
+                and _may_prompt_on_tty(args.get("cmd", ""))):
+            # A LOCAL ssh/git run_command may trigger pinentry on our tty (cold-cache
+            # auth). If the composer holds the tty in cbreak, pinentry collides with it
+            # -> raw-mode corruption (`stty sane`). Hand pinentry a clean terminal by
+            # suspending the composer for just this run, like /connect and ask_user_to_run.
+            # No spinner (it'd fight the suspend); warm-cache runs just don't prompt.
+            with composer_suspended():
+                result = self._run_tool(name, args)
         else:
             # Tool-running indicator (distinct from the model spinner),
             # labelled with the tool so you always see WHAT is running.
