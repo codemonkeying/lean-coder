@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L1445   Lean-tools (plugin tools: discovery, manager)
-  L1795   MCP client (connection, manager, OAuth, discovery)
-  L2249   Providers (backend plugin registry)
-  L2471   Interactive pickers + menus (raw-mode UI engine)
-  L2820   Terminal styling (colors, formatting helpers)
-  L3056   Streaming + markdown render (model output)
-  L3530   Composer (pinned input line, editor, stdin)
-  L4393   Token accounting (calibrated context meter)
-  L4578   Config (dataclass, field registry, load/save)
-  L8180   Tool execution + text tool-call parsing
-  L8613   Remote workspace (executor client, /connect)
-  L10252  Context meter
-  L10347  Agent (turn loop, context mgmt, tool dispatch)
-  L17169  Slash-command handlers + dispatch table
-  L17306  REPL (interactive loop, session resume)
-  L17731  Worker agent (headless --agent-run)
-  L18391  Entry (CLI arg parsing, main)
+  L1450   Lean-tools (plugin tools: discovery, manager)
+  L1800   MCP client (connection, manager, OAuth, discovery)
+  L2254   Providers (backend plugin registry)
+  L2476   Interactive pickers + menus (raw-mode UI engine)
+  L2825   Terminal styling (colors, formatting helpers)
+  L3061   Streaming + markdown render (model output)
+  L3535   Composer (pinned input line, editor, stdin)
+  L4398   Token accounting (calibrated context meter)
+  L4583   Config (dataclass, field registry, load/save)
+  L8185   Tool execution + text tool-call parsing
+  L8618   Remote workspace (executor client, /connect)
+  L10257  Context meter
+  L10352  Agent (turn loop, context mgmt, tool dispatch)
+  L17174  Slash-command handlers + dispatch table
+  L17311  REPL (interactive loop, session resume)
+  L17742  Worker agent (headless --agent-run)
+  L18402  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -116,7 +116,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.10.49"
+__version__ = "0.10.50"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -124,6 +124,11 @@ __version__ = "0.10.49"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.10.50": [
+        "fix: the idle prompt now shows the remote glyph ('>>') when tools run on a remote",
+        "  box, matching the mid-turn input row. The idle composer's location flag was never",
+        "  set, so it always drew the local '>' at the prompt even when you were connected.",
+    ],
     "0.10.49": [
         "run_command: commands now start in their own session (start_new_session), so a tool",
         "  that reaches for the controlling terminal - sudo, ssh, gpg - fails fast instead of",
@@ -17540,6 +17545,12 @@ def repl(cfg: Config, resume=None):
         # prompt shows the active location so you always know where you are
         indicator = f"[remote: {agent.remote.host}] " if agent.remote else ""
         _pg = GLYPH["prompt_remote"] if agent.remote else GLYPH["prompt"]
+        if idle_comp is not None:
+            # The idle composer draws its OWN input row (its glyph, not _pg), so it must
+            # track the active location too - set per loop, not once at creation, because
+            # /connect and /disconnect flip agent.remote mid-session. Without this the
+            # idle prompt always showed the local '>' even on a remote.
+            idle_comp.remote = bool(agent.remote)
         if agent._queued_turns:    # a command queued a full turn (e.g. /prompt use) - run it
             _q = agent._queued_turns.pop(0)
             # /prompt queues a (name, text) tuple so we can label which prompt fired;
