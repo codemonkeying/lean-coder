@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L1436   Lean-tools (plugin tools: discovery, manager)
-  L1786   MCP client (connection, manager, OAuth, discovery)
-  L2240   Providers (backend plugin registry)
-  L2462   Interactive pickers + menus (raw-mode UI engine)
-  L2811   Terminal styling (colors, formatting helpers)
-  L3047   Streaming + markdown render (model output)
-  L3521   Composer (pinned input line, editor, stdin)
-  L4384   Token accounting (calibrated context meter)
-  L4569   Config (dataclass, field registry, load/save)
-  L8144   Tool execution + text tool-call parsing
-  L8577   Remote workspace (executor client, /connect)
-  L10216  Context meter
-  L10311  Agent (turn loop, context mgmt, tool dispatch)
-  L17127  Slash-command handlers + dispatch table
-  L17264  REPL (interactive loop, session resume)
-  L17669  Worker agent (headless --agent-run)
-  L18329  Entry (CLI arg parsing, main)
+  L1445   Lean-tools (plugin tools: discovery, manager)
+  L1795   MCP client (connection, manager, OAuth, discovery)
+  L2249   Providers (backend plugin registry)
+  L2471   Interactive pickers + menus (raw-mode UI engine)
+  L2820   Terminal styling (colors, formatting helpers)
+  L3056   Streaming + markdown render (model output)
+  L3530   Composer (pinned input line, editor, stdin)
+  L4393   Token accounting (calibrated context meter)
+  L4578   Config (dataclass, field registry, load/save)
+  L8180   Tool execution + text tool-call parsing
+  L8613   Remote workspace (executor client, /connect)
+  L10252  Context meter
+  L10347  Agent (turn loop, context mgmt, tool dispatch)
+  L17169  Slash-command handlers + dispatch table
+  L17306  REPL (interactive loop, session resume)
+  L17731  Worker agent (headless --agent-run)
+  L18391  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -116,7 +116,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.10.48"
+__version__ = "0.10.49"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -124,6 +124,15 @@ __version__ = "0.10.48"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.10.49": [
+        "run_command: commands now start in their own session (start_new_session), so a tool",
+        "  that reaches for the controlling terminal - sudo, ssh, gpg - fails fast instead of",
+        "  hanging forever waiting on /dev/tty. Paired with a [hint] when a command clearly",
+        "  needs a real terminal, pointing you at ask_user_to_run / the interactive path.",
+        "fix: if another instance takes over your session (a /load elsewhere) while this one",
+        "  sits idle, it now detaches to a fresh 'auto-...' session at the prompt boundary and",
+        "  tells you BEFORE you type - instead of firing one more turn under the stolen name.",
+    ],
     "0.10.48": [
         "/prompt: a fired prompt now echoes into scrollback as a proper operator turn (the",
         "  orange bar - it IS you injecting it) labelled with which prompt ran, e.g.",
@@ -5934,6 +5943,38 @@ def _prune_stale_locks():
                 pass
 
 
+def _session_stolen(agent, cfg) -> bool:
+    """Read-only: True if ANOTHER live instance now holds our session's lock (a take-over
+    via /load elsewhere). Cheap (one lock read) so the idle poll can call it ~4x/s to
+    recycle the prompt promptly. No side effects - _detach_if_stolen does the rename."""
+    if cfg.incognito or not cfg.autosave:
+        return False
+    name = agent.autosave_name
+    info = _read_lock(name)
+    return bool(info and not _own_lock(name) and _lock_is_live(name))
+
+
+def _detach_if_stolen(agent, cfg) -> bool:
+    """If ANOTHER live instance has claimed our session's lock (an explicit take-over
+    via /load elsewhere), stop fighting over the name: rename ourselves to a fresh
+    auto- session and tell the USER (a one-off coloured notice, NOT an AI turn). Returns
+    True if we just detached (the caller can redraw so the status/prompt shows the new
+    name immediately). No-op when incognito, autosave-off, or we still own the lock.
+
+    Called at the IDLE BOUNDARY (top of the loop) so the detach lands BEFORE the next
+    turn/status draw - the user sees they're on 'auto-...' before typing, instead of
+    firing another turn still labelled with the stolen name and only learning post-turn.
+    autosave_session calls it too, as the backstop for a session that never idles."""
+    if not _session_stolen(agent, cfg):
+        return False
+    old = agent.autosave_name
+    agent.autosave_name = _new_autosave_name()
+    print(yellow(f"\n  {GLYPH.get('warn', '!')} session '{old}' resumed elsewhere"
+                 f" - /load {old} to take it back."))
+    print(dim(f"  continuing here in a new session '{agent.autosave_name}'."))
+    return True
+
+
 def autosave_session(agent, cfg):
     """Write the live conversation to its rolling autosave session. No-op when
     autosave is off or the conversation is empty. Must never raise into the turn
@@ -5943,16 +5984,11 @@ def autosave_session(agent, cfg):
     if not any(m.get("role") != "system" for m in agent.messages):
         return
     # If another instance has taken over our session (claimed the lock), don't
-    # fight over it: announce it once and fork to a fresh auto- session.
+    # fight over it: announce it once and fork to a fresh auto- session. Normally
+    # the idle-boundary check (_detach_if_stolen at the top of the loop) has already
+    # done this; this is the backstop for a session that autosaves before it idles.
+    _detach_if_stolen(agent, cfg)
     name = agent.autosave_name
-    info = _read_lock(name)
-    if info and not _own_lock(name) and _lock_is_live(name):
-        old = name
-        agent.autosave_name = _new_autosave_name()
-        print(yellow(f"\n  {GLYPH.get('warn', '!')} session '{old}' resumed elsewhere"
-                     f" - /load {old} to take it back."))
-        print(dim(f"  continuing here in a new session '{agent.autosave_name}'."))
-        name = agent.autosave_name
     try:
         rhost = agent.remote.host if getattr(agent, "remote", None) else None
         save_session(agent.messages, cfg, name, remote=rhost,
@@ -17036,6 +17072,12 @@ def handle_help_command(agent, cfg, arg):
 # continues. Keeps handlers pure (agent, cfg, arg) -> control|None, no exception-for-flow.
 REPL_EXIT = object()
 
+# Idle wake_check sentinel: a steal was detected while the prompt sat idle. The wake
+# path returns strings (they become turns), so this is a distinctive string the loop
+# spots and treats as "abort the read + re-cycle" (-> top-of-loop _detach_if_stolen),
+# NOT as a typed turn. Marker-framed so it can never collide with real typed input.
+_STEAL_RECYCLE = "\x00__lc_steal_recycle__\x00"
+
 
 def handle_quit_command(agent, cfg, arg):
     """/quit | /exit | /q - leave the repl. Remote teardown + final autosave are left
@@ -17480,6 +17522,11 @@ def repl(cfg: Config, resume=None):
         # (settings/model/tools/plan - the ctx row's per-turn token drift is excluded from
         # the signature) ALWAYS reprints regardless of cadence. /info and /usage show it too.
         prompt_no += 1
+        # Idle-boundary steal check: if another instance took over our session (claimed
+        # its lock via /load elsewhere) while we sat here, detach to a fresh auto- name
+        # NOW - before the status/prompt draw - so the user sees they're on the fork
+        # before typing, not one turn too late. User-only notice, no AI turn.
+        _detach_if_stolen(agent, cfg)
         _refresh_output_wrap(cfg)   # recompute prose-wrap width (tracks 'auto' terminal resize)
         _rows = _status_rows(agent, cfg)
         _key = _status_key(_rows)
@@ -17509,9 +17556,18 @@ def repl(cfg: Config, resume=None):
                 print(_operator_turn_lines(cfg.user_name, line, agent))
         else:
             try:
-                _wake = (agent.bg_wake_turn
-                         if (cfg.wake_on_bg_finish or agent._has_bg_optins())
-                         else None)
+                _bg_wake = (agent.bg_wake_turn
+                            if (cfg.wake_on_bg_finish or agent._has_bg_optins())
+                            else None)
+                # Idle steal-poll: while we sit at the prompt, watch for another instance
+                # claiming our session (take-over via /load elsewhere). On a steal, return
+                # the RECYCLE sentinel so the read aborts and the loop re-cycles into the
+                # top-of-loop _detach_if_stolen - the user sees 'auto-...' the instant it
+                # happens, without having to submit a turn first. Not an AI turn.
+                def _wake():
+                    if _session_stolen(agent, cfg):
+                        return _STEAL_RECYCLE
+                    return _bg_wake() if _bg_wake else None
                 if idle_comp is not None:
                     # Idle composer owns the line: correct multi-line paste render
                     # + Tab/history/emacs. Falls back to input() if it can't take
@@ -17521,6 +17577,8 @@ def repl(cfg: Config, resume=None):
                         line = idle_comp.read_line(
                             prompt_status=(indicator.strip() or None),
                             wake_check=_wake).strip()
+                        if line == _STEAL_RECYCLE:
+                            continue           # steal detected while idle - recycle to detach
                         # stop_tty() cleared the pinned input rows; echo the
                         # submitted line into scrollback with the operator's yellow
                         # accent bar so a human turn stands out from AI + tool lines.
@@ -17529,9 +17587,13 @@ def repl(cfg: Config, resume=None):
                     except RuntimeError:
                         line = _input_or_wake(
                             _rl_safe(bold(cyan(indicator + _pg + " "))), _wake)
+                        if line == _STEAL_RECYCLE:
+                            continue
                 else:
                     line = _input_or_wake(
                         _rl_safe(bold(cyan(indicator + _pg + " "))), _wake)
+                    if line == _STEAL_RECYCLE:
+                        continue
                 pending_exit = False   # any input (even empty) disarms the exit
             except EOFError:           # Ctrl-D
                 # Don't tear down remotes here: the atexit handlers do it in the RIGHT
