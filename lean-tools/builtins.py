@@ -349,12 +349,18 @@ class Tools:
             return "user declined to run the command"
         to = self.cfg.command_timeout
         try:
-            # stdin=DEVNULL: never let a child read the live terminal. With the
-            # composer's reader thread on cbreak stdin, an inherited fd makes a
-            # subshell (or any stdin-reading command) hang fighting for keystrokes.
+            # stdin=DEVNULL + start_new_session: run_command is NON-INTERACTIVE (sudo/
+            # ssh/gpg belong on ask_user_to_run). DEVNULL alone is NOT enough - sudo &co
+            # bypass stdin and read the password straight from /dev/tty, so the child
+            # would still grab the live terminal: it blocks on the hidden prompt until the
+            # timeout, fights the composer's reader thread for keystrokes (only every Nth
+            # lands, echo off), and a stray Enter leaks into the sudo prompt. start_new_
+            # session detaches the child from the controlling TTY, so opening /dev/tty
+            # fails and sudo dies FAST with 'a terminal is required' - a clear nudge to
+            # use ask_user_to_run, instead of a 300s hang that eats your input.
             r = subprocess.run(cmd, shell=True, cwd=self.cfg.cwd,
                                capture_output=True, text=True, timeout=to,
-                               stdin=subprocess.DEVNULL)
+                               stdin=subprocess.DEVNULL, start_new_session=True)
         except subprocess.TimeoutExpired:
             return (f"error: command timed out after {to}s (no output captured). "
                     f"For a long-running command, use the `background` tool - it "
@@ -367,7 +373,19 @@ class Tools:
         if r.stderr:
             out += ("\n[stderr]\n" if out else "") + r.stderr
         out = _truncate_output(out.rstrip())
-        return f"exit {r.returncode}\n{out}" if out else f"exit {r.returncode} (no output)"
+        result = f"exit {r.returncode}\n{out}" if out else f"exit {r.returncode} (no output)"
+        # If the command failed because it needed the terminal we deliberately withheld
+        # (sudo/ssh/gpg read /dev/tty, not stdin - run_command is non-interactive by
+        # design), tell the model WHY and where to go, so it re-routes instead of retrying
+        # the same doomed call. Only appended on an actual terminal-required failure, so
+        # it costs nothing on normal runs.
+        if r.returncode != 0 and _needs_terminal(out):
+            result += ("\n\n[hint] This command needs an interactive terminal (a password/"
+                       "passphrase or a pty), which run_command deliberately does not provide. "
+                       "Use ask_user_to_run to hand it to the operator's real terminal, or "
+                       "rework it to be non-interactive (e.g. a non-sudo path, `ssh -o "
+                       "BatchMode=yes`, a token/env credential).")
+        return result
 
     def _run_background(self, cmd: str, kind: str = "task", idle_timeout=None,
                         notify_on_exit=None, heartbeat_timeout=None,
@@ -674,6 +692,30 @@ def _truncate_output(s: str) -> str:
     dropped = len(s) - OUTPUT_HEAD - OUTPUT_TAIL
     return (s[:OUTPUT_HEAD] + f"\n…[truncated {dropped} chars]…\n" + s[-OUTPUT_TAIL:])
 
+
+# Signatures a command emits when it wanted the controlling terminal run_command
+# withholds (sudo/ssh/gpg read /dev/tty, not stdin). Used to append a re-route hint
+# so the model reaches for ask_user_to_run instead of retrying the doomed call.
+_TERMINAL_REQUIRED_SIGNS = (
+    "a terminal is required",              # sudo (no -S)
+    "a password is required",             # sudo -n / cached-cred miss
+    "no askpass program",                 # sudo/ssh SUDO_ASKPASS/SSH_ASKPASS path
+    "pseudo-terminal will not be allocated",  # ssh without a tty
+    "not a terminal",                     # ssh / various
+    "inappropriate ioctl for device",     # gpg / pinentry with no tty
+    "no tty present",                     # su / sudo
+    "/dev/tty",                           # a direct open('/dev/tty') failure
+    "gpg: signing failed: inappropriate", # gpg pinentry
+    "error: gpg failed to sign",          # git commit signing with no pinentry tty
+)
+
+
+def _needs_terminal(output: str) -> bool:
+    """True if `output` looks like a command failed because it needed the interactive
+    terminal run_command deliberately withholds. Case-insensitive substring match on
+    the known sudo/ssh/gpg signatures. Pure -> unit tested."""
+    low = (output or "").lower()
+    return any(sign in low for sign in _TERMINAL_REQUIRED_SIGNS)
 
 # --- the tool contract: schema + capability tier per builtin -----------------
 # (description text is the model-facing tool doc; kept verbatim from the old core
