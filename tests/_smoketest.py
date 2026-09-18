@@ -770,7 +770,33 @@ shutil.rmtree(_ext, ignore_errors=True)
 # 10. run_command
 rc = tools.run_command("echo hello && exit 0")
 check("run_command returns output", "hello" in rc and "exit 0" in rc, rc.replace("\n", " "))
-
+# NON-INTERACTIVE contract: run_command detaches from the controlling TTY
+# (start_new_session), so a child reading /dev/tty (sudo/ssh/gpg) fails FAST instead
+# of blocking on a hidden terminal prompt until the timeout (and stealing keystrokes).
+_ttyrc = tools.run_command(
+    "python3 -c \"open('/dev/tty')\" 2>&1; echo done")
+check("run_command: child cannot open /dev/tty (detached from terminal)",
+      "done" in _ttyrc and ("No such device" in _ttyrc or "No such file" in _ttyrc
+                            or "error" in _ttyrc.lower() or "Errno 6" in _ttyrc),
+      _ttyrc.replace("\n", " "))
+# and a terminal-required failure appends the re-route hint (nudges the model to
+# ask_user_to_run instead of retrying); a normal failure/success does NOT.
+import importlib.util as _ilu_b
+_bspec = _ilu_b.spec_from_file_location("_lcb_probe", "lean-tools/builtins.py")
+_lcb = _ilu_b.module_from_spec(_bspec); _bspec.loader.exec_module(_lcb)
+check("_needs_terminal: detects sudo/ssh/gpg terminal-required signatures",
+      _lcb._needs_terminal("sudo: a password is required")
+      and _lcb._needs_terminal("Pseudo-terminal will not be allocated because stdin is not a terminal")
+      and _lcb._needs_terminal("open('/dev/tty') OSError [Errno 6]"))
+check("_needs_terminal: false on normal output (no spurious hint)",
+      not _lcb._needs_terminal("exit 0\nhello world")
+      and not _lcb._needs_terminal("fatal: not a git repository"))
+_hintrc = tools.run_command("sudo -n true 2>&1 || sudo apt-get update 2>&1")
+check("run_command: appends the ask_user_to_run hint on a terminal-required failure",
+      "[hint]" in _hintrc and "ask_user_to_run" in _hintrc, _hintrc.replace("\n", " "))
+_nohint = tools.run_command("echo plain && exit 3")
+check("run_command: no hint on a normal (non-terminal) failure",
+      "[hint]" not in _nohint, _nohint.replace("\n", " "))
 # 10a. the background tool launches detached instead of hanging on the captured pipe
 _orig_cfgdir = lc.CONFIG_DIR
 lc.CONFIG_DIR = Path(tempfile.mkdtemp(prefix="lc_bg_"))
