@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L1458   Lean-tools (plugin tools: discovery, manager)
-  L1808   MCP client (connection, manager, OAuth, discovery)
-  L2262   Providers (backend plugin registry)
-  L2484   Interactive pickers + menus (raw-mode UI engine)
-  L2833   Terminal styling (colors, formatting helpers)
-  L3069   Streaming + markdown render (model output)
-  L3543   Composer (pinned input line, editor, stdin)
-  L4425   Token accounting (calibrated context meter)
-  L4610   Config (dataclass, field registry, load/save)
-  L8212   Tool execution + text tool-call parsing
-  L8645   Remote workspace (executor client, /connect)
-  L10284  Context meter
-  L10379  Agent (turn loop, context mgmt, tool dispatch)
-  L17210  Slash-command handlers + dispatch table
-  L17347  REPL (interactive loop, session resume)
-  L17778  Worker agent (headless --agent-run)
-  L18438  Entry (CLI arg parsing, main)
+  L1465   Lean-tools (plugin tools: discovery, manager)
+  L1815   MCP client (connection, manager, OAuth, discovery)
+  L2269   Providers (backend plugin registry)
+  L2491   Interactive pickers + menus (raw-mode UI engine)
+  L2840   Terminal styling (colors, formatting helpers)
+  L3076   Streaming + markdown render (model output)
+  L3550   Composer (pinned input line, editor, stdin)
+  L4432   Token accounting (calibrated context meter)
+  L4617   Config (dataclass, field registry, load/save)
+  L8219   Tool execution + text tool-call parsing
+  L8652   Remote workspace (executor client, /connect)
+  L10291  Context meter
+  L10386  Agent (turn loop, context mgmt, tool dispatch)
+  L17239  Slash-command handlers + dispatch table
+  L17376  REPL (interactive loop, session resume)
+  L17807  Worker agent (headless --agent-run)
+  L18467  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -116,7 +116,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.10.51"
+__version__ = "0.10.52"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -124,6 +124,13 @@ __version__ = "0.10.51"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.10.52": [
+        "/prompt new <name>: a proper create verb - makes a new custom prompt and opens it",
+        "  in the editor. 'new' refuses an existing name (no clobber) and 'edit' refuses a",
+        "  missing one, so the two verbs finally mean what they say. Also fixed a circular",
+        "  error ('create it with /prompt <name>' pointed at the command that just failed -",
+        "  it now points at /prompt new <name>).",
+    ],
     "0.10.51": [
         "fix: a LOCAL run_command that runs ssh/scp/sftp/rsync/git could, on a cold",
         "  credential cache, make gpg-agent/ssh-agent pop a pinentry box on the terminal the",
@@ -13589,10 +13596,24 @@ def _refresh_system_prompt(agent, name):
         agent.messages[0] = {"role": "system", "content": agent._system()}
 
 
-def _edit_prompt_file(agent, cfg, name):
+def _edit_prompt_file(agent, cfg, name, create=None):
+    """Open a prompt file in the editor. `create` gates on existence so 'new' and
+    'edit' have honest semantics: create=True (from /prompt new) refuses an existing
+    name; create=False (from /prompt edit) refuses a missing one; create=None (legacy)
+    seeds-or-opens either way. Built-ins are always editable (they seed from the baked
+    default), so the existence gate only applies to custom prompts."""
     if not _PROMPT_NAME_RE.match(name):
         print(yellow(f"invalid prompt name '{name}' (use letters, digits, . _ -)"))
         return
+    if name not in BUILTIN_PROMPTS:
+        exists = prompt_file(name).is_file()
+        if create is True and exists:
+            print(yellow(f"prompt '{name}' already exists - use /prompt edit {name} "
+                         f"to change it (or /prompt {name} to fire it)."))
+            return
+        if create is False and not exists:
+            print(yellow(f"no prompt '{name}' to edit - create it with /prompt new {name}."))
+            return
     f = seed_prompt_file(name)
     if open_in_editor(f, cfg):
         print(dim(f"saved {f}"))
@@ -13612,7 +13633,7 @@ def _use_prompt(agent, name):
             print(yellow(f"'{name}' is a system prompt, not a one-shot message - "
                          f"/prompt use is for your own custom prompts."))
         else:
-            print(yellow(f"no prompt '{name}' to use (create it with /prompt {name}, "
+            print(yellow(f"no prompt '{name}' to use (create it with /prompt new {name}, "
                          f"or drop a {f.name} in {PROMPTS_DIR})."))
         return
     # Carry the prompt NAME alongside the text so the loop can echo it as an operator
@@ -13625,10 +13646,11 @@ def handle_prompt_command(agent, cfg, arg):
     """/prompt: fire a saved prompt as a one-shot turn, or manage prompt files.
       /prompt                 picker: choose a saved prompt to USE (fires next turn)
       /prompt <name>          USE that prompt directly (fires as the next turn)
-      /prompt edit <name>     view/edit a prompt file (create a custom one if absent)
+      /prompt new <name>      create a new custom prompt and open it in the editor
+      /prompt edit <name>     view/edit an existing prompt file
       /prompt reset <name>    restore a built-in to its baked default
 
-    The verbs edit/use/reset are reserved: `/prompt use foo` always means the USE
+    The verbs new/edit/use/reset are reserved: `/prompt use foo` always means the USE
     verb, even if you have a prompt literally named 'use' (pick it from the no-arg
     picker instead). Bare `/prompt <name>` USES it - the common case - so a saved
     instruction fires without retyping."""
@@ -13648,10 +13670,16 @@ def handle_prompt_command(agent, cfg, arg):
         _use_prompt(agent, arg[4:].strip())
         return
     if arg.startswith("edit "):
-        _edit_prompt_file(agent, cfg, arg[5:].strip())
+        _edit_prompt_file(agent, cfg, arg[5:].strip(), create=False)
         return
     if arg == "edit":
         print(yellow("usage: /prompt edit <name>"))
+        return
+    if arg.startswith("new "):
+        _edit_prompt_file(agent, cfg, arg[4:].strip(), create=True)
+        return
+    if arg == "new":
+        print(yellow("usage: /prompt new <name>"))
         return
     if arg:
         # Bare `/prompt <name>` = USE it (the common case). An unknown name is
@@ -13664,7 +13692,7 @@ def handle_prompt_command(agent, cfg, arg):
     builtins, custom = list_prompts()
     names = builtins + custom
     if not names:
-        print(dim("no saved prompts yet - create one with /prompt edit <name>, "
+        print(dim("no saved prompts yet - create one with /prompt new <name>, "
                   f"then /prompt <name> fires it. (files live in {PROMPTS_DIR})"))
         return
     labels = []
@@ -14565,10 +14593,11 @@ def _arg_completions(agent, cfg, cmd):
         return list(getattr(agent, "remotes", {}))
     if cmd == "/prompt":
         b, c = list_prompts(all_builtins=True)   # bare /prompt <name> = USE; verbs first
-        return ["edit", "use", "reset"] + b + c
-    if cmd in ("/prompt use", "/prompt edit"):   # name-complete after the verb
+        return ["new", "edit", "use", "reset"] + b + c
+    if cmd in ("/prompt use", "/prompt edit"):   # name-complete after the verb (existing prompts)
         b, c = list_prompts(all_builtins=True)
         return b + c
+    # /prompt new takes a NEW name (nothing to complete), so no name list here.
     if cmd in ("/prompt reset", "/prompt restore"):   # only overridden built-ins can be reset
         return sorted(n for n in BUILTIN_PROMPTS if prompt_file(n).is_file())
     if cmd in ("/help", "/h", "/?"):              # /help <cmd> -> complete command names
