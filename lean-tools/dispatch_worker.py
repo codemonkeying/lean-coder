@@ -139,8 +139,8 @@ TOOL = {
                                          "the task first, then dispatch with taskboard=<name>."},
             "iterations": {"type": "integer",
                            "description": "Optional tool-call budget, capped at the operator ceiling "
-                                          "(omit = ceiling). On 'dispatch' sets the worker's cap; on "
-                                          "'resume' grants a FRESH budget (use it when the worker "
+                                          "(default 30; omit = ceiling). On 'dispatch' sets the worker's "
+                                          "cap; on 'resume' grants a FRESH budget (use it when the worker "
                                           "died by hitting its cap)."},
             "leash": {"type": "string", "enum": ["r", "rw", "rwe"], "default": "r",
                       "description": "Worker capability: r=read-only (default), rw=edit, rwe=edit+run. "
@@ -566,6 +566,9 @@ def run(args, cwd):
             _ri = int(_req_iter)
             if _ri > 0:
                 max_iter = min(_ri, _ceil_iter)
+                if _ri > _ceil_iter:   # tell the driver its request was clamped (silent before)
+                    cap_note += (f" (iterations {_ri} capped to the {_ceil_iter} ceiling - "
+                                 f"raise via /set worker_max_iterations)")
         except (TypeError, ValueError):
             pass
     idle_timeout = _ceiling("idle_timeout")

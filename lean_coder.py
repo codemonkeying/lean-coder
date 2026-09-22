@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L1465   Lean-tools (plugin tools: discovery, manager)
-  L1815   MCP client (connection, manager, OAuth, discovery)
-  L2269   Providers (backend plugin registry)
-  L2491   Interactive pickers + menus (raw-mode UI engine)
-  L2840   Terminal styling (colors, formatting helpers)
-  L3076   Streaming + markdown render (model output)
-  L3550   Composer (pinned input line, editor, stdin)
-  L4432   Token accounting (calibrated context meter)
-  L4617   Config (dataclass, field registry, load/save)
-  L8219   Tool execution + text tool-call parsing
-  L8652   Remote workspace (executor client, /connect)
-  L10291  Context meter
-  L10386  Agent (turn loop, context mgmt, tool dispatch)
-  L17239  Slash-command handlers + dispatch table
-  L17376  REPL (interactive loop, session resume)
-  L17807  Worker agent (headless --agent-run)
-  L18467  Entry (CLI arg parsing, main)
+  L1471   Lean-tools (plugin tools: discovery, manager)
+  L1821   MCP client (connection, manager, OAuth, discovery)
+  L2275   Providers (backend plugin registry)
+  L2497   Interactive pickers + menus (raw-mode UI engine)
+  L2846   Terminal styling (colors, formatting helpers)
+  L3082   Streaming + markdown render (model output)
+  L3556   Composer (pinned input line, editor, stdin)
+  L4438   Token accounting (calibrated context meter)
+  L4623   Config (dataclass, field registry, load/save)
+  L8225   Tool execution + text tool-call parsing
+  L8658   Remote workspace (executor client, /connect)
+  L10297  Context meter
+  L10392  Agent (turn loop, context mgmt, tool dispatch)
+  L17245  Slash-command handlers + dispatch table
+  L17382  REPL (interactive loop, session resume)
+  L17813  Worker agent (headless --agent-run)
+  L18473  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -116,7 +116,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.10.52"
+__version__ = "0.10.53"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -124,6 +124,12 @@ __version__ = "0.10.52"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.10.53": [
+        "dispatch_worker: a per-worker `iterations` request above the ceiling used to be",
+        "  clamped SILENTLY - the worker just died at 30 with no hint why. The dispatch now",
+        "  says it was capped (and how to raise it), the descriptor names the default (30),",
+        "  and the capped-worker death notice points at `/set worker_checkpoint on` + resume.",
+    ],
     "0.10.52": [
         "/prompt new <name>: a proper create verb - makes a new custom prompt and opens it",
         "  in the editor. 'new' refuses an existing name (no clobber) and 'edit' refuses a",
@@ -18356,8 +18362,8 @@ def run_agent_brief(args) -> int:
             Path(resultf).write_text(
                 f"{RESULT_MARK}\nINCOMPLETE: the worker hit its {cfg.max_iterations}-iteration "
                 f"budget before finishing the task, and checkpointing was off so it cannot be "
-                f"resumed. Re-dispatch with a higher worker_max_iterations, or turn on "
-                f"worker_checkpoint to make such a worker resumable.\n{RESULT_MARK}\n")
+                f"resumed. Re-dispatch with a higher `iterations`, or `/set worker_checkpoint on` "
+                f"so a capped worker can be action='resume'd instead.\n{RESULT_MARK}\n")
         except OSError as e:
             return _fail(f"cannot write result file: {e}")
         print(dim(f"agent-run: incomplete (iteration cap) -> {resultf}"))
