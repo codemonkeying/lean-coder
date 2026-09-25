@@ -61,11 +61,10 @@ def _scrub_invisible(text, cfg=None):
 _INJECT = (
     "IgnoreMatcher", "resolve_in_project", "_parse_search_replace", "_confirm_action",
     "_bg_running", "_bg_register", "_bg_status_items", "_bg_status_msg",
-    "_bg_spawn_detached", "_bg_kill",
+    "_bg_spawn_detached", "_bg_kill", "_bg_new_log",
     "READ_MAX_LINES", "READ_HEAD", "READ_TAIL", "TREE_DEFAULT_DEPTH", "TREE_MAX_ENTRIES",
     "SEARCH_MAX_MATCHES", "SEARCH_LINE_MAX", "SEARCH_MAX_FILE_BYTES",
     "OUTPUT_MAX_CHARS", "OUTPUT_HEAD", "OUTPUT_TAIL",
-    "CONFIG_DIR",
 )
 
 
@@ -101,14 +100,17 @@ class Tools:
             note = ""
             if e - s + 1 > READ_MAX_LINES:
                 e = s + READ_MAX_LINES - 1
-                note = f"\n…[range capped at {READ_MAX_LINES} lines; request a smaller range]…"
+                note = (f"\n…[range capped at {READ_MAX_LINES} lines; more: "
+                        f"read_file start={e + 1}]…")
             body = _number(alllines[s - 1:e], s)
             return (body + note) if body else "(no lines in range)"
         # whole file, head/tail truncated if very large
         if n > READ_MAX_LINES:
             head = _number(alllines[:READ_HEAD], 1)
             tail = _number(alllines[-READ_TAIL:], n - READ_TAIL + 1)
-            return head + f"\n…[truncated {n - READ_HEAD - READ_TAIL} lines]…\n" + tail
+            gap_s, gap_e = READ_HEAD + 1, n - READ_TAIL
+            return head + (f"\n…[lines {gap_s}-{gap_e} omitted; read them: read_file "
+                           f"start={gap_s} end={min(gap_e, gap_s + READ_MAX_LINES - 1)}]…\n") + tail
         return _number(alllines, 1) or "(empty file)"
 
     def list_files(self, path: str = "") -> str:
@@ -117,7 +119,7 @@ class Tools:
             return f"error: no such path: {path}"
         if base.is_file():
             return path
-        out, count, hidden = [], 0, 0
+        out, count, hidden, capped = [], 0, 0, []
         root = self.cfg.cwd.resolve()
 
         def _rel(p):
@@ -149,7 +151,11 @@ class Tools:
                 return
             for e in entries:
                 if count >= TREE_MAX_ENTRIES:
-                    out.append("…[more entries truncated]…")
+                    if not capped:
+                        capped.append(1)
+                        out.append(f"…[listing stopped at {TREE_MAX_ENTRIES} entries; for the "
+                                   f"rest, list one subdir at a time: list_files path=<a dir "
+                                   f"above>]…")
                     return
                 if self.ignore.ignored(e):
                     hidden += 1
@@ -186,7 +192,8 @@ class Tools:
         files = [base] if base.is_file() else _iter_files(base, self.ignore)
         for f in files:
             if count >= SEARCH_MAX_MATCHES:
-                hits.append("…[more matches truncated]…")
+                hits.append(f"…[stopped at {SEARCH_MAX_MATCHES} matches; there may be more. Narrow "
+                            f"it: a tighter pattern, or path=<subdir or file>]…")
                 break
             try:
                 # Never slurp a whole file into RAM (a multi-GB VM image / DB / log
@@ -426,9 +433,7 @@ class Tools:
         max_runtime = _posint(max_runtime)
         kill_on_max = True if kill_on_max is None else bool(kill_on_max)
         try:
-            logdir = CONFIG_DIR / "bg"
-            logdir.mkdir(parents=True, exist_ok=True)
-            log = logdir / f"{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}.log"
+            log = _bg_new_log()
             exitf = str(log) + ".exit"
             p = _bg_spawn_detached(cmd, log, exitf, str(log) + ".lease",
                                    logf=str(log), idle_timeout=idle_timeout,
@@ -690,7 +695,9 @@ def _truncate_output(s: str) -> str:
     if len(s) <= OUTPUT_MAX_CHARS:
         return s
     dropped = len(s) - OUTPUT_HEAD - OUTPUT_TAIL
-    return (s[:OUTPUT_HEAD] + f"\n…[truncated {dropped} chars]…\n" + s[-OUTPUT_TAIL:])
+    return (s[:OUTPUT_HEAD] + f"\n…[{dropped} chars omitted (not kept); to see them, re-run "
+            f"narrower: `| grep PATTERN`, `| sed -n 'A,Bp'`, or `> file` then read_file "
+            f"start=/end=]…\n" + s[-OUTPUT_TAIL:])
 
 
 # Signatures a command emits when it wanted the controlling terminal run_command

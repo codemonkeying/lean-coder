@@ -66,5 +66,8 @@ def run(args, cwd):
         out += ("\n[stderr]\n" if out else "") + r.stderr
     out = out.rstrip()
     if len(out) > 4000:
-        out = out[:4000] + "\n... (truncated)"
+        # head + tail: errors and stderr land at the END, so a head-only cut hid them.
+        out = (out[:2800] + f"\n...[{len(out) - 4000} chars omitted (not kept); re-run "
+               f"narrower on the remote: `| grep PATTERN`, `| sed -n 'A,Bp'`, `| tail -n N`]"
+               f"...\n" + out[-1200:])
     return f"exit {r.returncode}\n{out}" if out else f"exit {r.returncode} (no output)"

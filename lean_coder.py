@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L1471   Lean-tools (plugin tools: discovery, manager)
-  L1821   MCP client (connection, manager, OAuth, discovery)
-  L2275   Providers (backend plugin registry)
-  L2497   Interactive pickers + menus (raw-mode UI engine)
-  L2846   Terminal styling (colors, formatting helpers)
-  L3082   Streaming + markdown render (model output)
-  L3556   Composer (pinned input line, editor, stdin)
-  L4438   Token accounting (calibrated context meter)
-  L4623   Config (dataclass, field registry, load/save)
-  L8225   Tool execution + text tool-call parsing
-  L8658   Remote workspace (executor client, /connect)
-  L10297  Context meter
-  L10392  Agent (turn loop, context mgmt, tool dispatch)
-  L17245  Slash-command handlers + dispatch table
-  L17382  REPL (interactive loop, session resume)
-  L17813  Worker agent (headless --agent-run)
-  L18473  Entry (CLI arg parsing, main)
+  L1488   Lean-tools (plugin tools: discovery, manager)
+  L1838   MCP client (connection, manager, OAuth, discovery)
+  L2292   Providers (backend plugin registry)
+  L2514   Interactive pickers + menus (raw-mode UI engine)
+  L2863   Terminal styling (colors, formatting helpers)
+  L3099   Streaming + markdown render (model output)
+  L3573   Composer (pinned input line, editor, stdin)
+  L4455   Token accounting (calibrated context meter)
+  L4653   Config (dataclass, field registry, load/save)
+  L8322   Tool execution + text tool-call parsing
+  L8792   Remote workspace (executor client, /connect)
+  L10489  Context meter
+  L10584  Agent (turn loop, context mgmt, tool dispatch)
+  L17546  Slash-command handlers + dispatch table
+  L17683  REPL (interactive loop, session resume)
+  L18115  Worker agent (headless --agent-run)
+  L18775  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -116,7 +116,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.10.53"
+__version__ = "0.10.54"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -124,6 +124,22 @@ __version__ = "0.10.53"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.10.54": [
+        "/compact <k>: compact to a chosen FINAL size, one time (e.g. /compact 100 = ~100k;",
+        "  /compact to prompts). compact_at stays the trigger. If stubbing old tool results",
+        "  alone lands under k, no summary is written - it just stubs and says so. Compaction",
+        "  now keeps the newest 3 tool results whole (as /trim does).",
+        "Runtime state is per process: background tasks, worker files and claim boards live",
+        "  in one folder per session under $XDG_RUNTIME_DIR, removed on exit (or at the next",
+        "  start if the owner crashed). No shared registry, no age sweeps. Pausing a worker",
+        "  now saves it as a session. Remote: closing a session kills its remote tasks; two",
+        "  watchdog bugs fixed (stale watchdogs could wipe a newer session's executor).",
+        "Truncation notices now say exactly how to get the rest (run_command, list_files,",
+        "  search_files, diagnostics, ssh, git_summary, bg finish notice, read_file, worker",
+        "  results - the last two are now paged). diagnostics/ssh keep head AND tail.",
+        "Fixes: the smoketest could report ALL PASS after a failure; tests no longer write",
+        "  into the real ~/.config; Anthropic plan header updated.",
+    ],
     "0.10.53": [
         "dispatch_worker: a per-worker `iterations` request above the ceiling used to be",
         "  clamped SILENTLY - the worker just died at 30 with no hint why. The dispatch now",
@@ -842,6 +858,7 @@ COMPACT_EMERGENCY_KEEP = 1         # hardcoded backstop: on context OVERFLOW we 
 # WITHOUT re-filling the window (that would defeat compaction + cost a fresh cache write).
 # keep_budget = min(headroom * frac, keep_cap); NO floor - if the summary itself already
 # eats the window (small local models), headroom<=0 and we keep NOTHING (summary only).
+COMPACT_TARGET_MIN_HEADROOM = 4000   # /compact <k>: min room (tokens) above system+tools for a summary
 KEEP_FRAC_LO = 0.2                 # fraction of headroom kept when there's lots of room (>threshold)
 KEEP_FRAC_HI = 0.5                 # fraction kept when headroom is small (keep a bigger share of little)
 KEEP_FRAC_THRESHOLD = 50_000       # headroom (tokens) above which we switch HI->LO so big windows don't hoard
@@ -4552,6 +4569,19 @@ def _raw_messages_tokens(messages, tools) -> int:
     return total
 
 
+def _stub_tool_msgs(msgs, keep=None):
+    """Copy of `msgs` with tool-result bodies stubbed as _trim_tool_indices would, except
+    the newest `keep` (default TRIM_KEEP) - for sizing a trim BEFORE doing it. Pure."""
+    keep = TRIM_KEEP if keep is None else keep
+    idx = [i for i, m in enumerate(msgs) if m.get("role") == "tool"]
+    drop = set(idx[:-keep] if keep > 0 else idx)
+    return [{**m, "content": f"[trimmed {m.get('tool_name', 'tool')} result - "
+                             f"{len(m['content'].splitlines())} lines]"}
+            if i in drop and isinstance(m.get("content"), str)
+            and not m["content"].startswith("[trimmed") else m
+            for i, m in enumerate(msgs)]
+
+
 def messages_tokens(messages, tools) -> int:
     """Calibrated estimate of a full send (messages + tool schemas)."""
     return int(_raw_messages_tokens(messages, tools) * _TOK_FACTOR)
@@ -5988,6 +6018,27 @@ def _prune_stale_locks():
                 pass
 
 
+def _prune_dead_tmp_writes():
+    """Startup: remove '<file>.tmp<pid>' leftovers from _atomic_write_text whose writer pid
+    is dead on this host - a crash between the temp write and the rename leaves one beside
+    the real file (which is intact: the rename never happened). Liveness only, never age,
+    so a concurrent session mid-save is untouched. Covers every dir _atomic_write_text
+    writes into: sessions, taskboards, and the config dir."""
+    for d in (SESSIONS_DIR, TASKBOARDS_DIR, CONFIG_PATH.parent):
+        try:
+            files = list(Path(d).glob("*.tmp*"))
+        except OSError:
+            continue
+        for f in files:
+            m = re.search(r"\.tmp(\d+)$", f.name)
+            if not m or int(m.group(1)) == os.getpid() or _proc_alive(int(m.group(1))):
+                continue
+            try:
+                f.unlink()
+            except OSError:
+                pass
+
+
 def _session_stolen(agent, cfg) -> bool:
     """Read-only: True if ANOTHER live instance now holds our session's lock (a take-over
     via /load elsewhere). Cheap (one lock read) so the idle poll can call it ~4x/s to
@@ -6091,22 +6142,39 @@ def resolve_in_project(cfg: Config, path: str) -> Path:
 # Background tasks (a trailing '&' on run_command detaches; tracked + reaped)
 #
 # A backgrounded job is detached (own session) so it survives the turn, BUT it is
-# pegged to the lean-coder session: a registry under bg/tasks.jsonl records the pid +
-# the owning lean-coder pid, so a clean exit kills this session's jobs and a later
-# launch reaps orphans left by a crashed session. /bg lists + kills them.
+# pegged to the lean-coder process that launched it. There is NO shared registry: each
+# process keeps its own tasks under run_dir()/<host>-<pid>/ (one '<stamp>.json' record
+# per task beside its '<stamp>.log' + sidecars), written only by that process. A clean
+# exit kills its tasks and removes the dir; a crash leaves a dead-pid dir that the next
+# startup on this box reaps (_run_reap). Reads (_bg_load) scan every dir; nothing is
+# ever read-modify-written, so concurrent sessions can't clobber each other.
 # ----------------------------------------------------------------------------
 
-def _bg_registry_path():
-    return CONFIG_DIR / "bg" / "tasks.jsonl"
+_EXEC_ROLE = {"on": False, "watchdog": None}   # set in run_tool_executor / _arm_self_wipe
+
+
+def _bg_new_log(kind=None) -> Path:
+    """A fresh log path in THIS process's run dir (created on first use). The record
+    for the task is '<same stem>.json' beside it - see _bg_register."""
+    d = _run_pid_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    stem = time.strftime("%Y%m%d-%H%M%S") + f"-{time.monotonic_ns() % 10**6:06d}"
+    return d / (stem + (f"-{kind}" if kind else "") + ".log")
+
+
+def _bg_rec_path(log) -> Path:
+    """The per-task record file for a task log: '<log minus .log>.json'."""
+    s = str(log)
+    return Path((s[:-4] if s.endswith(".log") else s) + ".json")
 
 
 def _bg_register(pid, cmd, log, kind="task", idle_timeout=None,
                  notify_on_exit=False, heartbeat_timeout=None,
                  max_runtime=None, kill_on_max=True, meta=None):
-    """Record a backgrounded task (owner = this process's pid, host = this box).
-    A bg task runs on whichever box the executor is on, so the registry lives on
-    THAT box; the host field lets a reader tell 'my box' (pid is authoritative)
-    from a foreign record (never mine to reap) - see _proc_alive_here.
+    """Record a backgrounded task (owner = this process's pid, host = this box) as its
+    own record file in this process's run dir. A bg task runs on whichever box the
+    executor is on, so its record lives on THAT box; the host field lets a reader tell
+    'my box' (pid is authoritative) from a foreign record (never mine to reap).
 
     `kind` tags what the record is: "task" (a plain background task, the
     default) or "worker" (a dispatched agent). Both share this lifecycle, but the
@@ -6120,27 +6188,48 @@ def _bg_register(pid, cmd, log, kind="task", idle_timeout=None,
     _bg_bump_lease); when the parent is gone the lease goes stale and the task's
     own watchdog kills it. Inverse of session-lock staleness; caps runaway quota
     burn by a worker whose parent dropped. None = no lease (runs until done)."""
+    rec = {"pid": pid, "cmd": cmd, "log": str(log), "owner": os.getpid(),
+           "host": _HOSTNAME, "kind": kind,
+           "idle_timeout": idle_timeout,
+           "notify_on_exit": notify_on_exit,
+           "heartbeat_timeout": heartbeat_timeout,
+           "max_runtime": max_runtime, "kill_on_max": kill_on_max,
+           "started": time.strftime("%Y-%m-%d %H:%M:%S"),
+           "started_at": time.time()}
+    if _EXEC_ROLE["on"]:
+        # Launched by a remote EXECUTOR: only another executor may adopt it after a drop,
+        # and while its self-wipe watchdog lives a REPL's reaper leaves it alone (the
+        # watchdog owns its cleanup) - so a lean-coder REPL on the same box never kills a
+        # dropped session's survivors, and never adopts them either.
+        rec["role"] = "executor"
+        rec["watchdog"] = _EXEC_ROLE["watchdog"]
+    if meta:
+        # Extra caller-supplied fields (e.g. from_session=<name> so a reader can
+        # tell a session is being driven by a live worker). Never clobbers the core
+        # keys above.
+        for k, v in meta.items():
+            rec.setdefault(k, v)
+    _bg_write_rec(rec)
+
+
+def _bg_write_rec(rec):
+    """Atomically (re)write one task's record file beside its log. Only the owning
+    process writes it, so there is no read-modify-write race with other sessions."""
     try:
-        p = _bg_registry_path()
+        p = _bg_rec_path(rec["log"])
         p.parent.mkdir(parents=True, exist_ok=True)
-        rec = {"pid": pid, "cmd": cmd, "log": str(log), "owner": os.getpid(),
-               "host": _HOSTNAME, "kind": kind,
-               "idle_timeout": idle_timeout,
-               "notify_on_exit": notify_on_exit,
-               "heartbeat_timeout": heartbeat_timeout,
-               "max_runtime": max_runtime, "kill_on_max": kill_on_max,
-               "started": time.strftime("%Y-%m-%d %H:%M:%S"),
-               "started_at": time.time()}
-        if meta:
-            # Extra caller-supplied fields (e.g. from_session=<name> so a reader can
-            # tell a session is being driven by a live worker). Never clobbers the core
-            # keys above.
-            for k, v in meta.items():
-                rec.setdefault(k, v)
-        with open(p, "a") as f:
-            f.write(json.dumps(rec) + "\n")
-        global _BG_LOAD_CACHE
-        _BG_LOAD_CACHE = (None, [])   # invalidate: next _bg_load re-reads
+        tmp = p.with_name(p.name + ".tmp")
+        tmp.write_text(json.dumps(rec))
+        os.replace(tmp, p)
+    except (OSError, KeyError):
+        pass
+
+
+def _bg_drop(rec):
+    """Forget a task: remove its record and every sidecar (log/.exit/.lease/alerts)."""
+    _bg_clean_sidecars(rec)
+    try:
+        _bg_rec_path(rec.get("log", "")).unlink()
     except OSError:
         pass
 
@@ -6167,35 +6256,28 @@ def _bg_bump_lease(rec):
         pass
 
 
-_BG_LOAD_CACHE = (None, [])   # (mtime, records); registry read 2-5x/turn otherwise
-
-
-def _bg_load():
-    # Cache on the registry file's mtime: it changes only when a task starts/ends/is
-    # killed, so the cache is hot for the vast majority of the per-turn reads. A stale
-    # mtime just re-reads (always valid), so a cross-process write is never missed.
-    global _BG_LOAD_CACHE
-    p = _bg_registry_path()
-    try:
-        mtime = p.stat().st_mtime
-        if mtime == _BG_LOAD_CACHE[0]:
-            return list(_BG_LOAD_CACHE[1])
-        recs = [json.loads(ln) for ln in p.read_text().splitlines() if ln.strip()]
-        _BG_LOAD_CACHE = (mtime, recs)
-        return list(recs)
-    except (OSError, json.JSONDecodeError):
-        return []
-
-
-def _bg_save(recs):
-    global _BG_LOAD_CACHE
-    try:
-        p = _bg_registry_path()
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text("".join(json.dumps(r) + "\n" for r in recs))
-        _BG_LOAD_CACHE = (None, [])   # invalidate: next _bg_load re-reads
-    except OSError:
-        pass
+def _bg_load(owner_dir=None):
+    """Every task record on this box: one '<stamp>.json' per task under each process's
+    run dir (or only `owner_dir`). A torn/unreadable record is skipped. Cheap - a
+    handful of small files - so no cache (nothing to go stale)."""
+    dirs = [owner_dir] if owner_dir else []
+    if not dirs:
+        try:
+            dirs = [d for d in run_dir().iterdir() if d.is_dir()]
+        except OSError:
+            return []
+    recs = []
+    for d in dirs:
+        try:
+            files = sorted(Path(d).glob("*.json"))
+        except OSError:
+            continue
+        for f in files:
+            try:
+                recs.append(json.loads(f.read_text()))
+            except (OSError, ValueError):
+                continue
+    return recs
 
 
 def _proc_alive(pid):
@@ -6519,8 +6601,14 @@ def _bg_finished_here(owner):
         code = _bg_exit_code(r)
         if code is None:
             continue
+        log = r.get("log")
+        nlines = 0
+        try:
+            nlines = Path(log).read_text(errors="replace").count("\n") if log else 0
+        except (OSError, ValueError):
+            pass
         out.append({"pid": pid, "cmd": r.get("cmd", "?"), "code": code,
-                    "tail": _bg_log_tail(r.get("log"), 20),
+                    "tail": _bg_log_tail(log, 20), "log": log, "lines": nlines,
                     "notify_on_exit": bool(r.get("notify_on_exit"))})
     return out
 
@@ -6545,7 +6633,15 @@ def _bg_finished_msg(items):
     for it in items:
         head = f"background task finished: `{it.get('cmd', '?')}` exited {it.get('code')}"
         tail = it.get("tail") or ""
-        lines.append(head + (f"\nlast output:\n{tail}" if tail else ""))
+        body = f"\nlast output:\n{tail}" if tail else ""
+        # The notice shows only the tail; say where the rest is (the log is kept until
+        # this session exits) so the model reads it instead of guessing. Remote: the log
+        # is on that box, and read_file there reaches it the same way.
+        n, log = it.get("lines") or 0, it.get("log")
+        if log and n > 20:
+            body += (f"\n…[last 20 of {n} lines; full log: read_file path={log} "
+                     f"(start=/end= to page)]")
+        lines.append(head + body)
     return "\n\n".join(lines)
 
 
@@ -6834,9 +6930,7 @@ def _bg_launch(cmd, cwd=None, kind="task", idle_timeout=None,
     if not cmd:
         return {"error": "nothing to launch"}
     try:
-        logdir = CONFIG_DIR / "bg"
-        logdir.mkdir(parents=True, exist_ok=True)
-        log = logdir / f"{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}-{kind}.log"
+        log = _bg_new_log(kind)
         exitf = str(log) + ".exit"
         leasef = str(log) + ".lease"
         # heartbeat_file lets a worker point the (bark-not-bite) staleness watchdog at
@@ -6981,8 +7075,8 @@ def _close_worker_masters():
 
 # Worker sidecar scheme (MIRRORS dispatch_worker's file naming - a stable contract):
 # a worker with brief path '<stamp>.brief' owns exactly this family, all driver-side
-# under CONFIG_DIR/workers (never remote - the worker process is local, only its tools
-# reach an executor). Centralised here so every cleanup path nukes the WHOLE family and
+# in the DRIVER's run dir (never remote - the worker process is local, only its tools
+# reach an executor); a clean driver exit / the dead-pid reaper removes the whole dir. Centralised here so every cleanup path nukes the WHOLE family and
 # leaves zero mess/trace.
 def _worker_brief_from_cmd(cmd):
     """The '--brief-file' path from a worker record's launch cmd, or None. This is the
@@ -6999,43 +7093,20 @@ def _worker_brief_from_cmd(cmd):
 # A worker's on-disk sidecar family, as suffixes on the STAMP (the brief path minus
 # its '.brief'). The dispatch tool writes '<stamp>.brief' + '<stamp>.result'; the
 # worker loop adds the '.brief.progress' heartbeat and the '.brief.inject' /
-# '.brief.injects.log' inject files. SINGLE source of truth: both the family-nuker
-# (_clean_worker_sidecars) and the startup backstop sweep (_worker_dir_sweep) consume
-# this, so a NEW sidecar is added in ONE place and can never be half-registered (a
-# missed suffix would leak the file past every reap = a trace + unbounded growth).
+# '.brief.injects.log' inject files. SINGLE source of truth for _clean_worker_sidecars,
+# so a NEW sidecar is added in ONE place. (A paused worker is saved as a SESSION file,
+# so nothing here is ever 'parked' - the whole family is always scratch.)
 _WORKER_SIDECAR_SUFFIXES = (".brief", ".result", ".brief.progress",
                             ".brief.inject", ".brief.injects.log",
                             ".brief.plan", ".brief.note", ".brief.planview",
                             ".brief.usage", ".brief.checkpoint", ".brief.checkpoint.tmp",
-                            ".brief.suspended")
-
-
-def _worker_suspended(brief):
-    """True if a worker (identified by its '<stamp>.brief' path) is deliberately PAUSED
-    - i.e. a '<stamp>.brief.suspended' sentinel sits beside it. A paused worker's pid is
-    dead (killed on purpose) but its transcript checkpoint must SURVIVE for a later
-    action='resume', so the reap paths must NOT treat it as an orphan to wipe. On-disk so
-    it outlives the driver session too. Best-effort (unreadable dir -> not suspended)."""
-    if not brief:
-        return False
-    b = str(brief)
-    stamp = b[:-len(".brief")] if b.endswith(".brief") else b
-    try:
-        return Path(stamp + ".brief.suspended").exists()
-    except OSError:
-        return False
+                            ".brief.progress.silent", ".brief.progress.maxrun")
 
 
 def _clean_worker_sidecars(brief):
     """Unlink a worker's entire sidecar family given its '<stamp>.brief' path (see
-    _WORKER_SIDECAR_SUFFIXES for the family). Best-effort; a missing file is fine.
-    GUARD: a deliberately-SUSPENDED worker (a '.suspended' sentinel beside its brief) is
-    left entirely intact - its checkpoint is parked for a future resume, not orphaned
-    residue. To actually reclaim a paused worker, clear the sentinel first (stop), then
-    this cleans as normal."""
+    _WORKER_SIDECAR_SUFFIXES for the family). Best-effort; a missing file is fine."""
     if not brief:
-        return
-    if _worker_suspended(brief):
         return
     b = str(brief)
     stamp = b[:-len(".brief")] if b.endswith(".brief") else b
@@ -7062,53 +7133,31 @@ def _bg_clean_sidecars(rec):
         _clean_worker_sidecars(_worker_brief_from_cmd(rec.get("cmd")))
 
 
-def _worker_dir_sweep(grace=3600):
-    """Startup: remove ORPHANED worker sidecar files under CONFIG_DIR/workers - the
-    residue of a worker hard-killed by a reboot/SIGKILL where even the bg registry was
-    lost, so the normal reap paths never saw it. Two guards make this safe when dide is
-    running many concurrent sessions on the box:
-      1. a file still referenced by a LIVE bg worker record (any owner, THIS box) is
-         kept - never delete another session's running worker's files;
-      2. a `grace` window (default 1h) protects a worker just launched by another
-         session whose record this process hasn't observed yet.
-    Zero remote concern: these are driver-side only; the executor dir is wiped by
-    _wipe_remote. Host-gated via _bg_here on the reference check. Best-effort."""
+def _worker_dir_sweep():
+    """Startup, one-time migration: older builds kept worker files loose in
+    CONFIG_DIR/workers (now they live in the driver's run dir and share its lifecycle).
+    Remove each legacy '<date>-<time>-<driverpid>-<seq>.*' file whose DRIVER pid is dead
+    on this host - no age rule, so a still-running older-build session's live workers are
+    never touched. A legacy '.suspended' family is kept (an older build's parked
+    checkpoint - promote it by hand if wanted). Only loose files go; subdirs stay."""
     wdir = CONFIG_DIR / "workers"
     if not wdir.is_dir():
         return
-    referenced = set()
-    for r in _bg_load():
-        if r.get("kind") == "worker" and _bg_here(r):
-            b = _worker_brief_from_cmd(r.get("cmd"))
-            if b:
-                referenced.add(os.path.abspath(b))
-    now = time.time()
-    # Anchor on the brief: clean the whole family for any unreferenced, aged-out brief.
-    for f in wdir.glob("*.brief"):
-        if os.path.abspath(str(f)) in referenced:
+    try:
+        files = [f for f in wdir.iterdir() if f.is_file()]
+    except OSError:
+        return
+    stamp_re = re.compile(r"(\d{8}-\d{6}-(\d+)-\d+)\.")
+    parked = {m.group(1) for f in files
+              if f.name.endswith(".suspended") and (m := stamp_re.match(f.name))}
+    for f in files:
+        m = stamp_re.match(f.name)
+        if not m or m.group(1) in parked or _proc_alive(int(m.group(2))):
             continue
         try:
-            if now - f.stat().st_mtime < grace:
-                continue
+            f.unlink()
         except OSError:
-            continue
-        _clean_worker_sidecars(str(f))
-    # Belt-and-braces: a stray non-brief sidecar (.result/.progress/.inject/.injects.log)
-    # whose .brief is already gone (partial prior cleanup) - drop it once aged out. Derived
-    # from _WORKER_SIDECAR_SUFFIXES (minus '.brief', the anchor above), longest-first so a
-    # '.brief.injects.log' strips fully before the shorter '.brief.inject' can mis-match.
-    strays = sorted((s for s in _WORKER_SIDECAR_SUFFIXES if s != ".brief"),
-                    key=len, reverse=True)
-    for suf in strays:
-        for f in wdir.glob("*" + suf):
-            stamp = f.name[:-len(suf)]
-            if (wdir / (stamp + ".brief")).exists():
-                continue
-            try:
-                if now - f.stat().st_mtime >= grace:
-                    f.unlink()
-            except OSError:
-                pass
+            pass
 
 
 # ==========================================================================
@@ -7116,9 +7165,9 @@ def _worker_dir_sweep(grace=3600):
 # append-only files that peer workers on ONE repo read/write to avoid stepping on
 # each other. NOT a service: a claims file + a small claim-with-TTL helper, mirroring
 # the sidecar-file pattern (no server, no DB, no new transport). Driver-side only,
-# under CONFIG_DIR/workers/board/<session>, so it is purely a LOCAL concern and is
-# torn down at session exit + aged-out on startup, same two-trigger zero-trace scheme
-# as the worker sidecars (Constraint A). Only meaningful when >1 worker runs on one
+# in the driver's run dir (run_dir()/<host>-<pid>/board), so it is purely a LOCAL concern
+# and shares that dir's lifecycle: removed on clean exit, reaped by pid-liveness after a
+# crash - the same zero-trace scheme as the worker sidecars (Constraint A). Only meaningful when >1 worker runs on one
 # repo; a lone worker never touches it.
 #
 # CLAIM POLICY (resolves the design open-Q): FIRST-CLAIM-WINS + TTL. A worker claims a
@@ -7131,9 +7180,11 @@ def _worker_dir_sweep(grace=3600):
 _BOARD_CLAIM_TTL = 900          # seconds a claim holds before it is considered stale/expired
 
 def _board_dir(session_id):
-    """The board directory for a session (created lazily by the claim writer). Keyed by
-    session so concurrent sessions on one box never share a board."""
-    return CONFIG_DIR / "workers" / "board" / str(session_id)
+    """The claims board for a session: a 'board' subdir of the DRIVER's run dir
+    (session_id IS the driver's pid, handed down to its workers). Per-process scratch, so
+    it shares the run-dir lifecycle - removed on clean exit, reaped by pid-liveness after
+    a crash; no age sweep. Concurrent sessions never share a board (different pids)."""
+    return _run_pid_dir(int(session_id)) / "board"
 
 
 def _board_claims_path(session_id):
@@ -7246,35 +7297,21 @@ def _board_teardown(session_id):
         pass
 
 
-def _board_sweep(grace=3600):
-    """Startup backstop: remove aged-out board dirs left by a crashed session (where
-    _board_teardown never ran). A board whose claims.jsonl mtime is older than `grace`
-    (default 1h) is nuked. Empty/parentless dirs are pruned. Driver-side only; mirrors
-    _worker_dir_sweep's aged-out guard so a concurrent session's live board is never
-    touched. Best-effort."""
+def _board_sweep():
+    """Startup, one-time migration: older builds kept claims boards under
+    CONFIG_DIR/workers/board/<driverpid>/ and aged them out after 1h. Now they live in the
+    driver's run dir. Remove each legacy board whose driver pid is dead (never by age), and
+    the parent once empty."""
     root = CONFIG_DIR / "workers" / "board"
     if not root.is_dir():
         return
-    now = time.time()
     for d in root.glob("*"):
-        if not d.is_dir():
-            continue
-        claims = d / "claims.jsonl"
-        try:
-            mtime = claims.stat().st_mtime if claims.exists() else d.stat().st_mtime
-            if now - mtime < grace:
-                continue
-        except OSError:
-            continue
-        for f in d.glob("*"):
-            try:
-                f.unlink()
-            except OSError:
-                pass
-        try:
-            d.rmdir()
-        except OSError:
-            pass
+        if d.is_dir() and not (d.name.isdigit() and _proc_alive(int(d.name))):
+            shutil.rmtree(d, ignore_errors=True)
+    try:
+        root.rmdir()
+    except OSError:
+        pass
 
 
 # --- Task DAG board (Phase 2b) --------------------------------------------------------
@@ -7706,89 +7743,149 @@ def _is_board_participant(session_name) -> bool:
 
 
 
-def _bg_reap_orphans():
-    """Startup: on THIS box only, kill background tasks whose owning lean-coder is
-    gone and prune dead entries; keeps a crashed session from leaving daemons
-    running forever. Foreign-host records (a task on another box) are left
-    untouched - not ours to probe or reap; they age out via /bg kill. A record
-    with no host predates the field and is treated as local (back-compat)."""
-    recs = _bg_load()
-    if not recs:
-        return
-    keep, reaped = [], 0
-    for r in recs:
-        if not _bg_here(r):                       # another box's task -> leave it alone
-            keep.append(r)
-            continue
-        if not _proc_alive(r.get("pid")):
-            _bg_clean_sidecars(r)                 # already gone -> drop + tidy its files
-            continue
-        owner = r.get("owner")
-        if owner and not _proc_alive(owner):      # orphan from a dead session -> kill
-            _bg_kill(r.get("pid"))
+def _run_dir_owner(d) -> int:
+    """Who owns runtime dir `d`: the pid in an '.owner' file (written when a new executor
+    ADOPTS a dead one's surviving tasks - see _run_reap) else the pid in its name."""
+    try:
+        return int((Path(d) / ".owner").read_text().strip())
+    except (OSError, ValueError):
+        pass
+    pid = Path(d).name.rpartition("-")[2]
+    return int(pid) if pid.isdigit() else -1
+
+
+def _run_owned_dirs(owner=None):
+    """This host's runtime dirs owned by `owner` (default: me) - its own dir plus any it
+    adopted. Liveness is never consulted here; this is 'what is mine to tear down'."""
+    owner = owner or os.getpid()
+    out = []
+    try:
+        for d in run_dir().iterdir():
+            host = d.name.rpartition("-")[0]
+            if d.is_dir() and host == _HOSTNAME and _run_dir_owner(d) == owner:
+                out.append(d)
+    except OSError:
+        pass
+    return out
+
+
+def _run_teardown(dirs):
+    """Kill every live task recorded in `dirs` (and each one's registered descendants),
+    tidy each task's sidecars (a worker record also drops its worker family), then remove
+    the dirs. Returns how many live tasks were killed. Best-effort, never raises."""
+    killed = 0
+    allrecs = _bg_load()
+    for d in dirs:
+        for r in _bg_load(d):
+            if _bg_here(r) and _proc_alive(r.get("pid")):
+                for gk in _bg_descendant_pids(r.get("pid"), allrecs):
+                    _kill_tree(gk)
+                _bg_kill(r.get("pid"))
+                killed += 1
             _bg_clean_sidecars(r)
-            reaped += 1
+        shutil.rmtree(d, ignore_errors=True)
+    return killed
+
+
+def _run_reap(adopt=False):
+    """Startup reaper (the ONLY crash cleanup): for each runtime dir on this host whose
+    owner process is dead, kill its surviving tasks and remove it. Liveness = pid, never
+    age, so a live multi-day session is untouched; other hosts' dirs are never read.
+
+    adopt=True is the remote EXECUTOR's variant: a detached task deliberately survives
+    the ssh drop that killed the previous executor, so instead of killing survivors the
+    new executor claims the dir - only a dir of EXECUTOR-launched tasks (role=executor);
+    a crashed REPL's dir on the same box is reaped normally, never adopted. Conversely
+    the REPL reaper skips an executor dir whose self-wipe watchdog is still alive (the
+    drop may yet be followed by a reconnect; the watchdog tears it down at TTL). It claims (writes '.owner' = me and re-stamps the live records'
+    owner) - /bg keeps listing them and its clean close / self-wipe later tears them down.
+    A dead dir with nothing alive in it is simply removed either way."""
+    me, reaped = os.getpid(), 0
+    for d in _run_dead_dirs():
+        live = [r for r in _bg_load(d) if _proc_alive(r.get("pid"))]
+        exec_live = [r for r in live if r.get("role") == "executor"]
+        if not adopt and any(_proc_alive(r.get("watchdog")) for r in exec_live):
+            continue                    # a dropped executor's survivors: its watchdog owns them
+        if adopt and live and len(exec_live) == len(live):
+            try:
+                (d / ".owner").write_text(str(me))
+            except OSError:
+                continue
+            for r in _bg_load(d):
+                if _proc_alive(r.get("pid")):
+                    r["owner"] = me
+                    r["watchdog"] = _EXEC_ROLE["watchdog"]   # now guarded by MY watchdog
+                    _bg_write_rec(r)
+                else:
+                    _bg_drop(r)
             continue
-        keep.append(r)
-    _bg_save(keep)
+        reaped += _run_teardown([d])
+    return reaped
+
+
+def _bg_reap_orphans():
+    """Startup (REPL): reap dead sessions' runtime dirs (see _run_reap) and clear the
+    pre-run-dir legacy CONFIG_DIR/bg registry once. Prints only if it killed something."""
+    reaped = _run_reap()
+    _bg_legacy_cleanup()
     if reaped:
         print(dim(f"reaped {reaped} orphaned background task(s) from a previous session."))
 
 
 def _bg_adopt():
-    """Executor startup (a fresh executor after a reconnect): ADOPT this-box bg
-    tasks whose owning process is gone by re-stamping owner = my pid - instead of
-    reaping them. A remote bg task is detached and SURVIVES the ssh drop that
-    killed the prior executor; if the new executor ran the owner-based reap it
-    would see the dead owner and kill the still-running task (the foot-gun). Adopt
-    keeps it tracked to a live process so /bg still lists it after a reconnect.
-    Host-gated: foreign records are left alone. Dead (already-finished) same-box
-    tasks are dropped + their sidecars tidied on the way through."""
-    me = os.getpid()
-    recs = _bg_load()
-    if not recs:
+    """Executor startup (a fresh executor after a reconnect): adopt dead executors'
+    surviving tasks rather than killing them (see _run_reap adopt=True)."""
+    _run_reap(adopt=True)
+
+
+def _bg_legacy_cleanup():
+    """One-time migration: older builds kept a SHARED registry + logs in CONFIG_DIR/bg.
+    Remove every file there whose owner pid (from the filename '<date>-<time>-<pid>...' or
+    the registry record) is dead on this host; keep anything a still-running older build
+    owns. The dir itself goes once empty. Never age-based."""
+    bg = CONFIG_DIR / "bg"
+    if not bg.is_dir():
         return
-    keep, changed = [], False
-    for r in recs:
-        if not _bg_here(r):
-            keep.append(r); continue
-        if not _proc_alive(r.get("pid")):        # finished while we were away -> drop
-            _bg_clean_sidecars(r); changed = True; continue
-        owner = r.get("owner")
-        if owner and owner != me and not _proc_alive(owner):
-            r["owner"] = me                      # re-parent the survivor to me
-            changed = True
-        keep.append(r)
-    if changed:
-        _bg_save(keep)
+    live_logs = set()
+    reg = bg / "tasks.jsonl"
+    try:
+        for ln in reg.read_text().splitlines():
+            try:
+                r = json.loads(ln)
+            except ValueError:
+                continue
+            if _bg_here(r) and (_proc_alive(r.get("owner")) or _proc_alive(r.get("pid"))):
+                live_logs.add(Path(r.get("log", "")).name)
+    except OSError:
+        pass
+    for f in bg.iterdir():
+        if f.name == "tasks.jsonl":
+            continue
+        base = f.name.split(".log", 1)[0] + ".log" if ".log" in f.name else f.name
+        m = re.match(r"\d{8}-\d{6}-(\d+)", f.name)
+        if base in live_logs or (m and _proc_alive(int(m.group(1)))):
+            continue
+        try:
+            f.unlink()
+        except OSError:
+            pass
+    if not live_logs:
+        try:
+            reg.unlink()
+        except OSError:
+            pass
+    try:
+        bg.rmdir()                       # only succeeds once empty
+    except OSError:
+        pass
 
 
 def _bg_kill_session():
-    """Clean exit: kill the background tasks THIS process started (owner pid on
-    THIS box), drop them + tidy sidecars. Pegs background jobs to the lean-coder
-    that launched them. Host-gated so a pid that collides with a foreign record
-    can't make us kill/drop another box's task."""
-    me, host = os.getpid(), _HOSTNAME
-    recs = _bg_load()
-    if not recs:
-        return
-    def mine(r):
-        return r.get("owner") == me and _bg_here(r)
-    for r in recs:
-        if mine(r):
-            if _proc_alive(r.get("pid")):
-                # Cascade: kill this task AND any descendants it spawned (a worker's
-                # workers are owned by the worker, not me, so a flat kill would orphan
-                # them - _bg_kill_tree walks the owner graph). recs is passed so the
-                # walk sees the same snapshot.
-                for gk in _bg_descendant_pids(r.get("pid"), recs):
-                    _kill_tree(gk)
-                _bg_kill(r.get("pid"))
-            _bg_clean_sidecars(r)
-    remaining = [r for r in recs if not mine(r)]
-    if len(remaining) != len(recs):
-        _bg_save(remaining)
-
+    """Clean exit: kill every background task THIS process owns (its run dir + any it
+    adopted), including registered descendants, and remove those dirs. Pegs background
+    jobs to the lean-coder that launched them; other processes' dirs are never read for
+    writing, so there is nothing shared to rewrite."""
+    _run_teardown(_run_owned_dirs())
 
 # Marker lines (a whole line that is only the marker, modulo surrounding space).
 # We use the git-conflict-marker SEARCH/REPLACE format (<<<<<<< SEARCH / ======= /
@@ -8391,6 +8488,7 @@ def _emit_json(stream, obj):
 RAW_READ = "__read_raw__"
 BG_POLL  = "__bg_poll__"        # driver-only: finished bg tasks the executor owns
 BG_LIST  = "__bg_list__"        # driver-only: all bg tasks (running+finished) it owns, for /bg
+BG_TEARDOWN = "__bg_teardown__" # driver-only: clean close - kill + remove the tasks it owns
 
 
 def _read_raw_b64(path: Path, max_bytes=RAW_READ_MAX):
@@ -8542,11 +8640,13 @@ def _arm_self_wipe():
     # and native Windows (no sh/stat/date/rm dependency).
     try:
         argv = [sys.executable, os.path.abspath(__file__), "--wipe-watch",
-                json.dumps({"dir": mydir, "ttl": ttl, "chk": chk})]
+                json.dumps({"dir": mydir, "ttl": ttl, "chk": chk,
+                            "owner": os.getpid()})]
         wp = subprocess.Popen(argv, stdin=subprocess.DEVNULL,
                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                               **_detached_popen_kwargs())
         Path(pidf).write_text(str(wp.pid))
+        _EXEC_ROLE["watchdog"] = wp.pid
     except (OSError, ValueError):
         return
     def _bump():
@@ -8569,15 +8669,44 @@ def run_wipe_watchdog(cfg):
     ttl = int(cfg["ttl"])
     chk = int(cfg["chk"])
     lease = os.path.join(d, ".lease")
+    pidf = os.path.join(d, ".watchdog.pid")
+    owner = int(cfg.get("owner") or 0)
+    me = os.getpid()
     while True:
         if not os.path.isdir(d):
+            # Wiped by someone else (a clean close, or a sibling watchdog). If our executor
+            # is dead, still tear down whatever it left running - an adopter would have
+            # claimed the dir (.owner), so _run_owned_dirs(owner) only finds true orphans.
+            if owner and not _proc_alive(owner):
+                try:
+                    _run_teardown(_run_owned_dirs(owner))
+                except Exception:
+                    pass
             return
+        # One watchdog per pushed dir: the pid file names the CURRENT one. A newer
+        # executor re-arming replaces it, so a stale watchdog (from a previous session on
+        # this reused dir) steps aside instead of wiping the new session's executor.
+        try:
+            if int(Path(pidf).read_text().strip()) != me:
+                return
+        except (OSError, ValueError):
+            pass
         now = time.time()
         try:
             m = os.path.getmtime(lease)
         except OSError:
             m = now
         if now - m >= ttl:
+            # Gap-2 guard: tasks the dead executor launched live in its run dir (outside
+            # the pushed dir) and are detached, so they'd outlive the wipe. Tear them
+            # down first - 'executor gone for TTL' means its tasks go too. Scoped to that
+            # one owner's dirs (own + adopted); a local lean-coder on this box is a
+            # different pid and never touched.
+            if cfg.get("owner"):
+                try:
+                    _run_teardown(_run_owned_dirs(int(cfg["owner"])))
+                except Exception:
+                    pass
             shutil.rmtree(d, ignore_errors=True)
             return
         time.sleep(chk)
@@ -8600,6 +8729,7 @@ def run_tool_executor(cwd, lean_tools_dir=None):
             pass
     proto = sys.stdout
     sys.stdout = sys.stderr            # keep real stdout clean for the protocol
+    _EXEC_ROLE["on"] = True
     _arm_self_wipe()   # pushed executor: self-delete if the driver never cleanly disconnects
     cfg = Config(cwd=Path(cwd).expanduser().resolve(), approval="auto")  # driver pre-confirms
     tools = Tools(cfg)
@@ -8639,6 +8769,10 @@ def run_tool_executor(cwd, lean_tools_dir=None):
         if tool == BG_LIST:                # driver-only: all bg tasks (running+finished) WE own here
             _emit_json(proto, {"id": rid, "ok": True,
                                "result": _bg_status_items(os.getpid())})
+            continue
+        if tool == BG_TEARDOWN:            # driver-only: the session is CLOSING (not a drop -
+            _bg_kill_session()             # a drop just closes stdin, so tasks survive for adopt)
+            _emit_json(proto, {"id": rid, "ok": True, "result": "ok"})
             continue
         plug = lean_tools.get(tool) if lean_tools else None
         if tool not in EXEC_TOOLS and not plug:
@@ -9020,6 +9154,52 @@ def _runtime_dir() -> Path:
         pass
     _reap_dead_sockets(d)
     return d
+
+
+def run_dir() -> Path:
+    """Root for PER-PROCESS runtime state (bg task + worker records/logs): one
+    '<host>-<pid>' subdir per live lean-coder, owned by that process alone - no shared
+    registry, no age sweeps. Lives under _runtime_dir() (tmpfs XDG_RUNTIME_DIR when
+    present, else TMPDIR/tmp), so a reboot wipes it; falls back to CONFIG_DIR/run if that
+    can't be created. Either way the liveness reaper (_run_dead_dirs) is what cleans up
+    after a crash - a clean exit removes its own dir."""
+    try:
+        d = _runtime_dir() / "run"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+    except OSError:
+        d = CONFIG_DIR / "run"
+        d.mkdir(parents=True, exist_ok=True)
+        try:
+            d.chmod(0o700)
+        except OSError:
+            pass
+        return d
+
+
+def _run_pid_dir(pid=None) -> Path:
+    """This process's (or `pid`'s) own runtime dir: run_dir()/<host>-<pid>. The host is in
+    the name because the disk fallback (CONFIG_DIR) can be a home dir shared across boxes
+    (NFS) - a pid is only meaningful on its own host."""
+    return run_dir() / f"{_HOSTNAME}-{pid or os.getpid()}"
+
+
+def _run_dead_dirs():
+    """Runtime dirs on THIS host whose owning process is dead - the only thing the reaper
+    may remove. Liveness is the pid (same rule as session locks + control sockets), never
+    age: a live multi-day session is always kept. Other hosts' dirs are never touched. A
+    reused pid keeps its stale dir alive until that pid dies too (errs on the safe side)."""
+    out = []
+    try:
+        for d in run_dir().iterdir():
+            host, _, pid = d.name.rpartition("-")
+            if not d.is_dir() or host != _HOSTNAME or not pid.isdigit():
+                continue
+            if int(pid) != os.getpid() and not _proc_alive(int(pid)):
+                out.append(d)
+    except OSError:
+        pass
+    return out
 
 
 def _reap_dead_sockets(d: Path) -> None:
@@ -9893,6 +10073,15 @@ class RemoteWorkspace:
 
     def close(self):
         if self.client:
+            # A deliberate close ends this session's remote tasks (a DROP never gets here,
+            # so a dropped link's tasks survive for the next executor to adopt). Scoped to
+            # this executor's own pid on the remote - a worker's executor or a local
+            # lean-coder on that box is a different pid and untouched. Short deadline:
+            # a dead link must not stall quit (the self-wipe TTL covers it then).
+            try:
+                self.client.request(BG_TEARDOWN, deadline=time.monotonic() + 5)
+            except Exception:
+                pass
             self.client.close()
         # Only tear down a master we OWN. An attached worker rides its parent's
         # master - killing it would drop the parent's live connection.
@@ -9959,21 +10148,22 @@ class RemoteWorkspace:
         leaf = d.replace("\\", "/").rsplit("/", 1)[-1]
         if not d or leaf != "leancoder":
             return
-        # Remove the dir FIRST, then kill the watchdog. Order matters for robustness:
-        # `rm -rf` drops the .lease/.watchdog.pid sidecars, so ANY watchdog (including
-        # stale ones from earlier reconnects that .watchdog.pid no longer names) exits
-        # on its next poll ([ -d "$d" ] || exit 0) - the kill is then just a courtesy
-        # to reap the current one immediately. Doing rm first means a partial/aborted
-        # run still guarantees the trace is gone.
+        # Read the watchdog pid, remove the dir, then kill the watchdog. rm-before-kill
+        # means a partial/aborted run still guarantees the trace is gone; a watchdog that
+        # misses the kill exits on its next poll anyway (dir gone, or its pid no longer
+        # the one in .watchdog.pid).
         # Run in its OWN session (start_new_session) so a terminal ^C during a graceful
         # ^C^C/EOF quit - which SIGINTs the whole foreground process group - can't kill
         # this wipe's ssh mid-flight. Catch BaseException for the same reason (a pending
         # KeyboardInterrupt must not abort the wipe before rm lands).
         if self.remote_posix:
             q = shlex.quote(d)
-            cmd = (f'rm -rf {q}; '
-                   f'p=$(cat {shlex.quote(d + "/.watchdog.pid")} 2>/dev/null) && '
-                   f'kill "$p" 2>/dev/null; true')
+            # Read the watchdog pid BEFORE the rm (the rm deletes the pid file, so reading
+            # it after always failed and the kill never happened - leaving a stale watchdog
+            # that could later wipe a NEW session's re-pushed dir).
+            cmd = (f'p=$(cat {shlex.quote(d + "/.watchdog.pid")} 2>/dev/null); '
+                   f'rm -rf {q}; '
+                   f'[ -n "$p" ] && kill "$p" 2>/dev/null; true')
         else:
             # PowerShell: kill the watchdog by its pid file, then Remove-Item with a
             # short RETRY loop. client.close() already ended the executor (stdin close),
@@ -10094,7 +10284,9 @@ def _clip_output(s: str) -> str:
     if len(s) <= OUTPUT_MAX_CHARS:
         return s
     dropped = len(s) - OUTPUT_HEAD - OUTPUT_TAIL
-    return s[:OUTPUT_HEAD] + f"\n…[truncated {dropped} chars]…\n" + s[-OUTPUT_TAIL:]
+    return (s[:OUTPUT_HEAD] + f"\n…[{dropped} chars omitted (not kept); for the middle, ask "
+            f"the operator to re-run it narrower, e.g. `| grep PATTERN` or `| tail -n 50`]…\n"
+            + s[-OUTPUT_TAIL:])
 
 
 # CSI / OSC / other ANSI escape sequences - stripped from CAPTURED pty output before
@@ -11492,6 +11684,13 @@ class Agent:
         never hoards raw tail the summary already distilled. Pure-ish (reads cfg + meter)."""
         window     = self.cfg.ctx_window() or 0
         compact_at = self.cfg.compact_for().get("hard", self.cfg.compact_at)
+        # compact_at is the TRIGGER; here it only serves as the ceiling the kept tail must
+        # stay under (never refill to the line that fires the next compaction). A one-off
+        # `/compact <k>` puts k - the FINAL size wanted - in that slot and fills to it
+        # (no frac, no keep_cap: the operator chose the size). The trigger is untouched.
+        target = getattr(self, "_compact_target", None)
+        if target and window:
+            compact_at = target / window
         fixed = messages_tokens(
             [{"role": "system", "content": self._system()}], self.tool_defs)
         summary_tok = messages_tokens(
@@ -11499,6 +11698,8 @@ class Agent:
         headroom = int(window * compact_at) - fixed - summary_tok
         if headroom <= 0:
             return 0
+        if target:
+            return headroom                 # fill to the chosen size
         frac = KEEP_FRAC_LO if headroom > KEEP_FRAC_THRESHOLD else KEEP_FRAC_HI
         return max(0, min(int(headroom * frac), int(getattr(self.cfg, "keep_cap", 25000))))
 
@@ -11513,12 +11714,21 @@ class Agent:
         budget = self._keep_budget(summary_text)
         if budget <= 0:
             return []
+        # A one-off target must land ON k: _finish_compact stubs every kept tool body
+        # afterwards, so size the tail in that FINAL (stubbed) form - otherwise a 100k
+        # budget spent on full tool dumps shrinks to ~60k once they're stubbed.
+        if getattr(self, "_compact_target", None):
+            pre = _stub_tool_msgs(pre)
         turns = self._split_into_turns(pre)
         if not turns:
             return []
         remaining = budget
         kept = []
-        for turn in reversed(turns[-int(self.cfg.compact_keep):] if self.cfg.compact_keep > 0 else []):
+        # compact_keep caps the turn COUNT for a normal compaction; a one-off target sizes
+        # by tokens alone (the operator asked for "this big"), so every turn is a candidate.
+        pool = (turns if getattr(self, "_compact_target", None)
+                else turns[-int(self.cfg.compact_keep):] if self.cfg.compact_keep > 0 else [])
+        for turn in reversed(pool):
             cost = messages_tokens(turn, None)
             if cost <= remaining:
                 kept = turn + kept
@@ -11663,6 +11873,7 @@ class Agent:
         if tail:
             tool_idx = [i for i in range(2, len(self.messages))
                         if self.messages[i].get("role") == "tool"]
+            tool_idx = tool_idx[:-TRIM_KEEP] if TRIM_KEEP > 0 else tool_idx   # newest stay whole, as /trim
             if tool_idx:
                 self._trim_tool_indices(tool_idx)
         # Cache-boundary signal: after a compaction the prefix [system][summary] is STABLE,
@@ -11754,10 +11965,16 @@ class Agent:
             parsed, summary_prefix=summary_prefix,
             tail=tail, autostart=True, stamp_clock=not deliberate)
 
-    def compact(self):
+    def compact(self, target=None):
         """Manual /compact - a deliberate compaction (doesn't arm the anti-thrash guard).
-        Thin wrapper over the single _compact() implementation."""
-        return self._compact(zone="hard", deliberate=True)
+        Thin wrapper over the single _compact() implementation. `target` (tokens) = a
+        one-off FINAL size: the kept tail fills up to it (nothing persisted, the compact_at
+        trigger untouched; see _keep_budget)."""
+        self._compact_target = target
+        try:
+            return self._compact(zone="hard", deliberate=True)
+        finally:
+            self._compact_target = None
 
     def _request_compact(self):
         """The request_compact tool body: the model elects a compaction at a clean break.
@@ -11889,6 +12106,20 @@ class Agent:
             return self._note_cap(sel, f"in {lo} .. {hi}")
         return f"error: unknown note action {action!r} (add|recent|grep|range)."
 
+    def _tool_params(self, name):
+        """The parameter names a tool declares (lean-tool or MCP schema), or [] if unknown."""
+        try:
+            sch = [x for x, _ in self.lean_tools.schemas()]
+            if name.startswith(MCP_NS) and getattr(self, "mcp", None):
+                sch += [x for x, _ in self.mcp.schemas()]
+            for x in sch:
+                f = x.get("function", {})
+                if f.get("name") == name:
+                    return list((f.get("parameters") or {}).get("properties", {}))
+        except Exception:
+            pass
+        return []
+
     def _ingest_cap(self, text: str, label: str):
         """Universal ingestion hard stop for OPAQUE/UNTRUSTED tool output (mcp.call +
         generic lean-tools that don't self-cap). This is lever A from the context
@@ -11920,9 +12151,14 @@ class Agent:
         tight = budget < self.cfg.ingest_cap_ceil
         advice = (" or /compact | /trim if context is tight" if tight
                   else " (result is inherently large - compacting won't raise this cap)")
-        notice = (f"\n…[{label}: tool result truncated at ingestion - showing "
-                  f"{head + tail:,} of {len(text):,} chars, {dropped:,} dropped. "
-                  f"Re-fetch narrower (offset/grep) to see more{advice}.]…\n")
+        # Only point at paging args the tool REALLY has (a generic "use offset/grep" sent
+        # the model hunting for parameters that didn't exist). Else: call it narrower.
+        pager = [k for k in ("page", "start", "offset", "cursor", "limit", "find", "query")
+                 if k in self._tool_params(label)]
+        how = (f"re-call {label} with " + " / ".join(f"{k}=" for k in pager) + " to get the rest"
+               if pager else f"re-call {label} with narrower arguments to get the rest")
+        notice = (f"\n…[{label}: result cut at ingestion - showing {head + tail:,} of "
+                  f"{len(text):,} chars, the middle {dropped:,} dropped. {how}{advice}.]…\n")
         # User-facing print: only LOUD (orange) when context is tight, since that's the
         # only case where the user can/should act (/compact | /trim). A ceiling hit on a
         # roomy window is routine - a runaway blob got clamped, nothing's wrong - so keep
@@ -13523,7 +13759,7 @@ HELP_COMMANDS = [
     ("/new [name]", "start a separate session"),
     ("/rewind [N] [prompt]", "drop the last N user turns (refusal/derail escape); does NOT revert files"),
     ("/trim [keep]", "programmatic: stub old tool outputs, keep newest [keep] (no LLM)"),
-    ("/compact", "agentic: summarize + commit docs, replace history (the lever auto-compact pulls)"),
+    ("/compact [k|to]", "agentic: summarize + commit docs, replace history (k = one-off target, e.g. 100 = ~100k)"),
     ("/compact_at [frac]", "set THE auto-compaction lever (fill fraction; no arg shows zones)"),
     ("/save [name]", "name the current session"),
     ("/load [name]", "resume a session (no arg = picker)"),
@@ -14061,9 +14297,12 @@ def handle_bg_command(agent, cfg, arg):
             print(dim("usage: /bg kill <pid|all>"
                       + ("" if running else "  (no background tasks running)")))
             return
-        for pid in killed:
-            _bg_kill(pid)
-        _bg_save([r for r in _bg_load() if r.get("pid") not in set(killed)])
+        me = os.getpid()
+        for r in running:
+            if r.get("pid") in killed:
+                _bg_kill(r.get("pid"))
+                if r.get("owner") == me:   # only the owner removes a record; another
+                    _bg_drop(r)            # session sees its killed task finish instead
         print(dim(f"killed {len(killed)} background task(s)."))
         return
     if remote is not None:
@@ -14286,6 +14525,7 @@ def handle_board_command(agent, cfg, arg):
             return
         try:
             p.unlink()
+            Path(str(p) + ".lock").unlink(missing_ok=True)   # its flock sidecar goes too
             print(dim(f"deleted board '{p.stem}'."))
         except OSError as e:
             print(yellow(f"could not delete: {e}"))
@@ -16967,10 +17207,71 @@ def handle_compact_command(agent, cfg, arg):
     (keeping the last compact_keep turns). The manual lever the auto-compact zone pulls.
     The pre-compact snapshot (a <name>-precompact-N sidecar, so the live session keeps its
     name) is taken inside _compact() once a usable summary exists - so a failed /compact
-    leaves history AND the snapshot dir untouched (same rule as the auto path)."""
+    leaves history AND the snapshot dir untouched (same rule as the auto path).
+
+    `/compact <k>` compacts to a FINAL size of ~k thousand tokens, one time (compact_at,
+    the trigger, is untouched); `/compact to` prompts for k."""
+    target = None
+    raw = (arg or "").strip().lower()
+    if raw:
+        used = agent._ctx_used()
+        if raw == "to":
+            if not (sys.stdin.isatty() and _TTY):
+                print(dim("usage: /compact <k>   (e.g. /compact 100 = compact to ~100k)"))
+                return
+            try:
+                raw = input(f"context {used / 1000:.0f}k - compact to how many k? "
+                            f"(e.g. 100 = 100k, Enter cancels): ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                return
+            if not raw:
+                return
+        try:
+            target = int(float(raw.rstrip("k")) * 1000)
+        except ValueError:
+            print(yellow(f"not a size: {raw!r}. usage: /compact <k>  (e.g. /compact 100)"))
+            return
+        # Floor: the fixed system+tools cost plus room for a summary. Below it there is
+        # nothing to keep, so refuse rather than produce a summary-only surprise.
+        fixed = messages_tokens([{"role": "system", "content": agent._system()}], agent.tool_defs)
+        floor = fixed + COMPACT_TARGET_MIN_HEADROOM
+        if target < floor:
+            print(yellow(f"refused: {target / 1000:.0f}k is below the minimum "
+                         f"{-(-floor // 1000)}k (system + tools {fixed / 1000:.1f}k + room for a summary)."))
+            return
+        if target >= used:
+            print(dim(f"nothing to do: context is already {used / 1000:.0f}k "
+                      f"(<= {target / 1000:.0f}k)."))
+            return
+        trigger = int((cfg.ctx_window() or 0) * cfg.compact_for().get("hard", cfg.compact_at))
+        if trigger and target >= trigger:
+            print(yellow(f"refused: {target / 1000:.0f}k is at/above the compact_at trigger "
+                         f"({trigger / 1000:.0f}k) - the next turn would compact again. "
+                         f"Pick below {trigger // 1000}k, or raise /compact_at first."))
+            return
+    if target:
+        # Stubbing alone may land under k: keep the newest TRIM_KEEP whole, stepping down to
+        # 0 if huge recent results won't fit; only if none fits is a summary needed.
+        for keep in range(TRIM_KEEP, -1, -1):
+            after = messages_tokens(_stub_tool_msgs(agent.messages, keep), agent.tool_defs)
+            if after > target:
+                continue
+            before = agent._ctx_used()
+            agent.trim(keep)
+            agent.messages.append({"role": "user", "content":
+                f"[context maintenance] old tool results stubbed (~{before // 1000}k -> "
+                f"~{after // 1000}k tokens), newest {keep} kept whole; conversation "
+                f"otherwise intact, no summary. Re-run a tool if you need a stubbed result."})
+            print(dim(f"whole history fits after tool-result stubbing: ~{before / 1000:.0f}k -> "
+                      f"~{after / 1000:.0f}k (target {target / 1000:.0f}k, newest {keep} kept "
+                      f"whole) - no summary needed."))
+            agent._print_ctx()
+            return
     print(dim("compact: save + commit durable docs, then write the "
-              f"summary between {COMPACT_MARK} markers and finalize…"))
-    summary = agent.compact()
+              f"summary between {COMPACT_MARK} markers and finalize"
+              + (f" (target ~{target / 1000:.0f}k)…" if target else "…")))
+    summary = agent.compact(target=target)
     if summary is None:
         print(yellow("\nno summary captured - history left intact. (Write it "
                      f"between {COMPACT_MARK} markers as visible text.)"))
@@ -17407,6 +17708,7 @@ def repl(cfg: Config, resume=None):
     # age out logically after _LOCK_STALE_SECS but the files otherwise pile up forever).
     # Before we claim any session below, so it can never remove our own fresh lock.
     _prune_stale_locks()
+    _prune_dead_tmp_writes()
     # Release our session lock on exit so another instance doesn't see a stale
     # "live elsewhere" and prompt to take over a session nobody is holding.
     atexit.register(lambda: _release_lock(getattr(agent, "autosave_name", "")))
@@ -18562,6 +18864,10 @@ def main():
         run_tool_executor(args.cwd or ".", args.lean_tools_exec)
         return
     if args.agent_run:                 # headless worker role: run one brief, write result, exit
+        # A worker is its own lean-coder process: its bg tasks live in its OWN run dir.
+        # Tear that down on exit (it parks until its jobs finish, so this only kills what
+        # a lease-kill / crash left running) - else the dir waits for the next reap.
+        atexit.register(_bg_kill_session)
         sys.exit(run_agent_brief(args))
         return
 
@@ -18585,8 +18891,8 @@ def main():
         sys.exit(1)
     _register_dir_providers(cfg)          # register enabled providers/ plugins (bundled ollama + user)
     _bg_reap_orphans()                    # kill background tasks left by a crashed session
-    _worker_dir_sweep()                   # nuke orphaned worker sidecars (reboot/SIGKILL residue)
-    _board_sweep()                        # nuke aged-out swarm board dirs from a crashed session
+    _worker_dir_sweep()                   # one-time: legacy loose worker files of dead drivers
+    _board_sweep()                        # one-time: legacy claims boards of dead drivers
     atexit.register(_bg_kill_session)     # peg this session's bg tasks to it: kill on exit
     atexit.register(lambda: _board_teardown(os.getpid()))  # tear down this session's swarm board
     atexit.register(_close_worker_masters)  # tear down masters opened just to carry workers

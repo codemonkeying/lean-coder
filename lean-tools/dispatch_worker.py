@@ -79,15 +79,16 @@ TOOL = {
                        "default": "dispatch",
                        "description": "Default 'dispatch' (launch from `task`). 'models'=list "
                                       "models you can dispatch on. 'status' [pid]=worker state/"
-                                      "runtime/ready. 'result' (pid=)=FULL untruncated result "
+                                      "runtime/ready. 'result' (pid=, [page=])=FULL result, paged "
                                       "(the finish notice truncates a long one). 'transcript' "
                                       "(pid=, [page=])=read the worker's OWN full reasoning/tool "
                                       "trail, paged (needs worker_checkpoint on). 'cancel' "
-                                      "(pid=)=kill+discard it. FLEET lifecycle: 'pause' (pid=)="
-                                      "kill but KEEP its checkpoint so 'resume' (pid=) can "
-                                      "relaunch it later (also relaunches a DIED/capped worker); "
+                                      "(pid=)=kill+discard it. FLEET lifecycle: 'pause' (pid=, "
+                                      "[name=])=save it as a session, then stop it; 'resume' (pid=)"
+                                      " relaunches a paused/DIED/capped one here, or dispatch "
+                                      "from_session=<name> from any session later; "
                                       "'pause_all'/'stop_all'/'resume_all' ([taskboard=])=do it to "
-                                      "every worker (pause=resumable, stop=discarded), optionally "
+                                      "every worker (pause=saved, stop=discarded), optionally "
                                       "just one board's team. Steer a RUNNING worker: 'inject' "
                                       "(text=) a correction, 'set_plan' (plan=) replace its plan "
                                       "(omit plan to READ it first), 'add_note' (notes=). "
@@ -130,8 +131,8 @@ TOOL = {
                                             "turn on top; checkpointing is forced on so it can be "
                                             "promoted back to a session later."},
             "name": {"type": "string",
-                     "description": "For action='promote' (pid=): the session name to save the "
-                                    "worker's transcript under (loadable with /load)."},
+                     "description": "For 'promote'/'pause' (pid=): the session name to save the "
+                                    "worker under (pause defaults to worker-<pid>)."},
             "taskboard": {"type": "string",
                           "description": "Optional: assign this worker to a named task-board (see "
                                          "the `board` tool). The worker auto-gets the board tool and "
@@ -163,8 +164,8 @@ TOOL = {
                       "description": "Optional seed notes for the worker's notebook, one per line "
                                      "(tagged as from you). Also the payload for 'add_note'."},
             "page": {"type": "integer",
-                     "description": "For 'transcript' (pid=): which page of the worker's trail to "
-                                    "show (1-based, default 1). The reply tells you the page count "
+                     "description": "For 'result'/'transcript' (pid=): which page to show "
+                                    "(1-based, default 1). The reply tells you the page count "
                                     "and whether more remain."},
         },
         "required": [],
@@ -259,7 +260,12 @@ def _capped_leash(requested):
 
 
 def _workers_dir():
-    return Path(_H["CONFIG_DIR"]) / "workers"
+    """Where this driver's worker files (brief/result/progress/checkpoint...) live: its
+    OWN per-process runtime dir, beside its bg task records - so they share one
+    lifecycle (removed on clean exit, reaped by pid-liveness after a crash; never by
+    age). Falls back to CONFIG_DIR/workers only on a core that predates run dirs."""
+    rpd = _H.get("_run_pid_dir")
+    return Path(rpd()) if rpd else Path(_H["CONFIG_DIR"]) / "workers"
 
 
 def _compose_brief(task, model, cwd, max_iter, leash="r", provider="", brain_host="",
@@ -336,11 +342,11 @@ def run(args, cwd):
     if action == "models":
         return _worker_models()
     if action == "result":
-        return _worker_result(args.get("pid"))
+        return _worker_result(args.get("pid"), args.get("page"))
     if action == "cancel":
         return _worker_cancel(args.get("pid"))
     if action == "pause":
-        return _worker_pause(args.get("pid"))
+        return _worker_pause(args.get("pid"), args.get("name"))
     if action == "pause_all":
         return _worker_pause_all(_tb_arg(args))
     if action == "stop_all":
@@ -579,7 +585,7 @@ def run(args, cwd):
     # silence != dead, so it only alerts and the operator decides (cancel/inject).
     hb_timeout = max(300, idle_timeout // 2) if idle_timeout else 0
 
-    # Write the brief + result-file targets under CONFIG_DIR/workers.
+    # Write the brief + result-file targets in this driver's run dir.
     wdir = _workers_dir()
     try:
         wdir.mkdir(parents=True, exist_ok=True)
@@ -923,12 +929,13 @@ def _worker_models():
 
 
 
-def _worker_result(pid):
+def _worker_result(pid, page=None):
     """MODEL-facing full result (the tool's action='result'): return a worker's
-    COMPLETE ===RESULT=== block, untruncated. The turn-rider finish notice caps the
-    result at 1500 chars to avoid flooding the turn; this is how the model pulls the
-    rest without a human running /worker. `pid` is required (which worker); with no
-    pid, if exactly one worker exists, use it, else ask which."""
+    COMPLETE ===RESULT=== block, paged like 'transcript' (page=) so the core ingestion
+    cap never silently drops the middle of a long one. The turn-rider finish notice caps
+    the result at 1500 chars; this is how the model pulls the rest without a human
+    running /worker. `pid` is required (which worker); with no pid, if exactly one
+    worker exists, use it, else ask which."""
     workers = _H["workers"]
     if not workers:
         return "no workers dispatched this session."
@@ -956,9 +963,41 @@ def _worker_result(pid):
     if not meta.get("announced"):
         meta["announced"] = True
         _accrue_usage(meta)
-    return f"worker {pid} result (task: {meta['task'][:100]}):\n{res.strip()}"
+    head = f"worker {pid} result (task: {meta['task'][:100]})"
+    pages = _paginate_lines(res.strip(), _RESULT_PAGE)
+    if len(pages) <= 1:
+        return f"{head}:\n{res.strip()}"
+    try:
+        p = min(max(1, int(page or 1)), len(pages))
+    except (TypeError, ValueError):
+        p = 1
+    footer = ("" if p >= len(pages)
+              else f"\n\n[more: {len(pages) - p} page(s) left - action='result' page={p + 1}]")
+    return f"{head} - page {p}/{len(pages)}:\n{pages[p - 1]}{footer}"
 
 
+def _paginate_lines(text, size):
+    """Split text into pages of <= size chars, breaking at line boundaries (a single
+    over-long line is hard-split so no page can exceed size)."""
+    pages, cur = [], ""
+    for ln in text.split("\n"):
+        while len(ln) > size:
+            if cur:
+                pages.append(cur)
+                cur = ""
+            pages.append(ln[:size])
+            ln = ln[size:]
+        if cur and len(cur) + 1 + len(ln) > size:
+            pages.append(cur)
+            cur = ln
+        else:
+            cur = (cur + "\n" + ln) if cur else ln
+    if cur:
+        pages.append(cur)
+    return pages
+
+
+_RESULT_PAGE = 5500       # result page: leaves header/footer room under the 6k ingest cap
 _TRANSCRIPT_PAGE = 6000   # chars of rendered trail per page (keeps one read digestible)
 
 
@@ -1166,13 +1205,13 @@ def _live_worker_pids(taskboard=None):
     return out
 
 
-def _pause_one(pid):
-    """PAUSE a running worker: kill its process but KEEP its transcript checkpoint so it
-    can be action='resume'd later. Writes a '<brief>.suspended' sentinel first (so the
-    reaper leaves the checkpoint intact - a paused worker is parked, not orphaned), then
-    SIGTERMs the pid. Requires worker_checkpoint (else there's nothing to resume from);
-    the worker checkpoints each iteration, so a checkpoint already exists on disk. Returns
-    (ok, message)."""
+def _pause_one(pid, name=None):
+    """PAUSE a running worker: SAVE its transcript as a normal session file (the same
+    path as action='promote'), then kill it. The saved session is the durable handle -
+    nothing else is parked on disk, and the worker's scratch files go with the driver's
+    run dir as usual. Continue it later from this session (action='resume' pid=, which
+    reuses the original grant) or from ANY session (dispatch from_session=<name>).
+    Needs worker_checkpoint on and at least one written checkpoint. Returns (ok, msg)."""
     workers = _H["workers"]
     meta = workers.get(pid)
     if not meta:
@@ -1180,49 +1219,44 @@ def _pause_one(pid):
     if _read_result(meta["result"]) is not None:
         return False, f"worker {pid} already finished - nothing to pause (its result stands)."
     if not meta.get("checkpoint"):
-        return False, (f"worker {pid} has checkpointing off, so it can't be paused+resumed "
-                       f"(nothing would survive the kill). Dispatch with worker_checkpoint on.")
-    brief = meta.get("brief") or _brief_from_result(meta["result"])
-    ckpt = brief + ".checkpoint"
-    if not Path(ckpt).exists():
-        return False, (f"worker {pid} has not written a checkpoint yet (too early to pause - "
-                       f"let it run one iteration first).")
-    # Sentinel BEFORE the kill: if the reaper races in the instant after SIGTERM, the
-    # sentinel is already there to protect the checkpoint family.
-    try:
-        Path(brief + ".suspended").write_text(str(time.time()))
-    except OSError as e:
-        return False, f"error: could not mark worker {pid} suspended: {e}"
+        return False, (f"worker {pid} has checkpointing off, so it can't be paused (nothing to "
+                       f"save). Dispatch with worker_checkpoint on, or action='cancel' it.")
+    name = (name or "").strip() or f"worker-{pid}"
+    saved = _worker_promote(pid, name)
+    if not saved.startswith("promoted "):
+        return False, f"worker {pid} NOT paused (could not save it): {saved}"
     kill = _H.get("_bg_kill_tree") or _H.get("_bg_kill")
     if not kill:
         return False, "error: no kill hook available (core too old)."
     kill(pid)
     meta["announced"] = True          # a deliberate pause is not a failure - no finish notice
     meta["paused"] = True
-    return True, f"paused worker {pid} (checkpoint parked; task: {meta['task'][:60]})"
+    meta["saved_as"] = name
+    return True, f"paused worker {pid}: saved as session '{name}'"
 
 
-def _worker_pause(pid):
-    """MODEL-facing pause (the tool's action='pause'): kill a running worker but KEEP its
-    checkpoint parked on disk so action='resume' can bring it back later. Unlike 'cancel'
-    (which lets the reaper wipe everything), a paused worker is resumable indefinitely -
-    the controller's 'stop everyone, resume later' gesture. Needs worker_checkpoint on."""
+def _worker_pause(pid, name=None):
+    """MODEL-facing pause (the tool's action='pause'): save a running worker as a session
+    (name=, default 'worker-<pid>') and stop it. The return names both ways back."""
     if pid is None:
         return "error: action='pause' needs a pid (which worker to pause)."
     try:
         pid = int(pid)
     except (TypeError, ValueError):
         return f"error: bad pid {pid!r}."
-    ok, msg = _pause_one(pid)
+    ok, msg = _pause_one(pid, name)
     if ok:
-        msg += ". Bring it back with action='resume' pid=%d (a resume is a new pid)." % pid
+        n = _H["workers"][pid]["saved_as"]
+        msg += (f". Continue it: action='resume' pid={pid} [text=<steer>] [iterations=N] "
+                f"(this session), or dispatch from_session='{n}' task=<steer> (any session, "
+                f"even after a restart).")
     return msg
 
 
 def _worker_pause_all(taskboard=None):
     """MODEL-facing pause-all (the tool's action='pause_all'): pause EVERY running worker
-    this session (optionally only those on taskboard=<name>) in one call, each keeping its
-    checkpoint for a later resume. The 'freeze the whole team' gesture."""
+    this session (optionally only those on taskboard=<name>), each saved as its own
+    'worker-<pid>' session. The 'freeze the whole team' gesture."""
     pids = _live_worker_pids(taskboard)
     scope = f" on board '{taskboard}'" if taskboard else ""
     if not pids:
@@ -1231,11 +1265,14 @@ def _worker_pause_all(taskboard=None):
     for pid in pids:
         ok, msg = _pause_one(pid)
         (done if ok else failed).append((pid, msg))
-    lines = [f"paused {len(done)} worker(s){scope} (each resumable via action='resume'):"]
+    lines = [f"paused {len(done)} worker(s){scope}, each saved as a session:"]
     for pid, _ in done:
-        lines.append(f"  pid {pid} paused")
+        lines.append(f"  pid {pid} -> session '{_H['workers'][pid]['saved_as']}'")
     for pid, msg in failed:
         lines.append(f"  pid {pid} NOT paused: {msg}")
+    if done:
+        lines.append("Continue: action='resume_all' (this session), or dispatch "
+                     "from_session=<name> task=<steer> per worker (any session).")
     return "\n".join(lines)
 
 
@@ -1519,11 +1556,7 @@ def _worker_resume(pid, text, cwd, iterations=None):
     # If this worker was deliberately PAUSED, clear its sentinel now that we've read the
     # checkpoint + relaunched: the old sidecars are no longer parked and reap normally.
     if meta.get("paused"):
-        try:
-            Path(_brief_from_result(meta["result"]) + ".suspended").unlink()
-        except OSError:
-            pass
-        meta["paused"] = False
+        meta["paused"] = False      # its saved session stays - the operator's to keep/delete
     return (f"resumed worker {pid} as NEW pid {new_pid} (a resume is a fresh process; the "
             f"old pid is dead). It reloaded the saved transcript and continues from where "
             f"it stopped, with your steer on top. Its result reaches you automatically when "
@@ -1591,8 +1624,8 @@ def _worker_cmd(agent, cfg, arg):
       /worker transcript <pid> [page]  read a worker's own reasoning/tool trail (paged)
       /worker status [pid]       the model-facing status view (state/runtime/ready)
       /worker cancel <pid>       kill + discard a still-running worker
-      /worker pause <pid>        kill but KEEP its checkpoint (resumable later)
-      /worker pause_all [board]   pause every worker (or one board's team) - resumable
+      /worker pause <pid> [name] save it as a session (default worker-<pid>), then stop it
+      /worker pause_all [board]   pause every worker (or one board's team), each saved
       /worker stop_all [board]    kill + discard every worker (or one board's team)
       /worker resume_all [board]  relaunch every paused worker (or one board's team)
       /worker inject <pid> <msg> mid-task message to a running worker
@@ -1658,7 +1691,7 @@ def _worker_cmd(agent, cfg, arg):
             text = arg.split(None, 2)[2] if len(parts) > 2 else ""
             print(_worker_resume(pid, text, str(getattr(cfg, "cwd", "."))))
         elif sub == "pause":
-            print(_worker_pause(pid))
+            print(_worker_pause(pid, parts[2] if len(parts) > 2 else None))
         else:  # cancel
             print(_worker_cancel(pid))
         return
@@ -1732,7 +1765,7 @@ def setup(lc, cfg):
     # Capture the core hooks + helpers run()/the command need (a tool's run() gets
     # no lc). setup() is driver-only = exactly where a worker is launched, so these
     # are always present when run() fires.
-    for k in ("bg_launch", "bg_list", "bg_status", "_bg_kill", "_bg_kill_tree", "_bg_log_tail", "_extract_marked", "CONFIG_DIR",
+    for k in ("bg_launch", "bg_list", "bg_status", "_bg_kill", "_bg_kill_tree", "_bg_log_tail", "_extract_marked", "CONFIG_DIR", "_run_pid_dir",
               "BRIEF_MARK", "GRANT_MARK", "RESULT_MARK", "RESUME_MARK", "LEASH_LEVELS", "_norm_leash",
               "SEED_CONTEXT_MARK", "SEED_PLAN_MARK", "SEED_NOTES_MARK",
               "active_remote", "_ssh_master_alive", "ensure_worker_master",
