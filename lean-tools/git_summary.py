@@ -27,8 +27,15 @@ _SECTION_CAP = 1500  # per-section ceiling, so no one section dominates
 _DEADLINE = 20.0     # shared wall-clock budget across all git calls (seconds)
 
 
+# The full git command behind each section: a clipped section names it, so "see the rest"
+# is one exact run_command (piped narrower) instead of a guess.
+_FULL_CMD = {"commits": "git log --oneline", "status": "git status --short",
+             "staged": "git diff --cached --stat", "unstaged": "git diff --stat"}
+
+
 def _clip(text, label):
-    """Trim a section to _SECTION_CAP on a line boundary, noting how much was cut."""
+    """Trim a section to _SECTION_CAP on a line boundary, noting how much was cut and the
+    exact command that shows it all."""
     if len(text) <= _SECTION_CAP:
         return text
     head = text[:_SECTION_CAP]
@@ -36,7 +43,8 @@ def _clip(text, label):
     if nl > 0:
         head = head[:nl]
     dropped = text.count("\n", len(head)) + 1
-    return head + f"\n... ({label}: {dropped} more line(s) truncated)"
+    full = _FULL_CMD.get(label, "git " + label)
+    return head + f"\n... ({label}: {dropped} more line(s); all of it: run_command `{full}`)"
 
 
 def run(args, cwd):
@@ -76,5 +84,6 @@ def run(args, cwd):
 
     out = "\n\n".join(parts) if parts else "(no git output)"
     if len(out) > _CAP:
-        out = out[:_CAP] + "\n... (truncated)"
+        out = (out[:_CAP] + "\n... (summary cut at %d chars; for a section in full, run_command "
+               "`git status --short` / `git diff --stat` / `git log --oneline`)" % _CAP)
     return out

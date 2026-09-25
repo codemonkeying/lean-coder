@@ -17,6 +17,16 @@ import lean_coder as lc
 # would otherwise write to the developer's REAL ~/.config/leancoder/config.toml - which
 # leaked the mock server's ephemeral host port into it and corrupted it every run.
 lc.CONFIG_PATH = Path(tempfile.mktemp(suffix=".toml"))
+# Same for every other on-disk root a scenario can reach: sessions (a compaction writes a
+# '<name>-precompact-N' snapshot), taskboards, and per-process run dirs. A throwaway tree,
+# removed at exit, so a mock run leaves zero trace in the real config dir.
+_MOCK_ROOT = Path(tempfile.mkdtemp(prefix="lc_mock_root_"))
+lc.SESSIONS_DIR = _MOCK_ROOT / "sessions"
+lc.TASKBOARDS_DIR = _MOCK_ROOT / "taskboards"
+lc.run_dir = lambda: _MOCK_ROOT / "run"
+(_MOCK_ROOT / "run").mkdir()
+import atexit as _atexit_m
+_atexit_m.register(lambda: shutil.rmtree(_MOCK_ROOT, ignore_errors=True))
 
 ok = True
 def check(name, cond, extra=""):
@@ -468,6 +478,8 @@ agent = mk_agent(cfg)
 agent.messages.append({"role": "user", "content": "bind ollama to labnet"})
 agent.messages.append({"role": "tool", "tool_name": "run_command",
                        "content": "\n".join(["log line"] * 80)})
+for _k in range(lc.TRIM_KEEP):          # newer results: the newest TRIM_KEEP stay whole
+    agent.messages.append({"role": "tool", "tool_name": "run_command", "content": f"recent {_k}"})
 summary = agent.compact()
 check("[compact] returns the marked block", bool(summary) and "GOAL" in summary,
       repr(summary))
@@ -496,6 +508,8 @@ agent.messages.append({"role": "user", "content": "old goal"})
 agent.messages.append({"role": "tool", "tool_name": "run_command",
                        "content": "\n".join(["OLDDUMPLINE"] * 80)})
 agent.messages.append({"role": "assistant", "content": "did old thing"})
+for _k in range(lc.TRIM_KEEP):          # newer results: the newest TRIM_KEEP stay whole
+    agent.messages.append({"role": "tool", "tool_name": "run_command", "content": f"recent {_k}"})
 agent.messages.append({"role": "user", "content": "recent task"})
 agent.messages.append({"role": "assistant", "content": "working on recent"})
 block = agent.auto_compact("hard")

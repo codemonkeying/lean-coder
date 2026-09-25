@@ -130,5 +130,8 @@ def run(args, cwd):
         return (f"{cmd[0]}: no issues in {rel}" if r.returncode == 0
                 else f"{cmd[0]}: exit {r.returncode} (no output)")
     if len(out) > 4000:
-        out = out[:4000] + "\n... (truncated)"
+        # head + tail: linters print their summary/count LAST, so a head-only cut lost it.
+        out = (out[:2800] + f"\n...[{len(out) - 4000} chars omitted; for all of it, run "
+               f"diagnostics on ONE file (path=<file>) or `{cmd[0]}` via run_command "
+               f"piped to grep/sed]...\n" + out[-1200:])
     return f"{cmd[0]} [{'clean' if r.returncode == 0 else 'issues'}]:\n{out}"

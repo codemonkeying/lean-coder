@@ -2,14 +2,13 @@
 
 # lean-coder
 
-**A small terminal coding agent, dependency-free at its core, that treats context as the scarce resource it is.**
+**A small terminal coding agent. Stdlib-only Python core, minimal context overhead.**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
 ![Core dependencies: none](https://img.shields.io/badge/core%20dependencies-none%20(stdlib%20only)-brightgreen.svg)
-![Baseline overhead: ~2.5k tokens](https://img.shields.io/badge/baseline%20overhead-~2.5k%20tokens-orange.svg)
 
-[Install](#install) &middot; [Quick start](#quick-start) &middot; [What it is](#what-it-is) &middot; [Providers](#providers) &middot; [Safety](#safety-two-axes) &middot; [Tools](#tools) &middot; [Context](#context-management)
+[Install](#install) &middot; [Quick start](#quick-start) &middot; [Providers](#providers) &middot; [Safety](#safety) &middot; [Tools](#tools) &middot; [Context](#context-management)
 
 ![lean-coder auditing and fixing a real bug on a local model](demos/demo.gif)
 
@@ -20,49 +19,33 @@
 ## What it is
 
 lean-coder reads, edits, and runs code in your project through a model's native
-tool-calling API. It's built around one idea most agents ignore: **your context
-window is the scarce resource, so don't waste it describing the tool.** Mainstream
-agents spend tens of thousands of tokens on their own system prompt and tool
-scaffolding before you type a word - and that's *before* any MCP servers, which add
-[hundreds to thousands of tokens each](https://dev.to/kenimo49/your-mcp-server-eats-55000-tokens-before-your-agent-says-a-word-i-measured-the-real-cost-19l8)
-on top. That's context that can't hold your actual code.
+tool-calling API. It keeps the system prompt and tool descriptions short, so more of the
+context window is left for your code.
 
-lean-coder's system prompt plus its **entire always-on tool surface costs ~2.5k
-tokens** (a test enforces the ceiling). Turn on *every* optional bundled lean-tool at
-once and the full surface is **~6k** - still less than a single
-[typical MCP server](https://www.mindstudio.ai/blog/claude-code-mcp-server-token-overhead)
-(~2k tokens, roughly lean-coder's whole always-on surface). The optional tools are off
-by default and cost nothing until you enable them, so you pay only for what you
-deliberately add.
+Context overhead (system prompt + tool schemas), checked by the test suite:
 
-And when a long task *does* fill the window, it doesn't truncate and forget. The agent
-**documents its own work, pins a goal + plan, and hands over to a clean slate**, so the
-job continues instead of dying mid-run. It's stdlib-only Python - the core is one
-`curl`-and-run script with nothing to package, vendor, or compile - so the same tiny
-codebase scales across the whole range:
+<!-- overhead-gate: tests/_smoketest.py reads these two numbers; they are the pass/fail limits -->
+| Surface | Max tokens |
+|---|---|
+| Always-on (core tools) | 2500 |
+| Every bundled lean-tool enabled | 6500 |
 
-- drive a **small local model** with a few thousand tokens of context - the ~2.5k
-  baseline leaves room to actually work;
-- point it at a **frontier model** and let it spawn parallel background workers on
-  scoped sub-tasks, running a job far bigger than one context window;
-- run it **on your phone in [Termux](https://termux.dev)** - it's just `python3`,
-  nothing to compile;
-- or **`/connect` to a beefier box over SSH** and run every tool *there* through a
-  hermetic, secret-free executor, from the same terminal.
+Optional lean-tools are off by default and add nothing until enabled.
 
-If your model handles MCP well, add all the servers you like on top - lean-coder is a
-generic MCP client too. We just didn't want the platform *itself* to be the thing
-eating your context. This is open source, built for the folks running local and open
-models first. Core is one script (`lean_coder.py`) plus a required builtin-tools module
-(`lean-tools/builtins.py`) and provider adapters in `providers/` (Ollama, llama.cpp,
-MLX, Anthropic, Gemini, Groq, OpenAI, OpenRouter); it stays navigable because every
-change has to pass three gates before it ships. See [CONTRIBUTING.md](CONTRIBUTING.md).
+- Runs against local models (Ollama, llama.cpp, MLX) or hosted APIs.
+- When the context window fills, the agent updates its docs, pins a goal and plan, and
+  continues from a summary ([compaction](#compaction)).
+- Can dispatch background worker agents for sub-tasks (`dispatch_worker` lean-tool).
+- Runs on Termux, or drives a remote box over SSH with `/connect`.
+- Generic MCP client; no servers are configured by default.
+
+Layout: `lean_coder.py` (core), `lean-tools/builtins.py` (required file/shell tools),
+`lean-tools/` (optional tools), `providers/` (model backends). Every change must pass three
+test gates; see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Install
 
-**Prerequisites:** `python3` (3.11+, for stdlib `tomllib`) and `curl` **or** `git` to
-fetch the code. Python ships on most Linux/WSL images; a *minimal* one (fresh WSL Debian,
-slim containers) may lack curl/git - install them first with your package manager:
+Requires `python3` 3.11+ and `curl` or `git`. Minimal images may need these first:
 
 | Platform | Prerequisite install |
 |---|---|
@@ -73,45 +56,40 @@ slim containers) may lack curl/git - install them first with your package manage
 | Android / Termux | `pkg install -y python curl` |
 | macOS | `python3` + `curl` ship with the OS (or `brew install python`) |
 
-Then, on Linux / WSL / macOS:
+Linux / WSL / macOS:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/codemonkeying/lean-coder/main/install.sh | bash
 ```
 
-On Android / Termux (prerequisite + install in one line):
+Android / Termux:
 
 ```bash
 pkg install -y python curl && curl -fsSL https://raw.githubusercontent.com/codemonkeying/lean-coder/main/install.sh | bash
 ```
 
-The one-liner fetches `install.sh`, which installs the code and symlinks `lean_coder`
-onto your `PATH`. On Termux there's no sudo/systemd, so it points you at a remote Ollama
-(`lean_coder --host http://HOST:11434`). For a local Ollama on Linux, add
-`--with-ollama --pull`. It's idempotent; `./uninstall.sh` does a full teardown.
+`install.sh` installs the code and puts `lean_coder` on your `PATH`. Add
+`--with-ollama --pull` for a local Ollama on Linux. On Termux, point it at a remote Ollama
+(`lean_coder --host http://HOST:11434`). The installer is idempotent; `./uninstall.sh`
+removes everything.
 
-Prefer to inspect first? Clone and run it in place with no install at all (needs `git`):
+Or run from a clone without installing:
 
 ```bash
 git clone https://github.com/codemonkeying/lean-coder
 cd lean-coder
 ./install.sh --dry-run                          # show what it would do, change nothing
-python3 lean_coder.py                            # or run in place: local Ollama, default model
+python3 lean_coder.py                            # local Ollama, default model
 python3 lean_coder.py --host http://box:11434 --model qwen3-coder:30b
 ```
 
-**Runtime requirements:** Python 3.11+ and **no third-party Python packages** for the
-core - it's stdlib-only (a couple of opt-in lean-tools bring their own, e.g.
-`web_screenshot` needs Playwright, and say so). `/connect` to a remote also needs an
-`ssh` client (lean-coder prompts you to install it if missing). Plus a tool-calling model
-behind a provider - **Ollama** works out of the box, or a **hosted API** (Anthropic,
-Gemini, Groq, OpenAI, OpenRouter; the Anthropic *subscription* provider also needs `node`
-on PATH, and prompts to install it).
+**Runtime:** Python 3.11+, no third-party packages for the core. Some opt-in lean-tools
+have their own deps (e.g. `web_screenshot` needs Playwright) and say so when enabled.
+`/connect` needs an `ssh` client. The Anthropic subscription provider needs `node`.
 
-**Updating:** re-run the one-liner (or `git pull && ./install.sh`) any time. Or enable
-the `update` lean-tool and run `/update` from the REPL: it pulls only a newer
-`lean_coder.py` (`update_track` picks `stable` or `beta`); set `auto_update = true` to
-check once at launch.
+**Updating:** re-run the installer, or `git pull && ./install.sh`. With the `update`
+lean-tool enabled, `/update` pulls a newer `lean_coder.py` (`update_track` = `stable` or
+`beta`; `auto_update = true` checks at launch).
 
 ## Quick start
 
@@ -119,14 +97,12 @@ check once at launch.
 lean_coder                       # uses your config, or localhost Ollama + default model
 ```
 
-You get an interactive REPL. Type a request; the agent reads, edits, and runs as
-needed, **showing a diff before applying** and **confirming before running** shell
-commands (unless approval is `session`/`auto`). Type `/help` for the full command list.
+Type a request. The agent shows a diff before each edit and confirms before running
+commands (unless approval is `session` or `auto`). `/help` lists commands.
 
 ```
 $ lean_coder
 lean-coder  <your-model> @ <your-provider>
-  cwd: ~/myproject   ·   baseline overhead (system + always-on tools): ~2.5k tokens
 › add a --json flag to the export command and update the tests
 ● I'll look at the export command first.
   ⚙ read_file(path=src/export.py)
@@ -136,145 +112,106 @@ lean-coder  <your-model> @ <your-provider>
 
 ## Providers
 
-A **provider** is the adapter that connects lean-coder to a model backend. **Ollama
-ships bundled and default-enabled** - a fresh install talks to a local Ollama at
-`localhost:11434` with zero config. To use a hosted API instead, several ship bundled
-(disabled until you enable one and add a key):
+A provider connects lean-coder to a model backend. Ollama is enabled by default and uses
+`localhost:11434`. Hosted providers ship disabled until you log in:
 
 | Provider        | Backend | Get a key |
 |-----------------|---------|-----------|
 | `ollama`        | Local / self-hosted Ollama (default) | none needed |
 | `anthropic_api` | Anthropic API (Claude) | [console.anthropic.com](https://console.anthropic.com) |
 | `gemini`        | Google Gemini | [aistudio.google.com](https://aistudio.google.com/apikey) |
-| `groq`          | Groq (fast, free tier) | [console.groq.com](https://console.groq.com/keys) |
-| `openai`        | OpenAI (gpt / o-series; paid) | [platform.openai.com](https://platform.openai.com/api-keys) |
-| `openrouter`    | OpenRouter (gateway to many models) | [openrouter.ai](https://openrouter.ai/keys) |
-
-**Setup is one step** - log in and paste your key:
+| `groq`          | Groq | [console.groq.com](https://console.groq.com/keys) |
+| `openai`        | OpenAI | [platform.openai.com](https://platform.openai.com/api-keys) |
+| `openrouter`    | OpenRouter | [openrouter.ai](https://openrouter.ai/keys) |
 
 ```
 /provider login anthropic_api      # prompts for the key, saves it, switches to it
 ```
 
-That enables the backend, stores the key securely (a `chmod 600` file under
-`~/.config/leancoder/`, **never** in `config.toml`), and makes it active. An env var
-(e.g. `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`) is picked up automatically instead if set.
-Then `/provider` lists backends and switches between enabled ones; `/model` lists models
-across every enabled provider and switches in one step. If a turn fails because a key is
-missing or rejected, it offers the login prompt right there and retries.
+Keys are stored in a `chmod 600` file under `~/.config/leancoder/`, never in
+`config.toml`. An env var (e.g. `ANTHROPIC_API_KEY`) is used instead if set. `/provider`
+switches backends; `/model` lists and switches models across enabled providers.
 
-To wire up any other backend, copy
-[`examples/providers/example.py`](examples/providers/example.py) (an annotated
-OpenAI-compatible template) into `providers/`; see [PROVIDER_API.md](PROVIDER_API.md).
-Sessions are portable across providers (full history is re-sent each turn).
+For another backend, copy [`examples/providers/example.py`](examples/providers/example.py)
+into `providers/`; see [PROVIDER_API.md](PROVIDER_API.md). Sessions work across providers.
 
-## Safety: two axes
+## Safety
 
-**What it *can* do** and **whether it *asks*** are separate knobs that compose.
+Two independent settings:
 
-- **`/leash` - capability ceiling** (`chat` | `r` | `rw` | `rwe`, default `rwe`). Bounds
-  the tools the model is even *given*:
-  - `chat` - no tools at all (pure conversation).
-  - `r` - **read-only**: read/list/search files. Safe to walk away from.
-  - `rw` - read **+ edit files** (`apply_diff`, `write_file`).
-  - `rwe` - read + edit **+ run shell commands** (full agent).
+- **`/leash`** - which tools the model gets (default `rwe`):
+  `chat` (none) · `r` (read files) · `rw` (+ edit files) · `rwe` (+ run commands).
+  The model is told its level.
+- **`/approve`** - when to confirm (default `session`):
+  `ask` (every edit/command) · `session` (once per run) · `auto` (never).
 
-  The model is told its ceiling, so it says "I'm read-only; `/leash rw` to let me edit"
-  rather than failing opaquely.
-- **`/approve` - confirm cadence** (`ask` | `session` | `auto`, default `session`). *When* to
-  confirm within the ceiling:
-  - `ask` - confirm every edit/command (you see a diff / the command first).
-  - `session` - confirm once, then auto-approve the rest of this run.
-  - `auto` - never ask (full autonomy).
-
-Compose them: `leash r` = walk-away-safe analysis; `leash rw` + `approve auto` =
-unattended editing; `leash rwe` + `approve auto` = full autonomy. The leash bounds what
-the agent *attempts*; the **OS** (its file perms) bounds what it *can* do. Also:
-**`/incognito`** writes nothing to disk for the run (and tells the model), and
-**`/askread`** extends confirmation to read tools too.
+Examples: `leash r` for unattended analysis; `leash rw` + `approve auto` for unattended
+editing. OS file permissions still apply. `/incognito` writes nothing to disk;
+`/askread` also confirms read tools.
 
 ## Tools
 
-### The always-on set
+### Always-on
 
-Exposed via native tool calling. Descriptions are one line each, because they're
-serialized into **every** request. Eight file/shell tools live in the required
-builtin-tools module (`lean-tools/builtins.py`):
+Eight file/shell tools in `lean-tools/builtins.py`:
 
 | Tool            | What it does |
 |-----------------|--------------|
 | `read_file`     | Line-numbered file contents; optional line range; large files truncated. |
-| `list_files`    | Directory / shallow project tree, honoring ignore rules. |
+| `list_files`    | Directory listing, honoring ignore rules. |
 | `search_files`  | Regex search -> `file:line` matches (capped). |
-| `apply_diff`    | **Preferred edit tool.** SEARCH/REPLACE blocks - sends/returns only changed lines. |
-| `replace_lines` | Replace a line range by number (simpler than a diff when you have the line numbers). |
-| `write_file`    | Create or overwrite a whole file (mainly for new files). |
-| `run_command`   | Run a foreground shell command in the project dir; stdout/stderr truncated. |
-| `background`    | Run + manage long-lived tasks (dev servers, watchers, builds): `run` / `status` / `kill`, with optional notify/heartbeat/max-runtime watchdog. |
+| `apply_diff`    | Preferred edit tool: SEARCH/REPLACE blocks. |
+| `replace_lines` | Replace a line range by number. |
+| `write_file`    | Create or overwrite a whole file. |
+| `run_command`   | Run a foreground shell command; output truncated. |
+| `background`    | Run and manage long-lived tasks (`run` / `status` / `kill`). |
 
-Alongside these the model always has **`update_plan`** (a pinned goal + TODO that
-survives compaction) and **`note`** (a session notebook that travels with the session),
-plus, by default, **`ask_user_to_run`** - the escape hatch for anything `run_command`
-can't do: a command needing **sudo/root**, an **interactive prompt**, or a **typed
-secret**. The agent hands the exact command back to *you*; only the command and its exit
-code return, so **whatever you type never reaches the model**. Toggle it with `/set`. A
-batch of read-only calls in one turn runs **concurrently**.
+Also always present: `update_plan` (a pinned goal + TODO that survives compaction),
+`note` (a session notebook), and, by default, `ask_user_to_run`, which hands a command to
+you when it needs sudo, an interactive prompt, or a password. Only the command and exit
+code return to the model. Read-only calls in one turn run concurrently.
 
 ### Opt-in lean-tools
 
-Anything beyond local edit + shell is a **lean-tool**: a single `.py` file with a `TOOL`
-schema and a `run` function, discovered but **disabled by default**. Turn one on with
-`/tools` and it costs context only from that point. These ship bundled in
-[`lean-tools/`](lean-tools/):
+A lean-tool is one `.py` file with a `TOOL` schema and a `run` function. Bundled ones are
+in [`lean-tools/`](lean-tools/), off by default; enable them with `/tools`.
 
 | Lean-tool         | Adds |
 |-------------------|------|
-| `dispatch_worker` | Hand a scoped sub-task to a background worker agent; collect its result. Steer a running worker (inject / set plan / add notes), grant it a narrowed toolset, seed it with context, dispatch it against a named task `board`, and (with `worker_checkpoint` on) **resume** a worker that died. Adds `/worker`. |
-| `board`           | A driver-orchestrated **task board**: a named dependency DAG the driver lays out and assigns workers to (workers report their own task `done`). Blocked tasks stay blocked; survives a crash on disk. Auto-enabled for a worker dispatched with `taskboard=`. |
-| `web_fetch`       | Read a URL as clean text. |
-| `web_screenshot`  | Screenshot a URL with a headless browser + return the page text (and, on a vision model, the image). **Needs [Playwright](https://playwright.dev/python/)**; says so if absent. |
-| `brave_search`    | Web search (Brave API). |
-| `git_summary`     | Read-only git snapshot (branch, status, diffstat, recent commits). |
-| `diagnostics`     | Lint/typecheck with **whatever's already installed** (pyright, ruff, tsc, eslint, phpstan, clippy, shellcheck…), falling back to always-available basics (`py_compile`, `bash -n`, …). Zero deps of its own; never installs anything. |
-| `symbols`         | Navigate Python code without grepping: outline a file/dir's classes+defs, or locate a definition by name (stdlib `ast`). |
-| `shell_session`   | A persistent interactive shell held open across calls (REPL, ssh, etc.). |
-| `ssh`             | One-shot `ssh host cmd` (network egress, kept out of core). |
+| `dispatch_worker` | Run a sub-task in a background worker agent and collect its result. Workers can be steered, restricted to fewer tools, and assigned to a `board`. With `worker_checkpoint` on, a stopped worker can be resumed, and `pause` saves one as a session to continue later. Adds `/worker`. |
+| `board`           | A task board: a dependency graph of tasks the driver assigns to workers. Stored on disk. |
+| `web_fetch`       | Read a URL as text. |
+| `web_screenshot`  | Screenshot a URL with a headless browser and return the page text. Needs [Playwright](https://playwright.dev/python/). |
+| `brave_search`    | Web search (Brave API key). |
+| `git_summary`     | Read-only git status, diffstat, recent commits. |
+| `diagnostics`     | Lint/typecheck with whatever is installed (pyright, ruff, tsc, eslint, shellcheck, …), falling back to `py_compile` / `bash -n`. |
+| `symbols`         | Outline Python classes/functions or find a definition (stdlib `ast`). |
+| `shell_session`   | A persistent interactive shell (REPL, ssh, …). |
+| `ssh`             | One-shot `ssh host cmd`. |
 | `notify`          | Desktop notification when a long task finishes. |
-| `provision`       | `/provision` wizard: install lean-coder onto another box over SSH. |
-| `update`          | `/update` - self-update `lean_coder.py` to the latest published build. |
+| `provision`       | `/provision`: install lean-coder on another box over SSH. |
+| `update`          | `/update`: self-update `lean_coder.py`. |
 | `word_count`      | Count lines / words / chars in a file. |
 
-Almost all are stdlib-only. Two need a one-time setup and print the exact steps if
-enabled without it: **`web_screenshot`** (Playwright + a browser) and **`brave_search`**
-(a free [Brave Search API key](https://search.brave.com/app/keys) in
-`~/.config/leancoder/brave.key` or `LEANCODER_BRAVE_KEY`). `diagnostics` uses external
-linters if present but needs none. Every dep-bearing tool is off by default and says so
-clearly if a dep is missing. Full notes in [LEAN_TOOLS.md](LEAN_TOOLS.md);
-[`examples/lean-tools/`](examples/lean-tools/) has two annotated templates.
+`brave_search` needs a [Brave Search API key](https://search.brave.com/app/keys) in
+`~/.config/leancoder/brave.key` or `LEANCODER_BRAVE_KEY`. See [LEAN_TOOLS.md](LEAN_TOOLS.md);
+[`examples/lean-tools/`](examples/lean-tools/) has templates. There is no LSP integration.
 
-There's no persistent **LSP** integration - `diagnostics` (one-shot lint) and `symbols`
-(`ast` navigation) cover day-to-day. If you'd use proper LSP, open an issue.
+### MCP servers
 
-### MCP servers (Model Context Protocol)
-
-lean-coder is a **generic MCP client**, builtin, with **no servers shipped by default**
-(zero context until you add one). Point it at any MCP server and its tools join the
-model's surface, namespaced `mcp__<server>__<tool>`:
+lean-coder is an MCP client. Added servers' tools appear as `mcp__<server>__<tool>`:
 
 ```
 /mcp add fs npx -y @modelcontextprotocol/server-filesystem /some/dir   # stdio server
 /mcp add gw https://mcp-gateway.example.com/mcp/handbook/mcp           # HTTP server
-/mcp                       # enable/disable menu (per server)
+/mcp                       # enable/disable menu
 /mcp list                  # servers + connection state
-/mcp reconnect [name]      # (re)connect
+/mcp reconnect [name]
 /mcp remove <name>
 ```
 
-Two transports, both stdlib-only: **stdio** (a spawned subprocess, JSON-RPC over its
-pipes) and **HTTP** (streamable MCP, tolerating SSE or plain-JSON). HTTP auth is one
-`Authorization: Bearer` header: a static token/env, or an **OAuth 2.1**
-client-credentials JWT fetched + cached + refreshed automatically (prefer OAuth 2.1
-where the gateway offers it). For auth/env, edit the `mcp_servers` table in
+Transports: stdio and HTTP (streamable, SSE or JSON). HTTP auth is a Bearer token, or
+OAuth 2.1 client credentials (fetched and refreshed automatically). Configure in
 `config.toml`:
 
 ```toml
@@ -285,13 +222,10 @@ auth = { type = "bearer", token_env = "GW_KEY" }
 # or: auth = { type = "oauth", token_url = "…/oauth/token", client_id = "…", client_secret_env = "GW_SECRET", scope = "mcp:access" }
 ```
 
-MCP tools run on the **driver** (never a connected remote) and ride the **`rwe`** leash
-tier, confirming like any non-safe tool unless approval is armed. Enabled servers connect
-at launch; a dead one just contributes no tools. Full guide in [MCP.md](MCP.md).
+MCP tools run locally (never on a `/connect` remote), need leash `rwe`, and confirm like
+other non-read tools. See [MCP.md](MCP.md).
 
 ### `apply_diff` format
-
-The `diff` argument is one or more SEARCH/REPLACE blocks:
 
 ```
 <<<<<<< SEARCH
@@ -301,73 +235,41 @@ replacement text
 >>>>>>> REPLACE
 ```
 
-Blocks apply in order. If any SEARCH text isn't found, **nothing is written** and the
-model is told to re-read and match exactly. The markers are word-bearing so a model
-emits them reliably and they never collide with a plain row of `=` or a git conflict
-marker.
+Blocks apply in order. If any SEARCH text isn't found, nothing is written and the model is
+told to re-read the file.
 
 ## Context management
 
-Every agentic turn re-sends the whole conversation, so lean-coder reclaims space at
-several layers rather than letting it grow unchecked.
+- **Truncation and ignore rules.** Large reads and command output are cut head/tail with a
+  `…[truncated N …]…` notice. `.gitignore`, `.leancoderignore`, and built-in defaults
+  (`.git/`, `node_modules/`, …) are honored.
+- **Result cap.** Every tool result is capped on the way in (head + tail kept), sized to
+  the free window.
+- **`/trim [keep]`** replaces old tool results with one-line stubs, keeping the newest
+  `keep`. No LLM call.
+- **Meter.** Context use prints after each turn. `/usage` shows it; `/activity` lists
+  automatic actions (compaction, trim, caps).
 
-- **Truncation & ignore rules.** Large reads and command outputs are clipped head/tail
-  with a clear `…[truncated N …]…` notice. Reads honor `.gitignore`, an optional
-  `.leancoderignore`, and built-in defaults (`.git/`, `node_modules/`, `dist/`,
-  `*.lock`, binaries…); ignored paths are never listed, searched, or walked.
-- **Ingestion-time output caps.** Every tool result passes through one cap on the way in:
-  a runaway `mcp.call` or lean-tool result is sized to a share of the free window (head +
-  tail kept, middle marked) so no single result can blow the context. Results are born
-  small rather than clawed back later.
-- **`/trim [keep]`** stubs old tool results (file dumps, command output) to one-line
-  placeholders, keeping the newest `keep` in full. No LLM call - the lighter lever,
-  reclaiming the biggest consumer without touching the conversation or any edits. Fires
-  manually or, in an emergency, automatically.
-- **Budget meter.** After each turn a context-token figure (the real count from the
-  provider when available, else an estimate) prints against the window, colored as it
-  climbs. `/usage` reports it on demand; `/activity` replays what the system did on its
-  own (compaction, trim, fallback, ingestion caps), so it's auditable, not magic.
+### Compaction
 
-### Compaction: documenting work before a memory wipe
+On `/compact`, or automatically, the model gets one turn to:
 
-Compaction is what keeps a long-running task alive. The insight: **the agent knows
-what's in its own head**, so the moment to update documentation is *right before* that
-memory is compacted, not after it's gone stale. On `/compact` (or automatically) the
-model gets a full tool-capable turn to:
+1. Update the project's docs (and commit them in a git repo).
+2. Write a summary: goal, decisions, state, next step.
+3. Pin a goal + TODO.
+4. Write the next instruction for itself.
 
-1. **Persist durable docs** - update whatever the project uses (design doc, README,
-   notes) and commit them if it's a git repo.
-2. **Write a summary for its future self** - goal, key decisions, current state (done /
-   in progress / next), where the durable docs live, and a prompt to continue from.
-3. **Pin a goal + TODO** that survives the wipe.
-4. **Write a self-prompt** - the single next instruction.
+Older history is replaced by the summary (the last `compact_keep` turns, default 3, stay
+verbatim). The next instruction is then sent as a new turn after a 5-second `^C` window.
 
-The older conversation is then replaced with just that summary block (the most recent
-turns kept verbatim - a "smart `/clear`" that keeps the thread), and unless disabled the
-self-prompt is **fed back in as the next turn**, so the agent continues from a clean
-slate (a 5-second `^C`-to-cancel beat precedes it). That's how a task outruns the window
-while its docs stay current.
+Thresholds: a nudge near ~70% full, forced compaction at `compact_at` (~90%), emergency
+compaction at ~100%. A loop guard limits it to about once a minute. `auto_compact`,
+`autostart_after_compact`, `compact_emergency`, and the prompts are configurable.
 
-It runs itself in **tiers** as context fills: a **soft zone (~70%)** nudges it to wrap up
-at a clean break and compact tidily; a **hard threshold (~90%)** forces a compaction at a
-boundary; an **emergency stop (~100%)** compacts immediately. A loop guard (~1/min) stops
-a compact->continue->compact spin, and after a compaction the last few turns are kept
-verbatim (`compact_keep`, default 3). The single lever is **`compact_at`** (via `/set`) -
-the fill fraction at which it compacts; the soft-nudge zone auto-follows below it.
-`auto_compact`, `autostart_after_compact`, `compact_emergency`, and the prompts
-themselves are all tunable per model.
-
-- **Autonomous wake on background finish (on by default).** A finished background task or
-  worker wakes the agent with a synthesised turn so it reacts with no operator input,
-  instead of the notice waiting for your next turn. The wake only fires at an idle prompt
-  and never interrupts a turn in progress. Set `wake_on_bg_finish = false` to keep the
-  notice passive (it then rides your next turn); a single job can still opt back in via
-  `run_command`'s `notify_on_exit` / `heartbeat_timeout` / `max_runtime` args.
-- **Bounded send-window (off by default).** For a very small local model, even the
-  compaction flow can be too much history. `window_messages = N` caps each request to the
-  last N messages, cut at a *whole-turn boundary* so the current task is never truncated -
-  a hard token bound every turn, at the cost of the model seeing only recent turns. Most
-  models are better served leaving this off and letting compaction manage size.
+- **Wake on background finish** (on by default): a finished background task or worker
+  starts a turn when the prompt is idle. `wake_on_bg_finish = false` disables it.
+- **Send window** (off by default): `window_messages = N` sends only the last N messages,
+  cut at a turn boundary. For very small models.
 
 ## Configuration
 
@@ -383,13 +285,18 @@ Precedence: **CLI flag > env var > config file > default**.
 | Capability      | `--leash`              | -                 | `rwe`                     |
 | Resume session  | `--resume <name>`      | -                 | auto-load last for cwd    |
 
-Config lives in `~/.config/leancoder/config.toml` and **autosaves**: any change (`/set`,
-`/model`, `/provider`, `/approve`, …) is written back immediately. It also supports
-tiered host failover, memorable machine names, per-machine default models, and saved
-`/connect` targets. **Context auto-detection:** without `--num-ctx` (and when
-`auto_num_ctx` is on), lean-coder reads the model's window from the provider at startup;
-auto-detect only ever *lowers* the window (capped 32768), so pass `--num-ctx` to go
-higher explicitly.
+Config is `~/.config/leancoder/config.toml` and saves automatically on any change. It also
+holds host failover, named machines, per-machine default models, and saved `/connect`
+targets. Auto-detect only lowers the context window (capped 32768); use `--num-ctx` to go
+higher.
+
+**What stays on disk.** Only things you named: config, sessions (`~/.config/leancoder/sessions`),
+and task boards. Everything else a running lean-coder creates (background task logs, worker
+files, file-claim boards) lives in one folder per process under `$XDG_RUNTIME_DIR` (else
+`$TMPDIR` or `/tmp`). It is removed when that process exits; after a crash the next start on
+the same machine removes any folder whose process is gone. A remote executor does the same on
+its machine and deletes its copied code when the session closes or the link has been down
+longer than `LEANCODER_REMOTE_IDLE_TTL` (default 30 min).
 
 ## Slash commands
 
@@ -397,7 +304,8 @@ higher explicitly.
 /clear             wipe conversation, stay in this session
 /new [name]        start a separate session
 /trim [keep]       stub old tool outputs, keep newest [keep] in full (no LLM)
-/compact           agent commits durable docs, writes a future-self summary, replaces history
+/compact [k|to]    agent commits durable docs, writes a future-self summary, replaces history
+                   (k = compact to ~k thousand tokens this once; `to` prompts for it)
 /save [name]       name the current session
 /load [name]       resume a session (no arg = picker)
 /session           list | delete <name>
@@ -429,62 +337,49 @@ higher explicitly.
 /quit              exit
 ```
 
-Any command answers **`/<cmd> ?`** (or `/<cmd> help`) with its own detailed help. When
-stdlib `readline` is available, **Tab** completes commands and their arguments and you
-get line history; menu pickers (`/set`, `/model`, `/think`, …) are arrow-key navigable
-with type-to-filter, falling back to a numbered prompt when headless.
+`/<cmd> ?` shows help for a command. Tab completion and history work when `readline` is
+available; menus are arrow-key navigable.
 
-**Editable prompts:** `/prompt` opens the prompt files in your editor. The built-ins
-(`system`, `compact`, `auto_compact`, `compact_nudge`) can be tuned and take effect live
-(`/prompt reset <name>` reverts). You can also save your **own** named prompts and fire
-one as a one-shot turn with **`/prompt use <name>`** - handy for a refactor brief, a
-review checklist, or a commit-message style.
+`/prompt` edits the built-in prompts (`system`, `compact`, `auto_compact`,
+`compact_nudge`; `/prompt reset <name>` reverts). `/prompt new <name>` creates your own,
+and `/prompt use <name>` sends one as a turn.
 
 ## Remote workspace
 
-`/connect <[user@]host> [path]` runs lean-coder's tools on a remote box over SSH. Every
-file/exec tool then runs *there*, on the remote's filesystem, while the model's tool
-surface stays identical. The prompt shows `[remote: host] ›` so you always know where you
-are.
+`/connect <[user@]host> [path]` runs all file and shell tools on a remote box over SSH.
+The prompt shows `[remote: host] ›`.
 
-- **No install on the remote beyond `python3`** - the script is pushed into throwaway
-  space; the push is hash-skipped when a matching build is already there.
-- **The executor is hermetic:** no config, no model, no secrets, no network egress - it
-  only runs approved tool calls against the one directory.
-- **Confirmations stay local:** the preview and `y/N` happen on your machine; remote
-  edits still show a real unified diff.
-- Auth happens once via a multiplexed SSH master socket; none of the connection/install
-  output ever enters the model's context.
+- The remote only needs `python3`; the script is copied over (skipped if unchanged).
+- The remote executor has no config, model, secrets, or network access; it only runs
+  approved tool calls in that directory.
+- Previews and confirmations happen locally; remote edits show a real diff.
+- SSH authenticates once per connection; its output never enters the model's context.
 
-Because `/connect` moves only the *executor*, a single saved session can drive your
-laptop one moment and a remote box the next without losing a thing. Sessions autosave
-each turn and the last one auto-loads on start.
+The session stays the same when switching between local and remote.
 
 ## Agent loop
 
-1. Build messages: `[system] + history + latest turn`; attach the tools.
-2. Stream a chat completion from the provider.
-3. If the reply has tool calls, execute each, append each result as a `tool` message, and
-   loop.
-4. Content with no tool calls is the final answer.
-5. Capped tool rounds per turn prevent runaway loops.
+1. Send `[system] + history + latest turn` with the tool list.
+2. Stream the reply.
+3. Run any tool calls, append results, repeat.
+4. A reply with no tool calls ends the turn.
+5. Tool rounds per turn are capped.
 
-A batch of tool calls that are **all read-only** runs concurrently (wall time = the
-slowest call); any batch containing a writer or command runs sequentially, and a
-connected session is always sequential. Results are appended in call order.
+A batch of only read-only calls runs concurrently; any batch with a write or command runs
+in order, as does everything on a remote.
 
 ## Development
 
-Three gates, run bare from the repo root (each exits non-zero on failure):
+Three gates, from the repo root (each exits non-zero on failure):
 
 ```bash
-python3 tests/_smoketest.py     # offline unit suite (incl. the fixed-overhead budget check)
+python3 tests/_smoketest.py     # unit suite (incl. the overhead limits in this README)
 python3 tests/_mocktest.py      # scripted end-to-end suite
 bash tests/_sweep.sh            # hygiene lint (stray unicode, likely secrets/PII, etc.)
 ```
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for the bar, [LEAN_TOOLS.md](LEAN_TOOLS.md) for
-writing tools, and [PROVIDER_API.md](PROVIDER_API.md) for providers.
+See [CONTRIBUTING.md](CONTRIBUTING.md), [LEAN_TOOLS.md](LEAN_TOOLS.md), and
+[PROVIDER_API.md](PROVIDER_API.md).
 
 ## License
 
