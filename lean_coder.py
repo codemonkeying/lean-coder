@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L1514   Lean-tools (plugin tools: discovery, manager)
-  L1864   MCP client (connection, manager, OAuth, discovery)
-  L2318   Providers (backend plugin registry)
-  L2540   Interactive pickers + menus (raw-mode UI engine)
-  L2889   Terminal styling (colors, formatting helpers)
-  L3125   Streaming + markdown render (model output)
-  L3599   Composer (pinned input line, editor, stdin)
-  L4481   Token accounting (calibrated context meter)
-  L4679   Config (dataclass, field registry, load/save)
-  L8393   Tool execution + text tool-call parsing
-  L8866   Remote workspace (executor client, /connect)
-  L10581  Context meter
-  L10676  Agent (turn loop, context mgmt, tool dispatch)
-  L17638  Slash-command handlers + dispatch table
-  L17775  REPL (interactive loop, session resume)
-  L18207  Worker agent (headless --agent-run)
-  L18867  Entry (CLI arg parsing, main)
+  L1522   Lean-tools (plugin tools: discovery, manager)
+  L1872   MCP client (connection, manager, OAuth, discovery)
+  L2326   Providers (backend plugin registry)
+  L2548   Interactive pickers + menus (raw-mode UI engine)
+  L2897   Terminal styling (colors, formatting helpers)
+  L3133   Streaming + markdown render (model output)
+  L3607   Composer (pinned input line, editor, stdin)
+  L4489   Token accounting (calibrated context meter)
+  L4687   Config (dataclass, field registry, load/save)
+  L8401   Tool execution + text tool-call parsing
+  L8874   Remote workspace (executor client, /connect)
+  L10608  Context meter
+  L10703  Agent (turn loop, context mgmt, tool dispatch)
+  L17676  Slash-command handlers + dispatch table
+  L17813  REPL (interactive loop, session resume)
+  L18245  Worker agent (headless --agent-run)
+  L18905  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -116,7 +116,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.10.57"
+__version__ = "0.10.58"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -124,6 +124,14 @@ __version__ = "0.10.57"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.10.58": [
+        "Remote drop: a failed /sh now takes the same path as a failed tool call - ssh exit",
+        "  255 triggers one silent reconnect, and only if that fails too does the session drop",
+        "  to local (prompt glyph flips back). The model is told neutrally where it now is:",
+        "  'remote <host> dropped (<reason>); the session is now running LOCALLY on <host>.'",
+        "The session-env tail now names the host tools run on, so after a drop the model",
+        "  sees it moved before its next command.",
+    ],
     "0.10.57": [
         "search_files: hitting the 200-match cap in a single-file search (or in the last",
         "  file searched) cut the results SILENTLY - now it always says so and how to narrow.",
@@ -10515,15 +10523,34 @@ def run_sh_command(agent, cfg, arg: str):
         # (the individual commands aren't captured - that's the point of a real
         # subshell). When connected, ride the ssh master with a real tty so the
         # REMOTE shell's completion/history work exactly like a local one.
-        note = run_interactive_shell(cfg, remote=agent.remote)
+        rem = agent.remote
+        note = run_interactive_shell(cfg, remote=rem)
         agent.messages.append({"role": "user", "content": note})
         agent.dirty = True
+        _sh_check_remote(agent, rem, note)
         return note
     # the operator already typed the command: run it on one Enter, no re-edit
-    note = run_direct_command(cfg, arg, remote=agent.remote, editable=False)
+    rem = agent.remote
+    note = run_direct_command(cfg, arg, remote=rem, editable=False)
     agent.messages.append({"role": "user", "content": note})
     agent.dirty = True
+    _sh_check_remote(agent, rem, note)
     return note
+
+
+def _sh_check_remote(agent, remote, note):
+    """After a remote /sh: ssh exits 255 when IT failed (unreachable, auth, dead master)
+    - but a remote command can exit 255 too, so never drop on the code alone: try the
+    same single batch reconnect a tool call does, and drop only if that fails too."""
+    if remote is None or agent.remote is not remote or not isinstance(note, str):
+        return
+    if not re.search(r"\bexit\s*255\b", note):
+        return
+    try:
+        remote.connect(batch=True)
+        return                                        # it was the command, not the link
+    except (ConnectionError, OSError) as e:
+        agent._on_remote_lost(remote.host, e)
 
 
 def run_interactive_shell(cfg, remote=None) -> str:
@@ -10855,6 +10882,16 @@ class Agent:
         if self.remote is not None and self.remote.host == host:
             self.set_remote(None)            # back to local (rebuilds surface + cwd)
 
+    def _on_remote_lost(self, host, reason):
+        """The ONE remote-lost path (a model tool call or /sh found the box gone and a
+        batch reconnect failed too): drop to local via drop_remote (the prompt glyph
+        follows agent.remote, so it flips to '>' on the next prompt), tell the operator,
+        and return a neutral line for the model - where it is now, not what to do."""
+        self.drop_remote(host)
+        print(red(f"\n! remote {host} dropped ({reason}); switched to LOCAL."))
+        return (f"remote {host} dropped ({reason}); the session is now running "
+                f"LOCALLY on {_HOSTNAME}.")
+
     def close_all_remotes(self):
         """Tear down every pooled connection (on quit). Nothing remote survives a
         restart, so there is never stale remote code to worry about."""
@@ -10996,10 +11033,7 @@ class Agent:
         except (ConnectionError, OSError) as e:
             # reconnect failed too: the box rebooted or the link is truly down.
             # Fall back to local and tell the model, instead of crashing.
-            self.drop_remote(host)
-            print(red(f"\n! remote {host} dropped ({e}); switched to LOCAL."))
-            return (f"error: remote {host} dropped mid-command (rebooted or link "
-                    f"lost); the session is now LOCAL - retry the command.")
+            return "error: " + self._on_remote_lost(host, e)
         if name in ("apply_diff", "write_file", "replace_lines") and not any(
                 result.startswith(p) for p in
                 ("error", "operator declined", "user declined", "no changes")):
@@ -11250,8 +11284,12 @@ class Agent:
                     "a tool-capable model with /model).\n"
                     f"{self._ENV_FTR}")
         cwd = (self.remote.remote_cwd or self.remote.cwd) if self.remote else self.cfg.cwd
-        return (f"\n\n{self._ENV_HDR}\ncwd: {cwd}\nshell: {self._shell_family()}\n"
-                f"{self._ENV_FTR}")
+        # The host tools run on: cwd+shell alone can read identical on two POSIX boxes,
+        # so after a drop the model couldn't tell it had moved. Just the name - no
+        # remote/local wording (one unified surface), the change of name is the signal.
+        host = self.remote.host if self.remote else _HOSTNAME
+        return (f"\n\n{self._ENV_HDR}\nhost: {host}\ncwd: {cwd}\n"
+                f"shell: {self._shell_family()}\n{self._ENV_FTR}")
 
     def _with_plan_reminder(self, msgs):
         """Return a COPY of the sent slice with the uncached session tail (live env +
