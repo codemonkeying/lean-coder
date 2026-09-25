@@ -126,7 +126,9 @@ class Tools:
             # cwd-relative when the entry is inside the project (the common case);
             # otherwise the absolute path. A naive rootlen-slice mangled names for a
             # listing OUTSIDE cwd (e.g. an absolute /var/log) into garbage like 'g/f'.
-            rp = p.resolve()
+            # Resolve only the PARENT: resolving the entry itself turned every symlink
+            # into its target's name (a dir of 'a -> b' links listed 'b' N times).
+            rp = p.parent.resolve() / p.name
             try:
                 return str(rp.relative_to(root))
             except ValueError:
@@ -165,9 +167,18 @@ class Tools:
                 except OSError:
                     continue
                 rel = _rel(e)
-                out.append(rel + (os.sep if is_dir else ""))
+                link = ""
+                if e.is_symlink():
+                    # Show the link AS a link and never descend it: following a linked
+                    # dir leaks another tree into this listing (a real model saw
+                    # /etc/X11 files inside /usr/share) and can loop on a cycle.
+                    try:
+                        link = f" -> {os.readlink(e)}"
+                    except OSError:
+                        link = " -> ?"
+                out.append(rel + (os.sep if is_dir else "") + link)
                 count += 1
-                if is_dir:
+                if is_dir and not link:
                     walk(e, depth + 1)
         walk(base, 1)
         if out:
@@ -192,8 +203,6 @@ class Tools:
         files = [base] if base.is_file() else _iter_files(base, self.ignore)
         for f in files:
             if count >= SEARCH_MAX_MATCHES:
-                hits.append(f"…[stopped at {SEARCH_MAX_MATCHES} matches; there may be more. Narrow "
-                            f"it: a tighter pattern, or path=<subdir or file>]…")
                 break
             try:
                 # Never slurp a whole file into RAM (a multi-GB VM image / DB / log
@@ -242,6 +251,12 @@ class Tools:
                                 break
             except Exception:
                 continue
+        # Notice at the one place the cap actually stops us (it used to be appended only
+        # before the NEXT file, so a single-file search - or a cap hit in the last file -
+        # was cut silently; found by a real model that couldn't tell it was truncated).
+        if count >= SEARCH_MAX_MATCHES:
+            hits.append(f"…[stopped at {SEARCH_MAX_MATCHES} matches; there may be more. Narrow "
+                        f"it: a tighter pattern, or path=<subdir or file>]…")
         return "\n".join(hits) if hits else "(no matches)"
 
     # --- mutating (gated by confirmation) --------------------------------
@@ -694,10 +709,17 @@ def _iter_files(base, ignore):
 def _truncate_output(s: str) -> str:
     if len(s) <= OUTPUT_MAX_CHARS:
         return s
-    dropped = len(s) - OUTPUT_HEAD - OUTPUT_TAIL
-    return (s[:OUTPUT_HEAD] + f"\n…[{dropped} chars omitted (not kept); to see them, re-run "
+    # Cut on line boundaries (within the same budget) so neither side starts or ends
+    # on a fragment - a real model read a stray "67" after the notice as data.
+    head, tail = s[:OUTPUT_HEAD], s[-OUTPUT_TAIL:]
+    nl = head.rfind("\n")
+    head = head[:nl] if nl > OUTPUT_HEAD // 2 else head
+    nl = tail.find("\n")
+    tail = tail[nl + 1:] if 0 <= nl < OUTPUT_TAIL // 2 else tail
+    dropped = len(s) - len(head) - len(tail)
+    return (head + f"\n…[{dropped} chars omitted (not kept); to see them, re-run "
             f"narrower: `| grep PATTERN`, `| sed -n 'A,Bp'`, or `> file` then read_file "
-            f"start=/end=]…\n" + s[-OUTPUT_TAIL:])
+            f"start=/end=]…\n" + tail)
 
 
 # Signatures a command emits when it wanted the controlling terminal run_command
