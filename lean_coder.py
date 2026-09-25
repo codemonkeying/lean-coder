@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L1505   Lean-tools (plugin tools: discovery, manager)
-  L1855   MCP client (connection, manager, OAuth, discovery)
-  L2309   Providers (backend plugin registry)
-  L2531   Interactive pickers + menus (raw-mode UI engine)
-  L2880   Terminal styling (colors, formatting helpers)
-  L3116   Streaming + markdown render (model output)
-  L3590   Composer (pinned input line, editor, stdin)
-  L4472   Token accounting (calibrated context meter)
-  L4670   Config (dataclass, field registry, load/save)
-  L8384   Tool execution + text tool-call parsing
-  L8857   Remote workspace (executor client, /connect)
-  L10567  Context meter
-  L10662  Agent (turn loop, context mgmt, tool dispatch)
-  L17624  Slash-command handlers + dispatch table
-  L17761  REPL (interactive loop, session resume)
-  L18193  Worker agent (headless --agent-run)
-  L18853  Entry (CLI arg parsing, main)
+  L1514   Lean-tools (plugin tools: discovery, manager)
+  L1864   MCP client (connection, manager, OAuth, discovery)
+  L2318   Providers (backend plugin registry)
+  L2540   Interactive pickers + menus (raw-mode UI engine)
+  L2889   Terminal styling (colors, formatting helpers)
+  L3125   Streaming + markdown render (model output)
+  L3599   Composer (pinned input line, editor, stdin)
+  L4481   Token accounting (calibrated context meter)
+  L4679   Config (dataclass, field registry, load/save)
+  L8393   Tool execution + text tool-call parsing
+  L8866   Remote workspace (executor client, /connect)
+  L10581  Context meter
+  L10676  Agent (turn loop, context mgmt, tool dispatch)
+  L17638  Slash-command handlers + dispatch table
+  L17775  REPL (interactive loop, session resume)
+  L18207  Worker agent (headless --agent-run)
+  L18867  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -116,7 +116,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.10.56"
+__version__ = "0.10.57"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -124,6 +124,15 @@ __version__ = "0.10.56"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.10.57": [
+        "search_files: hitting the 200-match cap in a single-file search (or in the last",
+        "  file searched) cut the results SILENTLY - now it always says so and how to narrow.",
+        "list_files: symlinks were shown as their target's name (a dir of links listed the",
+        "  same file many times) and linked dirs were followed into other trees. Now each",
+        "  link shows as `name -> target` and is never descended.",
+        "run_command / operator output: truncation now cuts on line boundaries, so the text",
+        "  either side of the notice never starts or ends on a fragment.",
+    ],
     "0.10.56": [
         "Windows remote: with no Python on the box, lean-coder's cached embedded Python is",
         "  now reported as 'using cached python' instead of claiming a fresh push on every",
@@ -10361,10 +10370,15 @@ def _clip_output(s: str) -> str:
     the run_command cap, so a long log dump can't flood the model's context."""
     if len(s) <= OUTPUT_MAX_CHARS:
         return s
-    dropped = len(s) - OUTPUT_HEAD - OUTPUT_TAIL
-    return (s[:OUTPUT_HEAD] + f"\n…[{dropped} chars omitted (not kept); for the middle, ask "
+    head, tail = s[:OUTPUT_HEAD], s[-OUTPUT_TAIL:]          # cut on line boundaries
+    nl = head.rfind("\n")
+    head = head[:nl] if nl > OUTPUT_HEAD // 2 else head
+    nl = tail.find("\n")
+    tail = tail[nl + 1:] if 0 <= nl < OUTPUT_TAIL // 2 else tail
+    dropped = len(s) - len(head) - len(tail)
+    return (head + f"\n…[{dropped} chars omitted (not kept); for the middle, ask "
             f"the operator to re-run it narrower, e.g. `| grep PATTERN` or `| tail -n 50`]…\n"
-            + s[-OUTPUT_TAIL:])
+            + tail)
 
 
 # CSI / OSC / other ANSI escape sequences - stripped from CAPTURED pty output before
