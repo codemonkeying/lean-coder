@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L1522   Lean-tools (plugin tools: discovery, manager)
-  L1872   MCP client (connection, manager, OAuth, discovery)
-  L2326   Providers (backend plugin registry)
-  L2548   Interactive pickers + menus (raw-mode UI engine)
-  L2897   Terminal styling (colors, formatting helpers)
-  L3133   Streaming + markdown render (model output)
-  L3607   Composer (pinned input line, editor, stdin)
-  L4489   Token accounting (calibrated context meter)
-  L4687   Config (dataclass, field registry, load/save)
-  L8401   Tool execution + text tool-call parsing
-  L8874   Remote workspace (executor client, /connect)
-  L10608  Context meter
-  L10703  Agent (turn loop, context mgmt, tool dispatch)
-  L17676  Slash-command handlers + dispatch table
-  L17813  REPL (interactive loop, session resume)
-  L18245  Worker agent (headless --agent-run)
-  L18905  Entry (CLI arg parsing, main)
+  L1529   Lean-tools (plugin tools: discovery, manager)
+  L1879   MCP client (connection, manager, OAuth, discovery)
+  L2333   Providers (backend plugin registry)
+  L2555   Interactive pickers + menus (raw-mode UI engine)
+  L2904   Terminal styling (colors, formatting helpers)
+  L3140   Streaming + markdown render (model output)
+  L3614   Composer (pinned input line, editor, stdin)
+  L4496   Token accounting (calibrated context meter)
+  L4694   Config (dataclass, field registry, load/save)
+  L8408   Tool execution + text tool-call parsing
+  L8881   Remote workspace (executor client, /connect)
+  L10615  Context meter
+  L10710  Agent (turn loop, context mgmt, tool dispatch)
+  L17683  Slash-command handlers + dispatch table
+  L17820  REPL (interactive loop, session resume)
+  L18252  Worker agent (headless --agent-run)
+  L18912  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -116,7 +116,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.10.58"
+__version__ = "0.10.59"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -124,6 +124,13 @@ __version__ = "0.10.58"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.10.59": [
+        "list_files: when the 400-entry cap stops a listing, the notice now names the real",
+        "  dirs it never reached ('not yet listed: a, b, ... (+N more)') instead of",
+        "  '<a dir above>'.",
+        "read_file: a big file's omitted-middle notice also says how to JUMP - search_files",
+        "  for the line number, then read_file start=/end= around it - not just page.",
+    ],
     "0.10.58": [
         "Remote drop: a failed /sh now takes the same path as a failed tool call - ssh exit",
         "  255 triggers one silent reconnect, and only if that fails too does the session drop",

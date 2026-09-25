@@ -109,8 +109,13 @@ class Tools:
             head = _number(alllines[:READ_HEAD], 1)
             tail = _number(alllines[-READ_TAIL:], n - READ_TAIL + 1)
             gap_s, gap_e = READ_HEAD + 1, n - READ_TAIL
+            # Paging 18k lines in 600-line steps is the slow way: also say how to JUMP
+            # (find the line of what you want, then read around it). A real model asked
+            # for this - it had the file's own FILE MAP in the head but wasn't told to use it.
             return head + (f"\n…[lines {gap_s}-{gap_e} omitted; read them: read_file "
-                           f"start={gap_s} end={min(gap_e, gap_s + READ_MAX_LINES - 1)}]…\n") + tail
+                           f"start={gap_s} end={min(gap_e, gap_s + READ_MAX_LINES - 1)}, or jump: "
+                           f"search_files path={path} pattern=<name> for a line number, then "
+                           f"read_file start=/end= around it]…\n") + tail
         return _number(alllines, 1) or "(empty file)"
 
     def list_files(self, path: str = "") -> str:
@@ -119,7 +124,7 @@ class Tools:
             return f"error: no such path: {path}"
         if base.is_file():
             return path
-        out, count, hidden, capped = [], 0, 0, []
+        out, count, hidden, capped, unlisted = [], 0, 0, [], []
         root = self.cfg.cwd.resolve()
 
         def _rel(p):
@@ -151,13 +156,17 @@ class Tools:
                 # PermissionError, or a Windows untrusted-mount-point junction
                 # (WinError 448) - skip this dir rather than abort the whole listing.
                 return
-            for e in entries:
+            for i, e in enumerate(entries):
                 if count >= TREE_MAX_ENTRIES:
-                    if not capped:
-                        capped.append(1)
-                        out.append(f"…[listing stopped at {TREE_MAX_ENTRIES} entries; for the "
-                                   f"rest, list one subdir at a time: list_files path=<a dir "
-                                   f"above>]…")
+                    capped.append(1)
+                    # Remember what this level still had unshown, so the notice can name
+                    # real paths instead of "<a dir above>".
+                    for x in entries[i:]:
+                        try:
+                            if x.is_dir() and not x.is_symlink() and not self.ignore.ignored(x):
+                                unlisted.append(_rel(x))
+                        except OSError:
+                            pass
                     return
                 if self.ignore.ignored(e):
                     hidden += 1
@@ -181,6 +190,13 @@ class Tools:
                 if is_dir and not link:
                     walk(e, depth + 1)
         walk(base, 1)
+        if capped:
+            # Deepest level first is what the walk stopped in; outer levels follow.
+            names = list(dict.fromkeys(unlisted))
+            shown = ", ".join(names[:8]) + (f" (+{len(names) - 8} more)" if len(names) > 8 else "")
+            out.append(f"…[listing stopped at {TREE_MAX_ENTRIES} entries"
+                       + (f"; not yet listed: {shown}" if names else "")
+                       + "; for the rest, list one dir at a time: list_files path=<dir>]…")
         if out:
             return "\n".join(out)
         # Don't lie: a dir full of ignored files is NOT "(empty)". Say so, so the
