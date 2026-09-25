@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L1488   Lean-tools (plugin tools: discovery, manager)
-  L1838   MCP client (connection, manager, OAuth, discovery)
-  L2292   Providers (backend plugin registry)
-  L2514   Interactive pickers + menus (raw-mode UI engine)
-  L2863   Terminal styling (colors, formatting helpers)
-  L3099   Streaming + markdown render (model output)
-  L3573   Composer (pinned input line, editor, stdin)
-  L4455   Token accounting (calibrated context meter)
-  L4653   Config (dataclass, field registry, load/save)
-  L8322   Tool execution + text tool-call parsing
-  L8792   Remote workspace (executor client, /connect)
-  L10489  Context meter
-  L10584  Agent (turn loop, context mgmt, tool dispatch)
-  L17546  Slash-command handlers + dispatch table
-  L17683  REPL (interactive loop, session resume)
-  L18115  Worker agent (headless --agent-run)
-  L18775  Entry (CLI arg parsing, main)
+  L1498   Lean-tools (plugin tools: discovery, manager)
+  L1848   MCP client (connection, manager, OAuth, discovery)
+  L2302   Providers (backend plugin registry)
+  L2524   Interactive pickers + menus (raw-mode UI engine)
+  L2873   Terminal styling (colors, formatting helpers)
+  L3109   Streaming + markdown render (model output)
+  L3583   Composer (pinned input line, editor, stdin)
+  L4465   Token accounting (calibrated context meter)
+  L4663   Config (dataclass, field registry, load/save)
+  L8377   Tool execution + text tool-call parsing
+  L8847   Remote workspace (executor client, /connect)
+  L10547  Context meter
+  L10642  Agent (turn loop, context mgmt, tool dispatch)
+  L17604  Slash-command handlers + dispatch table
+  L17741  REPL (interactive loop, session resume)
+  L18173  Worker agent (headless --agent-run)
+  L18833  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -116,7 +116,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.10.54"
+__version__ = "0.10.55"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -124,6 +124,16 @@ __version__ = "0.10.54"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.10.55": [
+        "Windows remote fixes (tested live: all 16 checks pass on a real Windows box):",
+        "  - the run folder went to a stray C:\\tmp; it now uses the system temp dir",
+        "  - background tasks and the watchdog died when the ssh session dropped (sshd kills",
+        "    the session's job); they now break away from it where the box allows",
+        "  - dead processes read as alive (os.kill(pid, 0) isn't a probe on Windows), so",
+        "    nothing was reaped or adopted; liveness now asks the kernel",
+        "  - the watchdog's taskkill crashed with no console, so orphans survived; it now",
+        "    gets a hidden console and its result is checked",
+    ],
     "0.10.54": [
         "/compact <k>: compact to a chosen FINAL size, one time (e.g. /compact 100 = ~100k;",
         "  /compact to prompts). compact_at stays the trigger. If stubbing old tool results",
@@ -5918,15 +5928,7 @@ def _read_lock(name: str):
         return None
 
 def _pid_alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-        return True
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except OSError:
-        return False
+    return _proc_alive(pid)     # one liveness probe (Windows-correct; see _proc_alive)
 
 def _lock_is_live(name: str) -> bool:
     """True if some OTHER running instance currently holds this session.
@@ -6280,10 +6282,34 @@ def _bg_load(owner_dir=None):
     return recs
 
 
+def _win_proc_alive(pid):
+    """Windows liveness: os.kill(pid, 0) is NOT a probe there - it returns normally for
+    an EXITED pid (found live: every dead owner looked alive, so nothing was ever
+    reaped or adopted). Ask the kernel: open the process, read its exit code."""
+    import ctypes
+    k32 = ctypes.windll.kernel32
+    h = k32.OpenProcess(0x1000, False, int(pid))    # PROCESS_QUERY_LIMITED_INFORMATION
+    if not h:
+        return ctypes.GetLastError() == 5            # ACCESS_DENIED -> exists, not ours
+    try:
+        code = ctypes.c_ulong(0)
+        if not k32.GetExitCodeProcess(h, ctypes.byref(code)):
+            return True
+        return code.value == 259                     # STILL_ACTIVE
+    finally:
+        k32.CloseHandle(h)
+
+
 def _proc_alive(pid):
     # Zombie-aware: a killed/finished child we never waitpid()'d still has a pid that
     # os.kill(pid, 0) reports as alive, so check /proc state and treat 'Z' as dead.
-    # Falls back to signal-0 where /proc isn't available (non-Linux).
+    # Falls back to signal-0 where /proc isn't available (non-Linux). Windows has its
+    # own probe (signal-0 there reports dead pids alive).
+    if os.name == "nt":
+        try:
+            return _win_proc_alive(pid)
+        except (OSError, ValueError, TypeError, AttributeError):
+            return False
     try:
         with open(f"/proc/{int(pid)}/stat") as f:
             state = f.read().rpartition(")")[2].split()[0]
@@ -6309,10 +6335,33 @@ def _proc_alive(pid):
 def _detached_popen_kwargs():
     """Popen kwargs that put the child in its OWN session/process group, so a
     group kill takes the whole tree. POSIX: start_new_session (setsid), making
-    pgid == the child pid. Windows: CREATE_NEW_PROCESS_GROUP."""
+    pgid == the child pid. Windows: CREATE_NEW_PROCESS_GROUP, plus
+    CREATE_BREAKAWAY_FROM_JOB: Win32-OpenSSH runs each session in a kill-on-close job,
+    so without breakaway a "detached" child still dies with the executor (found live:
+    a dropped session's bg tasks and watchdog died instantly). Only if the job allows
+    breakaway - else Popen fails, so fall back to the plain group."""
     if os.name == "nt":
-        return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+        return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP
+                | (0x01000000 if _win_can_breakaway() else 0)}
     return {"start_new_session": True}
+
+
+_WIN_BREAKAWAY = None
+
+
+def _win_can_breakaway():
+    """Windows: can a child break away from the job this process is in? Probed once by
+    spawning a trivial child with the flag (a job that forbids breakaway -> OSError)."""
+    global _WIN_BREAKAWAY
+    if _WIN_BREAKAWAY is None:
+        try:
+            subprocess.run([sys.executable, "-c", "0"], stdin=subprocess.DEVNULL,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           creationflags=0x01000000, timeout=20)
+            _WIN_BREAKAWAY = True
+        except (OSError, subprocess.SubprocessError):
+            _WIN_BREAKAWAY = False
+    return _WIN_BREAKAWAY
 
 
 def _kill_tree(pid, sig=None):
@@ -6335,9 +6384,15 @@ def _kill_tree(pid, sig=None):
         pass
     if os.name == "nt":
         try:
-            subprocess.run(["taskkill", "/F", "/T", "/PID", str(int(pid))],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            return
+            # CREATE_NO_WINDOW: a detached caller (the watchdog, once its executor and
+            # ssh session are gone) has no console, and a console app it spawns then dies
+            # in init with 0xC0000142 - the kill silently never happened. Give taskkill
+            # its own hidden console. Nonzero rc = it didn't kill -> fall through.
+            r = subprocess.run(["taskkill", "/F", "/T", "/PID", str(int(pid))],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                               creationflags=0x08000000)
+            if r.returncode == 0:
+                return
         except (OSError, ValueError, TypeError):
             pass
     try:
@@ -9142,10 +9197,13 @@ def _runtime_dir() -> Path:
     ($PREFIX/tmp on Termux, where /tmp doesn't exist), then /tmp - so it works on
     Android/Termux and other non-FHS layouts, not just standard Linux. os.getuid is
     absent on some platforms (Windows), so the uid suffix is best-effort."""
-    uid = os.getuid() if hasattr(os, "getuid") else os.environ.get("USER", "user")
+    uid = (os.getuid() if hasattr(os, "getuid")
+           else os.environ.get("USER") or os.environ.get("USERNAME") or "user")
+    # Last resort is the platform temp dir, NOT a literal "/tmp": on Windows that resolves
+    # to C:\tmp - a stray top-level folder nothing else uses. (%TEMP% there; /tmp on POSIX.)
     base = (os.environ.get("XDG_RUNTIME_DIR")
             or os.environ.get("TMPDIR")
-            or "/tmp")
+            or tempfile.gettempdir())
     d = Path(base) / f"leancoder-{uid}" / "leancoder"
     d.mkdir(parents=True, exist_ok=True)
     try:
