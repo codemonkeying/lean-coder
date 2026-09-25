@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L1498   Lean-tools (plugin tools: discovery, manager)
-  L1848   MCP client (connection, manager, OAuth, discovery)
-  L2302   Providers (backend plugin registry)
-  L2524   Interactive pickers + menus (raw-mode UI engine)
-  L2873   Terminal styling (colors, formatting helpers)
-  L3109   Streaming + markdown render (model output)
-  L3583   Composer (pinned input line, editor, stdin)
-  L4465   Token accounting (calibrated context meter)
-  L4663   Config (dataclass, field registry, load/save)
-  L8377   Tool execution + text tool-call parsing
-  L8847   Remote workspace (executor client, /connect)
-  L10547  Context meter
-  L10642  Agent (turn loop, context mgmt, tool dispatch)
-  L17604  Slash-command handlers + dispatch table
-  L17741  REPL (interactive loop, session resume)
-  L18173  Worker agent (headless --agent-run)
-  L18833  Entry (CLI arg parsing, main)
+  L1505   Lean-tools (plugin tools: discovery, manager)
+  L1855   MCP client (connection, manager, OAuth, discovery)
+  L2309   Providers (backend plugin registry)
+  L2531   Interactive pickers + menus (raw-mode UI engine)
+  L2880   Terminal styling (colors, formatting helpers)
+  L3116   Streaming + markdown render (model output)
+  L3590   Composer (pinned input line, editor, stdin)
+  L4472   Token accounting (calibrated context meter)
+  L4670   Config (dataclass, field registry, load/save)
+  L8384   Tool execution + text tool-call parsing
+  L8857   Remote workspace (executor client, /connect)
+  L10567  Context meter
+  L10662  Agent (turn loop, context mgmt, tool dispatch)
+  L17624  Slash-command handlers + dispatch table
+  L17761  REPL (interactive loop, session resume)
+  L18193  Worker agent (headless --agent-run)
+  L18853  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -116,7 +116,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.10.55"
+__version__ = "0.10.56"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -124,6 +124,13 @@ __version__ = "0.10.55"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.10.56": [
+        "Windows remote: with no Python on the box, lean-coder's cached embedded Python is",
+        "  now reported as 'using cached python' instead of claiming a fresh push on every",
+        "  connect (and no longer re-measures it each time).",
+        "On a Windows host whose sshd won't let processes leave the session, connect now",
+        "  says so once: a connection DROP kills bg tasks there (exit always does, anywhere).",
+    ],
     "0.10.55": [
         "Windows remote fixes (tested live: all 16 checks pass on a real Windows box):",
         "  - the run folder went to a stray C:\\tmp; it now uses the system temp dir",
@@ -8790,7 +8797,10 @@ def run_tool_executor(cwd, lean_tools_dir=None):
     tools = Tools(cfg)
     lean_tools = LeanToolManager(lean_tools_dir) if lean_tools_dir else None  # enabled=None -> all
     _bg_adopt()   # reconnect: re-parent this-box bg tasks that survived the prior executor
-    _emit_json(proto, {"ready": True, "cwd": str(cfg.cwd)})
+    # detach=False: this Windows sshd's job forbids breakaway, so bg tasks can't
+    # outlive an ssh DROP here (the driver says so once; see _win_can_breakaway).
+    _emit_json(proto, {"ready": True, "cwd": str(cfg.cwd),
+                       "detach": os.name != "nt" or _win_can_breakaway()})
     for line in sys.stdin:
         line = line.strip()
         if not line:
@@ -9732,6 +9742,9 @@ class RemoteWorkspace:
                 stderr=subprocess.DEVNULL)
             self.client.host = self.host          # label the wait-spinner with the box
             self.remote_cwd = self.client.ready.get("cwd")
+        if self.client.ready.get("detach") is False:
+            print(yellow("  note: this host's sshd won't let bg tasks outlive the ssh "
+                         "session - a connection DROP kills them (exit does anyway)."))
 
     def read_raw(self, path):
         """Fetch exact remote file content for diff previews; None if unreadable.
@@ -10063,12 +10076,17 @@ class RemoteWorkspace:
         distro (all-stdlib, guarded lazy imports). `forced`=True means the caller CHOSE
         the embed runtime (--ephemeral), not that the box lacks Python - so the notice
         must not falsely claim 'no Python'."""
+        # Say "pushing" only when it really downloads - the zip is cached, so every
+        # later connect reuses it (the old notice claimed a push each time).
+        _, have, _ = self._run('Test-Path "$env:LOCALAPPDATA\\lc-runtime\\py-embed-amd64\\python.exe"')
+        verb = ("using cached python" if have.strip() == "True"
+                else "pushing python")
         if forced:
-            print(dim(f"  windows - ephemeral - pushing python {_WIN_EMBED_VER} "
-                      f"(one-time, cached)"))
+            print(dim(f"  windows - ephemeral - {verb} {_WIN_EMBED_VER}"))
         else:
-            print(dim(f"  windows - no python - pushing python {_WIN_EMBED_VER} "
-                      f"(one-time, cached); install python to skip this next time"))
+            print(dim(f"  windows - no python - {verb} {_WIN_EMBED_VER}"
+                      + ("" if verb.startswith("using") else " (one-time, cached)")
+                      + "; install python to skip this"))
         rc, out, err = self._run(_WIN_PROVISION_EMBED)
         out = (out or "").strip()
         if rc != 0 or not out or out.startswith("ERR:"):
@@ -10083,6 +10101,8 @@ class RemoteWorkspace:
         if not (ver.strip() and "\\" in ver):
             print(yellow("  provisioned python.exe did not run; falling back to error."))
             return None
+        if verb.startswith("using"):
+            return quoted              # already reported; no re-measure on every connect
         # Report the ACTUAL on-disk footprint (no hardcoded transfer size): measure the
         # provisioned dir. Best-effort - a failure just drops the size, never blocks.
         size = ""
