@@ -78,26 +78,23 @@ def _raise_sse_error(err):
     raise RuntimeError(msg)
 
 
-def _note_empty_response(content, tool_calls, stop_reason):
-    """Surface an empty assistant turn so it can't be mistaken for a dropped
-    connection. Anthropic returns a NORMAL 200 stream (no error frame) when it
-    declines - a message_delta carrying stop_reason 'refusal' and zero text_deltas -
-    so content ends up "" with no exception. Print a one-line reason instead of
-    silent nothing. No-op when there's real content or a tool call."""
+def _note_empty_response(content, tool_calls, stop_reason, retries=0):
+    """Tell the OPERATOR an empty assistant turn happened, once the silent retries are
+    spent. Anthropic answers a decline (and some congested/glitched sends) with a NORMAL
+    200 stream: no error frame, zero text, maybe stop_reason 'refusal' - so content is ""
+    with no exception. Never claims a cause: the stop_reason is a fact, not a verdict.
+    Operator-only: the model is never told (a model shown its own 'refusal' tends to
+    keep refusing for the rest of the session, even when the empty reply was a blip)."""
     if content or tool_calls:
         return
     yellow = _lc.get("yellow") or _lc.get("dim") or (lambda s: s)
     dim    = _lc.get("dim") or (lambda s: s)
     warn   = (_lc.get("GLYPH") or {}).get("warn", "!")
-    if stop_reason == "refusal":
-        print(yellow(f"  {warn} the model REFUSED this request (stop_reason: refusal) - "
-                     f"no content returned.")
-              + dim("  switch backend with /model (a local ollama model has no content policy)."))
-    else:
-        sr = f" (stop_reason: {stop_reason})" if stop_reason else ""
-        print(yellow(f"  {warn} the model returned an EMPTY response{sr} - not a dropped "
-                     f"connection.")
-              + dim("  retry, or /model to switch backend."))
+    sr = f"stop_reason: {stop_reason}" if stop_reason else "no stop_reason"
+    after = f" after {retries} retries" if retries else ""
+    print(yellow(f"  {warn} the model returned no reply{after} ({sr}) - possibly a refusal, "
+                 f"API congestion, or a network glitch.")
+          + dim("  retry, /rewind, or /model to switch backend."))
 
 
 def _interruptible_sleep(secs, should_abort):
@@ -426,6 +423,8 @@ class _ApiKeyClient:
     def __init__(self, cfg):
         self.cfg              = cfg
         self.last_out_tokens  = None
+        self.last_stop_reason = None   # stop_reason of the last reply (never sent to the model)
+        self.last_empty_retries = 0    # silent re-sends spent on an empty reply this call
         self._last_rl         = {}   # anthropic-ratelimit-* response headers  # sweep-ok
         self.last_cache_read  = 0    # cache_read_input_tokens from last turn
         self.last_cache_write = 0    # cache_creation_input_tokens from last turn
@@ -541,8 +540,7 @@ class _ApiKeyClient:
         if output_eval:
             self.last_out_tokens = output_eval
         content   = "".join(content_parts)
-        if not aborted:
-            _note_empty_response(content, tool_calls, stop_reason)
+        self.last_stop_reason = stop_reason   # read by the empty-reply retry (never sent to the model)
         assistant = {"role": "assistant", "content": content}
         if tool_calls:
             assistant["tool_calls"] = tool_calls
@@ -613,6 +611,32 @@ class _ApiKeyClient:
                 raise RuntimeError(
                     f"request failed: {str(getattr(e, 'reason', None) or e) or type(e).__name__}"
                 ) from None
+
+    def _send_retrying_empty(self, key, payload, should_abort):
+        """_send, plus: an EMPTY reply (no text, no tool call, not aborted) is a normal
+        200 with no exception, yet as likely a transient glitch as a real decline - so
+        re-send the same request with the same backoff + budget as a transient error.
+        History is untouched; the model never learns of it. The operator is told only
+        once the retries are spent (see _note_empty_response)."""
+        attempt = 0
+        self.last_empty_retries = 0
+        while True:
+            out = self._send(key, payload, should_abort)
+            _a, _pe, _ab = out
+            if (not _ab and not (_a or {}).get("content") and not (_a or {}).get("tool_calls")
+                    and attempt < _MAX_RETRIES):
+                wait = _backoff(attempt)
+                attempt += 1
+                self.last_empty_retries = attempt
+                print((_lc.get("red") or str)(f"[!] {payload.get('model', '')} returned no reply - "
+                                 f"retry {attempt}/{_MAX_RETRIES} in {wait:.0f}s"))
+                if not _interruptible_sleep(wait, should_abort):
+                    raise RuntimeError("aborted during retry wait") from None
+                continue
+            if not _ab:
+                _note_empty_response((_a or {}).get("content"), (_a or {}).get("tool_calls"),
+                                     getattr(self, "last_stop_reason", None), attempt)
+            return out
 
     def _on_error(self, key, payload, should_abort):
         """429 handler: report the rate limit + retry-after and raise. We do NOT
@@ -706,7 +730,7 @@ class _ApiKeyClient:
             payload["output_config"] = {"effort": self.cfg.setting("effort") or "low"}
 
         try:
-            result = self._send(key, payload, should_abort)
+            result = self._send_retrying_empty(key, payload, should_abort)
         except RuntimeError as e:
             if "429" in str(e):
                 result = self._on_error(key, payload, should_abort)
