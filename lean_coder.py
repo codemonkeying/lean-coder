@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L1540   Lean-tools (plugin tools: discovery, manager)
-  L1890   MCP client (connection, manager, OAuth, discovery)
-  L2344   Providers (backend plugin registry)
-  L2566   Interactive pickers + menus (raw-mode UI engine)
-  L2915   Terminal styling (colors, formatting helpers)
-  L3151   Streaming + markdown render (model output)
-  L3625   Composer (pinned input line, editor, stdin)
-  L4507   Token accounting (calibrated context meter)
-  L4705   Config (dataclass, field registry, load/save)
-  L8419   Tool execution + text tool-call parsing
-  L8892   Remote workspace (executor client, /connect)
-  L10626  Context meter
-  L10721  Agent (turn loop, context mgmt, tool dispatch)
-  L17694  Slash-command handlers + dispatch table
-  L17831  REPL (interactive loop, session resume)
-  L18263  Worker agent (headless --agent-run)
-  L18942  Entry (CLI arg parsing, main)
+  L1551   Lean-tools (plugin tools: discovery, manager)
+  L1901   MCP client (connection, manager, OAuth, discovery)
+  L2355   Providers (backend plugin registry)
+  L2577   Interactive pickers + menus (raw-mode UI engine)
+  L2926   Terminal styling (colors, formatting helpers)
+  L3162   Streaming + markdown render (model output)
+  L3636   Composer (pinned input line, editor, stdin)
+  L4518   Token accounting (calibrated context meter)
+  L4716   Config (dataclass, field registry, load/save)
+  L8468   Tool execution + text tool-call parsing
+  L8941   Remote workspace (executor client, /connect)
+  L11116  Context meter
+  L11211  Agent (turn loop, context mgmt, tool dispatch)
+  L18188  Slash-command handlers + dispatch table
+  L18325  REPL (interactive loop, session resume)
+  L18757  Worker agent (headless --agent-run)
+  L19436  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -116,7 +116,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.10.60"
+__version__ = "0.10.61"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -124,6 +124,17 @@ __version__ = "0.10.60"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.10.61": [
+        "/push and /pull: copy your own providers, lean-tools, prompts and provider logins",
+        "  to/from another box's ~/.config/leancoder. Menu-driven: pick the kinds first, then",
+        "  one short screen per kind (a login sits under its provider). A hash check skips",
+        "  files that are already the same; private (gitignored) files are locked unless",
+        "  --force; bundled plugins are never offered. After a copy it offers to enable what",
+        "  landed. `/push <file> [host]` skips the menus.",
+        "  Windows targets go through WSL (lean-coder runs on Windows only under WSL): the",
+        "  distro is found automatically, with a picker when there are several.",
+        "--enable provider:<name> / tool:<name>: enable a plugin in the config and exit.",
+    ],
     "0.10.60": [
         "Empty model replies (Anthropic): a reply with no text and no tool call - a",
         "  decline, API congestion, or a glitch - is now retried silently with the same",
@@ -5596,6 +5607,44 @@ class _DefaultsView:
         return getattr(cfg, name)
 
 
+def _cli_enable(specs) -> int:
+    """`--enable provider:<name>` / `--enable tool:<name>`: add names to the saved enabled
+    lists and exit. Config-only (no setup() run, no provider activation) - that happens
+    on the next start, exactly as when the user enables from a menu and restarts. Refuses
+    a name with no matching plugin file, so a typo can't enable a ghost."""
+    class _NoArgs(argparse.Namespace):        # load_config reads many flags: all unset
+        def __getattr__(self, _k):
+            return None
+    cfg = load_config(_NoArgs())
+    have = {"provider": {Path(f).stem for d in _provider_dirs(cfg) if Path(d).is_dir()
+                         for f in Path(d).glob("*.py")},
+            "tool": {Path(f).stem for d in _lean_tools_dirs(cfg) if Path(d).is_dir()
+                     for f in Path(d).glob("*.py")}}
+    rc, changed = 0, []
+    for spec in specs:
+        kind, _, name = str(spec).partition(":")
+        kind = {"providers": "provider", "lean-tool": "tool", "tools": "tool"}.get(kind, kind)
+        if kind not in have or not name:
+            print(f"--enable: expected provider:<name> or tool:<name>, got {spec!r}")
+            rc = 2
+            continue
+        if name not in have[kind]:
+            print(f"--enable: no {kind} named {name!r} on this box")
+            rc = 2
+            continue
+        attr = "providers_enabled" if kind == "provider" else "lean_tools_enabled"
+        cur = list(getattr(cfg, attr) or [])
+        if name in cur:
+            print(f"{kind} {name}: already enabled")
+            continue
+        setattr(cfg, attr, sorted(set(cur) | {name}))
+        changed.append(f"{kind} {name}")
+    if changed:
+        save_config(cfg, quiet=True)
+        print("enabled: " + ", ".join(changed))
+    return rc
+
+
 def save_config(cfg: Config, quiet: bool = False):
     cfg = _DefaultsView(cfg)          # persisted scalars read from _defaults, not live
     CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -10303,6 +10352,447 @@ class RemoteWorkspace:
 
 
 # ----------------------------------------------------------------------------
+# /push + /pull: copy YOUR config files (user providers, user lean-tools, prompts,
+# provider logins) to/from another box's ~/.config/leancoder. Menu-driven: pick the
+# kinds first, then one short screen per kind. Rides a plain ssh master (no executor),
+# reusing RemoteWorkspace's file helpers. Bundled plugins are never offered: the
+# code dir wins on load, so a pushed copy in ~/.config would be shadowed anyway.
+# ----------------------------------------------------------------------------
+
+SYNC_KINDS = ("providers", "lean-tools", "prompts")
+
+
+def _sync_is_private(path):
+    """A file git would NOT publish (the lean-coder checkout's .gitignore) - e.g. a
+    private provider. Such files are locked in the menus unless --force."""
+    try:
+        here = Path(__file__).resolve().parent
+        r = subprocess.run(["git", "-C", str(here), "check-ignore", "-q", str(path)],
+                           capture_output=True, timeout=5)
+        return r.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def _sync_local_items(cfg):
+    """{kind: [item]} of what THIS box can push. item = dict(kind, name, rel, path,
+    private, parent). rel is the path under the config dir (the SAME on the other box),
+    so push and pull share one layout. Provider logins (auth*.json) are listed under the
+    anthropic_plan provider they belong to (parent=that provider)."""
+    out = {k: [] for k in SYNC_KINDS}
+    bundled = {"providers": _bundled_dir("providers"), "lean-tools": _bundled_dir("lean-tools")}
+    seen = set()
+    for kind, dirs in (("providers", _provider_dirs(cfg)), ("lean-tools", _lean_tools_dirs(cfg))):
+        for d in dirs:
+            d = Path(d)
+            if not d.is_dir():
+                continue
+            for f in sorted(d.glob("*.py")):
+                if f.stem in seen or f.name == "builtins.py":
+                    continue
+                is_bundled = bundled[kind] is not None and d.resolve() == bundled[kind].resolve()
+                priv = _sync_is_private(f) if is_bundled else False
+                if is_bundled and not priv:
+                    continue        # ships with lean-coder: the other box already has it
+                seen.add(f.stem)
+                out[kind].append({"kind": kind, "name": f.stem, "path": f, "private": priv,
+                                  "rel": f"{kind}/{f.name}", "parent": None})
+    for f in sorted(CONFIG_DIR.glob("auth*.json")):
+        label = f.stem[len("auth"):].lstrip("-_") or "default"
+        email = ""
+        try:
+            email = (json.loads(f.read_text()).get("account") or {}).get("email_address") or ""
+        except (OSError, ValueError):
+            pass
+        out["providers"].append({"kind": "providers", "name": f"login: {label}", "path": f,
+                                 "private": False, "rel": f.name, "parent": "anthropic_plan",
+                                 "detail": email, "secret": True})
+    for f in sorted(PROMPTS_DIR.glob("*.txt")):
+        out["prompts"].append({"kind": "prompts", "name": f.stem, "path": f, "private": False,
+                               "rel": f"prompts/{f.name}", "parent": None})
+    for f in sorted(SYSTEM_PROMPTS_DIR.glob("*.txt")):
+        out["prompts"].append({"kind": "prompts", "name": f"{f.stem} (built-in override)",
+                               "path": f, "private": False,
+                               "rel": f"prompts/system/{f.name}", "parent": None})
+    return {k: v for k, v in out.items() if v}
+
+
+class _SyncHost(RemoteWorkspace):
+    """A RemoteWorkspace used ONLY for its ssh master + file helpers (no executor):
+    open the master, probe the OS, and resolve the other box's config dir."""
+
+    def open(self):
+        print(dim(f"connecting to {self.host} ..."))
+        _clear_master(self.host, self.ctl)
+        rc = subprocess.run(_ssh_master_argv(self.host, self.ctl),
+                            env=_refresh_gpg_agent_tty()).returncode
+        if rc != 0:
+            _clear_master(self.host, self.ctl)
+            raise ConnectionError(f"can't reach {self.host}")
+        _, uname, _ = self._run(_OS_PROBE)
+        self.remote_posix = _remote_is_posix(uname)
+        self.wsl = None
+        if not self.remote_posix:
+            # lean-coder runs on Windows only under WSL, so the files a Windows box USES
+            # live in a WSL distro's Linux home - never the Windows home. Go through it.
+            self.wsl = self._pick_wsl()
+            if not self.wsl:
+                self.close_master()
+                raise ConnectionError(
+                    f"no WSL on {self.host} - lean-coder runs on Windows only under WSL, "
+                    f"so there is nothing to {getattr(self, 'verb', 'sync')} there")
+            self.remote_posix = True          # from here on every command runs in WSL (sh)
+        _, d, _ = self._run('printf %s "$HOME/.config/leancoder"')
+        self.cfg_dir = d.strip()
+        if not self.cfg_dir:
+            self.close_master()
+            raise ConnectionError(f"{self.host}: could not resolve its config dir")
+        return self
+
+    def _pick_wsl(self):
+        """The WSL distro to use on a Windows box: the only one, or a picker when there
+        are several. None = no WSL. `wsl.exe -l -q` prints UTF-16 - strip the NULs."""
+        r = subprocess.run(_ssh_run_argv(self.host, self.ctl, "wsl.exe -l -q"),
+                           capture_output=True, timeout=30)
+        text = r.stdout.decode("utf-8", "replace").replace("\x00", "")
+        names = [l.strip() for l in text.splitlines()
+                 if l.strip() and "not installed" not in text and r.returncode == 0]
+        names = [n for n in names if not n.lower().startswith(("docker-desktop",))]
+        if not names:
+            return None
+        if len(names) == 1:
+            print(dim(f"  {self.host}: using WSL distro {names[0]}"))
+            return names[0]
+        return pick_one(f"{self.host} has several WSL distros - which one runs lean-coder?",
+                        names)
+
+    def _run(self, remote_cmd, tty=False):
+        """Over WSL, every command runs in the chosen distro's sh (wsl.exe -d D -e sh -c);
+        base64 so no Windows shell quoting touches it. Otherwise the normal path."""
+        if getattr(self, "wsl", None):
+            enc = base64.b64encode(remote_cmd.encode()).decode()
+            # sh -l: a login shell, so the user's PATH (~/.local/bin, where install.sh
+            # puts lean_coder) is set - a plain sh has only the system PATH.
+            remote_cmd = (f'wsl.exe -d {self.wsl} -e sh -lc '
+                          f'"echo {enc} | base64 -d | sh -l"')
+            r = subprocess.run(_ssh_run_argv(self.host, self.ctl, remote_cmd),
+                               capture_output=True, text=True, timeout=120)
+            return r.returncode, r.stdout, r.stderr
+        return RemoteWorkspace._run(self, remote_cmd, tty=tty)
+
+    def _remote_write(self, remote_path, data):
+        """Over WSL: Windows sshd deadlocks on data piped to a command, so scp the bytes
+        to Windows %TEMP% first, then copy them into the distro with wslpath (which also
+        handles a non-default /mnt/c mount) and remove the temp."""
+        if not getattr(self, "wsl", None):
+            return RemoteWorkspace._remote_write(self, remote_path, data)
+        import tempfile
+        r = subprocess.run(_ssh_run_argv(self.host, self.ctl,
+                                         _win_ps('[Console]::Out.Write($env:TEMP)')),
+                           capture_output=True, text=True, timeout=30)
+        wtemp = "".join(l for l in r.stdout.splitlines()
+                        if not l.startswith(("#< CLIXML", "<Objs"))).strip()
+        name = f"lc_sync_{os.getpid()}_{hashlib.sha256(data).hexdigest()[:10]}"
+        wfile = wtemp + "\\" + name
+        tf = tempfile.NamedTemporaryFile(prefix="lc_sync_", delete=False)
+        try:
+            tf.write(data); tf.close()
+            r = subprocess.run(_scp_argv(self.host, self.ctl, tf.name, wfile.replace("\\", "/")),
+                               capture_output=True, text=True, timeout=120)
+            if r.returncode != 0:
+                raise ConnectionError(f"scp to {self.host} failed: {(r.stderr or '')[:200]}")
+        finally:
+            try:
+                os.unlink(tf.name)
+            except OSError:
+                pass
+        rc, _, err = self._run(f'src=$(wslpath -u {shlex.quote(wfile)}) && '
+                               f'cp "$src" {shlex.quote(remote_path)} && rm -f "$src"')
+        if rc != 0:
+            raise ConnectionError(f"copy into WSL on {self.host} failed: {(err or '')[:200]}")
+
+    def close_master(self):
+        try:
+            subprocess.run(["ssh", "-o", f"ControlPath={self.ctl}", "-O", "exit", self.host],
+                           capture_output=True, timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+    def rpath(self, rel):
+        sep = self._remote_sep()
+        return self.cfg_dir + sep + rel.replace("/", sep)
+
+    def remote_items(self):
+        """{kind: [item]} of what the OTHER box has, same shape as _sync_local_items
+        (path = the remote path). One listing command: name + sha256 per file."""
+        if self.remote_posix:
+            q = shlex.quote(self.cfg_dir)
+            cmd = (f'cd {q} 2>/dev/null || exit 0; for f in providers/*.py lean-tools/*.py '
+                   f'prompts/*.txt prompts/system/*.txt auth*.json; do [ -f "$f" ] && '
+                   f'sha256sum "$f"; done; true')
+            _, out, _ = self._run(cmd)
+            rows = [l.split(None, 1) for l in out.splitlines() if len(l.split(None, 1)) == 2]
+            rows = [(h, r.strip()) for h, r in rows]
+        else:
+            cmd = (f'$b="{self.cfg_dir}"; if (Test-Path $b) {{ foreach ($g in @("providers\\*.py",'
+                   f'"lean-tools\\*.py","prompts\\*.txt","prompts\\system\\*.txt","auth*.json")) '
+                   f'{{ Get-ChildItem -Path (Join-Path $b $g) -EA SilentlyContinue | % {{ '
+                   f'(Get-FileHash -Algorithm SHA256 $_.FullName).Hash.ToLower() + " " + '
+                   f'$_.FullName.Substring($b.Length + 1).Replace("\\","/") }} }} }}')
+            _, out, _ = self._run(cmd)
+            rows = [tuple(l.split(None, 1)) for l in out.splitlines() if len(l.split(None, 1)) == 2]
+        out_d = {k: [] for k in SYNC_KINDS}
+        self.remote_hashes = {}
+        for h, rel in rows:
+            self.remote_hashes[rel] = h
+            name = rel.rsplit("/", 1)[-1]
+            if rel.startswith("providers/"):
+                out_d["providers"].append({"kind": "providers", "name": name[:-3], "rel": rel,
+                                           "path": self.rpath(rel), "private": False, "parent": None})
+            elif rel.startswith("lean-tools/"):
+                out_d["lean-tools"].append({"kind": "lean-tools", "name": name[:-3], "rel": rel,
+                                            "path": self.rpath(rel), "private": False, "parent": None})
+            elif rel.startswith("prompts/system/"):
+                out_d["prompts"].append({"kind": "prompts", "name": f"{name[:-4]} (built-in override)",
+                                         "rel": rel, "path": self.rpath(rel), "private": False,
+                                         "parent": None})
+            elif rel.startswith("prompts/"):
+                out_d["prompts"].append({"kind": "prompts", "name": name[:-4], "rel": rel,
+                                         "path": self.rpath(rel), "private": False, "parent": None})
+            elif rel.startswith("auth"):
+                label = name[len("auth"):-len(".json")].lstrip("-_") or "default"
+                out_d["providers"].append({"kind": "providers", "name": f"login: {label}",
+                                           "rel": rel, "path": self.rpath(rel), "private": False,
+                                           "parent": "anthropic_plan", "secret": True})
+        return {k: v for k, v in out_d.items() if v}
+
+    def read_bytes(self, rel):
+        """Byte-exact read of a remote config file (base64 over ssh: works on both OSes)."""
+        if self.remote_posix:
+            rc, out, _ = self._run(f"base64 < {shlex.quote(self.rpath(rel))}")
+            r = subprocess.CompletedProcess([], rc, out, "")
+        else:
+            r = subprocess.run(_ssh_run_argv(self.host, self.ctl, _win_ps(
+                f'[Convert]::ToBase64String([IO.File]::ReadAllBytes("{self.rpath(rel)}"))')),
+                capture_output=True, text=True, timeout=60)
+        if r.returncode != 0:
+            raise ConnectionError(f"read {rel} from {self.host} failed")
+        return base64.b64decode("".join(l for l in r.stdout.splitlines()
+                                        if not l.startswith(("#< CLIXML", "<Objs"))))
+
+    def write_bytes(self, rel, data, secret=False):
+        """Write a config file on the other box: mkdir its dir, write, verify the hash,
+        and chmod 600 a secret (a login)."""
+        sep = self._remote_sep()
+        target = self.rpath(rel)
+        self._remote_mkdir(target.rsplit(sep, 1)[0])
+        self._remote_write(target, data)
+        if self._remote_sha256(target) != hashlib.sha256(data).hexdigest():
+            raise ConnectionError(f"write {rel} to {self.host}: hash mismatch after copy")
+        if secret and self.remote_posix:
+            self._run(f"chmod 600 {shlex.quote(target)}")
+
+
+def _sync_status(src_hash, dst_hash):
+    return "same" if src_hash and src_hash == dst_hash else ("differs" if dst_hash else "new")
+
+
+def _sync_pick(items_by_kind, verb, host, force=False, preselect=None):
+    """The menus: kinds first (skipped when only one kind exists), then one short screen
+    per chosen kind. Returns the chosen items, or None if cancelled. Private files are
+    shown but locked unless force."""
+    kinds = [k for k in SYNC_KINDS if k in items_by_kind]
+    if not kinds:
+        print(dim(f"nothing to {verb}."))
+        return None
+    if preselect:
+        kinds = [k for k in kinds if k in preselect] or kinds
+    if len(kinds) > 1:
+        counts = {k: len(items_by_kind[k]) for k in kinds}
+        chosen_kinds = multiselect_menu(
+            f"{verb} {'to' if verb == 'push' else 'from'} {host} - step 1: which kinds? "
+            f"(you pick the files next)", kinds,
+            is_on=lambda k: bool(preselect and k in preselect),
+            desc=lambda k: f"{counts[k]} file{'s' if counts[k] != 1 else ''}")
+        if chosen_kinds is None:
+            return None
+        kinds = [k for k in kinds if k in chosen_kinds]
+        if not kinds:
+            print(dim("nothing selected."))
+            return None
+    picked = []
+    total = len(kinds) + (1 if len(items_by_kind) > 1 else 0)
+    # A login row sits right under the provider it belongs to (a login IS that
+    # provider's data, not a kind of its own).
+    for kind in kinds:
+        rows = items_by_kind[kind]
+        heads = [r for r in rows if not r.get("parent")]
+        order = []
+        for h in heads:
+            order.append(h)
+            order += [r for r in rows if r.get("parent") == h["name"]]
+        order += [r for r in rows if r.get("parent") and r not in order]
+        items_by_kind[kind] = order
+    for n, kind in enumerate(kinds, 1):
+        rows = items_by_kind[kind]
+        label = {id(r): ("    " if r.get("parent") else "") + r["name"] for r in rows}
+        keys = [label[id(r)] for r in rows]
+        by_key = dict(zip(keys, rows))
+
+        def _desc(key, _by=by_key):
+            r = _by[key]
+            bits = [r.get("detail") or ""]
+            if r.get("private") and not force:
+                bits.append(f"(private) locked - /{verb} --force")
+            elif r.get("private"):
+                bits.append("(private)")
+            if r.get("status"):
+                bits.append(r["status"])
+            return "  ".join(b for b in bits if b)
+        pre = preselect.get(kind) if isinstance(preselect, dict) else None
+        sel = multiselect_menu(
+            f"{verb} - step {n + total - len(kinds)} of {total}: {kind}  "
+            f"(space toggles, a = all, enter = next)", keys,
+            is_on=lambda k, _p=pre, _by=by_key: bool(_p and _p(_by[k])), desc=_desc)
+        if sel is None:
+            return None
+        for k in keys:
+            if k in sel:
+                r = by_key[k]
+                if r.get("private") and not force:
+                    print(yellow(f"  skipped {r['name']}: private - use /{verb} --force"))
+                    continue
+                picked.append(r)
+    return picked
+
+
+def handle_sync_command(agent, cfg, arg, verb, preselect=None):
+    """/push and /pull. `/push` = menus; `/push <file> [host]` = one file, no menus;
+    `--force` unlocks private (gitignored) files."""
+    parts = (arg or "").split()
+    force = "--force" in parts
+    parts = [p for p in parts if p != "--force"]
+    one = parts[0] if parts and not ("@" in parts[0] and len(parts) == 1) else None
+    host = (parts[1] if one and len(parts) > 1 else (parts[0] if parts and not one else None))
+    if not host and agent.remote is not None:
+        host = agent.remote.host
+    if not host:
+        host = pick_connect_menu(cfg.connect_hosts, list(agent.remotes),
+                                 used=getattr(cfg, "connect_used", None))
+        if not host:
+            return
+    sh = _SyncHost(host, ".")
+    sh.verb = verb
+    try:
+        sh.open()
+    except ConnectionError as e:
+        print(red(str(e)))
+        return
+    try:
+        _sync_run(sh, cfg, verb, one, force, preselect)
+    finally:
+        sh.close_master()
+
+
+def _sync_run(sh, cfg, verb, one, force, preselect):
+    local = _sync_local_items(cfg)
+    remote = sh.remote_items()
+    loc_hash = {}
+    for rows in local.values():
+        for r in rows:
+            try:
+                loc_hash[r["rel"]] = hashlib.sha256(Path(r["path"]).read_bytes()).hexdigest()
+            except OSError:
+                pass
+    src, dst_hash = (local, sh.remote_hashes) if verb == "push" else (remote, loc_hash)
+    for rows in src.values():
+        for r in rows:
+            h = loc_hash.get(r["rel"]) if verb == "push" else sh.remote_hashes.get(r["rel"])
+            r["status"] = _sync_status(h, dst_hash.get(r["rel"]))
+    if one:
+        want = one.rsplit("/", 1)[-1]
+        picked = [r for rows in src.values() for r in rows
+                  if r["rel"].rsplit("/", 1)[-1] in (want, f"{want}.py", f"{want}.txt", f"{want}.json")
+                  or r["name"] == want]
+        if not picked:
+            print(yellow(f"{verb}: no file matching {one!r} " +
+                         ("here" if verb == "push" else f"on {sh.host}")))
+            return
+        if any(r.get("private") for r in picked) and not force:
+            print(yellow(f"{verb}: {picked[0]['name']} is private (gitignored) - add --force"))
+            return
+    else:
+        picked = _sync_pick(src, verb, sh.host, force=force, preselect=preselect)
+        if not picked:
+            return
+    todo = [r for r in picked if r["status"] != "same"]
+    where = sh.host if verb == "push" else "this box"
+    for r in picked:
+        dest = (sh.rpath(r["rel"]) if verb == "push" else str(CONFIG_DIR / r["rel"]))
+        print(f"  {r['name']:<28} -> {dest}  {dim(r['status'] + (' (skip)' if r['status'] == 'same' else ''))}")
+    if not todo:
+        print(dim("everything selected is already the same - nothing to copy."))
+        return
+    if not _ask(f"{verb} {len(todo)} file{'s' if len(todo) != 1 else ''} to {where}?"):
+        return
+    done = []
+    for r in todo:
+        try:
+            if verb == "push":
+                sh.write_bytes(r["rel"], Path(r["path"]).read_bytes(), secret=r.get("secret"))
+            else:
+                data = sh.read_bytes(r["rel"])
+                dest = CONFIG_DIR / r["rel"]
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                _atomic_write_text(dest, data.decode("utf-8", "surrogateescape")) \
+                    if not r.get("secret") else dest.write_bytes(data)
+                if r.get("secret"):
+                    os.chmod(dest, 0o600)
+            done.append(r)
+            print(green(f"  {GLYPH.get('ok', 'v')} {r['name']}"))
+        except (OSError, ConnectionError) as e:
+            print(red(f"  x {r['name']}: {e}"))
+    _sync_offer_enable(sh, cfg, verb, done)
+
+
+def _sync_offer_enable(sh, cfg, verb, done):
+    """After a copy, offer to enable each provider/lean-tool that landed (prompts need
+    nothing). Pull -> this box's config; push -> `lean-coder --enable` over ssh when the
+    other box has lean-coder, else a hint."""
+    plugs = [(("provider" if r["kind"] == "providers" else "tool"), r["name"])
+             for r in done if r["kind"] in ("providers", "lean-tools") and not r.get("parent")]
+    if not plugs:
+        return
+    if verb == "pull":
+        want = [(k, n) for k, n in plugs if _ask(f"enable {k} {n} here?")]
+        if want:
+            _cli_enable([f"{k}:{n}" for k, n in want])
+            print(dim("  takes effect on the next start (or /reload for lean-tools)."))
+        return
+    lc_cmd = None
+    for cand in ("lean-coder", "lean_coder"):
+        rc, out, _ = sh._run(f"command -v {cand}" if sh.remote_posix
+                             else f"(Get-Command {cand} -EA SilentlyContinue).Source")
+        if rc == 0 and out.strip():
+            lc_cmd = cand
+            break
+    for kind, name in plugs:
+        if not lc_cmd:
+            print(dim(f"  {sh.host} has no lean-coder on PATH - enable {name} there with "
+                      f"{'/provider enable ' + name if kind == 'provider' else '/tools'}"))
+            continue
+        if _ask(f"enable {kind} {name} on {sh.host}?"):
+            rc, out, err = sh._run(f"{lc_cmd} --enable {kind}:{name}")
+            if "unrecognized arguments: --enable" in (err or "") + (out or ""):
+                # An older lean-coder over there: say so plainly, not argparse's usage dump.
+                print(yellow(f"  {sh.host}'s lean-coder is too old for --enable - update it "
+                             f"there, or enable {name} with "
+                             f"{'/provider enable ' + name if kind == 'provider' else '/tools'}"))
+                continue
+            print(dim(f"  {(out or err).strip().splitlines()[-1] if (out or err).strip() else ('done' if rc == 0 else f'exit {rc}')}"))
+
+
+# ----------------------------------------------------------------------------
 # Direct mode: the operator runs a command in a real terminal (so sudo prompts
 # work live, never entering context). Reached two ways: the model's
 # ask_user_to_run handoff, or the user's /sh command. The command is shown with
@@ -13700,7 +14190,7 @@ def _render_tool_call(entry: dict, cap: int = EXPAND_MAX_CHARS) -> str:
 # ----------------------------------------------------------------------------
 
 SLASH_COMMANDS = ["/clear", "/new", "/rewind", "/trim", "/compact", "/compact_at", "/session", "/save", "/load",
-                  "/prompt", "/sh", "/connect", "/machines", "/local", "/disconnect", "/tools", "/reload",
+                  "/prompt", "/sh", "/connect", "/machines", "/local", "/disconnect", "/tools", "/push", "/pull", "/reload",
                   "/model", "/models", "/provider", "/providers", "/think", "/effort",
                   "/set", "/usage", "/approve", "/leash", "/autosave", "/incognito",
                   "/askread", "/bg", "/background", "/note", "/plan", "/board", "/mcp", "/info", "/activity", "/expand",
@@ -13918,6 +14408,8 @@ HELP_COMMANDS = [
     ("/machines", "manage saved remote hosts (list; remove <name>)"),
     ("/local [host]", "detach the active remote"),
     ("/tools", "enable/disable lean-tools"),
+    ("/push [file] [host]", "copy your providers/lean-tools/prompts/logins TO another box (menus)"),
+    ("/pull [file] [host]", "copy them FROM another box (menus)"),
     ("/mcp", "manage MCP servers (list/add/remove/reconnect; no arg = enable/disable menu)"),
     ("/reload", "reload lean-tools"),
     ("/model [name]", "switch model (no arg = list)"),
@@ -17627,6 +18119,8 @@ _BUILTIN_COMMANDS_TABLE = {
     "/connect": handle_connect_command,
     "/machines": handle_machines_command,
     "/tools": handle_tools_command,
+    "/push": lambda a, c, arg: handle_sync_command(a, c, arg, "push"),
+    "/pull": lambda a, c, arg: handle_sync_command(a, c, arg, "pull"),
     "/mcp": handle_mcp_command,
     "/reload": handle_reload_command,
     "/local": handle_local_command, "/disconnect": handle_local_command,
@@ -19008,6 +19502,10 @@ def main():
     ap.add_argument("--remote-ctl", dest="remote_ctl",
                     help="(agent-run) ControlPath of the parent's ssh master to reuse; "
                          "internal")
+    ap.add_argument("--enable", action="append", default=[], metavar="KIND:NAME",
+                    help="enable a provider or lean-tool in the config and exit "
+                         "(provider:<name> | tool:<name>; repeatable). /push runs this on the "
+                         "other box after copying a file there.")
     ap.add_argument("--version", action="store_true",
                     help="print this build's source hash and exit "
                          "(used by /connect to skip a redundant re-push)")
@@ -19021,6 +19519,8 @@ def main():
             sys.exit(run_bg_child(json.loads(args.bg_run)) or 0)
         except Exception:
             sys.exit(1)
+    if args.enable:                    # headless config edit (e.g. run by /push over ssh)
+        sys.exit(_cli_enable(args.enable))
     if args.wipe_watch:                # detached self-wipe watchdog for a pushed executor
         try:
             run_wipe_watchdog(json.loads(args.wipe_watch))
