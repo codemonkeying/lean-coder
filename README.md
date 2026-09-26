@@ -89,7 +89,8 @@ have their own deps (e.g. `web_screenshot` needs Playwright) and say so when ena
 
 **Updating:** re-run the installer, or `git pull && ./install.sh`. With the `update`
 lean-tool enabled, `/update` pulls a newer `lean_coder.py` (`update_track` = `stable` or
-`beta`; `auto_update = true` checks at launch).
+`beta`; `auto_update = true` checks at launch). From a shell (or over ssh),
+`lean_coder --update [check|force]` does the same and exits; it doesn't need the tool enabled.
 
 ## Quick start
 
