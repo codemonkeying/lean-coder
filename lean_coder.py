@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L1551   Lean-tools (plugin tools: discovery, manager)
-  L1901   MCP client (connection, manager, OAuth, discovery)
-  L2355   Providers (backend plugin registry)
-  L2577   Interactive pickers + menus (raw-mode UI engine)
-  L2926   Terminal styling (colors, formatting helpers)
-  L3162   Streaming + markdown render (model output)
-  L3636   Composer (pinned input line, editor, stdin)
-  L4518   Token accounting (calibrated context meter)
-  L4716   Config (dataclass, field registry, load/save)
-  L8468   Tool execution + text tool-call parsing
-  L8941   Remote workspace (executor client, /connect)
-  L11116  Context meter
-  L11211  Agent (turn loop, context mgmt, tool dispatch)
-  L18188  Slash-command handlers + dispatch table
-  L18325  REPL (interactive loop, session resume)
-  L18757  Worker agent (headless --agent-run)
-  L19436  Entry (CLI arg parsing, main)
+  L1561   Lean-tools (plugin tools: discovery, manager)
+  L1911   MCP client (connection, manager, OAuth, discovery)
+  L2365   Providers (backend plugin registry)
+  L2587   Interactive pickers + menus (raw-mode UI engine)
+  L2936   Terminal styling (colors, formatting helpers)
+  L3172   Streaming + markdown render (model output)
+  L3646   Composer (pinned input line, editor, stdin)
+  L4528   Token accounting (calibrated context meter)
+  L4726   Config (dataclass, field registry, load/save)
+  L8510   Tool execution + text tool-call parsing
+  L8983   Remote workspace (executor client, /connect)
+  L11158  Context meter
+  L11253  Agent (turn loop, context mgmt, tool dispatch)
+  L18254  Slash-command handlers + dispatch table
+  L18391  REPL (interactive loop, session resume)
+  L18823  Worker agent (headless --agent-run)
+  L19502  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -116,7 +116,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.10.61"
+__version__ = "0.10.62"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -124,6 +124,16 @@ __version__ = "0.10.61"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.10.62": [
+        "--update [check|force]: self-update from a shell or over ssh and exit - the same",
+        "  code as /update (validate-all, overlay, import check + rollback). Works without",
+        "  the update lean-tool enabled.",
+        "The process is named 'lc:<session>' (Linux), so a terminal tab that shows the",
+        "  running program (Konsole's default) reads your session name instead of python3.",
+        "  It follows /load, /rename and /save.",
+        "On /load, a switch of where tools run (back to local, or reconnecting to the",
+        "  session's remote) is now shown in yellow and names the host.",
+    ],
     "0.10.61": [
         "/push and /pull: copy your own providers, lean-tools, prompts and provider logins",
         "  to/from another box's ~/.config/leancoder. Menu-driven: pick the kinds first, then",
@@ -5643,6 +5653,38 @@ def _cli_enable(specs) -> int:
         save_config(cfg, quiet=True)
         print("enabled: " + ", ".join(changed))
     return rc
+
+
+def _cli_update(mode) -> int:
+    """`--update [check|force]`: run the bundled /update headless and exit - same code
+    path as the slash command (probe, download, validate-all, overlay, import smoke +
+    rollback). The flag itself is the consent, so the overlay prompt auto-answers yes.
+    Works whether or not the 'update' lean-tool is enabled; auto_update is forced off
+    here so setup() doesn't run a second update."""
+    path = Path(__file__).resolve().parent / "lean-tools" / "update.py"
+    if not path.is_file():
+        print(f"--update: {path} not found (reinstall lean-coder)")
+        return 2
+
+    class _NoArgs(argparse.Namespace):
+        def __getattr__(self, _k):
+            return None
+    cfg = load_config(_NoArgs())
+    cfg.auto_update = False
+    got = {}
+    lc = dict(globals())
+    lc["register_command"] = lambda name, fn, *a, **k: got.setdefault(name, fn)
+    lc["_ask"] = lambda q: True
+    try:
+        _load_lean_tool(path).setup(lc, cfg)
+    except Exception as e:
+        print(f"--update: could not load the updater: {e}")
+        return 1
+    if "/update" not in got:
+        print("--update: the updater registered no /update command")
+        return 1
+    got["/update"](None, cfg, mode or "")
+    return 0
 
 
 def save_config(cfg: Config, quiet: bool = False):
@@ -11211,7 +11253,31 @@ class ContextMeter:
 # SECTION: Agent (turn loop, context mgmt, tool dispatch)
 # ==========================================================================
 
+def _set_proc_title(name):
+    """Name the process 'lc:<session>' so a terminal tab that shows the running process
+    (Konsole's default %n, top/ps) reads the session, not 'python3'. Linux-only, 15 chars
+    (the kernel's comm limit). Writes the MAIN thread's comm by path so it works from any
+    thread. Best-effort: no /proc (macOS, Windows) = silently skipped."""
+    pid = os.getpid()
+    try:
+        with open(f"/proc/{pid}/task/{pid}/comm", "w") as f:
+            f.write(f"lc:{name}"[:15])
+    except OSError:
+        pass
+
+
 class Agent:
+    # Every session-name change (launch, /load, /rename, /save as, stolen-session re-roll)
+    # goes through this one attribute, so the process title follows it for free.
+    @property
+    def autosave_name(self):
+        return self._autosave_name
+
+    @autosave_name.setter
+    def autosave_name(self, name):
+        self._autosave_name = name
+        _set_proc_title(name)
+
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self.ctx = ContextMeter(self)        # read-only ctx measurement + compaction policy
@@ -15907,19 +15973,19 @@ def _maybe_reconnect(agent, cfg, meta):
         return                                 # already where the session ran
     if not host:                               # session was local, we're on a remote
         if cfg.auto_reconnect:
-            print(dim(f"  detaching from {cur} - this session ran local "
-                      f"(auto_reconnect on)…"))
+            print(yellow(f"  detaching from {cur} - this session ran local "
+                         f"(auto_reconnect on)…"))
             agent.set_remote(None)             # keep it open in the pool
         elif _ask(f"this session ran local but you're on remote {cur} - "
                   f"return to local?"):
             agent.set_remote(None)
-            print(dim(f"  tools run locally again ({cur} still open - "
-                      f"/connect {cur} to switch back)."))
+            print(yellow(f"  tools now run LOCALLY on {_HOSTNAME} ({cur} still open - "
+                         f"/connect {cur} to switch back)."))
         else:
             print(dim(f"  staying on {cur} - /local to return to local."))
         return
     if cfg.auto_reconnect:
-        print(dim(f"  reconnecting to remote {host} (auto_reconnect on)…"))
+        print(yellow(f"  reconnecting to remote {host} (auto_reconnect on)…"))
         try:
             _do_connect(agent, cfg, host)
         except Exception as e:
@@ -19506,6 +19572,10 @@ def main():
                     help="enable a provider or lean-tool in the config and exit "
                          "(provider:<name> | tool:<name>; repeatable). /push runs this on the "
                          "other box after copying a file there.")
+    ap.add_argument("--update", nargs="?", const="", choices=("", "check", "force"),
+                    metavar="check|force",
+                    help="self-update to the latest published build and exit (same as "
+                         "/update; 'check' = report only, 'force' = re-pull anyway)")
     ap.add_argument("--version", action="store_true",
                     help="print this build's source hash and exit "
                          "(used by /connect to skip a redundant re-push)")
@@ -19521,6 +19591,8 @@ def main():
             sys.exit(1)
     if args.enable:                    # headless config edit (e.g. run by /push over ssh)
         sys.exit(_cli_enable(args.enable))
+    if args.update is not None:        # headless self-update (same path as /update)
+        sys.exit(_cli_update(args.update))
     if args.wipe_watch:                # detached self-wipe watchdog for a pushed executor
         try:
             run_wipe_watchdog(json.loads(args.wipe_watch))
