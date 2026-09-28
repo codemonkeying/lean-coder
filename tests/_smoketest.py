@@ -73,7 +73,7 @@ def check(name, cond, extra=""):
 _tbl = set(lc._BUILTIN_COMMANDS_TABLE)
 _slash = set(lc.SLASH_COMMANDS)
 _help = set(c.split()[0] for c, _ in lc.HELP_COMMANDS)
-_aliases = {"/exit", "/q", "/h", "/?", "/models", "/providers", "/disconnect", "/background"}
+_aliases = {"/exit", "/q", "/h", "/?", "/models", "/providers", "/disconnect", "/background", "/compactat"}
 check("every SLASH_COMMAND is dispatchable", not (_slash - _tbl - set(lc._lean_tool_commands)))
 check("every HELP command is dispatchable", not (_help - _tbl))
 check("every canonical command is in HELP",

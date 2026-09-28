@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L1584   Lean-tools (plugin tools: discovery, manager)
-  L1938   MCP client (connection, manager, OAuth, discovery)
-  L2392   Providers (backend plugin registry)
-  L2614   Interactive pickers + menus (raw-mode UI engine)
-  L2963   Terminal styling (colors, formatting helpers)
-  L3199   Streaming + markdown render (model output)
-  L3673   Composer (pinned input line, editor, stdin)
-  L4555   Token accounting (calibrated context meter)
-  L4753   Config (dataclass, field registry, load/save)
-  L8555   Tool execution + text tool-call parsing
-  L9028   Remote workspace (executor client, /connect)
-  L11203  Context meter
-  L11298  Agent (turn loop, context mgmt, tool dispatch)
-  L18299  Slash-command handlers + dispatch table
-  L18436  REPL (interactive loop, session resume)
-  L18868  Worker agent (headless --agent-run)
-  L19547  Entry (CLI arg parsing, main)
+  L1589   Lean-tools (plugin tools: discovery, manager)
+  L1943   MCP client (connection, manager, OAuth, discovery)
+  L2397   Providers (backend plugin registry)
+  L2619   Interactive pickers + menus (raw-mode UI engine)
+  L2968   Terminal styling (colors, formatting helpers)
+  L3204   Streaming + markdown render (model output)
+  L3678   Composer (pinned input line, editor, stdin)
+  L4560   Token accounting (calibrated context meter)
+  L4758   Config (dataclass, field registry, load/save)
+  L8560   Tool execution + text tool-call parsing
+  L9033   Remote workspace (executor client, /connect)
+  L11208  Context meter
+  L11303  Agent (turn loop, context mgmt, tool dispatch)
+  L18311  Slash-command handlers + dispatch table
+  L18448  REPL (interactive loop, session resume)
+  L18880  Worker agent (headless --agent-run)
+  L19559  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -116,7 +116,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.10.63"
+__version__ = "0.10.64"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -124,6 +124,11 @@ __version__ = "0.10.63"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.10.64": [
+        "/compactat is an alias for /compact_at.",
+        "/set keys no longer need their underscores: /set compactat 0.3 = /set compact_at",
+        "  0.3 (case-insensitive; only an exact, unambiguous match counts).",
+    ],
     "0.10.63": [
         "fix: a read-only worker granted web tools (tools=[brave_search, web_fetch, ...] at",
         "  leash r) silently got NO web tools - they only rode at rwe - while dispatch",
@@ -14300,7 +14305,7 @@ def _render_tool_call(entry: dict, cap: int = EXPAND_MAX_CHARS) -> str:
 # REPL
 # ----------------------------------------------------------------------------
 
-SLASH_COMMANDS = ["/clear", "/new", "/rewind", "/trim", "/compact", "/compact_at", "/session", "/save", "/load",
+SLASH_COMMANDS = ["/clear", "/new", "/rewind", "/trim", "/compact", "/compact_at", "/compactat", "/session", "/save", "/load",
                   "/prompt", "/sh", "/connect", "/machines", "/local", "/disconnect", "/tools", "/push", "/pull", "/reload",
                   "/model", "/models", "/provider", "/providers", "/think", "/effort",
                   "/set", "/usage", "/approve", "/leash", "/autosave", "/incognito",
@@ -14903,6 +14908,13 @@ def handle_settings_command(agent, cfg, arg):
             to_config = True
             arg = arg.split(maxsplit=1)[1] if len(arg.split(maxsplit=1)) > 1 else ""
         parts = arg.split(maxsplit=1)
+        if parts and parts[0] not in _SETTINGS_BY_KEY:
+            # Underscores optional: `/set compactat 0.3` = `/set compact_at 0.3` (one
+            # generic rule, so every key gets it; only an exact unique match counts).
+            _hit = [k for k in _SETTINGS_BY_KEY
+                    if k.replace("_", "") == parts[0].replace("_", "").lower()]
+            if len(_hit) == 1:
+                parts[0] = _hit[0]
         if to_config and len(parts) == 1 and parts[0] in _SETTINGS_BY_KEY:
             # `/set --config key` (no value): drop the session override so the live cfg
             # reverts to the config.toml default for that key.
@@ -18238,7 +18250,7 @@ _BUILTIN_COMMANDS_TABLE = {
     "/trim": handle_trim_command,
     "/rewind": handle_rewind_command,
     "/compact": handle_compact_command,
-    "/compact_at": handle_compact_at_command,
+    "/compact_at": handle_compact_at_command, "/compactat": handle_compact_at_command,
     "/session": handle_session_command,
     "/save": handle_save_command,
     "/load": handle_load_command,
