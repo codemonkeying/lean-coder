@@ -114,6 +114,9 @@ TOOL = {
     # apt-install pip + playwright + a browser (~hundreds of MB) onto the user's
     # server just to screenshot a URL - which it can reach over the network anyway.
     "driver_only": True,
+    # tier read: it only reads (the web), so it rides at /leash r - a read-only worker can
+    # research. Still not "safe": each call keeps its egress confirmation (approval=ask).
+    "tier": "read",
     "no_timeout": True,   # headless browser launch + JS render is long-by-design (has its own TIMEOUT)
 }
 

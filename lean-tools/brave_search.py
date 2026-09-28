@@ -39,6 +39,9 @@ TOOL = {
     # in the driver's ~/.config/leancoder/brave.key, and search traffic should egress
     # from the driver, never from the target box. Never pushed to the remote executor.
     "driver_only": True,
+    # tier read: it only reads (the web), so it rides at /leash r - a read-only worker can
+    # research. Still not "safe": each call keeps its egress confirmation (approval=ask).
+    "tier": "read",
 }
 
 BRAVE_URL = "https://api.search.brave.com/res/v1/web/search"

@@ -45,6 +45,9 @@ TOOL = {
     # per-dispatch on the driver only) is present, so the read is context-sized correctly
     # instead of falling back to full MAX_TEXT on a remote executor. Never pushed remote.
     "driver_only": True,
+    # tier read: it only reads (the web), so it rides at /leash r - a read-only worker can
+    # research. Still not "safe": each call keeps its egress confirmation (approval=ask).
+    "tier": "read",
 }
 
 MAX_BYTES = 400_000     # raw bytes read

@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L1561   Lean-tools (plugin tools: discovery, manager)
-  L1911   MCP client (connection, manager, OAuth, discovery)
-  L2365   Providers (backend plugin registry)
-  L2587   Interactive pickers + menus (raw-mode UI engine)
-  L2936   Terminal styling (colors, formatting helpers)
-  L3172   Streaming + markdown render (model output)
-  L3646   Composer (pinned input line, editor, stdin)
-  L4528   Token accounting (calibrated context meter)
-  L4726   Config (dataclass, field registry, load/save)
-  L8510   Tool execution + text tool-call parsing
-  L8983   Remote workspace (executor client, /connect)
-  L11158  Context meter
-  L11253  Agent (turn loop, context mgmt, tool dispatch)
-  L18254  Slash-command handlers + dispatch table
-  L18391  REPL (interactive loop, session resume)
-  L18823  Worker agent (headless --agent-run)
-  L19502  Entry (CLI arg parsing, main)
+  L1584   Lean-tools (plugin tools: discovery, manager)
+  L1938   MCP client (connection, manager, OAuth, discovery)
+  L2392   Providers (backend plugin registry)
+  L2614   Interactive pickers + menus (raw-mode UI engine)
+  L2963   Terminal styling (colors, formatting helpers)
+  L3199   Streaming + markdown render (model output)
+  L3673   Composer (pinned input line, editor, stdin)
+  L4555   Token accounting (calibrated context meter)
+  L4753   Config (dataclass, field registry, load/save)
+  L8555   Tool execution + text tool-call parsing
+  L9028   Remote workspace (executor client, /connect)
+  L11203  Context meter
+  L11298  Agent (turn loop, context mgmt, tool dispatch)
+  L18299  Slash-command handlers + dispatch table
+  L18436  REPL (interactive loop, session resume)
+  L18868  Worker agent (headless --agent-run)
+  L19547  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -116,7 +116,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.10.62"
+__version__ = "0.10.63"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -124,6 +124,15 @@ __version__ = "0.10.62"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.10.63": [
+        "fix: a read-only worker granted web tools (tools=[brave_search, web_fetch, ...] at",
+        "  leash r) silently got NO web tools - they only rode at rwe - while dispatch",
+        "  reported them as granted. Lean-tools can now declare a leash \"tier\"",
+        "  (read|write|exec); brave_search, web_fetch and web_screenshot are tier read, so",
+        "  they work at leash r. They still confirm each call under approval=ask.",
+        "dispatch_worker now refuses a named tool the worker's leash would drop, naming",
+        "  the leash it needs, instead of reporting it granted.",
+    ],
     "0.10.62": [
         "--update [check|force]: self-update from a shell or over ssh and exit - the same",
         "  code as /update (validate-all, overlay, import check + rollback). Works without",
@@ -1449,8 +1458,8 @@ def active_tools(cfg, remote=False, lean_tool_schemas=(), model_tools=True,
     # lean-tool that reuses a builtin name (e.g. todo.py's `update_plan`, which is
     # already a core tool) is silently dropped from the surface here.
     seen = {t["function"]["name"] for t in tools}
-    for sch, is_safe in lean_tool_schemas:
-        if not (is_safe or allow_exec):      # non-safe lean-tools may write/run -> rwe only
+    for sch, is_safe in lean_tool_schemas:   # is_safe: the lean-tool's tier (or safe flag)
+        if not _leash_allows_tool(leash, "", lean_safe=is_safe):
             continue
         nm = sch.get("function", {}).get("name")
         if not _named(nm):                   # narrowed out by the per-worker allowlist
@@ -1462,11 +1471,24 @@ def active_tools(cfg, remote=False, lean_tool_schemas=(), model_tools=True,
     return tools
 
 
+def _lean_tier(lean_safe):
+    """A lean-tool's LEASH tier from what the registry carries: its declared "tier"
+    string, or (no tier declared) its `safe` flag - safe = read, else exec. The tier only
+    decides which /leash a lean-tool rides at; confirmation and parallel reads still key
+    off `safe` alone (a tier:"read" web tool rides at r but still confirms)."""
+    if lean_safe in ("read", "write", "exec"):
+        return lean_safe
+    return "read" if lean_safe else "exec"
+
+
+_TIER_LEASH = {"read": "r", "write": "rw", "exec": "rwe"}
+
+
 def _min_leash_for(name, lean_safe=None):
-    """The lowest /leash level that permits `name`. `lean_safe`: a lean-tool's `safe`
-    flag, or None for a core tool. Used to tell the model exactly how to get unblocked."""
+    """The lowest /leash level that permits `name`. `lean_safe`: a lean-tool's tier (or
+    its `safe` flag), or None for a core tool. Used to tell the model how to get unblocked."""
     if lean_safe is not None:
-        return "r" if lean_safe else "rwe"
+        return _TIER_LEASH[_lean_tier(lean_safe)]
     if name in _WRITE_TIER:
         return "rw"
     if name in _EXEC_TIER or name == ASK_USER_TOOL["function"]["name"]:
@@ -1488,8 +1510,9 @@ def _leash_allows_tool(leash, name, lean_safe=None):
         return False                         # no tools at all
     allow_write = leash in ("rw", "rwe")
     allow_exec = leash == "rwe"
-    if lean_safe is not None:                # a lean-tool: safe -> r+, else rwe only
-        return bool(lean_safe) or allow_exec
+    if lean_safe is not None:                # a lean-tool: by its tier (read r+, write rw+, exec rwe)
+        t = _lean_tier(lean_safe)
+        return t == "read" or (t == "write" and allow_write) or allow_exec
     if name in _WRITE_TIER:
         return allow_write
     if name in _EXEC_TIER or name == ASK_USER_TOOL["function"]["name"]:
@@ -1624,6 +1647,10 @@ class LeanToolManager:
                         "parameters": spec.get("parameters",
                                                {"type": "object", "properties": {}})}}
                     entry["run"], entry["safe"] = run, bool(spec.get("safe"))
+                    # tier: optional "read"|"write"|"exec" - the LEASH tier only (see
+                    # _lean_tier). Absent = derived from safe, exactly as before.
+                    entry["tier"] = (spec.get("tier") if spec.get("tier") in ("read", "write", "exec")
+                                     else _lean_tier(entry["safe"]))
                     # driver_only: a model-facing tool that must run on the DRIVER even
                     # when the session is connected to a remote (it acts on the local
                     # machine / spawns a local process - e.g. dispatch_worker, whose
@@ -1677,9 +1704,9 @@ class LeanToolManager:
         return dim("(startup hook, no tool)")
 
     def schemas(self):
-        """(schema, is_safe) for each enabled tool lean-tool. The safe flag tiers it
-        for the /leash ceiling (safe = read-only -> rides at r+; else rwe only)."""
-        return [(p["schema"], bool(p.get("safe"))) for n, p in self.lean_tools.items()
+        """(schema, tier) for each enabled tool lean-tool. The tier sets which /leash it
+        rides at (read r+, write rw+, exec rwe); see _lean_tier."""
+        return [(p["schema"], p.get("tier") or _lean_tier(p.get("safe"))) for n, p in self.lean_tools.items()
                 if self._is_on(n) and "schema" in p]
 
     def enabled_paths(self):
@@ -7172,6 +7199,24 @@ def active_remote():
             "cwd": ws.remote_cwd or ws.cwd}
 
 
+def tool_min_leash(name):
+    """The lowest /leash that lets a worker actually USE tool `name` (core, lean-tool or
+    MCP), or None when unknown. dispatch_worker checks a named per-worker allowlist
+    against the worker's leash with this, so a tool the leash would silently filter out
+    is refused at dispatch instead of reported as granted."""
+    if name in ("update_plan", "note", "request_compact"):
+        return "r"
+    ag = _active_agent
+    plug = ag.lean_tools.get(name) if ag is not None else None
+    if plug:
+        return _min_leash_for(name, plug.get("tier") or plug.get("safe"))
+    if name.startswith(MCP_NS):
+        return "rwe"
+    if name in _TIERS or name == ASK_USER_TOOL["function"]["name"]:
+        return _min_leash_for(name)
+    return None
+
+
 def active_tool_names():
     """The set of tool names the parent session currently exposes to the model (core
     + lean-tools + MCP, at the live leash). dispatch_worker uses this to VALIDATE a
@@ -11552,7 +11597,7 @@ class Agent:
         # The model gets an instructive result; the operator sees the block.
         # MCP tools carry no lean-tool plug; they ride the rwe tier (may have side
         # effects), so pass lean_safe=False for them - matching the surface filter.
-        _leash_safe = (safe if plug else (False if is_mcp else None))
+        _leash_safe = ((plug.get("tier") or safe) if plug else (False if is_mcp else None))
         if not _leash_allows_tool(self.cfg.leash, name, lean_safe=_leash_safe):
             print(red(f"\n{GLYPH['warn']} blocked {name}: above the '{self.cfg.leash}' leash "
                       f"(not run; raise with /leash {_min_leash_for(name, _leash_safe)})"))
