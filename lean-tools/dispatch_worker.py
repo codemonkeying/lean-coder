@@ -542,6 +542,18 @@ def run(args, cwd):
                     return (f"error: tool(s) not available to you: {', '.join(bad)}. "
                             f"You can only grant tools you have. Available: "
                             f"{', '.join(sorted(parent_tools))}.")
+            # A named tool the worker's LEASH would filter out must fail here, not be
+            # reported as granted and then vanish from the worker's surface.
+            _need = _H.get("tool_min_leash")
+            if _need:
+                _lv = _H["LEASH_LEVELS"]
+                short = [(t, _need(t)) for t in want_tools]
+                short = [(t, n) for t, n in short if n and _lv.index(n) > _lv.index(leash)]
+                if short:
+                    return (f"error: at leash '{leash}' the worker can't use "
+                            + ", ".join(f"{t} (needs '{n}')" for t, n in short)
+                            + ". Dispatch with a higher leash; tools=[...] still limits it to "
+                              "exactly the tools you list.")
             tools_csv = ",".join(want_tools)
 
     # Optional named task-board (Phase 2b): assign this worker to a task DAG board by NAME.
@@ -1769,7 +1781,7 @@ def setup(lc, cfg):
               "BRIEF_MARK", "GRANT_MARK", "RESULT_MARK", "RESUME_MARK", "LEASH_LEVELS", "_norm_leash",
               "SEED_CONTEXT_MARK", "SEED_PLAN_MARK", "SEED_NOTES_MARK",
               "active_remote", "_ssh_master_alive", "ensure_worker_master",
-              "active_tool_names", "resolve_host", "_norm_host",
+              "active_tool_names", "tool_min_leash", "resolve_host", "_norm_host",
               "_board_claim", "_board_release", "_board_read_claims",
               "save_session", "load_envelope",
               "dim", "bold", "green", "cyan"):
