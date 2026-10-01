@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L1589   Lean-tools (plugin tools: discovery, manager)
-  L1943   MCP client (connection, manager, OAuth, discovery)
-  L2397   Providers (backend plugin registry)
-  L2619   Interactive pickers + menus (raw-mode UI engine)
-  L2968   Terminal styling (colors, formatting helpers)
-  L3204   Streaming + markdown render (model output)
-  L3678   Composer (pinned input line, editor, stdin)
-  L4560   Token accounting (calibrated context meter)
-  L4758   Config (dataclass, field registry, load/save)
-  L8560   Tool execution + text tool-call parsing
-  L9033   Remote workspace (executor client, /connect)
-  L11208  Context meter
-  L11303  Agent (turn loop, context mgmt, tool dispatch)
-  L18311  Slash-command handlers + dispatch table
-  L18448  REPL (interactive loop, session resume)
-  L18880  Worker agent (headless --agent-run)
-  L19559  Entry (CLI arg parsing, main)
+  L1606   Lean-tools (plugin tools: discovery, manager)
+  L1960   MCP client (connection, manager, OAuth, discovery)
+  L2414   Providers (backend plugin registry)
+  L2636   Interactive pickers + menus (raw-mode UI engine)
+  L2985   Terminal styling (colors, formatting helpers)
+  L3221   Streaming + markdown render (model output)
+  L3695   Composer (pinned input line, editor, stdin)
+  L4577   Token accounting (calibrated context meter)
+  L4775   Config (dataclass, field registry, load/save)
+  L8568   Tool execution + text tool-call parsing
+  L9041   Remote workspace (executor client, /connect)
+  L11216  Context meter
+  L11311  Agent (turn loop, context mgmt, tool dispatch)
+  L18410  Slash-command handlers + dispatch table
+  L18547  REPL (interactive loop, session resume)
+  L19003  Worker agent (headless --agent-run)
+  L19682  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -116,7 +116,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.10.64"
+__version__ = "0.10.65"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -124,6 +124,21 @@ __version__ = "0.10.64"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.10.65": [
+        "fix: a compaction run by a slash command (/load then /compact) was never saved -",
+        "  only typed turns autosaved - and closing the terminal (SIGHUP) skipped the exit",
+        "  save, so the compaction was lost. Any slash command that changes the history now",
+        "  autosaves, and SIGHUP exits cleanly (save, release lock, close remotes).",
+        "Compaction now lands ON keep_cap (default 25k) as the TOTAL size: system prompt +",
+        "  tools + summary + recent turns. The tail fills right up to it: conversation first,",
+        "  as many turns as fit (compact_keep is gone - no fixed turn count), measured after",
+        "  tool-result stubbing; then full tool results come back newest first within",
+        "  compact_tool_frac (default 0.2) of the tail. No gaps: an oversized turn is trimmed.",
+        "The compaction notice is one line with a size breakdown (summary / recent turns /",
+        "  tools / system / results cut); /expand N shows it all plus the /set knobs.",
+        "A 403 permission_error (org/account not allowed, e.g. a paused subscription) now",
+        "  says so in one line instead of offering a login that can't fix it.",
+    ],
     "0.10.64": [
         "/compactat is an alias for /compact_at.",
         "/set keys no longer need their underscores: /set compactat 0.3 = /set compact_at",
@@ -943,10 +958,12 @@ COMPACT_EMERGENCY_KEEP = 1         # hardcoded backstop: on context OVERFLOW we 
 # Context-aware compaction keep (soft/hard/manual). After the summary is written we
 # know EXACTLY how big it is, so we compute how much verbatim recent thread can be kept
 # WITHOUT re-filling the window (that would defeat compaction + cost a fresh cache write).
-# keep_budget = min(headroom * frac, keep_cap); NO floor - if the summary itself already
+# keep_budget = min(headroom * frac, keep_cap - system - tools - summary); NO floor - if the summary itself already
 # eats the window (small local models), headroom<=0 and we keep NOTHING (summary only).
 COMPACT_TARGET_MIN_HEADROOM = 4000   # /compact <k>: min room (tokens) above system+tools for a summary
 KEEP_FRAC_LO = 0.2                 # fraction of headroom kept when there's lots of room (>threshold)
+COMPACT_TOOL_FRAC = 0.2            # share of the post-compaction tail budget that may go to FULL
+                                   # tool results (newest first); the rest of the tail is conversation
 KEEP_FRAC_HI = 0.5                 # fraction kept when headroom is small (keep a bigger share of little)
 KEEP_FRAC_THRESHOLD = 50_000       # headroom (tokens) above which we switch HI->LO so big windows don't hoard
 SELFPROMPT_MARK = "===NEXT==="      # the model wraps its post-compaction self-prompt in these
@@ -4938,21 +4955,12 @@ class Config:
                                      # /compact), auto-run the model's self-prompt as the
                                      # next turn so work continues (a 5s ^C-to-cancel beat
                                      # precedes it; off = park at the prompt)
-    # keep_last: verbatim recent TURNS kept after the summary, PER compaction mode.
-    # Each mode trades differently (design decision 4): emergency keeps the break as
-    # low/cheap as possible under overflow pressure; soft/manual preserve enough recent
-    # thread for a voluntary compaction; hard is the middle ground when tight. A "turn"
-    # = a user message + the assistant/tool run that answers it; the tail always starts
-    # on a clean user boundary so a tool_result is never orphaned from its tool_call.
-    compact_keep: int = 15           # CEILING on verbatim TURNS kept after a compaction (soft/
-                                     # hard/manual). Not a target: the real bound is a TOKEN budget
-                                     # (keep_cap + a fraction of post-summary headroom) so the kept
-                                     # tail never re-fills the window. Emergency overflow uses a
-                                     # hardcoded backstop (COMPACT_EMERGENCY_KEEP), ignoring the budget.
-    keep_cap: int = 25000            # absolute ceiling (TOKENS) on the verbatim tail kept after a
-                                     # compaction. The budget is min(headroom*frac, keep_cap): this
-                                     # cap stops a huge (1M) window from hoarding 100k+ of raw tail
-                                     # when the summary already carries the gist. NOT compact_-prefixed
+    compact_tool_frac: float = COMPACT_TOOL_FRAC   # share of the kept tail that may be FULL
+                                     # tool results (newest first); the rest is conversation.
+    keep_cap: int = 25000            # TOTAL size (TOKENS) a compaction lands on: system prompt +
+                                     # tool schemas + summary + the verbatim tail, which fills what's
+                                     # left (measured after tool-result stubbing). Also bounded by
+                                     # headroom*frac so small windows never refill to the trigger. NOT compact_-prefixed
                                      # so /compact<TAB> stays clean; tune via /set keep_cap.
     compact_overrides: dict = field(default_factory=dict)  # per-model override of the
                                      # compaction settings (models fill context at different
@@ -5300,8 +5308,8 @@ _SCALAR_FIELDS = (
     ("compact_emergency",         1.00,                False),
     ("compact_min_interval",      60.0,                False),
     ("autostart_after_compact",   True,                False),
-    ("compact_keep",              15,                  False),
     ("keep_cap",                  25000,               False),
+    ("compact_tool_frac",         COMPACT_TOOL_FRAC,   False),
     ("auto_trim_interval",        0,                   False),
     ("auto_trim_hysteresis",      0.25,                False),
     ("auto_trim_keep",            TRIM_KEEP,           False),
@@ -12455,46 +12463,76 @@ class Agent:
         if target:
             return headroom                 # fill to the chosen size
         frac = KEEP_FRAC_LO if headroom > KEEP_FRAC_THRESHOLD else KEEP_FRAC_HI
-        return max(0, min(int(headroom * frac), int(getattr(self.cfg, "keep_cap", 25000))))
+        # keep_cap is the TOTAL post-compaction size (system + tools + summary + tail),
+        # so the tail gets what's left after the fixed parts; the frac share of the
+        # compact_at headroom still bounds it on small windows (never refill to the trigger).
+        total_room = int(getattr(self.cfg, "keep_cap", 25000)) - fixed - summary_tok
+        return max(0, min(int(headroom * frac), total_room))
 
     def _keep_tail_by_budget(self, pre, summary_text):
-        """The verbatim tail kept after a compaction, bounded by a TOKEN budget (not a
-        fixed turn count). Walk turns newest->oldest, at most compact_keep of them (a
-        CEILING): a turn that fits whole is kept; one that's too big is trimmed to fit
-        (drop oldest tool_call/result pairs, then stub tool bodies - see _trim_turn_to_budget)
-        and kept if a coherent remnant fits, else dropped. Stops when the budget is spent.
-        Returns the tail message list (possibly []). Never re-fills the window: the budget
-        is a fraction of post-summary headroom, hard-capped by keep_cap."""
+        """The verbatim tail kept after a compaction, filled RIGHT UP TO the token budget
+        (keep_cap - system - tools - summary; see _keep_budget). One adaptive pass:
+          1. every tool body is sized STUBBED; walk turns newest->oldest keeping each that
+             fits - no turn-count ceiling, so many small turns or a few big ones;
+          2. the first turn that won't fit whole is trimmed to the space left
+             (_trim_turn_to_budget) and the walk STOPS - no gaps in the kept thread;
+          3. the leftover goes to restoring full tool results, newest first, capped at
+             COMPACT_TOOL_FRAC of the budget - conversation carries most of the context,
+             so one giant dump can never eat the whole tail.
+        Returns the FINAL tail (already stubbed; _finish_compact leaves it as is)."""
         budget = self._keep_budget(summary_text)
         if budget <= 0:
             return []
-        # A one-off target must land ON k: _finish_compact stubs every kept tool body
-        # afterwards, so size the tail in that FINAL (stubbed) form - otherwise a 100k
-        # budget spent on full tool dumps shrinks to ~60k once they're stubbed.
-        if getattr(self, "_compact_target", None):
-            pre = _stub_tool_msgs(pre)
-        turns = self._split_into_turns(pre)
+        turns = self._split_into_turns(_stub_tool_msgs(pre, 0))
+        orig = self._split_into_turns(pre)
         if not turns:
             return []
-        remaining = budget
-        kept = []
-        # compact_keep caps the turn COUNT for a normal compaction; a one-off target sizes
-        # by tokens alone (the operator asked for "this big"), so every turn is a candidate.
-        pool = (turns if getattr(self, "_compact_target", None)
-                else turns[-int(self.cfg.compact_keep):] if self.cfg.compact_keep > 0 else [])
-        for turn in reversed(pool):
-            cost = messages_tokens(turn, None)
-            if cost <= remaining:
-                kept = turn + kept
-                remaining -= cost
-            else:
-                trimmed = self._trim_turn_to_budget(turn, remaining)
+        kept, kept_orig = [], []
+        pairs = list(zip(reversed(turns), reversed(orig)))
+        pos = 0
+
+        def walk(room, trim):
+            # Keep whole (stubbed) turns newest->oldest while they fit; the first that
+            # won't is trimmed to the space left and the walk ends (no gaps). -> room left
+            nonlocal kept, kept_orig, pos
+            while pos < len(pairs):
+                turn, oturn = pairs[pos]
+                cost = messages_tokens(turn, None)
+                if cost <= room:
+                    kept, kept_orig = turn + kept, oturn + kept_orig
+                    room -= cost
+                    pos += 1
+                    continue
+                if not trim:
+                    return room                     # pass 1: stop, older turns come later
+                trimmed = self._trim_turn_to_budget(turn, room)
                 if trimmed:
                     kept = trimmed + kept
-                    remaining -= messages_tokens(trimmed, None)
-                # else: this (older) turn won't fit coherently - drop it, keep newer ones
-            if remaining <= 0:
-                break
+                    kept_orig = [None] * len(trimmed) + kept_orig   # trimmed: no restores
+                    room -= messages_tokens(trimmed, None)
+                pos = len(pairs)
+            return room
+
+        # 1. conversation first, with the tool share held back; 2. restore full tool
+        # bodies newest-first inside that share (+ any slack); 3. hand whatever the tool
+        # share didn't need back to older turns.
+        frac = min(1.0, max(0.0, float(getattr(self.cfg, "compact_tool_frac", COMPACT_TOOL_FRAC))))
+        reserve = int(budget * frac)
+        room = walk(budget - reserve, False) + reserve
+        allow = min(room, reserve)                  # tool bodies never exceed their share
+        for i in range(len(kept) - 1, -1, -1):
+            o = kept_orig[i]
+            if o is None or o.get("role") != "tool" or o is kept[i]:
+                continue
+            # Per-message delta by chars (NOT messages_tokens([x]): its cache is keyed on
+            # id(list), and throwaway 1-item lists reuse ids -> stale sizes).
+            extra = int(((len(str(o.get("content") or "")) + 3) // 4
+                         - (len(str(kept[i].get("content") or "")) + 3) // 4) * _TOK_FACTOR)
+            if 0 < extra <= allow:
+                kept[i] = o
+                allow -= extra
+        # Restored bodies shift nothing positionally; older turns prepend safely.
+        walk(room - (min(room, reserve) - allow), True)
         return kept
 
     def _trim_turn_to_budget(self, turn, budget):
@@ -12595,8 +12633,43 @@ class Agent:
                 break
         return parsed, missing, attempt, turn_text
 
+    def _compact_report(self, before, kind):
+        """ONE terminal line: 'compacted 324k -> 25k (summary 3k · recent 15.7k/9 turns ·
+        tools 4.2k · system 2.1k · 12 tool results cut) kind'. Cut with '… /expand N' if it
+        would wrap; the full breakdown is stashed in the /expand ring."""
+        after = self._ctx_used()
+        p = getattr(self, "_compact_parts", None) or {}
+        f = _fmt_tokens
+        parts = []
+        if p:
+            parts = [f"summary {f(p['summary'])}",
+                     f"recent {f(p['recent'])}/{p['turns']} turn{'s' * (p['turns'] != 1)}",
+                     f"tools {f(p['tools'])}", f"system {f(p['system'])}"]
+            if p.get("cut"):
+                parts.append(f"{p['cut']} tool result{'s' * (p['cut'] != 1)} cut")
+        head = f"  {GLYPH['warn']} compacted {f(before)} -> {f(after)} tokens"
+        line = head + (f" ({' · '.join(parts)})" if parts else "") + f" - {kind}"
+        full = "\n".join([f"compacted {before:,} -> {after:,} tokens ({kind})"]
+                         + [f"  {x}" for x in parts]
+                         + [f"  target (keep_cap) {getattr(self.cfg, 'keep_cap', 25000):,}"
+                            f" - change: /set keep_cap <tokens>  (one-off: /compact <k>)",
+                            f"  full tool results up to {getattr(self.cfg, 'compact_tool_frac', COMPACT_TOOL_FRAC):.0%} of the tail"
+                            " - change: /set compact_tool_frac <0-1>",
+                            "  new cache boundary set on the summary"])
+        cid = None
+        try:
+            cid = self.record_tool_call("compaction", {})
+            self.record_tool_result(cid, full)
+        except Exception:
+            pass
+        width = max(20, _term_cols() - 1)
+        if len(line) > width and cid:
+            more = f"… /expand {cid}"
+            line = line[:width - len(more)].rstrip() + more
+        return yellow(line)
+
     def _finish_compact(self, parsed, *, summary_prefix, tail=None,
-                         autostart=False, stamp_clock=False):
+                         autostart=False, stamp_clock=False, presized=False):
         """Shared epilogue for compact() + auto_compact(): once the marked blocks
         are parsed, install the pinned plan, rebuild history as [system, summary(+tail)],
         set the stable cache boundary, and reset the per-turn counters. The two callers
@@ -12624,12 +12697,21 @@ class Agent:
         # lands near the old clean-cut size instead of dragging 10s of k of stale output
         # forward. Messages/reasoning stay; only tool-result bodies shrink to placeholders.
         # (indices >= 2 = everything after [system, summary].)
-        if tail:
+        if tail and not presized:
             tool_idx = [i for i in range(2, len(self.messages))
                         if self.messages[i].get("role") == "tool"]
             tool_idx = tool_idx[:-TRIM_KEEP] if TRIM_KEEP > 0 else tool_idx   # newest stay whole, as /trim
             if tool_idx:
                 self._trim_tool_indices(tool_idx)
+        # Size breakdown for the one-line "compacted X -> Y" report (see _compact_report).
+        self._compact_parts = {
+            "summary": messages_tokens([self.messages[1]], None),
+            "recent":  messages_tokens(self.messages[2:], None) if len(self.messages) > 2 else 0,
+            "tools":   messages_tokens([], self.tool_defs),
+            "system":  messages_tokens([self.messages[0]], None),
+            "turns":   len(self._split_into_turns([self.messages[0]] + self.messages[2:])),
+            "cut":     sum(1 for m in self.messages[2:] if m.get("role") == "tool"
+                           and str(m.get("content", "")).startswith("[trimmed"))}
         # Cache-boundary signal: after a compaction the prefix [system][summary] is STABLE,
         # so a client with a spare breakpoint can pin it and re-read the prefix at ~0.1x.
         # 2 = system + the one compacted-summary user message.
@@ -12650,7 +12732,7 @@ class Agent:
         durable docs and write the marked blocks (summary + plan + next-step); no finalize
         tool, the turn ENDING is the trigger. We tolerantly parse, re-solicit any missing
         block, then replace the older history with the summary, keeping the last
-        compact_keep TURNS verbatim (emergency: a hardcoded minimal tail so the overflow
+        as many TURNS verbatim as fit keep_cap (emergency: a hardcoded minimal tail so the overflow
         rescue can't itself re-overflow).
 
         A bad/absent summary leaves history UNTOUCHED (returns None). The pre-compact
@@ -12710,14 +12792,15 @@ class Agent:
         # keep against the REAL post-summary headroom (soft/hard/manual; emergency already
         # set a fixed minimal tail above). No summary-size guess, no floor.
         summary_prefix = "Earlier context (compacted summary):\n"
-        if tail is None:
+        presized = tail is None
+        if presized:
             tail = self._keep_tail_by_budget(pre, summary_prefix + block)
         # Consume the tolerant parse from the retry loop (NOT a second strict re-extract:
         # that would throw away plan/next salvaged from a degraded tier for exactly the
         # models the tolerant parser exists to rescue).
         return self._finish_compact(
             parsed, summary_prefix=summary_prefix,
-            tail=tail, autostart=True, stamp_clock=not deliberate)
+            tail=tail, autostart=True, stamp_clock=not deliberate, presized=presized)
 
     def compact(self, target=None):
         """Manual /compact - a deliberate compaction (doesn't arm the anti-thrash guard).
@@ -12751,7 +12834,7 @@ class Agent:
     def auto_compact(self, zone: str = "hard"):
         """Self-managing / elected compaction - arms the anti-thrash loop guard. Thin
         wrapper over the single _compact() implementation (zone picks the verbatim keep:
-        'emergency' = minimal overflow backstop, else compact_keep). Returns block or None."""
+        'emergency' = minimal overflow backstop, else the keep_cap budget). Returns block or None."""
         return self._compact(zone=zone, deliberate=False)
 
     def _update_plan(self, plan: str):
@@ -13473,8 +13556,7 @@ class Agent:
                     "/clear or switch to a larger-window model")
             return
         after = self._ctx_used()
-        print(yellow(f"  {GLYPH['warn']} compacted {_fmt_tokens(used)} -> {_fmt_tokens(after)} tokens "
-                     f"({kind}); new cache boundary set on the summary"))
+        print(self._compact_report(used, kind))
         self._log_activity(
             "compact",
             f"summarized the session: ~{used:,} -> ~{after:,} tokens kept",
@@ -13604,6 +13686,22 @@ class Agent:
         Returns True if login succeeded and the turn should be retried; False otherwise
         (unrecognized error, no login hook, or the user declined/cancelled)."""
         msg = str(err).lower()
+        # 403 permission_error = the credential WORKED but this org/account isn't allowed
+        # (subscription paused, OAuth disabled for the org). A new login can't fix that,
+        # so say why in one line and don't offer login or retry.
+        if "403" in msg and "permission_error" in msg:
+            m = re.search(r'"message"\s*:\s*"([^"]{1,160})', str(err))
+            who = self.cfg.provider
+            try:
+                acct = (self.cfg.setting("account") or "").strip()
+                who += f" (account {acct})" if acct else ""
+            except Exception:
+                pass
+            print(yellow(f"\n{GLYPH['warn']} {who}: {m.group(1) if m else 'permission denied'} - "
+                         f"a new login won't fix this; check the account/org, or switch "
+                         f"account/backend (/provider)"))
+            err.args = ("",)                        # already explained - no raw red dump
+            return False
         auth = ("no api key" in msg or "api key" in msg
                 or " 401" in msg or "401:" in msg or " 403" in msg or "403:" in msg
                 or "unauthorized" in msg or ("invalid" in msg and "key" in msg))
@@ -13768,7 +13866,8 @@ class Agent:
             return self._chat_with_model_fallback()
         except (ConnectionError, RuntimeError) as e:
             if not self._recover_and_should_retry(e):
-                print(red(f"\n{e}"))
+                if str(e):
+                    print(red(f"\n{e}"))
                 return None
             try:
                 return self._chat_with_model_fallback()
@@ -14754,8 +14853,8 @@ _SETTINGS_FIELDS = [
     ("gen_idle_timeout", "ollama: max gap between tokens (s; blank = off)", "float"),
     ("compact_min_interval", "min seconds between compactions", "float"),
     ("autostart_after_compact", "auto-continue the turn after a compaction (on by default; 5s ^C to cancel)", "bool"),
-    ("compact_keep", "max verbatim turns kept after a compaction (CEILING; real bound is a token budget)", "int"),
-    ("keep_cap", "absolute token ceiling on the verbatim tail kept after a compaction (big windows won't hoard)", "int"),
+    ("keep_cap", "total size (tokens) a compaction lands on: system + tools + summary + recent turns", "int"),
+    ("compact_tool_frac", "share (0-1) of the kept-tail budget that may hold FULL tool results after a compaction (rest = conversation)", "float"),
     ("wake_on_bg_finish", "wake + react autonomously when a background task finishes (on by default)", "bool"),
     ("auto_trim_interval", "auto-trim: stub old tool outputs every N tokens (0 = off)", "int"),
     ("auto_trim_hysteresis", "auto-trim re-arm margin (fraction of interval)", "float"),
@@ -17967,7 +18066,7 @@ def handle_compact_at_command(agent, cfg, arg):
 def handle_compact_command(agent, cfg, arg):
     """/compact - agentic compaction: the model saves+commits durable docs, writes
     the summary between the markers, and history is then replaced with that summary
-    (keeping the last compact_keep turns). The manual lever the auto-compact zone pulls.
+    (keeping as many recent turns as fit keep_cap). The manual lever the auto-compact zone pulls.
     The pre-compact snapshot (a <name>-precompact-N sidecar, so the live session keeps its
     name) is taken inside _compact() once a usable summary exists - so a failed /compact
     leaves history AND the snapshot dir untouched (same rule as the auto path).
@@ -18034,6 +18133,7 @@ def handle_compact_command(agent, cfg, arg):
     print(dim("compact: save + commit durable docs, then write the "
               f"summary between {COMPACT_MARK} markers and finalize"
               + (f" (target ~{target / 1000:.0f}k)…" if target else "…")))
+    _before = agent._ctx_used()
     summary = agent.compact(target=target)
     if summary is None:
         print(yellow("\nno summary captured - history left intact. (Write it "
@@ -18041,8 +18141,7 @@ def handle_compact_command(agent, cfg, arg):
     else:
         # Keep the live autosave_name: the next autosave writes the compacted history
         # back into the SAME session, so a named session stays named.
-        print(dim("\nhistory replaced with the summary above; "
-                  "new cache boundary set on the summary."))
+        print("\n" + agent._compact_report(_before, "manual" + (f", target {target / 1000:.0f}k" if target else "")))
         agent._print_ctx()
         # Continue the thread if the model queued a next-step (gated by
         # autostart_after_compact inside compact() -> _finish_compact): same 5s ^C beat
@@ -18448,6 +18547,15 @@ def _show_release_notes(cfg: Config):
 # SECTION: REPL (interactive loop, session resume)
 # ==========================================================================
 
+def _history_sig(agent):
+    """Cheap change-detector for the conversation: a compaction/rewind swaps or shortens
+    the list, a turn/trim appends or edits the tail. No hashing of a 1MB history."""
+    m = agent.messages
+    last = m[-1] if m else None
+    return (id(m), len(m), id(last), len(str(last.get("content", ""))) if last else 0,
+            getattr(agent, "compactions", 0))
+
+
 def repl(cfg: Config, resume=None):
     global _active_agent
     agent = Agent(cfg)
@@ -18486,6 +18594,14 @@ def repl(cfg: Config, resume=None):
     # LIFO): before _release_lock (lock still ours) and before close_all_remotes (so the
     # remote host is still readable for the saved meta).
     atexit.register(lambda: autosave_session(agent, cfg))
+    # Closing the terminal window sends SIGHUP, whose default action kills the process
+    # WITHOUT running atexit - so the save above never happened. Turn it into a normal
+    # exit so the atexit chain (save, release lock, close remotes) runs.
+    if hasattr(signal, "SIGHUP"):
+        try:
+            signal.signal(signal.SIGHUP, lambda *_: sys.exit(129))
+        except (ValueError, OSError):
+            pass
 
     # The active backend is ALWAYS a provider now. Any pre-activation transport
     # setup (e.g. the ollama provider's tiered host failover + per-host default
@@ -18772,8 +18888,15 @@ def repl(cfg: Config, resume=None):
             parts = line.split(maxsplit=1)
             cmd = parts[0]
             arg = parts[1].strip() if len(parts) > 1 else ""
+            _sig = _history_sig(agent)
             if dispatch_command(agent, cfg, cmd, arg):    # True only on /quit
                 return
+            # A slash command can change the conversation (/compact and the turn it
+            # autostarts, /trim, /rewind, /sh ...) with no typed turn after it, and only
+            # typed turns autosaved - so a /load + /compact then a closed window lost
+            # the compaction. Save whenever the history actually changed.
+            if _history_sig(agent) != _sig:
+                autosave_session(agent, cfg)
             continue
         if use_composer:
             comp = Composer()

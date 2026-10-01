@@ -477,7 +477,7 @@ MODE = "compact"; counter["n"] = 0; bodies.clear()
 agent = mk_agent(cfg)
 agent.messages.append({"role": "user", "content": "bind ollama to labnet"})
 agent.messages.append({"role": "tool", "tool_name": "run_command",
-                       "content": "\n".join(["log line"] * 80)})
+                       "content": "\n".join(["log line"] * 4000)})
 for _k in range(lc.TRIM_KEEP):          # newer results: the newest TRIM_KEEP stay whole
     agent.messages.append({"role": "tool", "tool_name": "run_command", "content": f"recent {_k}"})
 summary = agent.compact()
@@ -506,7 +506,7 @@ _saved_wm = agent.cfg.window_messages
 agent.cfg.window_messages = 4          # keep a small recent tail
 agent.messages.append({"role": "user", "content": "old goal"})
 agent.messages.append({"role": "tool", "tool_name": "run_command",
-                       "content": "\n".join(["OLDDUMPLINE"] * 80)})
+                       "content": "\n".join(["OLDDUMPLINE"] * 4000)})
 agent.messages.append({"role": "assistant", "content": "did old thing"})
 for _k in range(lc.TRIM_KEEP):          # newer results: the newest TRIM_KEEP stay whole
     agent.messages.append({"role": "tool", "tool_name": "run_command", "content": f"recent {_k}"})
