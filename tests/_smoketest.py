@@ -5623,7 +5623,7 @@ check("_status_rows hides compactions count when none have happened",
       "compactions" not in _plain)
 check("_status_rows shows the round-cap only in auto mode", "max 25 rounds" in _plain)
 check("_status_rows row1 shows the session name with a colon", "session: sess-x" in _plain)
-# window ON -> the size is shown; compactions count appears once any have happened.
+# window ON -> the size is shown; the compactions count stays in /info.
 # window_tokens (default 'auto') takes precedence in the row, so turn it off to exercise
 # the message-count display.
 _srag.cfg.window_tokens = 0
@@ -5631,7 +5631,7 @@ _srag.cfg.window_messages = 40
 _srag.compactions = 2
 _plain_w = "\n".join(_re.sub(r"\x1b\[[0-9;]*m", "", r) for r in lc._status_rows(_srag, _srag.cfg))
 check("_status_rows shows 'window N' when window is on", "window 40" in _plain_w)
-check("_status_rows shows compactions count once any happened", "2 compactions" in _plain_w)
+check("_status_rows leaves the compactions count to /info", "compactions" not in _plain_w)
 # window_tokens 'auto' is the norm -> hidden from the row (lives in /info)
 _srag.cfg.window_tokens = "auto"
 _plain_a = "\n".join(_re.sub(r"\x1b\[[0-9;]*m", "", r) for r in lc._status_rows(_srag, _srag.cfg))
