@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L1615   Lean-tools (plugin tools: discovery, manager)
-  L1969   MCP client (connection, manager, OAuth, discovery)
-  L2423   Providers (backend plugin registry)
-  L2645   Interactive pickers + menus (raw-mode UI engine)
-  L2994   Terminal styling (colors, formatting helpers)
-  L3231   Streaming + markdown render (model output)
-  L3705   Composer (pinned input line, editor, stdin)
-  L4587   Token accounting (calibrated context meter)
-  L4785   Config (dataclass, field registry, load/save)
-  L8578   Tool execution + text tool-call parsing
-  L9051   Remote workspace (executor client, /connect)
-  L11226  Context meter
-  L11321  Agent (turn loop, context mgmt, tool dispatch)
-  L18461  Slash-command handlers + dispatch table
-  L18598  REPL (interactive loop, session resume)
-  L19054  Worker agent (headless --agent-run)
-  L19733  Entry (CLI arg parsing, main)
+  L1619   Lean-tools (plugin tools: discovery, manager)
+  L1973   MCP client (connection, manager, OAuth, discovery)
+  L2427   Providers (backend plugin registry)
+  L2649   Interactive pickers + menus (raw-mode UI engine)
+  L2998   Terminal styling (colors, formatting helpers)
+  L3235   Streaming + markdown render (model output)
+  L3709   Composer (pinned input line, editor, stdin)
+  L4591   Token accounting (calibrated context meter)
+  L4789   Config (dataclass, field registry, load/save)
+  L8582   Tool execution + text tool-call parsing
+  L9055   Remote workspace (executor client, /connect)
+  L11230  Context meter
+  L11325  Agent (turn loop, context mgmt, tool dispatch)
+  L18463  Slash-command handlers + dispatch table
+  L18600  REPL (interactive loop, session resume)
+  L19056  Worker agent (headless --agent-run)
+  L19735  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -116,7 +116,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.10.66"
+__version__ = "0.10.67"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -124,6 +124,10 @@ __version__ = "0.10.66"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.10.67": [
+        "Compaction count left the status row; it's in /info's context line",
+        "  ('... N msgs, M turns, K compactions'), like the turn count.",
+    ],
     "0.10.66": [
         "Status rows condensed: 'approval: session · auto compact: 20% · tools: N' (MCP",
         "  servers shown separately as 'mcp: N' only when one is connected; tools counts",
@@ -15553,13 +15557,11 @@ def _status_rows(agent, cfg):
     col = _zone_color(zone) if c.get("auto") else _pct_color(pct)
     ctx = col(f"ctx {est}{_fmt_tokens(used)}/{_fmt_tokens(window)} ({pct:.0f}%{zlabel})")
     quota = _provider_usage_str(agent, cfg)     # leading separator already, or "" if none
-    # compactions is a live counter (row 3 reprints every turn); shown once any happened.
-    hov = (d + f"{agent.compactions} compactions") if agent.compactions else ""
-    # ctx -> compaction count -> the backend quota meters (5h / wk) -> think / effort
+    # ctx -> the backend quota meters (5h / wk) -> think / effort (compaction count: /info)
     # think/effort live in /usage + /info; the row shows them only when NOT the usual
     # setting (thinking adaptive/unset, effort low/unset), behind a brain glyph.
     tail = _think_tag(think, effort)
-    rows.append("  " + ctx + hov + quota + (d + tail if tail else ""))
+    rows.append("  " + ctx + quota + (d + tail if tail else ""))
     return rows
 
 
