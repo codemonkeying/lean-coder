@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L1606   Lean-tools (plugin tools: discovery, manager)
-  L1960   MCP client (connection, manager, OAuth, discovery)
-  L2414   Providers (backend plugin registry)
-  L2636   Interactive pickers + menus (raw-mode UI engine)
-  L2985   Terminal styling (colors, formatting helpers)
-  L3221   Streaming + markdown render (model output)
-  L3695   Composer (pinned input line, editor, stdin)
-  L4577   Token accounting (calibrated context meter)
-  L4775   Config (dataclass, field registry, load/save)
-  L8568   Tool execution + text tool-call parsing
-  L9041   Remote workspace (executor client, /connect)
-  L11216  Context meter
-  L11311  Agent (turn loop, context mgmt, tool dispatch)
-  L18410  Slash-command handlers + dispatch table
-  L18547  REPL (interactive loop, session resume)
-  L19003  Worker agent (headless --agent-run)
-  L19682  Entry (CLI arg parsing, main)
+  L1615   Lean-tools (plugin tools: discovery, manager)
+  L1969   MCP client (connection, manager, OAuth, discovery)
+  L2423   Providers (backend plugin registry)
+  L2645   Interactive pickers + menus (raw-mode UI engine)
+  L2994   Terminal styling (colors, formatting helpers)
+  L3231   Streaming + markdown render (model output)
+  L3705   Composer (pinned input line, editor, stdin)
+  L4587   Token accounting (calibrated context meter)
+  L4785   Config (dataclass, field registry, load/save)
+  L8578   Tool execution + text tool-call parsing
+  L9051   Remote workspace (executor client, /connect)
+  L11226  Context meter
+  L11321  Agent (turn loop, context mgmt, tool dispatch)
+  L18461  Slash-command handlers + dispatch table
+  L18598  REPL (interactive loop, session resume)
+  L19054  Worker agent (headless --agent-run)
+  L19733  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -116,7 +116,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.10.65"
+__version__ = "0.10.66"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -124,6 +124,15 @@ __version__ = "0.10.65"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.10.66": [
+        "Status rows condensed: 'approval: session · auto compact: 20% · tools: N' (MCP",
+        "  servers shown separately as 'mcp: N' only when one is connected; tools counts",
+        "  built-in + lean-tools). 'window auto' and the turn count moved to /info.",
+        "Thinking/effort left the status row; it shows them only when not the usual",
+        "  (adaptive/low), behind a brain glyph: '🧠 max · effort high'. /usage now ends",
+        "  with a 'thinking: X · effort: Y' line for every provider.",
+        "/info's window line no longer says 'off (full history sent)' when it's auto.",
+    ],
     "0.10.65": [
         "fix: a compaction run by a slash command (/load then /compact) was never saved -",
         "  only typed turns autosaved - and closing the terminal (SIGHUP) skipped the exit",
@@ -3110,6 +3119,7 @@ GLYPH = {
     "ok":       glyph("✓", "+"),
     "no":       glyph("✗", "x"),
     "think":    glyph("💭", "..."),    # reasoning
+    "brain":    glyph("🧠", "think"),  # status row: non-default thinking/effort
     "ghost":    glyph("👻", "~"),       # incognito session marker (ASCII fallback ~)
     "new":      glyph("✦", "+"),       # "start a new session" row in the session picker
     "dot":      glyph("·", "-"),       # inline separator
@@ -15443,6 +15453,30 @@ def _short_model(name, n=20):
     return name if len(name) <= n else name[:n - 1] + GLYPH["ellipsis"]
 
 
+_THINK_USUAL = {"adaptive", "na", "unset"}    # thinking values the status row hides
+_EFFORT_USUAL = {"low", "na", "-"}             # effort values the status row hides
+
+
+def _think_tag(think, effort):
+    """Status-row token for a NON-default thinking/effort, e.g. '🧠 max · effort high'
+    ('think max' without emoji). '' when both are the usual - they live in /usage."""
+    bits = []
+    if str(think) not in _THINK_USUAL:
+        bits.append(f"{GLYPH['brain']} {think}")
+    if str(effort) not in _EFFORT_USUAL:
+        bits.append(f"effort {effort}" if bits else f"{GLYPH['brain']} effort {effort}")
+    return dim(f" {GLYPH['dot']} ").join(bits)
+
+
+def _think_line(cfg):
+    """'thinking: X · effort: Y' for /usage (works for every provider)."""
+    if _provider_uses_settings(cfg):
+        think, effort = cfg.setting("thinking") or "off", cfg.setting("effort") or "-"
+    else:
+        think, effort = {True: "on", False: "off"}.get(cfg.think, "unset"), "-"
+    return f"thinking: {think}{dim(' ' + GLYPH['dot'] + ' ')}effort: {effort}"
+
+
 def _status_rows(agent, cfg):
     """The status rows printed above each prompt so the live state is never invisible:
       1. session (name + autosave / incognito / amnesic) + condensed model @ provider, + pinned plan
@@ -15456,18 +15490,15 @@ def _status_rows(agent, cfg):
     rows = []
     model_at = f"{_short_model(cfg.active_model())} @ {_provider_label(cfg)}"
 
-    # 1) session + model (at the top - what/where you're running). The live turn
-    # counter sits where 'autosaving' used to (autosave state -> /info now); it's a
-    # volatile token _status_key strips so 'changed-only' mode still gates correctly.
-    turns = _user_turns(agent.messages)
+    # 1) session + model (at the top - what/where you're running). Autosave state and
+    # the turn count live in /info.
     if cfg.incognito:
         s = [magenta(f"{GLYPH['ghost']} incognito")]
     elif cfg.autosave:
         s = [f"session: {agent.autosave_name}"]
     else:
         s = ["amnesic"]
-    s.append(f"{turns} turns")
-    s.append(model_at)
+    s.append(model_at)                        # turn count lives in /info (context line)
     rows.append("  " + d.join(s))
 
     # 2) perms + context management
@@ -15476,24 +15507,31 @@ def _status_rows(agent, cfg):
         p = [yellow("chat-only (model)")]
         if cfg.leash != "chat":
             p.append(dim(f"leash {cfg.leash} n/a"))   # the ceiling can't grant tools the model lacks
-        p.append(f"approve: {cfg.approval}")
+        p.append(f"approval: {cfg.approval}")
     else:
-        p = [bold(cfg.leash), f"approve: {cfg.approval}"]
+        p = [bold(cfg.leash), f"approval: {cfg.approval}"]
     if cfg.approval == "auto":                # the round-cap only bites when unattended
         mi = cfg.max_iterations
         p.append(f"max {mi} rounds" if mi else "no round cap")
     if cfg.confirm_reads:
         p.append("ask-read")
     _wt = cfg.window_tokens
-    if isinstance(_wt, str) and _wt.strip().lower() == "auto":
-        p.append("window auto")               # backstop: ctx - reply reserve, recomputed
-    elif isinstance(_wt, int) and _wt > 0:    # a hard token cap
+    # window 'auto' is the norm (ctx - reply reserve) -> /info only; show it only when set
+    if isinstance(_wt, int) and _wt > 0:      # a hard token cap
         p.append(f"window {_wt}tok")
-    elif cfg.window_messages > 0:             # only show when on - don't nag with 'window off'
-        p.append(f"window {cfg.window_messages}")
+    elif cfg.window_messages > 0 and not (isinstance(_wt, str) and _wt.strip().lower() == "auto"):
+        p.append(f"window {cfg.window_messages}")   # message-count window (auto tokens win)
     c = cfg.compact_for()
-    p.append(f"compact {c['hard'] * 100:.0f}%" if c.get("auto") else "compact off")
-    p.append(f"{len(agent.tool_defs)} tools")
+    p.append(f"auto compact: {c['hard'] * 100:.0f}%" if c.get("auto") else "auto compact: off")
+    # tools = built-in + lean-tools; MCP's share is its own token, shown only when a
+    # server is actually connected.
+    _ntools = sum(1 for t in agent.tool_defs
+                  if not str(t.get("function", {}).get("name", "")).startswith(MCP_NS))
+    p.append(f"tools: {_ntools}")
+    _mcp = getattr(agent, "mcp", None)
+    _nmcp = sum(1 for n in getattr(_mcp, "conns", {}) if _mcp._is_on(n)) if _mcp else 0
+    if _nmcp:
+        p.append(f"mcp: {_nmcp}")
     rows.append("  " + d.join(p))
 
     # 3) context (+ think/effort + backend quota tail)
@@ -15518,7 +15556,10 @@ def _status_rows(agent, cfg):
     # compactions is a live counter (row 3 reprints every turn); shown once any happened.
     hov = (d + f"{agent.compactions} compactions") if agent.compactions else ""
     # ctx -> compaction count -> the backend quota meters (5h / wk) -> think / effort
-    rows.append("  " + ctx + hov + quota + d + d.join([f"think {think}", f"effort {effort}"]))
+    # think/effort live in /usage + /info; the row shows them only when NOT the usual
+    # setting (thinking adaptive/unset, effort low/unset), behind a brain glyph.
+    tail = _think_tag(think, effort)
+    rows.append("  " + ctx + hov + quota + (d + tail if tail else ""))
     return rows
 
 
@@ -15559,8 +15600,16 @@ def handle_info_command(agent, cfg, arg=""):
     print(f"  context:  ~{_fmt_tokens(used)}/{_fmt_tokens(window)} "
           f"({used / window * 100:.0f}%, {zone}){dot}{len(agent.messages)} msgs, {turns} turns{hov}")
     # how context is managed - the two things that surprised people
-    wm = cfg.window_messages
-    print(f"  window:   {'off (full history sent)' if wm <= 0 else f'last {wm} messages sent'}")
+    wm, wt = cfg.window_messages, cfg.window_tokens
+    if isinstance(wt, str) and wt.strip().lower() == "auto":
+        win = "auto (send up to the window minus the reply reserve)"
+    elif isinstance(wt, int) and wt > 0:
+        win = f"last ~{wt:,} tokens sent"
+    elif wm > 0:
+        win = f"last {wm} messages sent"
+    else:
+        win = "off (full history sent)"
+    print(f"  window:   {win}")
     c = cfg.compact_for()
     if c.get("auto"):
         comp = (f"auto on{dot}soft {c['soft']:.0%}  hard {c['hard']:.0%}"
@@ -16825,6 +16874,7 @@ def handle_usage_command(agent, cfg, arg=""):
             return
         if out:
             print(out if isinstance(out, str) else str(out))
+            print(dim("  " + _think_line(cfg)))
             return
     # core default - works for any backend
     loc = _provider_label(cfg)
@@ -16840,6 +16890,7 @@ def handle_usage_command(agent, cfg, arg=""):
     warm = _warm_models(spec)              # loaded/instant models (ollama green dots)
     if warm:
         print(dim(f"  loaded    {', '.join(warm)}"))
+    print(dim("  " + _think_line(cfg)))
 
 
 def _index_pick(arg, items):
