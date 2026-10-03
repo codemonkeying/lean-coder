@@ -5616,16 +5616,16 @@ _srag.autosave_name = "sess-x"
 _srows = lc._status_rows(_srag, _srag.cfg)
 _plain = "\n".join(_re.sub(r"\x1b\[[0-9;]*m", "", r) for r in _srows)
 check("_status_rows returns 3 rows", len(_srows) == 3)
-check("_status_rows shows leash · approval · compact at · N tools",
+check("_status_rows shows leash · approval · compact N% · N tools",
       "rw" + " " + lc.GLYPH["dot"] + " auto" in _plain
-      and "compact at " in _plain and _re.search(r"\d+ tools", _plain))
+      and "compact " in _plain and _re.search(r"\d+ tools", _plain))
 check("_status_rows hides mcp when no server is connected", " mcp" not in _plain)
 check("_status_rows hides usual think/effort (na) - they live in /usage",
       "think" not in _plain and "effort" not in _plain)
 check("_status_rows hides 'window off' when window is off (default)",
       "window off" not in _plain)
 check("_status_rows leaves the turn count to /info", "turns" not in _plain)
-check("_status_rows compact shows only the hard pct (D3: 90%)", "compact at 90%" in _plain)
+check("_status_rows compact shows only the hard pct (D3: 90%)", "compact 90%" in _plain)
 check("_status_rows drops the 'ok' zone label from ctx", "ok)" not in _plain)
 check("_status_rows hides compactions count when none have happened",
       "compactions" not in _plain)
