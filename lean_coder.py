@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L1619   Lean-tools (plugin tools: discovery, manager)
-  L1973   MCP client (connection, manager, OAuth, discovery)
-  L2427   Providers (backend plugin registry)
-  L2649   Interactive pickers + menus (raw-mode UI engine)
-  L2998   Terminal styling (colors, formatting helpers)
-  L3235   Streaming + markdown render (model output)
-  L3709   Composer (pinned input line, editor, stdin)
-  L4591   Token accounting (calibrated context meter)
-  L4789   Config (dataclass, field registry, load/save)
-  L8582   Tool execution + text tool-call parsing
-  L9055   Remote workspace (executor client, /connect)
-  L11230  Context meter
-  L11325  Agent (turn loop, context mgmt, tool dispatch)
-  L18463  Slash-command handlers + dispatch table
-  L18600  REPL (interactive loop, session resume)
-  L19056  Worker agent (headless --agent-run)
-  L19735  Entry (CLI arg parsing, main)
+  L1626   Lean-tools (plugin tools: discovery, manager)
+  L1980   MCP client (connection, manager, OAuth, discovery)
+  L2434   Providers (backend plugin registry)
+  L2656   Interactive pickers + menus (raw-mode UI engine)
+  L3005   Terminal styling (colors, formatting helpers)
+  L3242   Streaming + markdown render (model output)
+  L3716   Composer (pinned input line, editor, stdin)
+  L4598   Token accounting (calibrated context meter)
+  L4796   Config (dataclass, field registry, load/save)
+  L8589   Tool execution + text tool-call parsing
+  L9062   Remote workspace (executor client, /connect)
+  L11237  Context meter
+  L11332  Agent (turn loop, context mgmt, tool dispatch)
+  L18478  Slash-command handlers + dispatch table
+  L18615  REPL (interactive loop, session resume)
+  L19071  Worker agent (headless --agent-run)
+  L19750  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -116,7 +116,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.10.67"
+__version__ = "0.10.68"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -124,6 +124,13 @@ __version__ = "0.10.67"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.10.68": [
+        "Status middle row tightened: 'rwe · session · compact at 20% · 22 tools'",
+        "  ('· N mcp' only when a server is connected).",
+        "Resume preview shows just the conversation (you/llm) - no tool output or empty",
+        "  tool-call turns - one terminal line each, '…' at the cut instead of wrapping.",
+        "Session picker drops its key-hint line (it was cut off on normal terminals).",
+    ],
     "0.10.67": [
         "Compaction count left the status row; it's in /info's context line",
         "  ('... N msgs, M turns, K compactions'), like the turn count.",
@@ -15511,9 +15518,9 @@ def _status_rows(agent, cfg):
         p = [yellow("chat-only (model)")]
         if cfg.leash != "chat":
             p.append(dim(f"leash {cfg.leash} n/a"))   # the ceiling can't grant tools the model lacks
-        p.append(f"approval: {cfg.approval}")
+        p.append(cfg.approval)
     else:
-        p = [bold(cfg.leash), f"approval: {cfg.approval}"]
+        p = [bold(cfg.leash), cfg.approval]   # 'rwe · session' - leash then approval mode
     if cfg.approval == "auto":                # the round-cap only bites when unattended
         mi = cfg.max_iterations
         p.append(f"max {mi} rounds" if mi else "no round cap")
@@ -15526,16 +15533,16 @@ def _status_rows(agent, cfg):
     elif cfg.window_messages > 0 and not (isinstance(_wt, str) and _wt.strip().lower() == "auto"):
         p.append(f"window {cfg.window_messages}")   # message-count window (auto tokens win)
     c = cfg.compact_for()
-    p.append(f"auto compact: {c['hard'] * 100:.0f}%" if c.get("auto") else "auto compact: off")
+    p.append(f"compact at {c['hard'] * 100:.0f}%" if c.get("auto") else "compact off")
     # tools = built-in + lean-tools; MCP's share is its own token, shown only when a
     # server is actually connected.
     _ntools = sum(1 for t in agent.tool_defs
                   if not str(t.get("function", {}).get("name", "")).startswith(MCP_NS))
-    p.append(f"tools: {_ntools}")
+    p.append(f"{_ntools} tools")
     _mcp = getattr(agent, "mcp", None)
     _nmcp = sum(1 for n in getattr(_mcp, "conns", {}) if _mcp._is_on(n)) if _mcp else 0
     if _nmcp:
-        p.append(f"mcp: {_nmcp}")
+        p.append(f"{_nmcp} mcp")
     rows.append("  " + d.join(p))
 
     # 3) context (+ think/effort + backend quota tail)
@@ -15994,17 +16001,26 @@ def _restore_backend_for(agent, cfg, meta):
     return ""
 
 
-def _render_message_tail(messages, n: int = 4, width: int = 100, hint: bool = False):
+def _render_message_tail(messages, n: int = 4, width: int = 100, hint: bool = False,
+                         chat_only: bool = False):
     """Echo the last `n` non-system messages so a resumed (or /expand msg) view shows
     what you were doing. Roles are labelled + coloured (you / lc / tool); long lines
     collapse so it stays scannable. `n` is clamped to [1, len] so a silly count never
     errors or under-shows. `hint` appends the '/expand msg N' pointer when the view is
-    partial. No-op for an empty conversation."""
+    partial. `chat_only` (resume banner) shows just you/llm prose - no tool output or
+    empty tool-call turns - each fitted to one terminal line. No-op for an empty
+    conversation."""
     body = [m for m in messages if m.get("role") != "system"]
     if not body:
         return False
     n = max(1, min(int(n), len(body)))               # clamp: never error, never over-read
-    tail = body[-n:]
+    if chat_only:                                    # one terminal line each, '…' at the cut
+        width = max(20, min(width, _term_cols() - 1 - 11))   # 11 = '    you · ' + '…'
+        talk = [m for m in body if m.get("role") in ("user", "assistant")
+                and isinstance(m.get("content"), str) and m["content"].strip()]
+        tail = talk[-n:] or body[-n:]
+    else:
+        tail = body[-n:]
     print(yellow(f"  recent context ({len(tail)} of {len(body)} messages):"))
     for m in tail:
         role = m.get("role", "?")
@@ -16033,7 +16049,7 @@ def _print_session_tail(messages, n: int = 4, width: int = 100):
     """Resume-banner view: the last few messages plus the '/expand msg N' hint so a
     user knows they can scroll further back without a reload. Thin wrapper over
     _render_message_tail (shared with /expand msg)."""
-    _render_message_tail(messages, n=n, width=width, hint=True)
+    _render_message_tail(messages, n=n, width=width, hint=True, chat_only=True)
 
 
 def _restore_session_state(agent, cfg, meta):
@@ -16522,7 +16538,6 @@ def _pick_one_tty(header, choices, current=None, labels=None, max_visible=None):
         elif cur >= top + body:
             top = cur - body + 1
         st["top"] = top
-        hint = dim("(up/down, #=jump, type to filter, enter select, esc cancel)")
         q = (cyan(st["query"]) + dim("_")) if st["query"] else dim("(type to filter)")
         more_up   = " ↑more" if top > 0 else ""      # sweep-ok
         more_down = " ↓more" if fi and top + body < len(fi) else ""      # sweep-ok
@@ -16530,7 +16545,7 @@ def _pick_one_tty(header, choices, current=None, labels=None, max_visible=None):
         def row(content):                          # fit to width so nothing wraps
             return "\r" + _fit_line(content) + "\033[K"
 
-        out = [row(bold(header) + "  " + hint),
+        out = [row(bold(header)),                  # keys are self-evident; no hint line
                row("  " + dim("filter: ") + q + dim(more_up + more_down))]
         for pos in range(top, min(top + body, len(fi))):
             i = fi[pos]
