@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L1626   Lean-tools (plugin tools: discovery, manager)
-  L1980   MCP client (connection, manager, OAuth, discovery)
-  L2434   Providers (backend plugin registry)
-  L2656   Interactive pickers + menus (raw-mode UI engine)
-  L3005   Terminal styling (colors, formatting helpers)
-  L3242   Streaming + markdown render (model output)
-  L3716   Composer (pinned input line, editor, stdin)
-  L4598   Token accounting (calibrated context meter)
-  L4796   Config (dataclass, field registry, load/save)
-  L8589   Tool execution + text tool-call parsing
-  L9062   Remote workspace (executor client, /connect)
-  L11237  Context meter
-  L11332  Agent (turn loop, context mgmt, tool dispatch)
-  L18478  Slash-command handlers + dispatch table
-  L18615  REPL (interactive loop, session resume)
-  L19071  Worker agent (headless --agent-run)
-  L19750  Entry (CLI arg parsing, main)
+  L1629   Lean-tools (plugin tools: discovery, manager)
+  L1983   MCP client (connection, manager, OAuth, discovery)
+  L2437   Providers (backend plugin registry)
+  L2659   Interactive pickers + menus (raw-mode UI engine)
+  L3008   Terminal styling (colors, formatting helpers)
+  L3245   Streaming + markdown render (model output)
+  L3719   Composer (pinned input line, editor, stdin)
+  L4601   Token accounting (calibrated context meter)
+  L4799   Config (dataclass, field registry, load/save)
+  L8592   Tool execution + text tool-call parsing
+  L9065   Remote workspace (executor client, /connect)
+  L11240  Context meter
+  L11335  Agent (turn loop, context mgmt, tool dispatch)
+  L18481  Slash-command handlers + dispatch table
+  L18618  REPL (interactive loop, session resume)
+  L19074  Worker agent (headless --agent-run)
+  L19753  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -116,7 +116,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.10.68"
+__version__ = "0.10.69"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -124,6 +124,9 @@ __version__ = "0.10.68"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.10.69": [
+        "Status middle row: 'compact at 20%' -> 'compact 20%'.",
+    ],
     "0.10.68": [
         "Status middle row tightened: 'rwe · session · compact at 20% · 22 tools'",
         "  ('· N mcp' only when a server is connected).",
@@ -15533,7 +15536,7 @@ def _status_rows(agent, cfg):
     elif cfg.window_messages > 0 and not (isinstance(_wt, str) and _wt.strip().lower() == "auto"):
         p.append(f"window {cfg.window_messages}")   # message-count window (auto tokens win)
     c = cfg.compact_for()
-    p.append(f"compact at {c['hard'] * 100:.0f}%" if c.get("auto") else "compact off")
+    p.append(f"compact {c['hard'] * 100:.0f}%" if c.get("auto") else "compact off")
     # tools = built-in + lean-tools; MCP's share is its own token, shown only when a
     # server is actually connected.
     _ntools = sum(1 for t in agent.tool_defs
