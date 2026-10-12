@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L1634   Lean-tools (plugin tools: discovery, manager)
-  L1988   MCP client (connection, manager, OAuth, discovery)
-  L2442   Providers (backend plugin registry)
-  L2664   Interactive pickers + menus (raw-mode UI engine)
-  L3013   Terminal styling (colors, formatting helpers)
-  L3250   Streaming + markdown render (model output)
-  L3724   Composer (pinned input line, editor, stdin)
-  L4606   Token accounting (calibrated context meter)
-  L4804   Config (dataclass, field registry, load/save)
-  L8597   Tool execution + text tool-call parsing
-  L9070   Remote workspace (executor client, /connect)
-  L11245  Context meter
-  L11340  Agent (turn loop, context mgmt, tool dispatch)
-  L18486  Slash-command handlers + dispatch table
-  L18623  REPL (interactive loop, session resume)
-  L19079  Worker agent (headless --agent-run)
-  L19758  Entry (CLI arg parsing, main)
+  L1639   Lean-tools (plugin tools: discovery, manager)
+  L1993   MCP client (connection, manager, OAuth, discovery)
+  L2447   Providers (backend plugin registry)
+  L2669   Interactive pickers + menus (raw-mode UI engine)
+  L3018   Terminal styling (colors, formatting helpers)
+  L3255   Streaming + markdown render (model output)
+  L3729   Composer (pinned input line, editor, stdin)
+  L4616   Token accounting (calibrated context meter)
+  L4814   Config (dataclass, field registry, load/save)
+  L8607   Tool execution + text tool-call parsing
+  L9080   Remote workspace (executor client, /connect)
+  L11255  Context meter
+  L11350  Agent (turn loop, context mgmt, tool dispatch)
+  L18500  Slash-command handlers + dispatch table
+  L18637  REPL (interactive loop, session resume)
+  L19099  Worker agent (headless --agent-run)
+  L19778  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -116,7 +116,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.10.70"
+__version__ = "0.10.71"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -124,6 +124,11 @@ __version__ = "0.10.70"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.10.71": [
+        "The autostarted turn after a manual /compact now runs in the normal pinned",
+        "  display (input box, mid-turn queueing) instead of the classic unpinned one",
+        "  with a coloured spinner.",
+    ],
     "0.10.70": [
         "Desktop notifications name the app, use a stock terminal icon and last 3s",
         "  (notify-send -a lean-coder -i utilities-terminal -t 3000) - KDE no longer",
@@ -4488,6 +4493,11 @@ class Composer:
             self._out.flush()
         except Exception:
             pass
+
+
+def _composer_ok(cfg) -> bool:
+    """True when turns run under the pinned composer (configured + a real TTY)."""
+    return bool(cfg.composer and _TTY and sys.stdin.isatty())
 
 
 @contextmanager
@@ -18223,7 +18233,11 @@ def handle_compact_command(agent, cfg, arg):
         # autostart_after_compact inside compact() -> _finish_compact): same 5s ^C beat
         # + run_turn as the auto path. Without this the manual /compact set the pending
         # self-prompt into a void (nothing consumed it) - the "no autostart" bug.
-        agent._consume_autostart()
+        # With the composer on, leave it pending: the REPL runs it inside a composer
+        # session like a typed turn (pinned input box, mid-turn queueing) instead of
+        # the classic unpinned display a slash command would otherwise give it.
+        if not _composer_ok(cfg):
+            agent._consume_autostart()
 
 
 def handle_autosave_command(agent, cfg, arg):
@@ -18834,7 +18848,7 @@ def repl(cfg: Config, resume=None):
 
     pending_exit = False           # armed by one ^C at the prompt; a second exits
     pending_inputs = []            # lines the user typed via the composer mid-turn
-    use_composer = cfg.composer and _TTY and sys.stdin.isatty()
+    use_composer = _composer_ok(cfg)
     # Persistent idle-prompt composer: owns the input line at idle (correct
     # multi-line paste rendering + Tab/history/emacs keys), and its history
     # persists to disk across the session. readline stays the no-TTY fallback.
@@ -18973,22 +18987,28 @@ def repl(cfg: Config, resume=None):
             # the compaction. Save whenever the history actually changed.
             if _history_sig(agent) != _sig:
                 autosave_session(agent, cfg)
-            continue
+            # /compact queued a self-prompt and left it for us (composer on): run it
+            # below as a composer turn, same as a typed one.
+            if not (use_composer and agent._autostart_pending):
+                continue
+            line = None
         if use_composer:
             comp = Composer()
             comp.remote = bool(agent.remote)   # mid-turn input row shows » when remote
             interrupted = False
             with composer_session(comp) as engaged:
                 try:
+                    # line None = the post-/compact autostart (its own countdown+turn)
+                    _go = agent._consume_autostart if line is None else (lambda: agent.run_turn(line))
                     if engaged:
-                        agent.run_turn(line)
+                        _go()
                     else:
                         # Composer couldn't take the TTY. Fall back to the SAME
                         # protection as the classic path - without this the turn
                         # ran with echo on, garbling the stream and line-buffering
                         # typeahead that then auto-fired as turns.
                         with suppress_echo():
-                            agent.run_turn(line)
+                            _go()
                 except KeyboardInterrupt:
                     interrupted = True
             queued = comp.pop_queued() if engaged else []
