@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L1629   Lean-tools (plugin tools: discovery, manager)
-  L1983   MCP client (connection, manager, OAuth, discovery)
-  L2437   Providers (backend plugin registry)
-  L2659   Interactive pickers + menus (raw-mode UI engine)
-  L3008   Terminal styling (colors, formatting helpers)
-  L3245   Streaming + markdown render (model output)
-  L3719   Composer (pinned input line, editor, stdin)
-  L4601   Token accounting (calibrated context meter)
-  L4799   Config (dataclass, field registry, load/save)
-  L8592   Tool execution + text tool-call parsing
-  L9065   Remote workspace (executor client, /connect)
-  L11240  Context meter
-  L11335  Agent (turn loop, context mgmt, tool dispatch)
-  L18481  Slash-command handlers + dispatch table
-  L18618  REPL (interactive loop, session resume)
-  L19074  Worker agent (headless --agent-run)
-  L19753  Entry (CLI arg parsing, main)
+  L1634   Lean-tools (plugin tools: discovery, manager)
+  L1988   MCP client (connection, manager, OAuth, discovery)
+  L2442   Providers (backend plugin registry)
+  L2664   Interactive pickers + menus (raw-mode UI engine)
+  L3013   Terminal styling (colors, formatting helpers)
+  L3250   Streaming + markdown render (model output)
+  L3724   Composer (pinned input line, editor, stdin)
+  L4606   Token accounting (calibrated context meter)
+  L4804   Config (dataclass, field registry, load/save)
+  L8597   Tool execution + text tool-call parsing
+  L9070   Remote workspace (executor client, /connect)
+  L11245  Context meter
+  L11340  Agent (turn loop, context mgmt, tool dispatch)
+  L18486  Slash-command handlers + dispatch table
+  L18623  REPL (interactive loop, session resume)
+  L19079  Worker agent (headless --agent-run)
+  L19758  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -116,7 +116,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.10.69"
+__version__ = "0.10.70"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -124,6 +124,11 @@ __version__ = "0.10.69"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.10.70": [
+        "Desktop notifications name the app, use a stock terminal icon and last 3s",
+        "  (notify-send -a lean-coder -i utilities-terminal -t 3000) - KDE no longer",
+        "  borrows another app's icon or guesses the timeout. macOS path unchanged.",
+    ],
     "0.10.69": [
         "Status middle row: 'compact at 20%' -> 'compact 20%'.",
     ],

@@ -20,6 +20,8 @@ import sys
 import time
 
 NOTIFY_AFTER = 8.0      # only ping for finished turns that actually took a while
+NOTIFY_ICON = "utilities-terminal"   # stock theme icon - present on every desktop
+NOTIFY_MS = 3000        # toast lifetime (ms)
 _state = {"on": True, "start": 0.0, "bell": False}   # bell OFF by default (no sound)
 
 
@@ -37,7 +39,11 @@ def _ping(summary="lean-coder", body=""):
             pass
     try:
         if shutil.which("notify-send"):
-            subprocess.run(["notify-send", summary, body],
+            # name the app + icon + timeout so the desktop doesn't guess (KDE otherwise
+            # borrows another app's icon). No -c category: im.* made Plasma reuse a
+            # messaging app's icon.
+            subprocess.run(["notify-send", "-a", "lean-coder", "-i", NOTIFY_ICON,
+                            "-t", str(NOTIFY_MS), summary, body],
                            timeout=5, capture_output=True)
         elif shutil.which("osascript"):
             subprocess.run(["osascript", "-e",
