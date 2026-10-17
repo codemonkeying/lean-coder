@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L1678   Lean-tools (plugin tools: discovery, manager)
-  L2032   MCP client (connection, manager, OAuth, discovery)
-  L2486   Providers (backend plugin registry)
-  L2708   Interactive pickers + menus (raw-mode UI engine)
-  L3057   Terminal styling (colors, formatting helpers)
-  L3351   Streaming + markdown render (model output)
-  L3843   Composer (pinned input line, editor, stdin)
-  L4747   Token accounting (calibrated context meter)
-  L4945   Config (dataclass, field registry, load/save)
-  L8738   Tool execution + text tool-call parsing
-  L9211   Remote workspace (executor client, /connect)
-  L11386  Context meter
-  L11481  Agent (turn loop, context mgmt, tool dispatch)
-  L18680  Slash-command handlers + dispatch table
-  L18817  REPL (interactive loop, session resume)
-  L19280  Worker agent (headless --agent-run)
-  L19959  Entry (CLI arg parsing, main)
+  L1683   Lean-tools (plugin tools: discovery, manager)
+  L2037   MCP client (connection, manager, OAuth, discovery)
+  L2491   Providers (backend plugin registry)
+  L2713   Interactive pickers + menus (raw-mode UI engine)
+  L3062   Terminal styling (colors, formatting helpers)
+  L3356   Streaming + markdown render (model output)
+  L3848   Composer (pinned input line, editor, stdin)
+  L4752   Token accounting (calibrated context meter)
+  L4950   Config (dataclass, field registry, load/save)
+  L8743   Tool execution + text tool-call parsing
+  L9216   Remote workspace (executor client, /connect)
+  L11391  Context meter
+  L11486  Agent (turn loop, context mgmt, tool dispatch)
+  L18693  Slash-command handlers + dispatch table
+  L18830  REPL (interactive loop, session resume)
+  L19293  Worker agent (headless --agent-run)
+  L19972  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -116,7 +116,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.10.73"
+__version__ = "0.10.74"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -124,6 +124,11 @@ __version__ = "0.10.73"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.10.74": [
+        "/load in incognito now switches to the loaded session's name (no lock, nothing",
+        "  written). Turning incognito off saves into that session and claims its lock,",
+        "  instead of autosaving it over whichever session was open before.",
+    ],
     "0.10.73": [
         "Status rows never wrap: each is cut to the terminal width with an ellipsis, and",
         "  row 1 shows a named host once ('@ 227', the url stays in /info).",
@@ -16465,9 +16470,13 @@ def _load_session_into(agent, cfg, name):
     # so it stays current (no silent fork into a new auto- name). Claim its lock NOW
     # (and drop the one we're leaving) so the first autosave owns it - this is what a
     # take-over actually does, and what stops the loader being forked straight off it.
+    # Always adopt the loaded name - even incognito - so turning incognito off later
+    # autosaves into THIS session, not over whichever one was open before (that wrote
+    # llmtesting's history over test.json). Incognito just leaves no lock on disk.
     if not cfg.incognito:
         _release_lock(agent.autosave_name)
-        agent.autosave_name = _session_name_ok(name)
+    agent.autosave_name = _session_name_ok(name)
+    if not cfg.incognito:
         _write_lock(agent.autosave_name)
     print(green(f"resumed '{_session_name_ok(name)}'  {GLYPH['dot']}  {n} msgs  "
                 f"{GLYPH['dot']}  saved {meta.get('saved_at', '?')}"))
@@ -17536,8 +17545,12 @@ def handle_incognito_command(agent, cfg, arg):
                     "NOTE: this does not hide anything from the model provider; "
                     "requests may still be processed/retained per its policy."))
     else:
+        # Back to persisting: claim the open session's lock now (incognito never
+        # takes one), so another instance can't write to it alongside us.
+        if cfg.autosave and agent.autosave_name:
+            _write_lock(agent.autosave_name)
         print(dim(f"{GLYPH['ghost']} incognito: off - session persistence follows your "
-                  "autosave setting again."))
+                  f"autosave setting again (saving as '{agent.autosave_name}')."))
 
 
 def _apply_leash(agent, cfg, want, persist=True):
