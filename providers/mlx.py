@@ -113,7 +113,7 @@ class MLXClient:
                             spin.stop()
                             if printed_think:
                                 sys.stdout.write("\n")
-                            sys.stdout.write(_lc["blue"]("● "))
+                            sys.stdout.write(_lc["blue"]((_lc.get("GLYPH") or {}).get("bullet", "*") + " "))
                             printed = True
                         md.feed(txt)
                         content_parts.append(txt)

@@ -487,7 +487,7 @@ class _GeminiClient:
                             if chunk:
                                 if not printed:
                                     spin.stop()
-                                    sys.stdout.write(_lc["blue"]("● "))
+                                    sys.stdout.write(_lc["blue"]((_lc.get("GLYPH") or {}).get("bullet", "*") + " "))
                                     printed = True
                                 md.feed(chunk)
                                 content_parts.append(chunk)

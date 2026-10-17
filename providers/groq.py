@@ -374,7 +374,7 @@ class _GroqClient:
                     if txt:
                         if not printed:
                             spin.stop()
-                            sys.stdout.write(_lc["blue"]("● "))
+                            sys.stdout.write(_lc["blue"]((_lc.get("GLYPH") or {}).get("bullet", "*") + " "))
                             printed = True
                         md.feed(txt)
                         content_parts.append(txt)

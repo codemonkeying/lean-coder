@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L1639   Lean-tools (plugin tools: discovery, manager)
-  L1993   MCP client (connection, manager, OAuth, discovery)
-  L2447   Providers (backend plugin registry)
-  L2669   Interactive pickers + menus (raw-mode UI engine)
-  L3018   Terminal styling (colors, formatting helpers)
-  L3255   Streaming + markdown render (model output)
-  L3729   Composer (pinned input line, editor, stdin)
-  L4616   Token accounting (calibrated context meter)
-  L4814   Config (dataclass, field registry, load/save)
-  L8607   Tool execution + text tool-call parsing
-  L9080   Remote workspace (executor client, /connect)
-  L11255  Context meter
-  L11350  Agent (turn loop, context mgmt, tool dispatch)
-  L18500  Slash-command handlers + dispatch table
-  L18637  REPL (interactive loop, session resume)
-  L19099  Worker agent (headless --agent-run)
-  L19778  Entry (CLI arg parsing, main)
+  L1672   Lean-tools (plugin tools: discovery, manager)
+  L2026   MCP client (connection, manager, OAuth, discovery)
+  L2480   Providers (backend plugin registry)
+  L2702   Interactive pickers + menus (raw-mode UI engine)
+  L3051   Terminal styling (colors, formatting helpers)
+  L3345   Streaming + markdown render (model output)
+  L3837   Composer (pinned input line, editor, stdin)
+  L4724   Token accounting (calibrated context meter)
+  L4922   Config (dataclass, field registry, load/save)
+  L8715   Tool execution + text tool-call parsing
+  L9188   Remote workspace (executor client, /connect)
+  L11363  Context meter
+  L11458  Agent (turn loop, context mgmt, tool dispatch)
+  L18644  Slash-command handlers + dispatch table
+  L18781  REPL (interactive loop, session resume)
+  L19243  Worker agent (headless --agent-run)
+  L19922  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -116,7 +116,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.10.71"
+__version__ = "0.10.72"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -124,6 +124,19 @@ __version__ = "0.10.71"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.10.72": [
+        "Context: a send never exceeds the window. If even the newest turn won't fit, its",
+        "  oldest tool results are stubbed on the SENT copy (newest kept, history untouched).",
+        "Emergency compaction stubs old tool output BEFORE asking for the summary, and",
+        "  rejects a summary that calls a non-empty session empty (history kept).",
+        "Reply wrap: lines fit the terminal (the leading dot is counted), wrapped lines",
+        "  indent under the reply, and bold/code colour carries across line breaks.",
+        "Markdown: ``double`` code, literal **/_ inside code, ***bold italic***, \\* escapes,",
+        "  links as 'text (url)', --- as a dim rule, table separator rows dropped, and",
+        "  hanging indents for -, 1. and a) items.",
+        "Providers: the reply dot falls back to ASCII; /usage colours switch off off a TTY.",
+        "The terminal tab title follows the session name (lc:<session>) on /load etc.",
+    ],
     "0.10.71": [
         "The autostarted turn after a manual /compact now runs in the normal pinned",
         "  display (input box, mid-turn queueing) instead of the classic unpinned one",
@@ -1221,6 +1234,26 @@ def _compact_missing(parsed) -> list:
     if not parsed.get("next"):
         missing.append("next-step")
     return missing
+
+
+_BLANK_SUMMARY_RE = re.compile(
+    r"\b(fresh|new|empty|blank)\s+(session|conversation|context)\b"
+    r"|\bno\s+(prior|previous|earlier)\s+(context|conversation|history|messages)\b"
+    r"|\bno\s+work\s+(has\s+been\s+)?(done|performed)\b"
+    r"|\bnothing\s+(durable\s+)?(to\s+save|has\s+happened|to\s+summari[sz]e)\b", re.I)
+
+
+def _compact_blank(block) -> bool:
+    """A summary that claims the session is empty: short AND says so. A real summary
+    can mention 'new session' in passing, so long ones are never judged blank."""
+    b = (block or "").strip()
+    return len(b) < 600 and bool(_BLANK_SUMMARY_RE.search(b))
+
+
+def _real_turns(msgs) -> int:
+    """User turns that carry real conversation (not summaries/autostart stubs)."""
+    return sum(1 for m in msgs if m.get("role") == "user"
+               and not str(m.get("content") or "").startswith(("Earlier context", "[autostart")))
 
 
 def _compact_nudge_missing(missing) -> str:
@@ -3172,8 +3205,16 @@ TOOL_FRAMES = glyph("◐◓◑◒", "|/-\\")             # moon when UTF-8, ASCI
 # (the color helpers are no-ops off a TTY). Line-level + a few inline forms only -
 # enough to de-noise headings/bold/code without a real markdown engine.
 _MD_H = re.compile(r"^\s{0,3}(#{1,6})\s+(.*?)\s*#*\s*$")
-_MD_CODE = re.compile(r"`([^`\n]+)`")
+# `code` and ``code with a ` inside`` (CommonMark: N backticks close only on N; the
+# padding space inside the double form is stripped).
+_MD_CODE = re.compile(r"``\s?(.+?)\s?``|`([^`\n]+)`")
 _MD_BOLD = re.compile(r"\*\*(.+?)\*\*|__(.+?)__")
+_MD_BOLDITAL = re.compile(r"\*\*\*(.+?)\*\*\*")             # ***bold italic***
+_MD_ESC = re.compile(r"\\([\\`*_~\[\]#|])")                  # \* -> a literal *
+_MD_LINK = re.compile(r"\[([^\]\n]+)\]\((\S+?)\)")             # [text](url)
+_MD_HR = re.compile(r"^\s{0,3}([-*_])(\s*\1){2,}\s*$")          # --- / *** / ___
+_MD_TABLE_SEP = re.compile(r"^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)+\|?\s*$")
+_MD_LIST = re.compile(r"^(\s*(?:[-*+]|\d{1,3}[.)]|[a-zA-Z][.)])\s+)")  # bullet lead
 # single-* / single-_ italic: only OUTSIDE the ** case (bold is stripped first),
 # and not touching ** pairs, list-bullet "* ", or bare/unbalanced markers. The
 # operands reject a marker adjacent to whitespace so "a * b" and "2 * 3" pass through.
@@ -3198,9 +3239,11 @@ def style_md_line(line: str) -> str:
         # Strip the '>' marker(s); render the remaining text (still inline-styled) as
         # plain dim prose - no bar prefix, so a copied "message to send" stays clean.
         return dim(style_md_inline(q.group(2)))
+    if _MD_HR.match(line):                      # --- / *** -> a short dim rule
+        return dim(GLYPH["rule"] * 20)
     h = _MD_H.match(line)
     if h:
-        inner = _MD_CODE.sub(lambda m: m.group(1), h.group(2))      # strip backticks
+        inner = _MD_CODE.sub(lambda m: m.group(1) or m.group(2), h.group(2))  # strip backticks
         inner = _MD_BOLD.sub(lambda m: m.group(1) or m.group(2), inner)  # strip **
         return bold(inner)
     return style_md_inline(line)
@@ -3209,10 +3252,23 @@ def style_md_line(line: str) -> str:
 def style_md_inline(line: str) -> str:
     """Inline styling only (code / bold / italic), no line-level heading or quote
     handling. Split out so the quote branch can reuse it on the quoted text."""
-    line = _MD_CODE.sub(lambda m: cyan(m.group(1)), line)
+    # Literal spans are parked behind placeholders so * / _ inside them aren't styled:
+    # code (x**2, a_b_c) -> cyan; \-escapes -> the bare char; links -> 'text (url)'
+    # with the URL left PLAIN (no colour codes inside it) so the terminal still
+    # detects it and a click/drag copies it whole.
+    parked = []
+
+    def _park(out):
+        parked.append(out)
+        return f"\x00{len(parked) - 1}\x00"
+    line = _MD_CODE.sub(lambda m: _park(cyan(m.group(1) or m.group(2))), line)
+    line = _MD_ESC.sub(lambda m: _park(m.group(1)), line)
+    line = _MD_LINK.sub(lambda m: _park(
+        m.group(2) if m.group(1).strip() == m.group(2) else f"{m.group(1)} ({m.group(2)})"), line)
+    line = _MD_BOLDITAL.sub(lambda m: bold(italic(m.group(1))), line)
     line = _MD_BOLD.sub(lambda m: bold(m.group(1) or m.group(2)), line)
     line = _MD_ITALIC.sub(lambda m: italic(m.group(1) or m.group(2)), line)
-    return line
+    return re.sub(r"\x00(\d+)\x00", lambda m: parked[int(m.group(1))], line)
 
 
 def _resolve_wrap_width(setting) -> int:
@@ -3231,6 +3287,40 @@ def _resolve_wrap_width(setting) -> int:
     except ValueError:
         return 0
     return n if n >= 20 else 0        # too-narrow / negative -> treat as off
+
+
+_SGR_RE = re.compile(r"\x1b\[([0-9;]*)m")
+
+
+def _wrap_styled(styled: str, width: int) -> "list[str]":
+    """Greedy word-wrap of an ALREADY-STYLED line to `width` VISIBLE columns (ANSI
+    codes count 0). Words fill a line until the next won't fit; a long unbroken token
+    stays whole. Colour open at a break is closed at the line end and re-opened at the
+    start of the next, so styling survives the wrap (ansiwrap's approach, stdlib only)."""
+    if width <= 0 or not _SGR_RE.sub("", styled).strip():
+        return [styled]
+    vis = lambda t: len(_SGR_RE.sub("", t))
+    lines, cur, cur_w = [], [], 0
+    for w in styled.split(" "):
+        ww = vis(w)
+        if cur and cur_w + 1 + ww > width:
+            lines.append(" ".join(cur))
+            cur, cur_w = [w], ww
+        else:
+            cur_w += (1 if cur else 0) + ww
+            cur.append(w)
+    lines.append(" ".join(cur))
+    out, open_codes = [], []
+    for ln in lines:
+        text = "".join(f"\x1b[{c}m" for c in open_codes) + ln
+        for m in _SGR_RE.finditer(ln):
+            c = m.group(1)
+            if c in ("", "0"):
+                open_codes = []
+            else:
+                open_codes.append(c)
+        out.append(text + ("\x1b[0m" if open_codes else ""))
+    return out
 
 
 def _wrap_prose(line: str, width: int) -> "list[str]":
@@ -3431,6 +3521,10 @@ class MarkdownStream:
         # wrap_width=None (the usual provider call) reads the live module setting that
         # core refreshes from cfg each turn - so providers need no change to opt in.
         self._wrap = int(_OUTPUT_WRAP_WIDTH if wrap_width is None else wrap_width or 0)
+        # Providers print the 2-col '● ' before the first chunk; every later prose line
+        # is indented the same 2 so the reply lines up under it as one block.
+        self._lead = 2
+        self._first = True
 
     def _emit(self, line, newline):
         # A fence can be nested inside a blockquote ("> ```") - the model does this
@@ -3457,12 +3551,26 @@ class MarkdownStream:
         # codes don't count toward the width (which was making lines wrap short of the
         # terminal edge). Each wrapped piece gets its own newline; the trailing piece
         # honours the caller's `newline` flag.
+        if _MD_TABLE_SEP.match(line):           # |---|---| is pure noise on a terminal
+            return
         if self._wrap > 0:
-            pieces = _wrap_prose(line, self._wrap)
+            # greedy: words fill the line until the next one won't fit. Width = terminal
+            # minus 1 (never touch the last column, or the terminal wraps it itself)
+            # minus the 2-col lead ('● ' on the first line, an indent on the rest).
+            # Style the WHOLE line first (so a **bold**/`code` pair that crosses the wrap
+            # point still matches), then wrap the styled text by VISIBLE width, carrying
+            # the open colour onto the next line - the ansiwrap approach.
+            # a list item's wrapped lines hang under its text, not under the '- '
+            lm = _MD_LIST.match(line)
+            hang = len(lm.group(1)) if lm else 0
+            pieces = _wrap_styled(style_md_line(line), max(20, self._wrap - 1 - self._lead - hang))
             for i, p in enumerate(pieces):
                 last = (i == len(pieces) - 1)
-                self._write(style_md_line(p) + ("\n" if (not last or newline) else ""))
+                pad = "" if (self._first or not p.strip()) else " " * (self._lead + (hang if i else 0))
+                self._first = False
+                self._write(pad + p + ("\n" if (not last or newline) else ""))
             return
+        self._first = False
         self._write(style_md_line(line) + ("\n" if newline else ""))
 
     def feed(self, text):
@@ -11361,6 +11469,14 @@ def _set_proc_title(name):
             f.write(f"lc:{name}"[:15])
     except OSError:
         pass
+    # Also set the terminal tab title (OSC 0) so it updates at once on /load etc. -
+    # Konsole caches the process name; its %w shows this. TTY only (never into a pipe).
+    try:
+        if sys.stdout.isatty():
+            sys.stdout.write(f"\033]0;lc:{name}\007")
+            sys.stdout.flush()
+    except (OSError, ValueError):
+        pass
 
 
 class Agent:
@@ -12397,10 +12513,23 @@ class Agent:
             else:
                 break                          # older turns only get bigger; stop
         if best is None:
-            # Not even the last turn fits the remaining budget: send the last turn anyway
-            # (coherent over empty); the provider handles the overflow like the no-window case.
+            # Not even the last turn fits: stub its OLDEST tool results (on copies - stored
+            # history is untouched) until it does, keeping the newest whole. Never send over
+            # the window; the model sees '[trimmed ...]' and can re-read narrower.
             start = self._first_user_from(body, len(body) - 1)
-            return (head + body[start:]) if start is not None else msgs
+            if start is None:
+                return msgs
+            turn = [dict(m) for m in body[start:]]
+            tools = [i for i, m in enumerate(turn) if m.get("role") == "tool"
+                     and not str(m.get("content") or "").startswith("[trimmed")]
+            for i in tools[:-1]:
+                if messages_tokens(turn, None) <= remaining:
+                    break
+                c = str(turn[i].get("content") or "")
+                turn[i]["content"] = (f"[trimmed {turn[i].get('tool_name', 'tool')} result - "
+                                      f"{len(c.splitlines())} lines; over the window, re-call narrower]")
+                turn[i].pop("image_path", None)
+            return head + turn
         if best == 0:
             return msgs                         # whole history fits -> unchanged
         return head + body[best:]
@@ -12784,7 +12913,9 @@ class Agent:
         so it shouldn't throttle the next auto-compaction. Returns the summary block, or None."""
         if not [m for m in self.messages if m["role"] != "system"]:
             return None
-        pre       = list(self.messages)                # capture BEFORE the compaction turn
+        # Capture BEFORE the compaction turn. Copy each dict: the emergency pre-trim below
+        # stubs tool content IN PLACE, and the snapshot / failure-restore must keep it whole.
+        pre       = [dict(m) for m in self.messages]
         pre_plan  = getattr(self, "pinned_plan", "")   # for the recovery snapshot below
         # Emergency keep is a fixed minimal backstop (fires AT overflow - no token math,
         # just get small NOW). Soft/hard/manual defer the keep to AFTER the summary exists
@@ -12792,6 +12923,11 @@ class Agent:
         if zone == "emergency":
             keep_from = self._keep_tail_turns(pre, COMPACT_EMERGENCY_KEEP)
             tail = pre[keep_from:] if keep_from is not None else []
+            # Make room BEFORE asking for the summary: an overflowing history gets
+            # front-truncated by the server, so the model summarises an empty-looking
+            # session and wipes real work. Stubbing every tool result (the /trim step)
+            # keeps the whole conversation + which tools ran, and fits.
+            self.trim(0)
         else:
             tail = None                # computed post-summary
 
@@ -12802,6 +12938,14 @@ class Agent:
         instr = read_prompt("compact") or COMPACT_INSTR
         parsed, missing, attempt, _turn_text = self._solicit_compact(instr)
         block = parsed["compact"]
+        if block and _compact_blank(block) and _real_turns(pre) >= 2:
+            # The model saw (or claims) an empty session while there were real turns:
+            # it was fed a truncated/blank history. Accepting it would wipe real work.
+            print(yellow(f"  {GLYPH['warn']} compaction summary says the session is empty "
+                         f"but it isn't - rejected, history kept."))
+            self._log_activity("compact", "rejected blank summary",
+                               "model summarised a non-empty session as empty (truncated input)")
+            block = None
         self.tool_defs = saved
         if not block:                         # no usable summary -> don't nuke history
             self.messages = pre

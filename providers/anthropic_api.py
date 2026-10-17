@@ -491,7 +491,7 @@ class _ApiKeyClient:
                         if chunk:
                             if not printed:
                                 spin.stop()
-                                sys.stdout.write(_lc["blue"]("● "))
+                                sys.stdout.write(_lc["blue"]((_lc.get("GLYPH") or {}).get("bullet", "*") + " "))
                                 printed = True
                             md.feed(chunk)
                             content_parts.append(chunk)
@@ -820,9 +820,9 @@ def _detail(agent, cfg):
     red  = _lc["red"]
 
     def _co(s, pct):
-        if pct >= 90: return f"\033[31m{s}\033[0m"
-        if pct >= 50: return f"\033[33m{s}\033[0m"
-        return f"\033[2;34m{s}\033[0m"
+        if pct >= 90: return _lc["red"](s)
+        if pct >= 50: return _lc["yellow"](s)
+        return _lc["dim"](_lc["blue"](s))      # colour helpers: plain off a TTY
 
     cur_model  = cfg.active_model()
     cur_think  = cfg.setting("thinking") or "off"
