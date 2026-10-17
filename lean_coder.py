@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L1672   Lean-tools (plugin tools: discovery, manager)
-  L2026   MCP client (connection, manager, OAuth, discovery)
-  L2480   Providers (backend plugin registry)
-  L2702   Interactive pickers + menus (raw-mode UI engine)
-  L3051   Terminal styling (colors, formatting helpers)
-  L3345   Streaming + markdown render (model output)
-  L3837   Composer (pinned input line, editor, stdin)
-  L4724   Token accounting (calibrated context meter)
-  L4922   Config (dataclass, field registry, load/save)
-  L8715   Tool execution + text tool-call parsing
-  L9188   Remote workspace (executor client, /connect)
-  L11363  Context meter
-  L11458  Agent (turn loop, context mgmt, tool dispatch)
-  L18644  Slash-command handlers + dispatch table
-  L18781  REPL (interactive loop, session resume)
-  L19243  Worker agent (headless --agent-run)
-  L19922  Entry (CLI arg parsing, main)
+  L1678   Lean-tools (plugin tools: discovery, manager)
+  L2032   MCP client (connection, manager, OAuth, discovery)
+  L2486   Providers (backend plugin registry)
+  L2708   Interactive pickers + menus (raw-mode UI engine)
+  L3057   Terminal styling (colors, formatting helpers)
+  L3351   Streaming + markdown render (model output)
+  L3843   Composer (pinned input line, editor, stdin)
+  L4747   Token accounting (calibrated context meter)
+  L4945   Config (dataclass, field registry, load/save)
+  L8738   Tool execution + text tool-call parsing
+  L9211   Remote workspace (executor client, /connect)
+  L11386  Context meter
+  L11481  Agent (turn loop, context mgmt, tool dispatch)
+  L18680  Slash-command handlers + dispatch table
+  L18817  REPL (interactive loop, session resume)
+  L19280  Worker agent (headless --agent-run)
+  L19959  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -116,7 +116,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.10.72"
+__version__ = "0.10.73"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -124,6 +124,12 @@ __version__ = "0.10.72"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.10.73": [
+        "Status rows never wrap: each is cut to the terminal width with an ellipsis, and",
+        "  row 1 shows a named host once ('@ 227', the url stays in /info).",
+        "Resizing at the prompt (e.g. the Termux keyboard opening) redraws the status rows",
+        "  above the input rule instead of losing them.",
+    ],
     "0.10.72": [
         "Context: a send never exceeds the window. If even the newest turn won't fit, its",
         "  oldest tool results are stubbed on the SENT copy (newest kept, history untouched).",
@@ -3873,6 +3879,7 @@ class Composer:
         self.completer = None            # optional fn(word)->[options]; set by wiring
         self.comp_display = []           # last completion candidates, for the renderer
         self._read_active = False        # True only inside read_line() (idle reader)
+        self.status_rows_fn = None       # idle: () -> status rows, reprinted on resize
         self._read_eof = False           # Ctrl-D on an empty buffer during read_line
         self._read_wake = threading.Event()   # reader thread -> read_line: line ready/EOF
         self.rule_label = ""             # STATIC idle-rule label (e.g. remote host);
@@ -4403,6 +4410,22 @@ class Composer:
             try:
                 self._out.write(f"\033[1;{self._rows - reserve}r")
                 self._out.write(f"\033[{self._rows - reserve};1H\0337")
+                # The status rows live in the scrolling output, so a resize (Termux
+                # keyboard open/close) reflows them away. While idle, reprint them just
+                # above the pinned rule - re-rendered at the NEW width.
+                rows_fn = self.status_rows_fn if self._read_active else None
+                if rows_fn:
+                    try:
+                        srows = rows_fn() or []
+                    except Exception:
+                        srows = []
+                    if srows:
+                        # Overwrite the bottom of the output area in place (clearing each
+                        # line) instead of appending, so a surviving old copy is replaced,
+                        # not duplicated. The rows sit directly above the pinned rule.
+                        top = max(1, self._rows - reserve - len(srows) + 1)
+                        buf = "".join(f"\033[{top + i};1H\033[2K{r}" for i, r in enumerate(srows))
+                        self._out.write(buf + f"\033[{self._rows - reserve};1H\0337")
                 self._redraw_locked()
                 self._out.flush()
             except Exception:
@@ -15661,7 +15684,10 @@ def _status_rows(agent, cfg):
         return []
     d = dim(f" {GLYPH['dot']} ")
     rows = []
-    model_at = f"{_short_model(cfg.active_model())} @ {_provider_label(cfg)}"
+    # The row shows the host ONCE: a 'name (url)' label keeps just the name (/info has
+    # the url). A bare url stays as-is.
+    _loc = re.sub(r"^(\S+) \((?:https?://)?[^)]*\)$", r"\1", _provider_label(cfg))
+    model_at = f"{_short_model(cfg.active_model())} @ {_loc}"
 
     # 1) session + model (at the top - what/where you're running). Autosave state and
     # the turn count live in /info.
@@ -15731,7 +15757,17 @@ def _status_rows(agent, cfg):
     # setting (thinking adaptive/unset, effort low/unset), behind a brain glyph.
     tail = _think_tag(think, effort)
     rows.append("  " + ctx + quota + (d + tail if tail else ""))
-    return rows
+    # Never wrap: a wrapped row on a narrow terminal (Termux) pushes the rest off the
+    # pinned area and desyncs redraws. Cut to the width with an ellipsis.
+    return [_fit_status_row(r) for r in rows]
+
+
+def _fit_status_row(row, width=None):
+    """_fit_line plus a trailing ellipsis when the row was actually cut."""
+    width = width or max(1, _term_cols() - 1)
+    if len(_ANSI_RE.sub("", row)) <= width:
+        return row
+    return _fit_line(row, width - 1) + GLYPH.get("ellipsis", "...")
 
 
 def _status_key(rows):
@@ -19072,6 +19108,7 @@ def repl(cfg: Config, resume=None):
                     # + Tab/history/emacs. Falls back to input() if it can't take
                     # the TTY (RuntimeError). The prompt glyph is drawn by the
                     # composer's own input row, so pass only the remote indicator.
+                    idle_comp.status_rows_fn = lambda: _status_rows(agent, cfg)
                     try:
                         line = idle_comp.read_line(
                             prompt_status=(indicator.strip() or None),
