@@ -432,7 +432,7 @@ class OllamaClient:
         return payload
 
     def _stream_chat(self, model, messages, tools, should_abort,
-                     _cold_retried=False, _stall_retried=False):
+                     _cold_retried=False, _stall_retried=False, _cut_retried=False):
         """Stream one /api/chat request. Returns
         (content_parts, tool_calls, prompt_eval, aborted). Retries once without
         `think` if the model reports it doesn't support thinking, retries once
@@ -610,6 +610,25 @@ class OllamaClient:
             self._preload(model)
             return self._stream_chat(model, messages, tools, should_abort,
                                      _cold_retried=True, _stall_retried=_stall_retried)
+        # Cut-off reply: some output arrived but the stream ended WITHOUT a done frame
+        # (server dropped / model process restarted). Same shape as anthropic's empty-
+        # reply handling: retry once silently-ish, then tell the OPERATOR (never the
+        # model) and keep what arrived. done_reason 'length' = hit num_ctx/num_predict.
+        if not aborted and (content_parts or tool_calls or printed_think):
+            warn = GLYPH.get("warn", "!")
+            if not saw_done and not _cut_retried:
+                print(yellow(f"  {warn} {model}: server ended the reply early "
+                                    f"(no done frame) - retrying once"))
+                return self._stream_chat(model, messages, tools, should_abort,
+                                         _cold_retried=True, _stall_retried=_stall_retried,
+                                         _cut_retried=True)
+            if not saw_done:
+                print(yellow(f"  {warn} {model}: reply cut off again by the server "
+                                    f"(no done frame)") + dim("  check the host, retry, or /model."))
+            elif done_reason == "length":
+                print(yellow(f"  {warn} {model}: reply stopped at the length limit "
+                                    f"(num_ctx {self.cfg.options().get('num_ctx')})")
+                      + dim("  /compact to free room, or raise the model's context."))
         return content_parts, tool_calls, prompt_eval, aborted
 
 
