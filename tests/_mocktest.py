@@ -197,6 +197,20 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self._emit({"error": '"kilo-coder:latest" does not support thinking'})
             return
+        if MODE == "cutoff":
+            # Server drops mid-reply: one word, then the stream closes with NO done
+            # frame (seen on a remote Mac). First call only; the retry answers whole.
+            self.send_response(200)
+            self.send_header("Content-Type", "application/x-ndjson")
+            self.end_headers()
+            if not cold_state["warmed"]:
+                cold_state["warmed"] = True
+                self._emit({"message": {"role": "assistant", "content": "The"}, "done": False})
+                return
+            self._emit({"message": {"role": "assistant", "content": "full answer"}, "done": False})
+            self._emit({"message": {"role": "assistant", "content": ""}, "done": True,
+                        "done_reason": "stop", "prompt_eval_count": 50, "eval_count": 2})
+            return
         if MODE == "coldload":
             # Cold-model streaming quirk (measured on a real remote ollama): the first
             # stream:true call kicks off the VRAM load and CLOSES the stream with a
@@ -455,6 +469,17 @@ cl2.run_turn("again")
 check("[coldload] warm run does not preload/retry (single stream request)",
       len(bodies) == 1 and cl2.messages[-1]["content"] == "warm answer",
       f"n={len(bodies)}")
+
+# --- cut-off: partial reply then the stream closes with no done frame; the client
+# must retry once and keep the full answer, not save the fragment ---------------
+print("\n--- scenario: cutoff ---")
+MODE = "cutoff"; counter["n"] = 0; bodies.clear()
+cold_state["warmed"] = False
+co = mk_agent(cfg)
+co.run_turn("hi")
+check("[cutoff] retried once after a no-done-frame cut and kept the full answer",
+      len(bodies) == 2 and co.messages[-1]["content"] == "full answer",
+      f"n={len(bodies)} content={co.messages[-1]['content']!r}")
 
 # --- clean SIGINT path: chat() aborts cooperatively via should_abort ---------
 print("\n--- scenario: abort ---")

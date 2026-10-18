@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L1683   Lean-tools (plugin tools: discovery, manager)
-  L2037   MCP client (connection, manager, OAuth, discovery)
-  L2491   Providers (backend plugin registry)
-  L2713   Interactive pickers + menus (raw-mode UI engine)
-  L3062   Terminal styling (colors, formatting helpers)
-  L3356   Streaming + markdown render (model output)
-  L3848   Composer (pinned input line, editor, stdin)
-  L4752   Token accounting (calibrated context meter)
-  L4950   Config (dataclass, field registry, load/save)
-  L8743   Tool execution + text tool-call parsing
-  L9216   Remote workspace (executor client, /connect)
-  L11391  Context meter
-  L11486  Agent (turn loop, context mgmt, tool dispatch)
-  L18693  Slash-command handlers + dispatch table
-  L18830  REPL (interactive loop, session resume)
-  L19293  Worker agent (headless --agent-run)
-  L19972  Entry (CLI arg parsing, main)
+  L1690   Lean-tools (plugin tools: discovery, manager)
+  L2044   MCP client (connection, manager, OAuth, discovery)
+  L2498   Providers (backend plugin registry)
+  L2720   Interactive pickers + menus (raw-mode UI engine)
+  L3069   Terminal styling (colors, formatting helpers)
+  L3363   Streaming + markdown render (model output)
+  L3855   Composer (pinned input line, editor, stdin)
+  L4759   Token accounting (calibrated context meter)
+  L4957   Config (dataclass, field registry, load/save)
+  L8754   Tool execution + text tool-call parsing
+  L9227   Remote workspace (executor client, /connect)
+  L11402  Context meter
+  L11497  Agent (turn loop, context mgmt, tool dispatch)
+  L18704  Slash-command handlers + dispatch table
+  L18841  REPL (interactive loop, session resume)
+  L19304  Worker agent (headless --agent-run)
+  L19983  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -116,7 +116,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.10.74"
+__version__ = "0.10.75"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -124,6 +124,13 @@ __version__ = "0.10.74"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.10.75": [
+        "Ollama: send the detected context window as num_ctx (e.g. a model's 196k pin),",
+        "  not the 32768 default. The status bar showed the real window while requests",
+        "  went out at 32k, squeezing replies on long sessions.",
+        "Ollama: a reply that stops without the server's done frame is retried once, then",
+        "  flagged to the operator; a reply that hits the length limit is flagged too.",
+    ],
     "0.10.74": [
         "/load in incognito now switches to the loaded session's name (no lock, nothing",
         "  written). Turning incognito off saves into that session and claims its lock,",
@@ -5383,8 +5390,12 @@ class Config:
         self.model_explicit = True
 
     def options(self) -> dict:
+        # num_ctx = the RESOLVED window (provider-detected, e.g. ollama's 196k pin), not
+        # the raw 32768 default: sending the default while the meter showed 196k made
+        # ollama truncate a 32k history to fit and cut replies off after a word.
         return {
-            "num_ctx": self.num_ctx,
+            "num_ctx": self.provider_settings.get(self.provider, {}).get("num_ctx")
+                       or self.num_ctx,
             "temperature": self.temperature,
             "top_p": self.top_p,
             "top_k": self.top_k,
