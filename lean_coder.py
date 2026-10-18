@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L1690   Lean-tools (plugin tools: discovery, manager)
-  L2044   MCP client (connection, manager, OAuth, discovery)
-  L2498   Providers (backend plugin registry)
-  L2720   Interactive pickers + menus (raw-mode UI engine)
-  L3069   Terminal styling (colors, formatting helpers)
-  L3363   Streaming + markdown render (model output)
-  L3855   Composer (pinned input line, editor, stdin)
-  L4759   Token accounting (calibrated context meter)
-  L4957   Config (dataclass, field registry, load/save)
-  L8754   Tool execution + text tool-call parsing
-  L9227   Remote workspace (executor client, /connect)
-  L11402  Context meter
-  L11497  Agent (turn loop, context mgmt, tool dispatch)
-  L18704  Slash-command handlers + dispatch table
-  L18841  REPL (interactive loop, session resume)
-  L19304  Worker agent (headless --agent-run)
-  L19983  Entry (CLI arg parsing, main)
+  L1697   Lean-tools (plugin tools: discovery, manager)
+  L2051   MCP client (connection, manager, OAuth, discovery)
+  L2505   Providers (backend plugin registry)
+  L2727   Interactive pickers + menus (raw-mode UI engine)
+  L3076   Terminal styling (colors, formatting helpers)
+  L3370   Streaming + markdown render (model output)
+  L3862   Composer (pinned input line, editor, stdin)
+  L4766   Token accounting (calibrated context meter)
+  L4964   Config (dataclass, field registry, load/save)
+  L8761   Tool execution + text tool-call parsing
+  L9234   Remote workspace (executor client, /connect)
+  L11409  Context meter
+  L11504  Agent (turn loop, context mgmt, tool dispatch)
+  L18711  Slash-command handlers + dispatch table
+  L18848  REPL (interactive loop, session resume)
+  L19311  Worker agent (headless --agent-run)
+  L19990  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -116,7 +116,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.10.75"
+__version__ = "0.10.76"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -124,6 +124,13 @@ __version__ = "0.10.75"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.10.76": [
+        "llamacpp: token telemetry against llama-server - requests ask for the usage",
+        "  chunk and per-token timings, so prompt/out tokens, decode tok/s and slot-cache",
+        "  hits (client.last_cache_n) are filled instead of 0/None.",
+        "llamacpp router mode (--models-preset): /model marks the loaded model with the",
+        "  green dot, and switching to an unloaded model prints a 'loading...' hint.",
+    ],
     "0.10.75": [
         "Ollama: send the detected context window as num_ctx (e.g. a model's 196k pin),",
         "  not the 32768 default. The status bar showed the real window while requests",

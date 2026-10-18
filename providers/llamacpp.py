@@ -59,6 +59,20 @@ _lc = {}
 _HOST = None
 
 
+def _entry_status(m):
+    """A /v1/models entry's router status as a lowercase string, or None. Accepts
+    both the object form {"status": {"value": "loaded", ...}} and a bare string."""
+    st = m.get("status")
+    if isinstance(st, dict):
+        st = st.get("value")
+    return st.lower() if isinstance(st, str) and st else None
+
+
+# Last model this process sent to the server: a different one means a possible
+# router swap, so we probe its status once and warn about the load wait.
+_LAST_SENT = None
+
+
 def _base():
     """Active llama-server base URL. Precedence: the /llamacpp-set host (module state,
     seeded from cfg at setup) -> LLAMACPP_HOST env -> the compiled default. rstrip so
@@ -83,23 +97,44 @@ class LlamaCppClient:
     def __init__(self, cfg):
         self.cfg = cfg
         self.last_out_tokens = None
+        # Decode telemetry (core reads last_out_tokens + last_eval_ns for tok/s), and
+        # prompt tokens served from the slot cache (timings.cache_n), per call.
+        self.last_eval_tokens = self.last_eval_ns = None
+        self.last_cache_n = None
         self._models = None
 
+    def _model_entries(self, timeout=10):
+        """Raw /v1/models entries; [] on failure. Single-model llama-server lists one
+        id; router mode (--models-preset) lists every preset with a status."""
+        try:
+            req = urllib.request.Request(f"{_base()}/v1/models", headers=_headers(), method="GET")
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                data = json.loads(r.read())
+            return [m for m in data.get("data", []) if isinstance(m, dict) and m.get("id")]
+        except (urllib.error.URLError, OSError, ValueError, KeyError, AttributeError):
+            return []
+
     def list_models(self):
-        """GET /v1/models (cached). llama-server reports the single loaded model.
-        [] on failure so menu/availability checks degrade gracefully."""
+        """GET /v1/models (cached) -> model ids. [] on failure so menu/availability
+        checks degrade gracefully."""
         if self._models is None:
-            try:
-                req = urllib.request.Request(f"{_base()}/v1/models", headers=_headers(), method="GET")
-                with urllib.request.urlopen(req, timeout=10) as r:
-                    data = json.loads(r.read())
-                self._models = [m.get("id") for m in data.get("data", []) if m.get("id")]
-            except (urllib.error.URLError, OSError, ValueError, KeyError):
-                self._models = []
+            self._models = [m["id"] for m in self._model_entries()]
         return self._models
 
+    def model_status(self, timeout=10):
+        """{id: 'loaded'|'loading'|'unloaded'|...} for router-mode entries that carry a
+        status; {} for a single-model server (no status field) or on failure."""
+        out = {}
+        for m in self._model_entries(timeout):
+            st = _entry_status(m)
+            if st:
+                out[m["id"]] = st
+        return out
+
     def running_models(self):
-        return []
+        """Router mode: the model(s) currently loaded (green dot in /model). Live, not
+        cached - loads change under us. [] on a single-model server."""
+        return [mid for mid, st in self.model_status().items() if st == "loaded"]
 
     def detect_num_ctx(self):
         return _CTX_DEFAULT
@@ -112,6 +147,9 @@ class LlamaCppClient:
         tool_acc      = {}
         order         = []
         prompt_total  = None
+        timings       = None
+        self.last_out_tokens = self.last_eval_tokens = self.last_eval_ns = None
+        self.last_cache_n = None
         out_tokens    = None
         printed       = False
         printed_think = False
@@ -181,6 +219,10 @@ class LlamaCppClient:
                             else:
                                 slot["args_obj"] = _a
 
+                # llama-server's per-chunk timings (timings_per_token); last one wins.
+                tm = obj.get("timings")
+                if isinstance(tm, dict):
+                    timings = tm
                 um = obj.get("usage")
                 if um:
                     prompt_total = um.get("prompt_tokens", prompt_total)
@@ -220,6 +262,14 @@ class LlamaCppClient:
                 "function": {"name": slot["name"], "arguments": args},
             })
 
+        if timings:
+            self.last_eval_tokens = timings.get("predicted_n") or None
+            self.last_eval_ns = int((timings.get("predicted_ms") or 0) * 1e6) or None
+            self.last_cache_n = timings.get("cache_n")
+            if not out_tokens:
+                out_tokens = self.last_eval_tokens
+            if prompt_total is None and timings.get("prompt_n") is not None:
+                prompt_total = (timings.get("prompt_n") or 0) + (timings.get("cache_n") or 0)
         if out_tokens:
             self.last_out_tokens = out_tokens
 
@@ -257,6 +307,18 @@ class LlamaCppClient:
             assistant["tool_calls"] = tool_calls
         return assistant, prompt_total, aborted
 
+    def _swap_hint(self, model):
+        """Router mode: when the model changes and the server reports it isn't loaded
+        yet, say so - a swap is a silent 30-65s wait otherwise. One quick status probe
+        per model change; a single-model server (no status) prints nothing."""
+        global _LAST_SENT
+        if not model or model == _LAST_SENT:
+            return
+        _LAST_SENT = model
+        st = self.model_status(timeout=3).get(model)
+        if st and st != "loaded":
+            print(_lc["dim"](f"  loading {model} on llama-server (router swap, can take ~1 min)..."))
+
     def chat(self, messages, tools, should_abort=None):
         """POST /v1/chat/completions (streamed). Returns
         (assistant_dict, prompt_tokens, aborted)."""
@@ -264,14 +326,19 @@ class LlamaCppClient:
             return {"role": "assistant", "content": ""}, None, True
 
         body = {
-            "model":       self.cfg.active_model(),   # llama-server ignores it (single model) but harmless
+            "model":       self.cfg.active_model(),   # router mode (--models-preset): selects/loads the model
             "messages":    messages,
             "max_tokens":  _OUT_CAP,
             "temperature": getattr(self.cfg, "temperature", 0.0),
             "stream":      True,
+            # Usage chunk (prompt/completion tokens) is opt-in, as on OpenAI; timings
+            # carry decode time + slot-cache hits. Unknown keys are ignored server-side.
+            "stream_options":    {"include_usage": True},
+            "timings_per_token": True,
         }
         if tools:
             body["tools"] = tools
+        self._swap_hint(body["model"])
         # Thinking control. cfg.think is the same bool|None the ollama provider sends
         # (True/False = force on/off; None = don't touch, let the template default
         # decide). BUT stock llama-server IGNORES a top-level enable_thinking / think
@@ -318,6 +385,8 @@ PROVIDER = {
     "autostart":      lambda: False,   # explicit selection only
     "tag":            "gguf",
     "capabilities":   lambda model: {},
+    # Router mode: loaded model(s) get the green dot in /model; [] otherwise.
+    "warm_models":    lambda: LlamaCppClient(_lc.get("_cfg")).running_models() if _lc.get("_cfg") else [],
 }
 
 
