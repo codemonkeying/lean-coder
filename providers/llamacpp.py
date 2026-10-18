@@ -32,7 +32,7 @@ SERVER-SIDE TOOL-USE NOTES (stock llama-server):
     string - _consume accepts either.
   - thinking control: stock llama-server IGNORES a top-level enable_thinking/think
     key; Qwen-class templates only honour it via chat_template_kwargs. chat() maps
-    cfg.think (bool|None) -> chat_template_kwargs.enable_thinking so --think off/on
+    cfg.think (bool|None|level str) -> chat_template_kwargs.enable_thinking (+ reasoning_effort for a level) so --think off/on
     actually takes effect (None = leave the template default). Without it, a
     thinking model dumps everything into reasoning_content and a pure-text turn
     (e.g. auto_compact) returns EMPTY content. _consume streams the reasoning_content
@@ -51,6 +51,10 @@ _DEFAULT_HOST = "http://127.0.0.1:8080"
 _API_BASE    = os.environ.get("LLAMACPP_HOST", _DEFAULT_HOST)
 _CTX_DEFAULT = 32_768        # llama-server's -c; we can't read it back reliably, so default
 _OUT_CAP     = 4096
+# cfg.think level -> chat_template_kwargs.reasoning_effort (qwen3.8: low/medium/xhigh).
+_EFFORT    = {"low": "low", "medium": "medium", "med": "medium",
+              "high": "xhigh", "xhigh": "xhigh", "max": "xhigh"}
+_THINK_OFF = {"off", "false", "no", "0", "none", ""}
 
 _lc = {}
 # Active base URL, resolved at setup() from (in precedence order) the provider-scoped
@@ -347,8 +351,21 @@ class LlamaCppClient:
         # pure-TEXT turn (e.g. auto_compact's no-tools summary) comes back with EMPTY
         # content. So map the toggle into chat_template_kwargs.enable_thinking; leave
         # it off entirely when think is None so we don't override the model default.
-        if self.cfg.think is not None:
-            body["chat_template_kwargs"] = {"enable_thinking": bool(self.cfg.think)}
+        # A level string (headless callers set cfg.think="low"|"medium"|"high", as
+        # ollama takes it) ALSO goes in as reasoning_effort, mapped to the qwen3.8
+        # vocabulary: its template defaults to xhigh and RAISES on unknown values, so
+        # an unmapped level drops the key rather than forwarding it. Templates without
+        # reasoning_effort ignore the extra kwarg. "off"-style strings mean False.
+        t = self.cfg.think
+        if t is not None:
+            if isinstance(t, str) and t.strip().lower() in _THINK_OFF:
+                t = False
+            kw = {"enable_thinking": bool(t)}
+            if isinstance(t, str):
+                eff = _EFFORT.get(t.strip().lower())
+                if eff:
+                    kw["reasoning_effort"] = eff
+            body["chat_template_kwargs"] = kw
 
         req = urllib.request.Request(
             f"{_base()}/v1/chat/completions",
