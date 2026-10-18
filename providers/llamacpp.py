@@ -44,12 +44,13 @@ import json
 import os
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 
 _PROVIDER    = "llamacpp"
 _DEFAULT_HOST = "http://127.0.0.1:8080"
 _API_BASE    = os.environ.get("LLAMACPP_HOST", _DEFAULT_HOST)
-_CTX_DEFAULT = 32_768        # llama-server's -c; we can't read it back reliably, so default
+_CTX_DEFAULT = 32_768        # fallback when /props can't give a real n_ctx
 _OUT_CAP     = 4096
 # cfg.think level -> chat_template_kwargs.reasoning_effort (qwen3.8: low/medium/xhigh).
 _EFFORT    = {"low": "low", "medium": "medium", "med": "medium",
@@ -75,6 +76,60 @@ def _entry_status(m):
 # Last model this process sent to the server: a different one means a possible
 # router swap, so we probe its status once and warn about the load wait.
 _LAST_SENT = None
+
+
+# Context window per (host, model), read from /props. Real values cache for good;
+# a miss (unloaded router model, old server, network) caches the fallback for
+# _CTX_RETRY s so the per-render status bar never stalls on a down host. A reply
+# from the model (it's loaded now) drops a fallback entry so the next read is real.
+_CTX_CACHE = {}
+_CTX_RETRY = 300.0
+
+
+def _props_ctx(base, model, timeout=3):
+    """Per-conversation window from GET /props?model=<id> (plain /props fallback):
+    default_generation_settings.n_ctx. That is ALREADY per slot (llama-server reports
+    n_ctx_slot() = llama_n_ctx_seq, capped by --kv-unified-per-slot), so it is NOT
+    divided by total_slots. None when unreadable. Router: an UNLOADED model is
+    never probed, so reading the window can't trigger a 30-65s swap."""
+    q = f"?model={urllib.parse.quote(model)}" if model else ""
+    for url in ((f"{base}/props{q}", f"{base}/props") if q else (f"{base}/props",)):
+        try:
+            req = urllib.request.Request(url, headers=_headers(), method="GET")
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                d = json.loads(r.read())
+        except (urllib.error.URLError, OSError, ValueError):
+            continue
+        if not isinstance(d, dict):
+            continue
+        n = (d.get("default_generation_settings") or {}).get("n_ctx") or d.get("n_ctx")
+        try:
+            n = int(n)
+        except (TypeError, ValueError):
+            continue
+        if n > 0:
+            return n
+    return None
+
+
+def _ctx_window(model):
+    """Cached real window for `model` on the active host, else _CTX_DEFAULT."""
+    import time as _t
+    base = _base()
+    key = (base, model or "")
+    hit = _CTX_CACHE.get(key)
+    if hit and (hit[1] is None or _t.monotonic() < hit[1]):
+        return hit[0]
+    n = None
+    cfg = _lc.get("_cfg")
+    st = LlamaCppClient(cfg).model_status(timeout=3).get(model) if (cfg and model) else None
+    if st in (None, "loaded"):          # single-model server (no status) or loaded
+        n = _props_ctx(base, model)
+    if n:
+        _CTX_CACHE[key] = (n, None)
+        return n
+    _CTX_CACHE[key] = (_CTX_DEFAULT, _t.monotonic() + _CTX_RETRY)
+    return _CTX_DEFAULT
 
 
 def _base():
@@ -141,7 +196,7 @@ class LlamaCppClient:
         return [mid for mid, st in self.model_status().items() if st == "loaded"]
 
     def detect_num_ctx(self):
-        return _CTX_DEFAULT
+        return _ctx_window(self.cfg.active_model() if self.cfg else None)
 
     def _consume(self, resp, should_abort, tools=None):
         """Parse a streamed OpenAI SSE response, printing content as it arrives and
@@ -376,7 +431,13 @@ class LlamaCppClient:
             with urllib.request.urlopen(
                     req,
                     timeout=(getattr(self.cfg, "gen_connect_timeout", None) or 600)) as resp:
-                return self._consume(resp, should_abort, tools)
+                out = self._consume(resp, should_abort, tools)
+                # It answered, so it's loaded: drop a fallback window cached while it
+                # was unloaded so the next read gets the real n_ctx.
+                _ck = (_base(), body["model"] or "")
+                if _CTX_CACHE.get(_ck, (0, None))[1] is not None:
+                    _CTX_CACHE.pop(_ck, None)
+                return out
         except urllib.error.HTTPError as e:
             detail = e.read().decode("utf-8", "replace")[:300]
             if e.code in (401, 403):
@@ -397,7 +458,7 @@ PROVIDER = {
     "description":    "llama.cpp (llama-server) - local GGUF, OpenAI-compatible",
     "make_client":    _make_client,
     "list_models":    lambda: LlamaCppClient(_lc.get("_cfg")).list_models() if _lc.get("_cfg") else [],
-    "context_window": lambda model: _CTX_DEFAULT,
+    "context_window": lambda model: _ctx_window(model),
     "available":      lambda: True,    # local + free
     "autostart":      lambda: False,   # explicit selection only
     "tag":            "gguf",

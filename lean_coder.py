@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L1703   Lean-tools (plugin tools: discovery, manager)
-  L2057   MCP client (connection, manager, OAuth, discovery)
-  L2511   Providers (backend plugin registry)
-  L2733   Interactive pickers + menus (raw-mode UI engine)
-  L3082   Terminal styling (colors, formatting helpers)
-  L3376   Streaming + markdown render (model output)
-  L3868   Composer (pinned input line, editor, stdin)
-  L4772   Token accounting (calibrated context meter)
-  L4970   Config (dataclass, field registry, load/save)
-  L8767   Tool execution + text tool-call parsing
-  L9240   Remote workspace (executor client, /connect)
-  L11415  Context meter
-  L11510  Agent (turn loop, context mgmt, tool dispatch)
-  L18717  Slash-command handlers + dispatch table
-  L18854  REPL (interactive loop, session resume)
-  L19317  Worker agent (headless --agent-run)
-  L19996  Entry (CLI arg parsing, main)
+  L1709   Lean-tools (plugin tools: discovery, manager)
+  L2063   MCP client (connection, manager, OAuth, discovery)
+  L2517   Providers (backend plugin registry)
+  L2739   Interactive pickers + menus (raw-mode UI engine)
+  L3088   Terminal styling (colors, formatting helpers)
+  L3382   Streaming + markdown render (model output)
+  L3874   Composer (pinned input line, editor, stdin)
+  L4778   Token accounting (calibrated context meter)
+  L4976   Config (dataclass, field registry, load/save)
+  L8773   Tool execution + text tool-call parsing
+  L9246   Remote workspace (executor client, /connect)
+  L11421  Context meter
+  L11516  Agent (turn loop, context mgmt, tool dispatch)
+  L18723  Slash-command handlers + dispatch table
+  L18860  REPL (interactive loop, session resume)
+  L19323  Worker agent (headless --agent-run)
+  L20002  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -116,7 +116,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.10.77"
+__version__ = "0.10.78"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -124,6 +124,12 @@ __version__ = "0.10.77"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.10.78": [
+        "llamacpp: the context window is read from llama-server (/props?model=<id>,",
+        "  default_generation_settings.n_ctx, already per slot) instead of a hardcoded 32K,",
+        "  so the meter and auto-compact match the server (e.g. 256K). An unloaded router",
+        "  model keeps 32K until it answers - reading the window never triggers a swap.",
+    ],
     "0.10.77": [
         "llamacpp: a think LEVEL (cfg.think = low/medium/high) is now sent as",
         "  chat_template_kwargs.reasoning_effort (low/medium/xhigh for qwen3.8), not just",
