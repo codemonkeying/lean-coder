@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L1709   Lean-tools (plugin tools: discovery, manager)
-  L2063   MCP client (connection, manager, OAuth, discovery)
-  L2517   Providers (backend plugin registry)
-  L2739   Interactive pickers + menus (raw-mode UI engine)
-  L3088   Terminal styling (colors, formatting helpers)
-  L3382   Streaming + markdown render (model output)
-  L3874   Composer (pinned input line, editor, stdin)
-  L4778   Token accounting (calibrated context meter)
-  L4976   Config (dataclass, field registry, load/save)
-  L8773   Tool execution + text tool-call parsing
-  L9246   Remote workspace (executor client, /connect)
-  L11421  Context meter
-  L11516  Agent (turn loop, context mgmt, tool dispatch)
-  L18723  Slash-command handlers + dispatch table
-  L18860  REPL (interactive loop, session resume)
-  L19323  Worker agent (headless --agent-run)
-  L20002  Entry (CLI arg parsing, main)
+  L1714   Lean-tools (plugin tools: discovery, manager)
+  L2068   MCP client (connection, manager, OAuth, discovery)
+  L2522   Providers (backend plugin registry)
+  L2744   Interactive pickers + menus (raw-mode UI engine)
+  L3093   Terminal styling (colors, formatting helpers)
+  L3387   Streaming + markdown render (model output)
+  L3879   Composer (pinned input line, editor, stdin)
+  L4830   Token accounting (calibrated context meter)
+  L5028   Config (dataclass, field registry, load/save)
+  L8825   Tool execution + text tool-call parsing
+  L9298   Remote workspace (executor client, /connect)
+  L11477  Context meter
+  L11572  Agent (turn loop, context mgmt, tool dispatch)
+  L18800  Slash-command handlers + dispatch table
+  L18937  REPL (interactive loop, session resume)
+  L19400  Worker agent (headless --agent-run)
+  L20079  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -116,7 +116,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.10.78"
+__version__ = "0.10.79"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -124,6 +124,11 @@ __version__ = "0.10.78"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.10.79": [
+        "ssh: when an ssh call needs a key unlock prompt, it now gets a clean terminal",
+        "  instead of garbling the session. Covers the ssh tool, ssh/git commands and",
+        "  remote reconnects; no change on setups where no prompt is needed.",
+    ],
     "0.10.78": [
         "llamacpp: the context window is read from llama-server (/props?model=<id>,",
         "  default_generation_settings.n_ctx, already per slot) instead of a hardcoded 32K,",
@@ -4720,6 +4725,53 @@ def composer_suspended():
 # executor run_commands are immune (they run over a pipe with no local tty), so callers
 # gate this on `self.remote is None`.
 _SSH_CRED_RE = re.compile(r'(?:^|[|&;]|\s)(?:ssh|scp|sftp|rsync|git)\b')
+
+
+def _gpg_ssh_locked() -> bool:
+    """True only when ssh auth goes through gpg-agent AND one of its ssh keys is
+    passphrase-protected and NONE of them is cached - i.e. the next ssh signature WILL pop
+    pinentry on gpg-agent's registered terminal. Uses `KEYINFO --ssh-list`
+    (field 7 = cached '1', field 8 = protection 'P'). Fails OPEN to False on
+    anything unexpected: no gpg-connect-agent (Termux, Windows, plain ssh-agent),
+    SSH_AUTH_SOCK not gpg-agent's, timeout, odd output - behaviour is then unchanged."""
+    try:
+        sock = os.environ.get("SSH_AUTH_SOCK", "")
+        gca = shutil.which("gpg-connect-agent")
+        if not sock or not gca or "gpg-agent" not in os.path.basename(sock):
+            return False
+        r = subprocess.run([gca, "KEYINFO --ssh-list", "/bye"], capture_output=True,
+                           text=True, timeout=3, stdin=subprocess.DEVNULL)
+        prot = [f for f in (ln.split() for ln in (r.stdout or "").splitlines())
+                if len(f) >= 8 and f[:2] == ["S", "KEYINFO"] and f[7] == "P"]
+        # Locked only when NO protected key is cached: with several keys listed and one
+        # unlocked, that one is (almost always) the key ssh uses, so no prompt comes.
+        return bool(prot) and not any(f[6] == "1" for f in prot)
+    except Exception:
+        pass
+    return False
+
+
+def _tool_may_hit_pinentry(name: str, args: dict) -> bool:
+    """A LOCAL tool call that may make gpg-agent draw pinentry on our terminal:
+    run_command/background/shell_session whose command runs ssh/git, or the ssh
+    tool (its BatchMode=yes does NOT stop gpg-agent prompting)."""
+    if name == "ssh":
+        return True
+    if name in ("run_command", "background"):
+        return _may_prompt_on_tty(args.get("cmd", ""))
+    if name == "shell_session" and args.get("action") == "start":
+        return _may_prompt_on_tty(args.get("command", ""))
+    return False
+
+
+@contextmanager
+def _unlock_handoff():
+    """Give a pending gpg-agent pinentry a clean terminal: say so, release the
+    composer, register this tty with gpg-agent, run the body, then restore."""
+    print(dim("  [gpg] ssh key locked - unlock prompt on this terminal"))
+    with composer_suspended():
+        _refresh_gpg_agent_tty()
+        yield
 
 
 def _may_prompt_on_tty(cmd: str) -> bool:
@@ -11360,7 +11412,11 @@ def _sh_check_remote(agent, remote, note):
     if not re.search(r"\bexit\s*255\b", note):
         return
     try:
-        remote.connect(batch=True)
+        if sys.stdin.isatty() and _gpg_ssh_locked():
+            with _unlock_handoff():
+                remote.connect(batch=True)
+        else:
+            remote.connect(batch=True)
         return                                        # it was the command, not the link
     except (ConnectionError, OSError) as e:
         agent._on_remote_lost(remote.host, e)
@@ -11872,7 +11928,11 @@ class Agent:
                 # master -> silent success; a password host or dead box -> fail fast,
                 # caught below and dropped to LOCAL (operator re-/connect to prompt).
                 print(dim(f"\n  remote {host} link lost ({e}); reconnecting ..."))
-                self.remote.connect(batch=True)
+                if sys.stdin.isatty() and _gpg_ssh_locked():
+                    with _unlock_handoff():       # key locked: prompt here, cleanly
+                        self.remote.connect(batch=True)
+                else:
+                    self.remote.connect(batch=True)
                 result = self.remote.call(name, args,
                                           should_abort=lambda: self._abort)
         except (ConnectionError, OSError) as e:
@@ -14139,6 +14199,23 @@ class Agent:
                 result = run_direct_command(
                     self.cfg, args.get("cmd", ""), args.get("reason"),
                     remote=self.remote)
+        elif (self.remote is None and _tool_may_hit_pinentry(name, args)
+                and _gpg_ssh_locked()):
+            # gpg-agent is about to pop pinentry-curses (an ssh key with a cold cache).
+            # It draws on whatever tty was LAST registered with gpg-agent - often a
+            # different terminal (the last `git push`, another session) whose composer
+            # holds raw mode -> garbled screen. So: register OUR tty (updatestartuptty,
+            # like the shell `export GPG_TTY` ritual) and hand it over clean for this
+            # one call. No real tty here (worker/headless): don't run it at all - the
+            # prompt would land on someone else's terminal.
+            if not sys.stdin.isatty():
+                result = ("error: the ssh key (gpg-agent) is locked and this session has "
+                          "no terminal to show the passphrase prompt on. Ask the operator "
+                          "to run this same ssh command once via ask_user_to_run (that "
+                          "unlocks it), then retry.")
+            else:
+                with _unlock_handoff():
+                    result = self._run_tool(name, args)
         elif (name == "run_command" and self.remote is None
                 and _may_prompt_on_tty(args.get("cmd", ""))):
             # A LOCAL ssh/git run_command may trigger pinentry on our tty (cold-cache
