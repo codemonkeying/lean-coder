@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L1736   Lean-tools (plugin tools: discovery, manager)
-  L2090   MCP client (connection, manager, OAuth, discovery)
-  L2544   Providers (backend plugin registry)
-  L2766   Interactive pickers + menus (raw-mode UI engine)
-  L3115   Terminal styling (colors, formatting helpers)
-  L3409   Streaming + markdown render (model output)
-  L3901   Composer (pinned input line, editor, stdin)
-  L4852   Token accounting (calibrated context meter)
-  L5050   Config (dataclass, field registry, load/save)
-  L8847   Tool execution + text tool-call parsing
-  L9320   Remote workspace (executor client, /connect)
-  L11499  Context meter
-  L11594  Agent (turn loop, context mgmt, tool dispatch)
-  L18872  Slash-command handlers + dispatch table
-  L19009  REPL (interactive loop, session resume)
-  L19472  Worker agent (headless --agent-run)
-  L20151  Entry (CLI arg parsing, main)
+  L1739   Lean-tools (plugin tools: discovery, manager)
+  L2093   MCP client (connection, manager, OAuth, discovery)
+  L2547   Providers (backend plugin registry)
+  L2769   Interactive pickers + menus (raw-mode UI engine)
+  L3118   Terminal styling (colors, formatting helpers)
+  L3412   Streaming + markdown render (model output)
+  L3904   Composer (pinned input line, editor, stdin)
+  L4855   Token accounting (calibrated context meter)
+  L5053   Config (dataclass, field registry, load/save)
+  L8850   Tool execution + text tool-call parsing
+  L9323   Remote workspace (executor client, /connect)
+  L11502  Context meter
+  L11597  Agent (turn loop, context mgmt, tool dispatch)
+  L18881  Slash-command handlers + dispatch table
+  L19018  REPL (interactive loop, session resume)
+  L19481  Worker agent (headless --agent-run)
+  L20160  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -116,7 +116,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.10.84"
+__version__ = "0.10.85"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -124,6 +124,9 @@ __version__ = "0.10.84"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.10.85": [
+        "remote: after a dropped connection the model is told clearly which host and user it is now on.",
+    ],
     "0.10.84": [
         "board: new myboards action lists the boards your session is on (only those).",
     ],
@@ -11812,8 +11815,14 @@ class Agent:
         and return a neutral line for the model - where it is now, not what to do."""
         self.drop_remote(host)
         print(red(f"\n! remote {host} dropped ({reason}); switched to LOCAL."))
+        me = os.environ.get("USER") or os.environ.get("LOGNAME") or "?"
+        # Tell the model WHERE it now is (this box's real hostname/user, never a fixed
+        # name) and what changed: ssh aliases/keys/agent of the remote box don't exist
+        # here, so 'Permission denied (publickey)' now means wrong box, not a flaky link.
         return (f"remote {host} dropped ({reason}); the session is now running "
-                f"LOCALLY on {_HOSTNAME}.")
+                f"LOCALLY on {_HOSTNAME} as {me}. ssh aliases/keys from {host} don't "
+                f"exist here; ssh {host} directly if needed. Only the operator can "
+                f"/connect to put the session back on it.")
 
     def close_all_remotes(self):
         """Tear down every pooled connection (on quit). Nothing remote survives a
