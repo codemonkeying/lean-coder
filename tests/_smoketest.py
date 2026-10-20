@@ -2119,12 +2119,12 @@ _bt.run({"action": "add", "board": "swarm", "task": "ui", "deps": ["t1"]}, "/tmp
 _readyadd = _plain(_bt.run({"action": "add", "board": "swarm", "task": "docs"}, "/tmp"))
 check("board tool: add reports READY for a dep-free task", "READY" in _readyadd)
 check("board tool: add nudges that a ready+unassigned task pinged no one",
-      "no peer was pinged" in _readyadd)
+      "no one pinged" in _readyadd)
 _blockedadd = _plain(_bt.run({"action": "add", "board": "swarm", "task": "test",
                               "deps": ["t2"]}, "/tmp"))
 check("board tool: add reports blocked for an unmet-dep task", "blocked" in _blockedadd)
 check("board tool: add is silent about pinging on a blocked task",
-      "no peer was pinged" not in _blockedadd)
+      "no one pinged" not in _blockedadd)
 check("board tool: add refuses an unknown dep",
       "unknown dep" in _bt.run({"action": "add", "board": "swarm", "task": "z",
                                 "deps": ["t99"]}, "/tmp"))
