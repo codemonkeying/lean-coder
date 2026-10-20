@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L1725   Lean-tools (plugin tools: discovery, manager)
-  L2079   MCP client (connection, manager, OAuth, discovery)
-  L2533   Providers (backend plugin registry)
-  L2755   Interactive pickers + menus (raw-mode UI engine)
-  L3104   Terminal styling (colors, formatting helpers)
-  L3398   Streaming + markdown render (model output)
-  L3890   Composer (pinned input line, editor, stdin)
-  L4841   Token accounting (calibrated context meter)
-  L5039   Config (dataclass, field registry, load/save)
-  L8836   Tool execution + text tool-call parsing
-  L9309   Remote workspace (executor client, /connect)
-  L11488  Context meter
-  L11583  Agent (turn loop, context mgmt, tool dispatch)
-  L18818  Slash-command handlers + dispatch table
-  L18955  REPL (interactive loop, session resume)
-  L19418  Worker agent (headless --agent-run)
-  L20097  Entry (CLI arg parsing, main)
+  L1730   Lean-tools (plugin tools: discovery, manager)
+  L2084   MCP client (connection, manager, OAuth, discovery)
+  L2538   Providers (backend plugin registry)
+  L2760   Interactive pickers + menus (raw-mode UI engine)
+  L3109   Terminal styling (colors, formatting helpers)
+  L3403   Streaming + markdown render (model output)
+  L3895   Composer (pinned input line, editor, stdin)
+  L4846   Token accounting (calibrated context meter)
+  L5044   Config (dataclass, field registry, load/save)
+  L8841   Tool execution + text tool-call parsing
+  L9314   Remote workspace (executor client, /connect)
+  L11493  Context meter
+  L11588  Agent (turn loop, context mgmt, tool dispatch)
+  L18866  Slash-command handlers + dispatch table
+  L19003  REPL (interactive loop, session resume)
+  L19466  Worker agent (headless --agent-run)
+  L20145  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -116,7 +116,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.10.81"
+__version__ = "0.10.82"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -124,6 +124,11 @@ __version__ = "0.10.81"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.10.82": [
+        "/board <name> rm <id> [<id>...]: remove individual tasks from a saved board.",
+        "  Confirms first, warns if other tasks still depend on what you're removing, and",
+        "  reports any ids that aren't on the board.",
+    ],
     "0.10.81": [
         "board: adding a task now reminds you that an add alone notifies no one - assign",
         "  it when you want a peer woken. Just a hint; adding a note-to-the-board still",
@@ -15685,9 +15690,10 @@ def handle_board_command(agent, cfg, arg):
     """/board - inspect the task boards (the model's `board` tool coordination surface),
     read-only and WITHOUT enabling the tool: a board is just a JSON doc under the config
     dir, so this reads it directly - no ~500-token tool schema in context, no model turn.
-      /board            list every saved board (name, task counts, when updated)
-      /board <name>     show one board's tasks + which are ready to assign
-      /board delete <n> remove a saved board (they otherwise accumulate forever)
+      /board              list every saved board (name, task counts, when updated)
+      /board <name>       show one board's tasks + which are ready to assign
+      /board <name> rm <id> [<id>...]  remove individual tasks from a board
+      /board delete <n>   remove a saved board (they otherwise accumulate forever)
     Creating/adding/assigning stays the model's job (driver-orchestration) - letting the
     operator hand-edit task state would desync it from what the model believes is there."""
     arg = (arg or "").strip()
@@ -15728,6 +15734,48 @@ def handle_board_command(agent, cfg, arg):
         except OSError as e:
             print(yellow(f"could not delete: {e}"))
         return
+
+    # /board <name> rm <id> [<id>...] - drop individual tasks (operator prune). Same
+    # read-the-JSON-directly approach as `delete`; a task the model still believes is
+    # there just vanishes from its next reconcile, so it's confirmed and lock-held.
+    if len(parts) == 2:
+        sub = parts[1].split()
+        if sub and sub[0].lower() in ("rm", "remove"):
+            bname = parts[0]
+            ids = [i.strip() for i in sub[1:] if i.strip()]
+            if not ids:
+                print("error: `/board <name> rm <taskid> [<taskid>...]` needs a task id.")
+                return
+            bp = _taskboard_path(bname)
+            if not bp or not bp.is_file():
+                print(dim(f"no board named '{_session_name_ok(bname)}'."))
+                return
+            with _taskboard_locked(bname):
+                board = _taskboard_load(bname)
+                tasks = board.get("tasks", [])
+                have = {t.get("id") for t in tasks}
+                hit = [i for i in ids if i in have]
+                miss = [i for i in ids if i not in have]
+                if miss:
+                    print(yellow(f"not on the board: {', '.join(miss)}"))
+                if not hit:
+                    print(dim("nothing to remove."))
+                    return
+                # Warn if removing a task others still depend on (leaves a dangling dep).
+                dangling = sorted({t.get("id") for t in tasks
+                                   if t.get("id") not in hit
+                                   and set(t.get("deps") or []) & set(hit)})
+                extra = (f"  {len(dangling)} task(s) still depend on it: "
+                         f"{', '.join(dangling)}") if dangling else ""
+                if not _ask(f"remove {len(hit)} task(s) [{', '.join(hit)}] from "
+                            f"'{_session_name_ok(bname)}'?{extra} (the model can no longer reconcile them)"):
+                    print(dim("remove cancelled."))
+                    return
+                board["tasks"] = [t for t in tasks if t.get("id") not in hit]
+                _taskboard_save(bname, board)
+                print(dim(f"removed {', '.join(hit)} from board '{_session_name_ok(bname)}' "
+                          f"({len(board['tasks'])} left)."))
+            return
 
     # /board <name> - show it
     board = _taskboard_load(arg)
