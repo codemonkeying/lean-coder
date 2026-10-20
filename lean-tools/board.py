@@ -438,8 +438,17 @@ def run(args, cwd):
         if err:
             return f"error: {err}"
         ready, _ = _H["_taskboard_ready"](board2)
-        rflag = "READY" if task["id"] in {t.get("id") for t in ready} else "blocked (deps not done)"
-        return f"added {task['id']} '{task_name}'{(' deps=' + ','.join(deps)) if deps else ''} -> {rflag}."
+        is_ready = task["id"] in {t.get("id") for t in ready}
+        rflag = "READY" if is_ready else "blocked (deps not done)"
+        base = f"added {task['id']} '{task_name}'{(' deps=' + ','.join(deps)) if deps else ''} -> {rflag}."
+        # Soft nudge: a task only PINGS a peer when it's assigned. An add alone notifies
+        # nobody - the likeliest reason "they don't talk". Hint (don't fail) when it's
+        # ready-and-unassigned, since plenty of adds are deliberate (a note-to-board, or
+        # a task to assign in a later step). Silent on a blocked task (not actionable yet).
+        if is_ready:
+            base += (f" No one is assigned yet, so no peer was pinged - "
+                     f"assign it (action='assign' worker=...) when you want someone woken.")
+        return base
 
     if action == "assign":
         if not _is_driver():
