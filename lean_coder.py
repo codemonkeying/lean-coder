@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L1714   Lean-tools (plugin tools: discovery, manager)
-  L2068   MCP client (connection, manager, OAuth, discovery)
-  L2522   Providers (backend plugin registry)
-  L2744   Interactive pickers + menus (raw-mode UI engine)
-  L3093   Terminal styling (colors, formatting helpers)
-  L3387   Streaming + markdown render (model output)
-  L3879   Composer (pinned input line, editor, stdin)
-  L4830   Token accounting (calibrated context meter)
-  L5028   Config (dataclass, field registry, load/save)
-  L8825   Tool execution + text tool-call parsing
-  L9298   Remote workspace (executor client, /connect)
-  L11477  Context meter
-  L11572  Agent (turn loop, context mgmt, tool dispatch)
-  L18800  Slash-command handlers + dispatch table
-  L18937  REPL (interactive loop, session resume)
-  L19400  Worker agent (headless --agent-run)
-  L20079  Entry (CLI arg parsing, main)
+  L1720   Lean-tools (plugin tools: discovery, manager)
+  L2074   MCP client (connection, manager, OAuth, discovery)
+  L2528   Providers (backend plugin registry)
+  L2750   Interactive pickers + menus (raw-mode UI engine)
+  L3099   Terminal styling (colors, formatting helpers)
+  L3393   Streaming + markdown render (model output)
+  L3885   Composer (pinned input line, editor, stdin)
+  L4836   Token accounting (calibrated context meter)
+  L5034   Config (dataclass, field registry, load/save)
+  L8831   Tool execution + text tool-call parsing
+  L9304   Remote workspace (executor client, /connect)
+  L11483  Context meter
+  L11578  Agent (turn loop, context mgmt, tool dispatch)
+  L18813  Slash-command handlers + dispatch table
+  L18950  REPL (interactive loop, session resume)
+  L19413  Worker agent (headless --agent-run)
+  L20092  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -116,7 +116,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.10.79"
+__version__ = "0.10.80"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -124,6 +124,12 @@ __version__ = "0.10.79"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.10.80": [
+        "run_command can now background a command directly: pass background=true (or just",
+        "  write the usual nohup/trailing-& form) and it detaches and returns a pid instead",
+        "  of blocking, matching how most tools work. The background tool stays for checking",
+        "  and stopping tasks.",
+    ],
     "0.10.79": [
         "ssh: when an ssh call needs a key unlock prompt, it now gets a clean terminal",
         "  instead of garbling the session. Covers the ssh tool, ssh/git commands and",
@@ -14396,8 +14402,15 @@ def _fmt_call_args(name: str, args: dict) -> str:
 
 
 def _is_bg_call(name: str, args: dict) -> bool:
-    """True when this call STARTS a detached background task (background tool, run
-    action - explicit or the cmd-implies-run default)."""
+    """True when this call STARTS a detached background task - so the call line gets the
+    'bg' glyph + '(background)' tag. Two launch paths: the background tool's run action
+    (explicit or the cmd-implies-run default), and run_command backgrounding (explicit
+    background=true, or a bg idiom - nohup/setsid/trailing '&' - we auto-route)."""
+    if name == "run_command":
+        bg = args.get("background")
+        if bg is not None:
+            return bool(bg)
+        return _BUILTINS._cmd_wants_background(args.get("cmd", ""))
     if name != "background":
         return False
     act = (str(args.get("action", "")).strip().lower() or ("run" if args.get("cmd") else "status"))

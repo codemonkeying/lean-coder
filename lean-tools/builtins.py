@@ -54,6 +54,63 @@ def _scrub_invisible(text, cfg=None):
     clean, n = _INVISIBLE_RE.subn("", text)
     return clean, n
 
+# Backgrounding idioms a model reaches for ON run_command instead of the background
+# tool (nohup/setsid prefix, trailing '&'). Every frontier harness folds backgrounding
+# into the command tool, so models are TRAINED to emit these - detecting them lets the
+# wrong-looking call just work (routed through the detached-bg machinery) instead of
+# running foreground (an un-redirected '&' would hold the pipe and hang to the timeout).
+_BG_LEADER_RE = re.compile(r"^\s*(?:nohup|setsid)\s+(?:nohup|setsid\s+)*", re.I)
+# A trailing '&' that is a real background operator, not '&&' and not inside quotes we
+# can't see - we only strip a bare final '&' (optionally before a trailing comment-free
+# whitespace). '&&' is excluded by requiring the char before not be '&'.
+_BG_TRAIL_RE = re.compile(r"(?<!&)&\s*$")
+# A shell job-control '&' anywhere: a single '&' NOT part of '&&' (logical-and) and NOT
+# a redirect ('2>&1', '>&2' -> preceded by '>'). Used to spot an INNER '&' (a '&' that
+# is not the final token) so autodetect can bow out of multi-'&' commands it can't
+# safely normalise (see _cmd_wants_background).
+_BG_JOBCTL_RE = re.compile(r"(?<![&>])&(?!&)")
+
+
+def _has_inner_background(s):
+    """True if `s` has a job-control '&' that is NOT the final token (e.g.
+    'sleep 5 & echo hi', 'foo & &'). Stripping only removes the single trailing '&', so
+    an inner '&' would survive into the detached wrapper and self-detach there - the
+    exact double-background we avoid. When present, autodetect declines (runs foreground,
+    as written); an explicit background=true still routes verbatim."""
+    s = s.rstrip()
+    return any(m.end() != len(s) for m in _BG_JOBCTL_RE.finditer(s))
+
+
+def _cmd_wants_background(cmd):
+    """True if `cmd` uses a shell backgrounding idiom we can safely normalise: a leading
+    nohup/setsid, or a SINGLE bare trailing '&'. Declines on an inner/multi '&' (can't
+    normalise without re-introducing a double-background). Purely lexical - a '&' inside
+    quotes we can't parse ('echo \"a &\"') is only ever an issue if it's lexically final,
+    an accepted regex-vs-shell-parse tradeoff. Pure + cheap so core shares it for the
+    call-line glyph."""
+    if not cmd:
+        return False
+    s = cmd.strip()
+    if _has_inner_background(s):
+        return False
+    return bool(_BG_LEADER_RE.match(s) or _BG_TRAIL_RE.search(s))
+
+
+def _strip_background_tokens(cmd):
+    """Remove the backgrounding tokens (leading nohup/setsid, trailing '&') so the BARE
+    command can go through the detached-bg wrapper, which supplies the detachment + log
+    itself. Doing both (model's '&' AND our wrapper) would double-background: the inner
+    '&' returns instantly, our wrapper's wait() sees the child gone and writes the exit
+    sidecar while the real process runs orphaned + untracked. Stripping first = one
+    clean detached process with a correct pid + .exit. Also drops nohup/setsid, so we
+    don't depend on those binaries being present (helps busybox/Termux). Only ever called
+    on a command _cmd_wants_background approved, so there is no inner '&' left to strip."""
+    s = cmd.strip()
+    s = _BG_LEADER_RE.sub("", s, count=1)
+    s = _BG_TRAIL_RE.sub("", s).rstrip()
+    return s
+
+
 # --- injected by setup() from core (resolved as plain names below) -----------
 # Stable core helpers/constants this module's code reaches for. setup() copies each
 # from the core module globals so the moved code runs unchanged. Mutable state is
@@ -382,9 +439,20 @@ class Tools:
         note = f"; stripped {_scrubbed} invisible char(s)" if _scrubbed else ""
         return f"{verb} {path} ({len(content.splitlines())} lines){note}"
 
-    def run_command(self, cmd: str) -> str:
+    def run_command(self, cmd: str, background=None) -> str:
         if not _confirm_action(self.cfg, "exec", cmd=cmd):
             return "user declined to run the command"
+        # Background routing: an explicit background=true, OR a backgrounding idiom the
+        # model wrote onto the command itself (nohup/setsid/trailing '&'). Either way we
+        # strip the bg tokens and hand the BARE command to the detached-bg machinery -
+        # see _strip_background_tokens for why doing both would double-background. The
+        # separate `background` tool stays the surface for status/kill/watchdog tuning.
+        wants_bg = bool(background) or (background is None and _cmd_wants_background(cmd))
+        if wants_bg:
+            bare = _strip_background_tokens(cmd)
+            if not bare:
+                return "error: nothing to run in the background"
+            return self._run_background(bare)
         to = self.cfg.command_timeout
         try:
             # stdin=DEVNULL + start_new_session: run_command is NON-INTERACTIVE (sudo/
@@ -401,8 +469,9 @@ class Tools:
                                stdin=subprocess.DEVNULL, start_new_session=True)
         except subprocess.TimeoutExpired:
             return (f"error: command timed out after {to}s (no output captured). "
-                    f"For a long-running command, use the `background` tool - it "
-                    f"returns a pid immediately; check it with background(pid=...).")
+                    f"For a long-running command, rerun with background=true - it "
+                    f"detaches and returns a pid immediately; check/stop it with the "
+                    f"background tool (background(pid=...) / action='kill').")
         except Exception as e:
             return f"error running command: {e}"
         out = ""
@@ -811,9 +880,10 @@ BUILTIN_TOOLS = [
                        "content": {"type": "string", "description": "Full new contents of the file."}},
         "required": ["path", "content"]}},
     {"name": "run_command", "tier": "exec",
-     "description": "Run a non-interactive shell command (builds, tests, git, file ops); returns exit code + stdout/stderr (truncated - if clipped, pipe to a file or grep/head/tail it). Fresh shell each call - cd/env don't persist, chain with '&&'. Runs in the FOREGROUND and is killed at {command_timeout}s: for anything slower, or any server/daemon/watcher, use the `background` tool instead. For sudo/interactive use ask_user_to_run; for a persistent shell (REPL, ssh) use shell_session.",
+     "description": "Run a non-interactive shell command (builds, tests, git, file ops); returns exit code + stdout/stderr (truncated - if clipped, pipe to a file or grep/head/tail it). Fresh shell each call - cd/env don't persist, chain with '&&'. Runs in the FOREGROUND and is killed at {command_timeout}s: for anything slower, or any server/daemon/watcher, pass background=true instead (returns a pid immediately; check/stop it with the background tool). For sudo/interactive use ask_user_to_run; for a persistent shell (REPL, ssh) use shell_session.",
      "parameters": {"type": "object",
-        "properties": {"cmd": {"type": "string", "description": "The shell command to run."}},
+        "properties": {"cmd": {"type": "string", "description": "The shell command to run."},
+                       "background": {"type": "boolean", "description": "Run detached and return a pid immediately instead of waiting for it to finish - for dev servers, watchers, daemons, or any command that won't stop on its own. Check output (its log path) / stop it with the background tool."}},
         "required": ["cmd"]}},
     {"name": "background", "tier": "exec",
      "description": "Run/manage long-lived tasks (dev servers, watchers, builds) that would blow run_command's foreground timeout. action: run (default when cmd given) starts a detached task, returns pid + log; status (default, no cmd) lists this session's tasks, or one with pid; kill needs pid. Detached tasks die on exit; use nohup/systemd to outlive that.",
