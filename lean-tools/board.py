@@ -41,7 +41,7 @@ TOOL = {
         "properties": {
             "action": {"type": "string",
                        "enum": ["create", "add", "assign", "done", "fail", "cancel",
-                                "list", "reconcile", "participant"],
+                                "list", "reconcile", "participant", "myboards"],
                        "description": "create=new board; add=append a task (deps=[...]); "
                                       "assign=put a worker/participant on a READY task; done/fail="
                                       "record an outcome; cancel=void a task that should not have "
@@ -55,9 +55,10 @@ TOOL = {
                                       "whether a peer is live-here/live-elsewhere/dormant/missing, "
                                       "instead of learning it as a side effect of assigning). Driver-only: "
                                       "create/add/assign/cancel/participant-register. Workers: done/fail "
-                                      "their task + list/reconcile/participant-list."},
+                                      "their task + list/reconcile/participant-list. myboards=boards this "
+                                      "session is a participant on (no board= needed)."},
             "board": {"type": "string",
-                      "description": "Board name (like a session name). Required by every action."},
+                      "description": "Board name (like a session name). Required by every action except myboards."},
             "task": {"type": "string",
                      "description": "add: the new task's name. assign/done/fail: the task id "
                                     "(e.g. 't3', from add or list)."},
@@ -87,7 +88,7 @@ TOOL = {
             "query": {"type": "string",
                       "description": "list: only tasks whose id/name/note contains this text."},
         },
-        "required": ["action", "board"],
+        "required": ["action"],
     },
     "safe": True,
     # driver_only: the board is pure driver-orchestration state - a JSON doc under the
@@ -306,6 +307,22 @@ def run(args, cwd):
         return "error: board tool is not initialised (its setup() did not run)."
     action = (args.get("action") or "").strip().lower()
     name = (args.get("board") or "").strip()
+    if action == "myboards":
+        # Privacy-scoped discovery: ONLY boards this session is a registered participant
+        # on - never a general enumerator of every board on disk. Needs no board name.
+        me = (_H.get("_my_session_name") or (lambda: ""))()
+        if not me:
+            return "error: this session has no name, so it can't be on any board."
+        mine = []
+        for bname, _meta in _H["_taskboards_list"]():
+            bd = _H["_taskboard_load"](bname) or {}
+            p = next((x for x in (bd.get("participants") or []) if isinstance(x, dict) and x.get("name") == me), None)
+            if p:
+                ready, _ = _H["_taskboard_ready"](bd)
+                mine.append(f"  {bname} role={p.get('role')} ready={len(ready)}")
+        if not mine:
+            return f"'{me}' is not a participant on any board."
+        return "\n".join([f"boards with '{me}':"] + mine)
     if not name:
         return "error: board tool needs a 'board' name."
 
