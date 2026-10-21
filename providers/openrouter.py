@@ -15,7 +15,7 @@ from pathlib import Path
 # an identity (just stringify tool-call args + tag tool defs as type:function).
 _API_BASE    = "https://openrouter.ai/api/v1"  # sweep-ok
 _MAX_TOKENS  = 8192
-_OUT_CAP     = 32768       # don't request more completion tokens than this
+_MIN_ROOM    = 1024        # below this much reply room, ask for /compact instead
 _CTX_DEFAULT = 128_000
 _PROVIDER    = "openrouter"  # sweep-ok
 
@@ -31,6 +31,49 @@ _PRIVACY_HI = True   # medium risk -> yellow
 # 'provider: <name>  model: <model>' line already announces the backend). NOTE:
 # this provider's privacy note is medium-risk - consider True to keep it visible.
 _SHOW_BANNER = False
+
+# Published free-tier caps (openrouter.ai/docs/api_reference/limits): every
+# :free model shares 20 req/min and 50 req/day per account, 1000/day once the
+# account has ever bought $10+ of credits. The x-ratelimit-limit header reports
+# the real daily figure and overrides this. Paid models: no OpenRouter cap.
+_RATE_DEFAULTS = {":free": {"rpm": 20, "rpd": 50}, "openrouter/free": {"rpm": 20, "rpd": 50}}
+_FREE_ROUTER   = "openrouter/free"   # routes to whichever free model is up
+_EMPTY_RETRIES = 1        # re-asks after an empty reply (on a free fallback model)
+_REASON_MIN_OUT = 16384   # floor when /models under-reports a model's output limit
+_LEDGER        = None
+
+
+def _ledger():
+    """Client-side request ledger (core RateLedger), created lazily after setup."""
+    global _LEDGER
+    if _LEDGER is None and _lc.get("RateLedger"):
+        _LEDGER = _lc["RateLedger"](_PROVIDER, _RATE_DEFAULTS, day_reset="utc",
+                                    shared=("rpm", "rpd"))
+    return _LEDGER
+
+
+def _free_fallback(model, cfg):
+    """Next model to try when a FREE model is throttled upstream: the first
+    or_fallback entry that is free, else the openrouter/free router. Paid models
+    never hop (that would change cost); returns None for them."""
+    if not (model.endswith(":free") or model == _FREE_ROUTER):
+        return None
+    try:
+        fb = (cfg.setting("or_fallback") or "").replace(",", " ").split()
+    except Exception:
+        fb = []
+    for m in fb:
+        if m != model and (m.endswith(":free") or m == _FREE_ROUTER):
+            return m
+    return _FREE_ROUTER if model != _FREE_ROUTER else None
+
+
+class _UpstreamError(Exception):
+    """An error delivered INSIDE a 200 stream (OpenRouter forwards an upstream
+    provider's 429/5xx as an error chunk / finish_reason "error")."""
+    def __init__(self, code, msg):
+        super().__init__(msg)
+        self.code = code
 
 
 # ----------------------------------------------------------------------------
@@ -110,7 +153,7 @@ def _fetch_models(key):
                 "max_tokens":       max_out,
                 "tools":            "tools" in params,
                 "reason":           "reasoning" in params,
-                "free":             mid.endswith(":free"),
+                "free":             mid.endswith(":free") or mid == _FREE_ROUTER,
             })
         if out:
             try:
@@ -136,13 +179,13 @@ def _ensure_models(force=False):
 
 def _list_models():
     """The /model picker. OpenRouter has 300+ models, ~250 tool-capable. A coding
-    agent needs tool calling, so only tool-capable models are listed. All tiers by
-    default (`tier=all`): paid + free models - `/set tier free` limits to `:free`
-    only. `/set or_filter <substring>` narrows WITHIN the current tier. New models
+    agent needs tool calling, so only tool-capable models are listed. Free tier by
+    default (`tier=free`): only `:free` models - `/set tier all` adds paid
+    models. `/set or_filter <substring>` narrows WITHIN the current tier. New models
     surface automatically (live fetch)."""
     show_all = True
     try:
-        show_all = ((_cfg.setting("tier") or "all") != "free") if _cfg else True  # sweep-ok
+        show_all = ((_cfg.setting("tier") or "free") != "free") if _cfg else False  # sweep-ok
     except Exception:
         show_all = True
     sel = [m for m in _ensure_models().values()
@@ -157,12 +200,24 @@ def _list_models():
     return [m["id"] for m in sel]
 
 
+def _tool_support(model):
+    """True unless /models says the model lacks tool calling. Unknown ids (not in
+    the list, e.g. offline) are assumed capable rather than silently degraded."""
+    m = _ensure_models().get(model)
+    return True if m is None else bool(m.get("tools"))
+
+
+def _model_status(model):
+    # Shown dimmed next to the model in /model.
+    return None if _tool_support(model) else "chat-only (no tool calling)"
+
+
 def _context_window(model):
     return _ensure_models().get(model, {}).get("max_input_tokens", _CTX_DEFAULT)
 
 
 def _capabilities(model):
-    caps = {"tier": ["all", "free"]}     # all (default) lists paid + free; free limits to :free only
+    caps = {"tier": ["free", "all"]}     # free (default) limits to :free only; all adds paid
     if _ensure_models().get(model, {}).get("reason"):
         caps["effort"] = ["off", "low", "med", "high"]
     return caps
@@ -252,7 +307,14 @@ def _retry_after_secs(headers, body):
     return None
 
 
-def _interruptible_sleep(secs, should_abort):
+def _interruptible_sleep(secs, should_abort, why="waiting"):
+    vw = _lc.get("_visible_wait")
+    if vw:      # live countdown, so a wait is never a silent blank screen
+        return vw(secs, why, should_abort)
+    return _plain_sleep(secs, should_abort)
+
+
+def _plain_sleep(secs, should_abort):
     """Sleep in small slices so should_abort()/Ctrl-C can break the wait.
     Returns False if aborted, True if the full wait elapsed."""
     waited = 0.0
@@ -376,6 +438,11 @@ class _OpenRouterClient:
             self._last_rl = {"limit": lim,
                              "remaining": _i("x-ratelimit-remaining") or 0,
                              "reset": _i("x-ratelimit-reset")}
+            # The header carries the ACCOUNT's real free daily cap (50 or 1000);
+            # teach the ledger so its predictions use the real number.
+            led = _ledger()
+            if led and lim >= 50:
+                led.learn("*", rpd=lim)
 
     def _model(self):
         return self.cfg.active_model()
@@ -401,6 +468,9 @@ class _OpenRouterClient:
         md            = _lc["MarkdownStream"](sys.stdout.write)
 
         spin = _lc["Spinner"]("thinking", _lc["THINK_FRAMES"]).start()
+        reason_chars = 0
+        self.last_finish = None
+        self.last_served = None
         try:
             for raw in _lc["stream_tiered"](resp, self.cfg):
                 if should_abort and should_abort():
@@ -417,8 +487,38 @@ class _OpenRouterClient:
                 except Exception:
                     continue
 
+                # Upstream failure smuggled into a 200 stream: a top-level "error"
+                # chunk, or a choice with finish_reason "error" + choice.error.
+                err = obj.get("error")
+                if not err:
+                    for ch in obj.get("choices", []):
+                        if ch.get("finish_reason") == "error" or ch.get("error"):
+                            err = ch.get("error") or {"message": "upstream error"}
+                            break
+                if err:
+                    try:
+                        code = int(err.get("code")) if isinstance(err, dict) else 0
+                    except (TypeError, ValueError):
+                        code = 0
+                    msg = err.get("message", "") if isinstance(err, dict) else str(err)
+                    if not printed and not tool_acc:
+                        raise _UpstreamError(code or 502, msg or "upstream error")
+                    # Already streamed part of a reply: keep it, tell the operator.
+                    print(_lc["yellow"](f"\n[!] stream cut by upstream error {code}: {msg[:120]}"))
+                    break
+
+                if obj.get("model"):
+                    self.last_served = obj["model"]
                 for ch in obj.get("choices", []):
                     delta = ch.get("delta", {})
+                    if ch.get("finish_reason"):
+                        self.last_finish = ch["finish_reason"]
+                    # Reasoning streams before any visible text; show progress on
+                    # the spinner so a long think isn't a frozen screen.
+                    rz = delta.get("reasoning") or delta.get("reasoning_content")
+                    if rz and not printed:
+                        reason_chars += len(rz)
+                        spin.label = f"reasoning ~{reason_chars // 4:,} tok"
                     txt   = delta.get("content")
                     if txt:
                         if not printed:
@@ -469,6 +569,7 @@ class _OpenRouterClient:
 
         if out_tokens:
             self.last_out_tokens = out_tokens
+        self._last_in_total = prompt_total or 0
         # prompt_tokens is the FULL input incl. cache hits; core sums
         # prompt_eval + cache_read + cache_write, so return only the uncached part.
         self.last_cache_read  = cached
@@ -487,7 +588,16 @@ class _OpenRouterClient:
         data    = json.dumps(payload).encode()
         model   = payload.get("model", "")
         attempt = 0
+        led     = _ledger()
         while True:
+            model = payload.get("model", "")
+            data  = json.dumps(payload).encode()
+            if led:
+                warn = led.preflight(model, self.cfg)
+                if warn and attempt == 0:
+                    print(_lc["yellow"](f"[!] {model}: {warn}"))
+            self._last_in_total = 0
+            self.last_out_tokens = None
             req = urllib.request.Request(
                 f"{_API_BASE}/chat/completions",
                 data=data, method="POST",
@@ -501,10 +611,37 @@ class _OpenRouterClient:
                         req,
                         timeout=(getattr(self.cfg, "gen_connect_timeout", None) or 600)) as resp:
                     self._capture_rl(resp.headers)
-                    return self._consume(resp, should_abort)
+                    result = self._consume(resp, should_abort)
+                    if led:
+                        led.record(model, self._last_in_total, self.last_out_tokens or 0, 200)
+                    return result
+            except _UpstreamError as e:
+                # Upstream provider throttled/failed behind a 200. Not the account
+                # cap, so retrying (or hopping to another free model) usually works.
+                if led:
+                    led.record(model, 0, 0, 429 if e.code == 429 else e.code)
+                if attempt < _MAX_RETRIES:
+                    attempt += 1
+                    nxt = _free_fallback(model, self.cfg)
+                    if nxt and nxt != model:
+                        print(_lc["red"](f"[!] {model} upstream {e.code} ({str(e)[:80]}) - "
+                                         f"retry {attempt}/{_MAX_RETRIES} on {nxt}"))
+                        payload = dict(payload, model=nxt)
+                        payload.pop("models", None)
+                        continue
+                    wait = _backoff(attempt - 1)
+                    print(_lc["red"](f"[!] {model} upstream {e.code} ({str(e)[:80]}) - "
+                                     f"retry {attempt}/{_MAX_RETRIES} in {wait:.0f}s"))
+                    if not _interruptible_sleep(wait, should_abort, f"{model} retry {attempt}/{_MAX_RETRIES}"):
+                        raise RuntimeError("aborted during retry wait") from None
+                    continue
+                raise RuntimeError(f"{model} upstream error {e.code}: {str(e)[:300]} - "
+                                   f"try another :free model or {_FREE_ROUTER}") from None
             except urllib.error.HTTPError as e:
                 self._capture_rl(e.headers)
                 body = e.read().decode(errors="replace")
+                if led:
+                    led.record(model, 0, 0, e.code)
                 if e.code in _RETRY_CODES and attempt < _MAX_RETRIES:
                     hint = _retry_after_secs(e.headers or {}, body)
                     if e.code == 429:
@@ -516,13 +653,23 @@ class _OpenRouterClient:
                         reason = "rate limited" if e.code == 429 else f"unavailable ({e.code})"
                         print(_lc["red"](f"[!] {model} {reason} - retry {attempt}/{_MAX_RETRIES} "
                                          f"in {wait:.0f}s"))
-                        if not _interruptible_sleep(wait, should_abort):
+                        if not _interruptible_sleep(wait, should_abort, f"{model} retry {attempt}/{_MAX_RETRIES}"):
                             raise RuntimeError("aborted during retry wait") from None
                         continue
                 if e.code == 429:
                     dm = _daily_cap_msg(body)
                     if dm:
                         raise RuntimeError(dm) from None
+                    # Per-model upstream throttle with no retry hint: hop to
+                    # another free model rather than fail the turn.
+                    nxt = _free_fallback(model, self.cfg)
+                    if nxt and nxt != model and attempt < _MAX_RETRIES:
+                        attempt += 1
+                        print(_lc["red"](f"[!] {model} rate limited upstream - "
+                                         f"retry {attempt}/{_MAX_RETRIES} on {nxt}"))
+                        payload = dict(payload, model=nxt)
+                        payload.pop("models", None)
+                        continue
                 raise RuntimeError(f"API {e.code}: {body[:400]}") from None
             except (urllib.error.URLError, ConnectionError, OSError) as e:
                 # Transport failure (dropped connection, TLS reset, DNS blip) - no
@@ -533,7 +680,7 @@ class _OpenRouterClient:
                     detail = str(getattr(e, "reason", None) or e) or type(e).__name__
                     print(_lc["red"](f"[!] {model} connection error ({detail[:80]}) - "
                                      f"retry {attempt}/{_MAX_RETRIES} in {wait:.0f}s"))
-                    if not _interruptible_sleep(wait, should_abort):
+                    if not _interruptible_sleep(wait, should_abort, f"{model} retry {attempt}/{_MAX_RETRIES}"):
                         raise RuntimeError("aborted during retry wait") from None
                     continue
                 raise RuntimeError(
@@ -549,19 +696,29 @@ class _OpenRouterClient:
         minfo     = _ensure_models().get(cur_model, {})
         # Free-tier lock (default): refuse a known paid model so a credited key can't
         # spend by accident. Lift it deliberately with `/set tier all`.
-        show_all  = (self.cfg.setting("tier") or "all") != "free"
-        if minfo and not minfo.get("free") and not show_all:
+        show_all  = (self.cfg.setting("tier") or "free") != "free"
+        is_free   = (cur_model == _FREE_ROUTER or cur_model.endswith(":free")
+                     or bool(minfo.get("free")))
+        if not is_free and not show_all:
             raise RuntimeError(
                 f"{cur_model} is a paid model and tier=free - run '/set tier all' to "
                 f"allow paid models, or pick a :free model with /model"
             )
-        max_out   = min(minfo.get("max_tokens", _MAX_TOKENS), _OUT_CAP)
+        # Never cap a reply below what the model can produce: a truncated reply
+        # wastes the whole turn (the only fix is to ask again). Ask for the
+        # model's full output limit, shrunk only to fit the context window.
+        max_out   = max(minfo.get("max_tokens") or _MAX_TOKENS, _REASON_MIN_OUT)
         max_in    = minfo.get("max_input_tokens", _CTX_DEFAULT)
-        _est_toks = len(json.dumps(messages)) // 4
-        if _est_toks > max_in:
+        send_tools = tools if (tools and _tool_support(cur_model)) else None
+        _mt       = _lc.get("messages_tokens")
+        _est_toks = _mt(messages, send_tools) if _mt else len(json.dumps(messages)) // 4
+        if _mt is None and send_tools:
+            _est_toks += len(json.dumps(send_tools)) // 4
+        max_out = min(max_out, max_in - _est_toks)
+        if max_out < _MIN_ROOM:
             raise RuntimeError(
                 f"context too large for {cur_model} "
-                f"(~{_est_toks:,} tokens vs {max_in:,} limit) - run /compact first"
+                f"(~{_est_toks:,} of {max_in:,} tokens used, no room to reply) - run /compact first"
             )
 
         payload = {
@@ -571,11 +728,14 @@ class _OpenRouterClient:
             "stream":        True,
             "stream_options": {"include_usage": True},
         }
-        if tools:
-            payload["tools"] = _cvt_tools(tools)
+        # Models whose /models entry lacks "tools" in supported_parameters 400 on a
+        # tools array; send none so they answer chat-only (flagged in /model).
+        if send_tools:
+            payload["tools"] = _cvt_tools(send_tools)
 
-        if minfo.get("reason"):
-            eff = self.cfg.setting("effort")
+        is_free_m = cur_model.endswith(":free") or cur_model == _FREE_ROUTER
+        if minfo.get("reason") or cur_model == _FREE_ROUTER:
+            eff = self.cfg.setting("effort") or ("low" if is_free_m else None)
             if eff and eff != "off":
                 payload["reasoning"] = {"effort": "medium" if eff == "med" else eff}
             elif eff == "off":
@@ -595,9 +755,30 @@ class _OpenRouterClient:
                 payload["models"] = [cur_model] + extra
                 payload["route"]  = "fallback"
 
-        result = self._send(key, payload, should_abort)
-        self._sess_cache_read  += self.last_cache_read
-        self._sess_cache_write += self.last_cache_write
+        # Empty-reply recovery. Free reasoning models can spend the whole output
+        # budget thinking and return nothing (measured: 3/12 turns on
+        # openrouter/free). Retry once on a free model, saying so out loud.
+        tried = {cur_model}
+        for _ in range(_EMPTY_RETRIES + 1):
+            result = self._send(key, payload, should_abort)
+            self._sess_cache_read  += self.last_cache_read
+            self._sess_cache_write += self.last_cache_write
+            a, _pe, ab = result
+            if ab or (a.get("content") or "").strip() or a.get("tool_calls"):
+                return result
+            served = self.last_served or payload["model"]
+            why = ("used its whole output budget on reasoning"
+                   if self.last_finish == "length" else
+                   f"returned nothing (finish: {self.last_finish or 'none'})")
+            nxt = _free_fallback(payload["model"], self.cfg)
+            if not nxt or (nxt in tried and nxt != _FREE_ROUTER):
+                print(_lc["yellow"](f"[!] {served} {why} - no free fallback to try; "
+                                    f"retry, or /model to switch"))
+                return result
+            tried.add(nxt)
+            print(_lc["yellow"](f"[!] {served} {why} - retrying on {nxt}"))
+            payload = dict(payload, model=nxt)
+            payload.pop("models", None)
         return result
 
 
@@ -622,14 +803,17 @@ def _on_activate(agent, cfg):
     _cfg = cfg
     _ensure_models(force=True)
     if cfg.setting("effort") is None and _ensure_models().get(cfg.active_model(), {}).get("reason"):
-        cfg.set_setting("effort", "med")
+        # Free reasoning models at default effort can loop for 4k+ tokens and
+        # return nothing; low effort measured 6/6 clean answers. Paid: med.
+        m = cfg.active_model()
+        cfg.set_setting("effort", "low" if (m.endswith(":free") or m == _FREE_ROUTER) else "med")
     if cfg.setting("tier") is None:
-        cfg.set_setting("tier", "all")
+        cfg.set_setting("tier", "free")
     if _SHOW_BANNER:
         key    = _api_key()
         masked = f"{key[:12]}...{key[-4:]}" if key and len(key) > 16 else "(env)"
         print(_lc["dim"](f"  OpenRouter key  {masked}"))
-    if (cfg.setting("tier") or "all") != "all":
+    if (cfg.setting("tier") or "free") != "all":
         print(_lc["dim"]("  free tier: only :free models listed; /set tier all for paid, /set or_filter <text> to narrow"))
     else:
         print(_lc["dim"]("  tier all: paid + free models listed; /set tier free for :free only, /set or_filter <text> to narrow"))
@@ -637,7 +821,7 @@ def _on_activate(agent, cfg):
     if fb:
         print(_lc["dim"](f"  fallback chain: {cfg.active_model()} -> {fb}  (/set or_fallback '' to disable)"))
     else:
-        print(_lc["dim"]("  /set or_fallback 'openai/gpt-5,google/gemini-3-pro' for auto cross-model fallback on outage/ratelimit"))
+        print(_lc["dim"]("  /set or_fallback 'anthropic/claude-sonnet-4.5,openai/gpt-5' for auto cross-model fallback on outage/ratelimit"))
     if _SHOW_BANNER:
         print(_privacy_note())
     d = _cred_data()
@@ -681,27 +865,29 @@ def _clear(agent, cfg):
 
 
 def _usage(agent, cfg):
-    # Surface the free-models-per-day cap as a meter, same shape as the Claude
-    # quota meters. Data comes from the last response's x-ratelimit-* headers.
-    rl  = getattr(agent.client, "_last_rl", {}) or {}
-    lim = rl.get("limit")
-    if not lim:
-        return None
-    rem   = rl.get("remaining") or 0
-    reset = rl.get("reset")
-    if reset and reset / 1000.0 < time.time():
-        return None                      # window already reset; stale until next call refreshes
-    resets_at = ""
-    if reset:
-        try:
-            resets_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(reset / 1000.0))
-        except Exception:
-            pass
-    pct = max(0.0, (lim - rem) / lim * 100.0)
-    return {"meters": [{"label": "day", "pct": pct, "resets_at": resets_at}]}
+    # Free-tier meters (min / day) from the client-side ledger. The server's own
+    # x-ratelimit-* daily counter, when fresh, is the source of truth for "day".
+    model = cfg.active_model()
+    led   = _ledger()
+    out   = led.meters(model, cfg) if led else None
+    rl    = getattr(agent.client, "_last_rl", {}) or {}
+    lim, reset = rl.get("limit"), rl.get("reset")
+    if lim and not (reset and reset / 1000.0 < time.time()):
+        rem = rl.get("remaining") or 0
+        resets_at = ""
+        if reset:
+            try:
+                resets_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(reset / 1000.0))
+            except Exception:
+                pass
+        day = {"label": "day", "pct": max(0.0, (lim - rem) / lim * 100.0),
+               "resets_at": resets_at, "reset_on_warn": True}
+        ms = [m for m in (out or {}).get("meters", []) if m["label"] != "day"] + [day]
+        out = {"meters": ms}
+    return out
 
 
-def _detail(agent, cfg):
+def _detail(agent, cfg, arg=""):
     bold = _lc["bold"]
     dim  = _lc["dim"]
 
@@ -717,6 +903,11 @@ def _detail(agent, cfg):
     cache_s = f"   cache r {_sn(cr)} w {_sn(cw)}" if (cr or cw) else ""
     lines.append(dim(f"\n  session   in {si:,}   out {so:,}   total {si + so:,}{cache_s}"))
     lines.append("\n" + _privacy_note())
+    led = _ledger()
+    if led and led.caps(cur_model, cfg)["rpd"]:
+        lines.append(dim("\n" + "\n".join(led.detail_lines(cur_model, cfg))))
+        lines.append(dim("  free caps: 20/min, 50/day (1000/day after a one-time $10 top-up);"
+                         " upstream hosts may also throttle"))
     lines.append(dim("  (OpenRouter - see openrouter.ai/credits for balance)"))  # sweep-ok
     return "\n".join(lines)
 
@@ -732,6 +923,8 @@ PROVIDER = {
     "list_models":    _list_models,
     "context_window": _context_window,
     "capabilities":   _capabilities,
+    "model_status":   _model_status,
+    "tool_support":   _tool_support,   # core forces chat-only for these
     "available":      _available,
     "autostart":      _autostart,
     "on_activate":    _on_activate,

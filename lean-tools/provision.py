@@ -78,8 +78,9 @@ def _build_config(model, addrs, lean_tools):
     elif addrs:
         lines.append("hosts = [" + ", ".join(f'"{n}"' for n, _ in addrs) + "]")
     lines.append(f'model = "{model}"')
-    if lean_tools:
-        lines.append("lean_tools_enabled = [" + ", ".join(f'"{p}"' for p in lean_tools) + "]")
+    # Always written (even empty): the operator's pick is explicit, so a provisioned box
+    # gets exactly these lean-tools, never core's fresh-install "all bundled" seed.
+    lines.append("lean_tools_enabled = [" + ", ".join(f'"{p}"' for p in lean_tools) + "]")
     if named:
         lines.append("")
         lines.append("[machines]")

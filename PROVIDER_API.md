@@ -8,7 +8,7 @@ to a `/connect` remote and exposes no model tool; it wires in through a native
 registry, so it never has to monkey-patch core or mutate `cfg`.
 
 Ollama is the bundled default (`provider = "ollama"`); more providers ship bundled too
-(`anthropic_api`, `gemini`, `groq`, `openai`, `openrouter`, plus the
+(`anthropic_api`, `gemini`, `groq`, `openai`, `openrouter`, `kilo`, `ovh`, plus the
 local servers `llamacpp` and `mlx`), disabled until you enable and key them. Config
 **autosaves** - no manual `/save` step.
 
@@ -49,6 +49,10 @@ PROVIDER = {                       # module-level; the ProviderManager reads + r
     "model_status":   lambda model: None,              # install/availability hint in /model (e.g. "pull")
     "endpoints":      lambda: ["http://host:11434"],   # multi-endpoint failover (Ollama uses this)
     "restore_settings": lambda agent, cfg: ...,        # re-sync provider-HELD settings after a session load (below)
+    "location":       lambda cfg: "box (http://...)",  # status/info label for the active backend
+    "prepare":        lambda agent, cfg: None,         # pre-activation transport setup (below)
+    "on_conn_error":  lambda agent, cfg, err: False,   # send-failure recovery; True = retry the turn
+    "system_addendum": lambda agent, cfg: "",          # extra system-prompt text for the active model
 }
 
 def setup(lc, cfg):               # OPTIONAL, helpers-only - do NOT register_provider here
@@ -61,6 +65,24 @@ nothing (core degrades gracefully). A hosted single-endpoint API returns `[]` fr
 `warm_models()` and omits `endpoints()`; the bundled Ollama provider implements both.
 There is **no `on_error` hook** - retry/fallback lives inside the client
 (`client.chat()`), with core's cross-provider next-model fallback as the backstop.
+
+Transport hooks (all optional; the bundled Ollama provider implements each):
+
+- `location(cfg) -> str`: short label for the active backend shown in status/info
+  output. Ollama returns `name (url)` when the host has a machine alias, else the
+  bare URL. Exceptions are swallowed and the label is omitted.
+- `prepare(agent, cfg)`: run by core BEFORE `activate_provider()` when switching
+  to the provider. Use it for transport setup: Ollama probes its priority host
+  pool, picks the first live host into `cfg.host`, then adopts that host's
+  last-used model. Return value is ignored.
+- `on_conn_error(agent, cfg, err) -> bool`: last-chance recovery when a send fails
+  at the transport level. Return True if you fixed things (e.g. Ollama fails over
+  to the next live host in its pool) and core retries the turn; False and core
+  prints the original error.
+- `system_addendum(agent, cfg) -> str`: extra text appended to the system prompt
+  for the active model (only when the model supports tools). Ollama returns
+  short tool-calling guidance for small models (by parameter size) and `""`
+  otherwise. Keep it deterministic per model so prompt caching stays valid.
 
 ### First-class onboarding: `login` + recognizable auth errors
 
@@ -237,3 +259,14 @@ Core accumulates `agent.session_in` / `agent.session_out` across the session (ze
 by `/clear`), so `/usage` shows a token count for *any* backend without the provider
 tracking it. Input comes from `chat()`'s returned `prompt_eval`; output from the
 optional `client.last_out_tokens` the client sets per call.
+
+
+## Sampling (local providers)
+
+Local backends should not send a global temperature. Call
+`_lc["sampling_for"](cfg, model, server_card, "<where the card came from>")` and send only the
+returned `send` dict; pass the defaults your server already applies (e.g. llama.cpp `/props`,
+ollama `/api/show` PARAMETERs, `generation_config.json`) as `server_card`, or `None` if unknown.
+Store `{"params": effective, "source": source, "sent": send}` on `client.last_sampling` (and/or
+expose `client.resolve_sampling()`) so `/usage` and `lean_coder.effective_sampling()` can report it.
+Hosted providers send no sampling parameters at all. See docs/design/sampling-defaults.md.

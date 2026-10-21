@@ -536,12 +536,17 @@ def run(args, cwd):
         want_tools = [t for t in want_tools if t not in _META]
         if want_tools:
             parent_tools = _H.get("active_tool_names", lambda: set())()
-            if parent_tools:
-                bad = [t for t in want_tools if t not in parent_tools]
-                if bad:
-                    return (f"error: tool(s) not available to you: {', '.join(bad)}. "
-                            f"You can only grant tools you have. Available: "
-                            f"{', '.join(sorted(parent_tools))}.")
+            # Fail CLOSED: with no readable parent surface we can't prove the driver has
+            # these tools, and the worker force-enables granted lean-tools - so refuse
+            # rather than wave unchecked names through.
+            if not parent_tools:
+                return ("error: can't verify your own tools right now, so tools=[...] can't "
+                        "be granted. Dispatch without tools= (full leash surface) or retry.")
+            bad = [t for t in want_tools if t not in parent_tools]
+            if bad:
+                return (f"error: tool(s) not available to you: {', '.join(bad)}. "
+                        f"You can only grant tools you have. Available: "
+                        f"{', '.join(sorted(parent_tools))}.")
             # A named tool the worker's LEASH would filter out must fail here, not be
             # reported as granted and then vanish from the worker's surface.
             _need = _H.get("tool_min_leash")

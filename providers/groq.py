@@ -13,10 +13,7 @@ from pathlib import Path
 # Auth is a Bearer key (gsk_...). Wire format is OpenAI-compatible, so conversion
 # from lean-coder's internal format is nearly an identity.
 _API_BASE    = "https://api.groq.com/openai/v1"  # sweep-ok
-_MAX_TOKENS  = 4096
-_OUT_CAP     = 4096        # free tier per-minute token budget is tiny (as low as 8k TPM
-                           # on gpt-oss-20b) and counts max_tokens; keep the cap small so
-                           # a turn fits the budget. Large contexts may still 413 (clear msg)
+_MAX_TOKENS  = 32768       # fallback when /models doesn't report a model's output limit
 _CTX_DEFAULT = 131_072
 _PROVIDER    = "groq"  # sweep-ok
 
@@ -27,6 +24,40 @@ _lc         = {}
 # Groq's edge (Cloudflare) 403s the default Python-urllib User-Agent (error 1010);
 # any real UA passes.  # sweep-ok
 _UA = "lean-coder"  # sweep-ok
+
+# Free-tier caps (console.groq.com/docs/rate-limits): 30 req/min on chat models;
+# per-model req/day and tokens/min. Every response's x-ratelimit-* headers carry
+# the account's REAL per-model values (limit-requests = per DAY, limit-tokens =
+# per MINUTE) and override these. Unknown models fall back to "*".
+# Measured Oct 2026 from headers: every chat model on this free key (gpt-oss-120b,
+# gpt-oss-20b, qwen3.8-27b) = 1000 req/day, 8000 tokens/min. Llama models are
+# no longer served to it.
+_RATE_DEFAULTS = {
+    "*": {"rpm": 30, "rpd": 1000, "tpm": 8000},
+}
+_LEDGER = None
+
+
+def _ledger():
+    global _LEDGER
+    if _LEDGER is None and _lc.get("RateLedger"):
+        # Groq's daily request window is rolling (tokens/requests replenish
+        # continuously), so count the last 24h rather than since midnight.
+        _LEDGER = _lc["RateLedger"](_PROVIDER, _RATE_DEFAULTS, day_reset="rolling")
+    return _LEDGER
+
+
+def _learn_rl(model, headers):
+    """x-ratelimit-limit-requests is per DAY, -tokens per MINUTE on Groq."""
+    led = _ledger()
+    if not (led and headers):
+        return
+    def _i(k):
+        try:
+            return int(headers.get(k))
+        except (TypeError, ValueError):
+            return None
+    led.learn(model, rpd=_i("x-ratelimit-limit-requests"), tpm=_i("x-ratelimit-limit-tokens"))
 
 # Privacy posture shown at the point of use (on connect + in /usage).
 _PRIVACY    = "prompts are not used for training (API traffic under a separate DPA)"
@@ -113,7 +144,14 @@ def _backoff(attempt):
     return min(2.0 * (2 ** attempt), _MAX_WAIT)
 
 
-def _interruptible_sleep(secs, should_abort):
+def _interruptible_sleep(secs, should_abort, why="waiting"):
+    vw = _lc.get("_visible_wait")
+    if vw:      # live countdown, so a wait is never a silent blank screen
+        return vw(secs, why, should_abort)
+    return _plain_sleep(secs, should_abort)
+
+
+def _plain_sleep(secs, should_abort):
     waited = 0.0
     while waited < secs:
         if should_abort and should_abort():
@@ -422,6 +460,7 @@ class _GroqClient:
 
         if out_tokens:
             self.last_out_tokens = out_tokens
+        self._last_in_total = prompt_total or 0
         # prompt_tokens includes any cache hit; core sums prompt_eval + cache, so
         # return only the uncached part.
         self.last_cache_read  = cached
@@ -440,7 +479,14 @@ class _GroqClient:
         data    = json.dumps(payload).encode()
         model   = payload.get("model", "")
         attempt = 0
+        led     = _ledger()
+        if led:
+            warn = led.preflight(model, self.cfg)
+            if warn:
+                print(_lc["yellow"](f"[!] {model}: {warn}"))
         while True:
+            self._last_in_total = 0
+            self.last_out_tokens = None
             req = urllib.request.Request(
                 f"{_API_BASE}/chat/completions",
                 data=data, method="POST",
@@ -452,8 +498,15 @@ class _GroqClient:
                 with urllib.request.urlopen(
                         req,
                         timeout=(getattr(self.cfg, "gen_connect_timeout", None) or 600)) as resp:
-                    return self._consume(resp, should_abort)
+                    _learn_rl(model, resp.headers)
+                    result = self._consume(resp, should_abort)
+                    if led:
+                        led.record(model, self._last_in_total, self.last_out_tokens or 0, 200)
+                    return result
             except urllib.error.HTTPError as e:
+                _learn_rl(model, e.headers)
+                if led:
+                    led.record(model, 0, 0, e.code)
                 body = e.read().decode(errors="replace")
                 if e.code in _RETRY_CODES and attempt < _MAX_RETRIES:
                     hint = _retry_after_secs(e.headers or {}, body)
@@ -466,7 +519,7 @@ class _GroqClient:
                         reason = "rate limited" if e.code == 429 else f"unavailable ({e.code})"
                         print(_lc["red"](f"[!] {model} {reason} - retry {attempt}/{_MAX_RETRIES} "
                                          f"in {wait:.0f}s"))
-                        if not _interruptible_sleep(wait, should_abort):
+                        if not _interruptible_sleep(wait, should_abort, f"{model} retry {attempt}/{_MAX_RETRIES}"):
                             raise RuntimeError("aborted during retry wait") from None
                         continue
                 raise RuntimeError(f"API {e.code}: {body[:400]}") from None
@@ -479,7 +532,7 @@ class _GroqClient:
                     detail = str(getattr(e, "reason", None) or e) or type(e).__name__
                     print(_lc["red"](f"[!] {model} connection error ({detail[:80]}) - "
                                      f"retry {attempt}/{_MAX_RETRIES} in {wait:.0f}s"))
-                    if not _interruptible_sleep(wait, should_abort):
+                    if not _interruptible_sleep(wait, should_abort, f"{model} retry {attempt}/{_MAX_RETRIES}"):
                         raise RuntimeError("aborted during retry wait") from None
                     continue
                 raise RuntimeError(
@@ -493,19 +546,39 @@ class _GroqClient:
 
         cur_model = self._model()
         minfo     = _ensure_models().get(cur_model, {})
-        max_out   = min(minfo.get("max_tokens", _MAX_TOKENS), _OUT_CAP)
+        # No artificial cap: ask for the model's full output limit. The ONLY clamp
+        # is Groq's tokens/minute rule below (it rejects a request whose input +
+        # requested output exceeds TPM), which is a hard server rule, not a choice.
+        max_out   = minfo.get("max_tokens") or _MAX_TOKENS
         max_in    = minfo.get("max_input_tokens", _CTX_DEFAULT)
-        _est_toks = len(json.dumps(messages)) // 4
-        if _est_toks > max_in:
+        _mt       = _lc.get("messages_tokens")
+        _est_toks = _mt(messages, tools) if _mt else len(json.dumps(messages)) // 4
+        if _mt is None and tools:
+            _est_toks += len(json.dumps(tools)) // 4
+        # Groq counts the REQUESTED max_completion_tokens against tokens/minute, so
+        # an output budget above (TPM - input) 429s every time (measured: 8000 TPM
+        # on gpt-oss-120b, 16384 requested = instant reject). Clamp it to fit.
+        led = _ledger()
+        tpm = led.caps(cur_model, self.cfg).get("tpm") if led else None
+        if tpm:
+            room = tpm - _est_toks - 256
+            if room < 512:
+                raise RuntimeError(
+                    f"~{_est_toks:,} input tokens leaves no room under {cur_model}'s "
+                    f"{tpm:,} tokens/min free cap - /compact, or switch provider "
+                    f"(gemini / openrouter take far larger contexts)")
+            max_out = min(max_out, room)
+        max_out = min(max_out, max_in - _est_toks)
+        if max_out < 512:
             raise RuntimeError(
                 f"context too large for {cur_model} "
-                f"(~{_est_toks:,} tokens vs {max_in:,} limit) - run /compact first"
+                f"(~{_est_toks:,} of {max_in:,} tokens used, no room to reply) - run /compact first"
             )
 
         payload = {
             "model":          cur_model,
             "messages":       _cvt_messages(messages),
-            "max_tokens":     max_out,
+            "max_completion_tokens": max_out,
             "stream":         True,
             "stream_options": {"include_usage": True},
         }
@@ -591,10 +664,11 @@ def _clear(agent, cfg):
 
 
 def _usage(agent, cfg):
-    return None
+    led = _ledger()
+    return led.meters(cfg.active_model(), cfg) if led else None
 
 
-def _detail(agent, cfg):
+def _detail(agent, cfg, arg=""):
     bold = _lc["bold"]
     dim  = _lc["dim"]
 
@@ -610,6 +684,9 @@ def _detail(agent, cfg):
     cache_s = f"   cache r {_sn(cr)} w {_sn(cw)}" if (cr or cw) else ""
     lines.append(dim(f"\n  session   in {si:,}   out {so:,}   total {si + so:,}{cache_s}"))
     lines.append("\n" + _privacy_note())
+    led = _ledger()
+    if led:
+        lines.append(dim("\n" + "\n".join(led.detail_lines(cur_model, cfg))))
     lines.append(dim("  (Groq - see console.groq.com for limits)"))  # sweep-ok
     return "\n".join(lines)
 

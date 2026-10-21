@@ -49,13 +49,42 @@ import urllib.request
 
 _PROVIDER    = "llamacpp"
 _DEFAULT_HOST = "http://127.0.0.1:8080"
-_API_BASE    = os.environ.get("LLAMACPP_HOST", _DEFAULT_HOST)
+
 _CTX_DEFAULT = 32_768        # fallback when /props can't give a real n_ctx
-_OUT_CAP     = 4096
 # cfg.think level -> chat_template_kwargs.reasoning_effort (qwen3.8: low/medium/xhigh).
 _EFFORT    = {"low": "low", "medium": "medium", "med": "medium",
               "high": "xhigh", "xhigh": "xhigh", "max": "xhigh"}
 _THINK_OFF = {"off", "false", "no", "0", "none", ""}
+
+
+# Reply-length guard for LOCAL models. A paid API is never capped (a cut reply
+# wastes the turn), but locally a runaway/looping model can grind the GPU for
+# many minutes with nothing else able to run. Default 32k is far above any real
+# reply; /set max_out <n> to change, /set max_out 0 for unlimited.
+_MAX_OUT_DEFAULT = 32_768
+
+
+def _max_out(cfg):
+    """Configured local reply cap: None = unlimited, else a positive int."""
+    try:
+        v = cfg.setting("max_out") if cfg is not None else None
+    except Exception:
+        v = None
+    if v in (None, ""):
+        return _MAX_OUT_DEFAULT
+    try:
+        v = int(v)
+    except (TypeError, ValueError):
+        return _MAX_OUT_DEFAULT
+    return v if v > 0 else None
+
+
+def _note_cut(cfg, finish):
+    """Tell the operator when OUR cap cut the reply (never silent truncation)."""
+    cap = _max_out(cfg)
+    if finish == "length" and cap:
+        print(_lc["yellow"](f"[!] reply hit max_out ({cap:,} tokens) and was cut off - "
+                            f"/set max_out <higher> or /set max_out 0 for unlimited"))
 
 _lc = {}
 # Active base URL, resolved at setup() from (in precedence order) the provider-scoped
@@ -132,6 +161,55 @@ def _ctx_window(model):
     return _CTX_DEFAULT
 
 
+# Sampling card per (host, model): what llama-server applies when a request OMITS a
+# field (router preset / CLI flags / GGUF general.sampling.*), read from
+# /props default_generation_settings. Values equal to llama.cpp's compiled built-ins
+# mean "nobody set it" and are not reported as a card. Cached like _CTX_CACHE.
+_SAMP_CACHE = {}
+_LLAMA_BUILTIN = {"temperature": 0.8, "top_k": 40, "top_p": 0.95, "min_p": 0.05,
+                  "presence_penalty": 0.0, "repeat_penalty": 1.0}
+_PROPS_KEYS = {"temperature": "temperature", "temp": "temperature", "top_k": "top_k",
+               "top_p": "top_p", "min_p": "min_p", "presence_penalty": "presence_penalty",
+               "repeat_penalty": "repeat_penalty"}
+
+
+def _props_card(base, model, timeout=3):
+    """dict of non-built-in sampling defaults the server applies, {} if it only has
+    built-ins, None if /props is unreadable (unloaded router model / old server)."""
+    q = f"?model={urllib.parse.quote(model)}" if model else ""
+    for url in ((f"{base}/props{q}", f"{base}/props") if q else (f"{base}/props",)):
+        try:
+            req = urllib.request.Request(url, headers=_headers(), method="GET")
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                d = json.loads(r.read())
+        except (urllib.error.URLError, OSError, ValueError):
+            continue
+        g = (d.get("default_generation_settings") or {}) if isinstance(d, dict) else {}
+        g = g.get("params") if isinstance(g.get("params"), dict) else g
+        card = {}
+        for pk, k in _PROPS_KEYS.items():
+            v = g.get(pk)
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                if abs(float(v) - _LLAMA_BUILTIN[k]) > 1e-6:
+                    card[k] = v
+        return card
+    return None
+
+
+def _server_card(model):
+    import time as _t
+    key = (_base(), model or "")
+    hit = _SAMP_CACHE.get(key)
+    if hit and (hit[1] is None or _t.monotonic() < hit[1]):
+        return hit[0]
+    cfg = _lc.get("_cfg")
+    st = LlamaCppClient(cfg).model_status(timeout=3).get(model) if (cfg and model) else None
+    card = _props_card(_base(), model) if st in (None, "loaded") else None
+    # A router preset that isn't loaded yet can't be read without a swap: retry later.
+    _SAMP_CACHE[key] = (card, None if card is not None else _t.monotonic() + _CTX_RETRY)
+    return card
+
+
 def _base():
     """Active llama-server base URL. Precedence: the /llamacpp-set host (module state,
     seeded from cfg at setup) -> LLAMACPP_HOST env -> the compiled default. rstrip so
@@ -198,10 +276,27 @@ class LlamaCppClient:
     def detect_num_ctx(self):
         return _ctx_window(self.cfg.active_model() if self.cfg else None)
 
+    def resolve_sampling(self, full=False):
+        """Effective sampling for the active model ({'params','source','sent'});
+        full=True returns the (send, effective, source) triple used to build a request.
+        Also stored as self.last_sampling (read via lean_coder.effective_sampling)."""
+        model = self.cfg.active_model() if self.cfg else ""
+        sf = _lc.get("sampling_for")
+        if sf is None:
+            return ({}, {}, "server built-in") if full else None
+        try:
+            card = _server_card(model)
+        except Exception:
+            card = None
+        send, eff, src = sf(self.cfg, model, card, "llama-server /props")
+        self.last_sampling = {"params": eff, "source": src, "sent": dict(send)}
+        return (send, eff, src) if full else self.last_sampling
+
     def _consume(self, resp, should_abort, tools=None):
         """Parse a streamed OpenAI SSE response, printing content as it arrives and
         accumulating any tool_calls. Returns (assistant_dict, prompt_tokens, aborted).
         Mirrors providers/openai.py::_consume."""
+        finish        = None
         content_parts = []
         tool_acc      = {}
         order         = []
@@ -233,6 +328,8 @@ class LlamaCppClient:
                     continue
 
                 for ch in obj.get("choices", []):
+                    if ch.get("finish_reason"):
+                        finish = ch["finish_reason"]
                     delta = ch.get("delta", {})
                     # Thinking channel: stock llama-server streams reasoning on
                     # delta.reasoning_content (some builds/models use delta.thinking).
@@ -364,6 +461,8 @@ class LlamaCppClient:
                 _tc.setdefault("id", f"call_{_i}")
                 _tc.setdefault("type", "function")
             assistant["tool_calls"] = tool_calls
+        if not aborted:
+            _note_cut(self.cfg, finish)
         return assistant, prompt_total, aborted
 
     def _swap_hint(self, model):
@@ -387,16 +486,21 @@ class LlamaCppClient:
         body = {
             "model":       self.cfg.active_model(),   # router mode (--models-preset): selects/loads the model
             "messages":    messages,
-            "max_tokens":  _OUT_CAP,
-            "temperature": getattr(self.cfg, "temperature", 0.0),
             "stream":      True,
             # Usage chunk (prompt/completion tokens) is opt-in, as on OpenAI; timings
             # carry decode time + slot-cache hits. Unknown keys are ignored server-side.
             "stream_options":    {"include_usage": True},
             "timings_per_token": True,
         }
+        _cap = _max_out(self.cfg)
+        if _cap:
+            body["max_tokens"] = _cap
         if tools:
             body["tools"] = tools
+        # Sampling: only what the user set, or the family table when the server has
+        # no card of its own (unset fields fall through to preset / GGUF metadata).
+        send, _eff, _src = self.resolve_sampling(full=True)
+        body.update(send)
         self._swap_hint(body["model"])
         # Thinking control. cfg.think is the same bool|None the ollama provider sends
         # (True/False = force on/off; None = don't touch, let the template default
@@ -462,7 +566,7 @@ PROVIDER = {
     "available":      lambda: True,    # local + free
     "autostart":      lambda: False,   # explicit selection only
     "tag":            "gguf",
-    "capabilities":   lambda model: {},
+    "capabilities":   lambda model: {"thinking": ["off", "on"]},
     # Router mode: loaded model(s) get the green dot in /model; [] otherwise.
     "warm_models":    lambda: LlamaCppClient(_lc.get("_cfg")).running_models() if _lc.get("_cfg") else [],
 }
@@ -491,8 +595,17 @@ def _norm_url(s):
     s = (s or "").strip()
     if not s:
         return ""
+    if any(c.isspace() for c in s):
+        return ""
     if "://" not in s:
         s = "http://" + s
+    try:
+        p = urllib.parse.urlparse(s)
+        p.port  # raises ValueError on a bad port
+    except ValueError:
+        return ""
+    if p.scheme not in ("http", "https") or not p.hostname:
+        return ""
     return s.rstrip("/")
 
 
@@ -501,23 +614,26 @@ def _set_host(agent, cfg, url, persist=True):
     (and thus the live client) uses it immediately, record it as the provider-scoped
     'host' setting, and persist to config.toml. Clears the client's cached model list
     so the next read re-resolves against the new host."""
-    global _HOST
+    global _HOST, _LAST_SENT
     _HOST = url
+    _LAST_SENT = None   # new server: the swap hint must fire again
     try:
-        cfg.set_setting("host", url)
+        cfg.provider_settings.setdefault("llamacpp", {})["host"] = url
     except Exception:
         pass
-    # Drop any cached model list on the live client so /model re-reads the new host.
+    # Drop any cached model list on the live llama.cpp client so /model re-reads.
     client = getattr(agent, "client", None)
-    if client is not None and getattr(client, "_models", None) is not None:
+    if isinstance(client, LlamaCppClient) and client._models is not None:
         client._models = None
     if persist:
         save = _lc.get("save_config") or _lc.get("autosave_config")
-        if save:
+        if not save:
+            print(_lc["yellow"]("no config saver available; host set for this session only."))
+        else:
             try:
                 save(cfg)
-            except Exception:
-                pass
+            except Exception as e:
+                print(_lc["yellow"](f"could not save config ({e}); host set for this session only."))
     print(_lc["green"](f"llama-server host -> {url}"))
 
 
@@ -568,6 +684,9 @@ def _handle_llamacpp(agent, cfg, arg):
     /llamacpp host        -> same (explicit)
     /llamacpp host <url>  -> set the active base URL (probed, persisted)
     /llamacpp <url>       -> shorthand: treat a bare URL/name as a host set
+
+    Host precedence: the host set here (saved as provider_settings.llamacpp.host)
+    wins over the LLAMACPP_HOST env var, which wins over http://127.0.0.1:8080.
     """
     arg = (arg or "").strip()
     parts = arg.split(maxsplit=1)

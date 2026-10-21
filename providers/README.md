@@ -13,9 +13,11 @@ is **not** a lean-tool: it wires in through a native registry, never ships to a
   per-host last-used model, num_ctx auto-detect + OOM cap, and its own `/ollama`
   command. Read this first when writing your own.
 - **`anthropic_api.py`, `gemini.py`, `groq.py`, `openai.py`,
-  `openrouter.py`** - bundled hosted providers, disabled until you enable + key them
+  `openrouter.py`, `kilo.py`, `ovh.py`** - bundled hosted providers, disabled until you enable + key them
   (`/provider enable <name>`, then `/provider login <name>`). `anthropic_api` is the
-  OAuth-subscription variant (Claude Pro/Max) of `anthropic_api`.
+  OAuth-subscription variant (Claude Pro/Max) of `anthropic_api`. `kilo` needs no
+  key at all (anonymous free lane, 200 requests/hour per IP); nor does `ovh`
+  (OVHcloud, EU-hosted, 2 requests/minute per model per IP - it never sends a key).
 - **`llamacpp.py`, `mlx.py`** - bundled local-server providers (llama.cpp and Apple
   MLX), the same "point at a local backend" shape as `ollama`.
 

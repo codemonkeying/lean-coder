@@ -17,7 +17,6 @@ from pathlib import Path
 # required); this is here for users who already have a paid key.  # sweep-ok
 _API_BASE    = "https://api.openai.com/v1"  # sweep-ok
 _MAX_TOKENS  = 16_384      # fallback max output for an unmapped model
-_OUT_CAP     = 100_000     # hard ceiling on requested output (gpt-5/o-series can emit 100k+)
 _CTX_DEFAULT = 128_000
 _PROVIDER    = "openai"  # sweep-ok
 
@@ -40,11 +39,17 @@ _SHOW_BANNER = False
 _SKIP_KEYS = (
     "embedding", "whisper", "tts", "audio", "realtime", "transcribe",
     "dall-e", "image", "moderation", "search", "codex", "davinci", "babbage",
+    "-pro", "deep-research", "o1-mini", "o1-preview",
 )  # sweep-ok
 
 # Reasoning-effort-capable families (accept reasoning_effort low/med/high).
 # The o-series and gpt-5 line reason; the gpt-4 line does not.  # sweep-ok
 _REASON_KEYS = ("gpt-5", "o1", "o3", "o4")  # sweep-ok
+_NON_REASON_KEYS = ("-chat",)   # gpt-5-chat-latest is a non-reasoning chat model  # sweep-ok
+
+
+def _is_reasoning(low):
+    return any(k in low for k in _REASON_KEYS) and not any(k in low for k in _NON_REASON_KEYS)
 
 # Known context windows (the /models endpoint doesn't report them). Matched by
 # substring; the longest matching prefix wins. Falls back to _CTX_DEFAULT.  # sweep-ok
@@ -208,7 +213,7 @@ def _fetch_models(key):
                 "id":               mid,
                 "max_input_tokens": _ctx_for(mid),
                 "max_tokens":       _out_for(mid),
-                "reason":           any(k in low for k in _REASON_KEYS),
+                "reason":           _is_reasoning(low),
             })
         if out:
             out.sort(key=lambda m: m["id"])
@@ -245,6 +250,8 @@ def _capabilities(model):
     caps = {}
     if _ensure_models().get(model, {}).get("reason"):
         caps["effort"] = ["low", "med", "high"]
+        if "gpt-5" in model.lower():          # gpt-5 family also accepts "minimal"
+            caps["effort"] = ["minimal"] + caps["effort"]
     return caps
 
 
@@ -296,8 +303,13 @@ _VISION_FAMILIES = ("gpt-4o", "gpt-4.1", "gpt-4-turbo", "gpt-4-vision",
                     "o1", "o3", "o4", "gpt-5", "chatgpt-4o")
 
 
+_NO_VISION = ("o1-mini", "o3-mini")   # text-only minis (o4-mini does see images)
+
+
 def _model_supports_vision(model_id):
     m = (model_id or "").lower()
+    if any(f in m for f in _NO_VISION):
+        return False
     return any(f in m for f in _VISION_FAMILIES)
 
 
@@ -570,13 +582,18 @@ class _OpenAIClient:
 
         cur_model = self._model()
         minfo     = _ensure_models().get(cur_model, {})
-        max_out   = min(minfo.get("max_tokens", _MAX_TOKENS), _OUT_CAP)
+        # Never cap below the model's real output limit (a cut reply wastes the turn).
+        max_out   = minfo.get("max_tokens") or _MAX_TOKENS
         max_in    = minfo.get("max_input_tokens", _CTX_DEFAULT)
-        _est_toks = len(json.dumps(messages)) // 4
-        if _est_toks > max_in:
+        _mt       = _lc.get("messages_tokens")
+        _est_toks = _mt(messages, tools) if _mt else len(json.dumps(messages)) // 4
+        if _mt is None and tools:
+            _est_toks += len(json.dumps(tools)) // 4
+        max_out = min(max_out, max_in - _est_toks)
+        if max_out < 1024:
             raise RuntimeError(
                 f"context too large for {cur_model} "
-                f"(~{_est_toks:,} tokens vs {max_in:,} limit) - run /compact first"
+                f"(~{_est_toks:,} of {max_in:,} tokens used, no room to reply) - run /compact first"
             )
 
         payload = {
@@ -624,7 +641,9 @@ def _on_activate(agent, cfg):
         cfg.set_setting("effort", "med")
     if _SHOW_BANNER:
         key    = _api_key()
-        masked = f"{key[:8]}...{key[-4:]}" if key and len(key) > 12 else "(env)"
+        masked = f"{key[:8]}...{key[-4:]}" if key and len(key) > 12 else "(set)" if key else "(none)"
+        if key and os.environ.get("OPENAI_API_KEY", "") == key:  # sweep-ok
+            masked += " (env)"
         print(_lc["dim"](f"  OpenAI API key  {masked}"))
         print(_privacy_note())
     d = _cred_data()
@@ -671,7 +690,7 @@ def _usage(agent, cfg):
     return None
 
 
-def _detail(agent, cfg):
+def _detail(agent, cfg, arg=""):
     bold = _lc["bold"]
     dim  = _lc["dim"]
 

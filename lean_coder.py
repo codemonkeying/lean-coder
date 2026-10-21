@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L1739   Lean-tools (plugin tools: discovery, manager)
-  L2093   MCP client (connection, manager, OAuth, discovery)
-  L2547   Providers (backend plugin registry)
-  L2769   Interactive pickers + menus (raw-mode UI engine)
-  L3118   Terminal styling (colors, formatting helpers)
-  L3412   Streaming + markdown render (model output)
-  L3904   Composer (pinned input line, editor, stdin)
-  L4855   Token accounting (calibrated context meter)
-  L5053   Config (dataclass, field registry, load/save)
-  L8850   Tool execution + text tool-call parsing
-  L9323   Remote workspace (executor client, /connect)
-  L11502  Context meter
-  L11597  Agent (turn loop, context mgmt, tool dispatch)
-  L18881  Slash-command handlers + dispatch table
-  L19018  REPL (interactive loop, session resume)
-  L19481  Worker agent (headless --agent-run)
-  L20160  Entry (CLI arg parsing, main)
+  L1752   Lean-tools (plugin tools: discovery, manager)
+  L2139   MCP client (connection, manager, OAuth, discovery)
+  L2593   Providers (backend plugin registry)
+  L2815   Interactive pickers + menus (raw-mode UI engine)
+  L3164   Terminal styling (colors, formatting helpers)
+  L3458   Streaming + markdown render (model output)
+  L3950   Composer (pinned input line, editor, stdin)
+  L4907   Token accounting (calibrated context meter)
+  L5105   Config (dataclass, field registry, load/save)
+  L9055   Tool execution + text tool-call parsing
+  L9528   Remote workspace (executor client, /connect)
+  L11707  Context meter
+  L11802  Agent (turn loop, context mgmt, tool dispatch)
+  L19364  Slash-command handlers + dispatch table
+  L19506  REPL (interactive loop, session resume)
+  L19969  Worker agent (headless --agent-run)
+  L20654  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -116,7 +116,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.10.85"
+__version__ = "0.10.86"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -124,6 +124,19 @@ __version__ = "0.10.85"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.10.86": [
+        "sampling: local providers (llamacpp, mlx, ollama) no longer force temperature 0.7 /",
+        "  top_p 0.8 / top_k 20 / repeat_penalty 1.05 on every request - the model card applies",
+        "  (llama-server preset or GGUF metadata, generation_config.json, Modelfile), else a",
+        "  built-in per-family table (Qwen3 thinking: 1.0/0.95/20). Thinking models stop looping.",
+        "/set temperature|top_p|top_k|min_p|presence_penalty|repeat_penalty <n> still wins;",
+        "  '/set temperature default' goes back to the model card. /usage shows the sampling in",
+        "  effect and where it came from. A config holding exactly the old defaults is migrated.",
+        "warning when a thinking model runs greedy (temperature 0) - model cards say it loops.",
+        "tools: a fresh install now starts with the bundled tools on (web, workers, board, ssh...);",
+        "  existing configs are untouched and get a one-time /tools hint. Workers now reliably get",
+        "  the tools they are granted.",
+    ],
     "0.10.85": [
         "remote: after a dropped connection the model is told clearly which host and user it is now on.",
     ],
@@ -1917,6 +1930,39 @@ def _bundled_lean_tools_dir():
 
 def _lean_tools_dirs(cfg):
     return _plugin_dirs("lean-tools", _lean_tools_dir(cfg))
+
+
+# Bundled lean-tools NOT switched on for a fresh install: notify monkeypatches the turn
+# loop and pops a desktop toast on every confirm / long turn - opt in via /tools.
+_DEFAULT_OFF_LEAN_TOOLS = ("notify",)
+
+
+def _bundled_lean_tool_names():
+    """Names of the lean-tools SHIPPED with the code (bundled dir only, never the user's
+    drop-in dir) - the out-of-the-box enabled set for a fresh install. Listed by file
+    stem WITHOUT importing anything (bundled tools name themselves after their file, so
+    no module code runs and no load warnings print during config load)."""
+    d = _bundled_lean_tools_dir()
+    if not d:
+        return []
+    try:
+        return sorted(f.stem for f in d.glob("*.py")
+                      if f.name != "builtins.py" and f.stem not in _DEFAULT_OFF_LEAN_TOOLS)
+    except OSError:
+        return []
+
+
+def _grant_enable_tools(cfg, names):
+    """Worker side: make sure every lean-tool the driver GRANTED (by name) loads, even if
+    this box's config.toml has it disabled - the worker builds its toolset from the config
+    on disk, not the driver's live state, so a stripped/edited config silently dropped
+    granted web tools. Only real lean-tool names are added (core and MCP names aren't
+    lean-tools, and must never leak into lean_tools_enabled). The leash still caps the
+    surface (active_tools/_gate_tool); dispatch already refused names the driver lacks."""
+    known = {f.stem for d in _lean_tools_dirs(cfg) if Path(d).is_dir()
+             for f in Path(d).rglob("*.py") if "__pycache__" not in f.parts}
+    en = list(cfg.lean_tools_enabled or [])
+    cfg.lean_tools_enabled = en + [n for n in names if n in known and n not in en]
 
 
 # ----------------------------------------------------------------------------
@@ -4680,6 +4726,12 @@ class Composer:
                 pass
         return len(text)
 
+    def isatty(self):
+        # Stands in for sys.stdout during a turn; callers that probe isatty()
+        # (e.g. _visible_wait) must get plain one-line output, not \r tricks
+        # that would fight the pinned input box.
+        return False
+
     def flush(self):
         try:
             self._out.flush()
@@ -5126,10 +5178,17 @@ class Config:
                                      # a guardrail, not a wall.
     cwd: Path = field(default_factory=Path.cwd)
     approval: str = "session"        # ask (confirm each) | session (ask once) | auto (never)
-    temperature: float = 0.7
-    top_p: float = 0.8
-    top_k: int = 20
-    repeat_penalty: float = 1.05
+    # Sampling: None = NOT SET -> the model card decides (server preset / GGUF
+    # general.sampling / generation_config / Modelfile), else SAMPLING_FAMILIES, else
+    # omitted. A number is an explicit user choice and is always sent where accepted.
+    # (Pre-0.10.86 the defaults were 0.7/0.8/20/1.05 - the Qwen NON-thinking preset,
+    # forced on every local request; see docs/design/sampling-defaults.md.)
+    temperature: "float | None" = None
+    top_p: "float | None" = None
+    top_k: "int | None" = None
+    repeat_penalty: "float | None" = None
+    min_p: "float | None" = None
+    presence_penalty: "float | None" = None
     think: "bool | None" = None      # None = don't send; True/False = send think param
     auto_num_ctx: bool = False       # detect num_ctx from `ollama show` at startup
     keep_alive: str = "10m"          # ollama: how long the model stays resident after a
@@ -5492,11 +5551,139 @@ class Config:
         return {
             "num_ctx": self.provider_settings.get(self.provider, {}).get("num_ctx")
                        or self.num_ctx,
-            "temperature": self.temperature,
-            "top_p": self.top_p,
-            "top_k": self.top_k,
-            "repeat_penalty": self.repeat_penalty,
+            **{k: getattr(self, k) for k in SAMPLING_KEYS
+               if getattr(self, k, None) is not None},
         }
+
+
+# ----------------------------------------------------------------------------
+# Sampling defaults (docs/design/sampling-defaults.md). Hosted providers send NO
+# sampling params (Anthropic 4.7+/5.x 400 on non-default, GPT-5/6 reject while
+# reasoning, Gemini 3 'keep 1.0'). Local providers (llamacpp, mlx, ollama) call
+# sampling_for(): user > model card (server-side) > SAMPLING_FAMILIES > omit.
+# ----------------------------------------------------------------------------
+SAMPLING_KEYS = ("temperature", "top_p", "top_k", "min_p", "presence_penalty",
+                 "repeat_penalty")
+
+# Family table: used ONLY when the server reports no card values of its own.
+# (label, regex on the lowercased model id, thinking-on row, thinking-off row). Sources:
+# Qwen3.8/3.6 cards (thinking: 1.0/0.95/20/0, 'DO NOT use greedy decoding'), Qwen3
+# Instruct-2507 (0.7/0.8/20), Gemma 4 generation_config (1.0/0.95/64), gpt-oss
+# (1.0/1.0). First match wins.
+SAMPLING_FAMILIES = [
+    ("qwen3-instruct", r"qwen3.*(instruct|2507)|qwen3.*coder",
+     {"temperature": 0.7, "top_p": 0.8, "top_k": 20, "min_p": 0.0},
+     {"temperature": 0.7, "top_p": 0.8, "top_k": 20, "min_p": 0.0}),
+    ("qwen3", r"qwen3",
+     {"temperature": 1.0, "top_p": 0.95, "top_k": 20, "min_p": 0.0,
+      "presence_penalty": 0.0, "repeat_penalty": 1.0},
+     {"temperature": 0.7, "top_p": 0.8, "top_k": 20, "min_p": 0.0,
+      "presence_penalty": 1.5, "repeat_penalty": 1.0}),
+    ("gemma", r"gemma.?[34]",
+     {"temperature": 1.0, "top_p": 0.95, "top_k": 64},
+     {"temperature": 1.0, "top_p": 0.95, "top_k": 64}),
+    ("gpt-oss", r"gpt-oss",
+     {"temperature": 1.0, "top_p": 1.0},
+     {"temperature": 1.0, "top_p": 1.0}),
+]
+
+
+def _family_sampling(model, think_on):
+    import re as _re
+    m = (model or "").lower()
+    for label, pat, on, off in SAMPLING_FAMILIES:
+        if _re.search(pat, m):
+            return dict(on if think_on else off), label
+    return None, None
+
+
+def _think_is_on(think):
+    """cfg.think -> bool. None (template default) counts as ON: every family in the
+    table that has a thinking mode defaults to it."""
+    if think is None:
+        return True
+    if isinstance(think, str):
+        return think.strip().lower() not in ("off", "false", "no", "0", "none", "")
+    return bool(think)
+
+
+_GREEDY_WARNED = set()
+
+
+def sampling_for(cfg, model, server_card=None, server_label="server"):
+    """Resolve the sampling params a LOCAL provider should send for `model`.
+
+    server_card: the card values the server already applies when a field is omitted
+      (llama.cpp /props default_generation_settings when they differ from built-ins,
+      ollama /api/show parameters, mlx generation_config.json) - a dict, or None if
+      the server has none / it couldn't be read.
+    Returns (send, effective, source):
+      send      - dict to put in the request (ONLY what lean-coder must send),
+      effective - best-known values actually in force (for /usage + harness stamps),
+      source    - human string: 'you (/set)', 'model card (<server_label>)',
+                  'lean-coder table (<family>)', 'server built-in', or a mix 'a + b'.
+    Precedence per key: user (/set / CLI / headless cfg attr) > server card > family
+    table > omit."""
+    user = {k: getattr(cfg, k, None) for k in SAMPLING_KEYS}
+    user = {k: v for k, v in user.items() if v is not None}
+    card = {k: v for k, v in (server_card or {}).items() if k in SAMPLING_KEYS and v is not None}
+    think_on = _think_is_on(getattr(cfg, "think", None))
+    send, eff, srcs = dict(user), dict(card), []
+    eff.update(user)
+    if user:
+        srcs.append("you (/set)")
+    if card and any(k not in user for k in card):
+        srcs.append(f"model card ({server_label})")
+    if not card:
+        fam, pat = _family_sampling(model, think_on)
+        if fam:
+            add = {k: v for k, v in fam.items() if k not in user}
+            if add:
+                send.update(add)
+                eff.update(add)
+                srcs.append(f"lean-coder table ({pat}, think "
+                            f"{'on' if think_on else 'off'})")
+    if not srcs:
+        srcs.append("server built-in")
+    # Greedy guard: warn once per model, never silently override the caller.
+    t = eff.get("temperature")
+    if t is not None and t <= 0.0 and think_on and model not in _GREEDY_WARNED:
+        _GREEDY_WARNED.add(model)
+        try:
+            print(yellow(f"[!] temperature {t} = greedy decoding on a thinking model ({model})"
+                         " - model cards warn it causes endless repetition; "
+                         "/set temperature default to use the model card"))
+        except Exception:
+            pass
+    return send, eff, " + ".join(srcs)
+
+
+def _fmt_sampling(eff):
+    short = {"temperature": "temp", "top_p": "top_p", "top_k": "top_k", "min_p": "min_p",
+             "presence_penalty": "presence", "repeat_penalty": "repeat"}
+    return " ".join(f"{short[k]} {eff[k]:g}" for k in SAMPLING_KEYS if k in eff) or "(none sent)"
+
+
+def effective_sampling(agent_or_client):
+    """Public: the EFFECTIVE sampling of the last (or next) request + its source, as
+    {"params": {...}, "source": str, "sent": {...}} - or None when the active provider
+    doesn't resolve sampling (hosted providers send none: the vendor default applies).
+    Accepts an Agent or a provider client."""
+    c = getattr(agent_or_client, "client", agent_or_client)
+    s = getattr(c, "last_sampling", None)
+    if s is None and hasattr(c, "resolve_sampling"):
+        try:
+            s = c.resolve_sampling()
+        except Exception:
+            s = None
+    return dict(s) if s else None
+
+
+def _sampling_line(agent):
+    s = effective_sampling(agent)
+    if not s:
+        return ""
+    return f"sampling: {_fmt_sampling(s['params'])}  ({s['source']})"
 
 
 def _norm_host(h: str) -> str:
@@ -5597,10 +5784,12 @@ _SCALAR_FIELDS = (
     ("auto_trim_keep",            TRIM_KEEP,           False),
     ("wake_on_bg_finish",         True,                False),
     ("notes_spool",               2000,                False),
-    ("temperature",               0.7,                 True),
-    ("top_p",                     0.8,                 True),
-    ("top_k",                     20,                  True),
-    ("repeat_penalty",            1.05,                True),
+    ("temperature",               None,                False),
+    ("top_p",                     None,                False),
+    ("top_k",                     None,                False),
+    ("repeat_penalty",            None,                False),
+    ("min_p",                     None,                False),
+    ("presence_penalty",          None,                False),
     ("ask_user_to_run",           True,                True),
     ("autosave",                  True,                True),
     ("command_timeout",           300,                 True),
@@ -5722,7 +5911,8 @@ def load_config(args) -> Config:
     cfg = Config()
     # config file (lowest, above defaults)
     file_vals = {}
-    if CONFIG_PATH.is_file():
+    _cfg_existed = CONFIG_PATH.is_file()   # fresh install = no file at all (lean-tool seed)
+    if _cfg_existed:
         raw = ""
         try:
             import tomllib  # lazy: the hermetic --tool-exec role never needs it
@@ -5748,6 +5938,13 @@ def load_config(args) -> Config:
     # carrying the old key maps onto the new field, unless the new key is also present.
     if "compact_hard" in file_vals and "compact_at" not in file_vals:
         file_vals["compact_at"] = file_vals["compact_hard"]
+    # Migration (0.10.86): the old sampling defaults were always written to config.toml
+    # (always=True), so a file carrying EXACTLY the old preset never chose it - drop
+    # those keys so the model card applies. Any other value is a real user choice.
+    _old_samp = {"temperature": 0.7, "top_p": 0.8, "top_k": 20, "repeat_penalty": 1.05}
+    if all(file_vals.get(k) == v for k, v in _old_samp.items()):
+        for k in _old_samp:
+            file_vals.pop(k, None)
     for key in _PERSISTED_SCALAR_KEYS + ("composer",):  # composer: read-only (see _EPHEMERAL_KEYS)
         if key in file_vals:
             setattr(cfg, key, file_vals[key])
@@ -5776,6 +5973,13 @@ def load_config(args) -> Config:
         cfg.approval = "ask"
     if isinstance(file_vals.get("lean_tools_enabled"), list):
         cfg.lean_tools_enabled = [p for p in file_vals["lean_tools_enabled"] if isinstance(p, str)]
+    elif not _cfg_existed:
+        # TRUE fresh install (no config.toml at all): seed the bundled lean-tools so web/
+        # worker/board/ssh tools work out of the box. Only when the FILE is absent: an
+        # existing config without the key was written by an older build that omitted an
+        # EMPTY list, i.e. possibly "I disabled them all" - that must stay off, never be
+        # silently re-enabled (and persisted) on upgrade. User drop-ins stay opt-in.
+        cfg.lean_tools_enabled = _bundled_lean_tool_names()
     if isinstance(file_vals.get("mcp_servers"), dict):
         cfg.mcp_servers = {k: dict(v) for k, v in file_vals["mcp_servers"].items()
                            if isinstance(v, dict)}
@@ -6061,9 +6265,10 @@ def save_config(cfg: Config, quiet: bool = False):
         lines.append("always_expand = [" + ", ".join(_toml_value(x) for x in cfg.always_expand) + "]")
     if cfg.show_snapshots:                      # default off (snapshots hidden in /load)
         lines.append("show_snapshots = true")
-    if cfg.lean_tools_enabled:
-        lines.append("lean_tools_enabled = ["
-                     + ", ".join(f'"{p}"' for p in cfg.lean_tools_enabled) + "]")
+    # Always written (even empty): an ABSENT key means "fresh - seed all bundled
+    # lean-tools" on load, so an explicit empty set must be persisted to stick.
+    lines.append("lean_tools_enabled = ["
+                 + ", ".join(f'"{p}"' for p in cfg.lean_tools_enabled) + "]")
     if cfg.mcp_enabled:
         lines.append("mcp_enabled = ["
                      + ", ".join(f'"{p}"' for p in cfg.mcp_enabled) + "]")
@@ -14379,6 +14584,271 @@ def render_usage_meters(usage, verbose=False) -> str:
     return sep + sep.join(parts)
 
 
+def _visible_wait(secs, why, should_abort):
+    """Sleep with a live one-line countdown so the operator sees WHY nothing is
+    happening (never a silent blank screen). Ctrl-C/abort breaks it. Returns
+    False if aborted."""
+    try:                                 # stdout may be a stand-in (Composer)
+        tty = bool(sys.stdout.isatty())
+    except Exception:
+        tty = False
+    dim  = yellow
+    end  = time.time() + secs
+    last = None
+    if not tty:
+        print(dim(f"[..] {why} - waiting {secs:.0f}s"), flush=True)
+    try:
+        while True:
+            left = end - time.time()
+            if left <= 0:
+                break
+            if should_abort and should_abort():
+                return False
+            n = int(left + 0.999)
+            if tty and n != last:
+                sys.stdout.write("\r\033[K" + dim(f"[..] {why} - sending in {n}s (Ctrl-C to cancel)"))
+                sys.stdout.flush()
+                last = n
+            time.sleep(min(0.25, left))
+    finally:
+        if tty:
+            sys.stdout.write("\r\033[K")
+            sys.stdout.flush()
+    return True
+
+
+class RateLedger:
+    """Client-side request/token ledger for rate-capped (mostly free-tier) API
+    providers. Every send is recorded so we can PREDICT when a cap will bite
+    instead of discovering it via a 429 mid-turn.
+
+    Caps are per model: {"rpm", "rpd", "tpm", "tpd"} (None = unknown/none).
+    Sources, highest priority first: a user override (/set rpm_cap|rpd_cap|
+    tpm_cap|tpd_cap), a learned value (rate-limit headers or a 429 body), then the
+    provider's published defaults. `day_reset` is how the provider counts a day:
+    "utc" (UTC midnight), "pacific" (Gemini: midnight US Pacific), or "rolling"
+    (last 24h). Persisted to CONFIG_DIR/ratelog-<provider>.json so counts survive
+    restarts (a daily cap does not care that you relaunched)."""
+
+    WINDOW = 86400 + 3600   # keep a little over a day of history
+
+    def __init__(self, provider, defaults=None, day_reset="utc", shared=()):
+        self.provider  = provider
+        self.defaults  = defaults or {}   # model-substring -> caps; "*" = fallback
+        self.day_reset = day_reset
+        # Caps counted across ALL models of the provider rather than per model
+        # (e.g. OpenRouter's free-models-per-day is account-wide).
+        self.shared    = set(shared)
+        self.path      = CONFIG_DIR / f"ratelog-{provider}.json"
+        self.events    = []   # [ts, model, in_tok, out_tok, status]
+        self.learned   = {}   # model -> caps learned from the API
+        self.last_hdr  = {}   # model -> last raw rate-limit headers seen
+        self._load()
+
+    # -- persistence --
+    def _load(self):
+        try:
+            d = json.loads(self.path.read_text())
+            self.events  = d.get("events", [])
+            self.learned = d.get("learned", {})
+        except Exception:
+            pass
+
+    def _save(self):
+        try:
+            cut = time.time() - self.WINDOW
+            self.events = [e for e in self.events if e[0] >= cut]
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.path.write_text(json.dumps({"events": self.events, "learned": self.learned}))
+        except Exception:
+            pass
+
+    # -- recording --
+    def record(self, model, in_tok=0, out_tok=0, status=200):
+        self.events.append([time.time(), model, int(in_tok or 0), int(out_tok or 0), status])
+        self._save()
+
+    def block(self, model, until, why):
+        """A hard cap was hit (e.g. a per-day quota): remember until when, so we
+        refuse up front with a clear message instead of resending into a 429."""
+        self.learned.setdefault("_blocked", {})[model] = [until, why]
+        self._save()
+
+    def blocked(self, model):
+        """(seconds_left, why) if `model` is blocked by a hard cap, else None."""
+        b = (self.learned.get("_blocked") or {}).get(model)
+        if b and b[0] > time.time():
+            return b[0] - time.time(), b[1]
+        return None
+
+    def learn(self, model, **caps):
+        """Store caps reported by the API (headers / 429 body). None values ignored."""
+        cur = self.learned.setdefault(model, {})
+        changed = False
+        for k, v in caps.items():
+            if v is not None and cur.get(k) != v:
+                cur[k] = v
+                changed = True
+        if changed:
+            self._save()
+
+    # -- queries --
+    def _day_start(self, now=None):
+        now = now or time.time()
+        if self.day_reset == "rolling":
+            return now - 86400
+        if self.day_reset == "pacific":
+            try:
+                from zoneinfo import ZoneInfo
+                tz = ZoneInfo("America/Los_Angeles")
+            except Exception:
+                tz = datetime.timezone(datetime.timedelta(hours=-8))
+        else:
+            tz = datetime.timezone.utc
+        dt = datetime.datetime.fromtimestamp(now, tz)
+        return dt.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+
+    def day_resets_at(self):
+        """ISO time of the next daily reset ('' for a rolling window)."""
+        if self.day_reset == "rolling":
+            return ""
+        nxt = self._day_start() + 86400 + 60
+        nxt = self._day_start(nxt)
+        return datetime.datetime.fromtimestamp(nxt, datetime.timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%SZ")
+
+    def caps(self, model, cfg=None):
+        out = {"rpm": None, "rpd": None, "tpm": None, "tpd": None}
+        base = self.defaults.get("*", {})
+        best = ""
+        for k in self.defaults:     # longest matching substring wins
+            if k != "*" and k in (model or "") and len(k) > len(best):
+                best = k
+        out.update(base)
+        if best:
+            out.update(self.defaults[best])
+        # learned["*"] = account-wide caps (e.g. OpenRouter's free daily cap); a
+        # per-model learned value overrides it.
+        for src in (self.learned.get("*") if self._applies_star(model) else None,
+                    self.learned.get(model)):
+            for k, v in (src or {}).items():
+                if k in out and v:
+                    out[k] = v
+        # An explicit /set <k>_cap is the operator's call and wins over everything
+        # (e.g. to budget below the real cap).
+        if cfg is not None:
+            for k in ("rpm", "rpd", "tpm", "tpd"):
+                try:
+                    v = cfg.setting(f"{k}_cap")
+                    if v not in (None, ""):
+                        out[k] = int(v)
+                except Exception:
+                    pass
+        return out
+
+    def _applies_star(self, model):
+        """Account-wide learned caps only apply to models the defaults cap at all
+        (e.g. OpenRouter :free models, not paid ones)."""
+        if "*" in self.defaults and self.defaults["*"]:
+            return True
+        return any(k != "*" and k in (model or "") for k in self.defaults)
+
+    def stats(self, model, cfg=None):
+        """Usage vs caps for `model` (and the whole provider), plus a prediction of
+        how many more turns of the recent average size fit before a cap bites."""
+        now = time.time()
+        m1, d0 = now - 60, self._day_start(now)
+        ev  = [e for e in self.events if e[1] == model]
+        def agg(evs, since):
+            # Rejected (429) sends don't consume quota; count accepted ones only.
+            sel = [e for e in evs if e[0] >= since and e[4] != 429]
+            return len(sel), sum(e[2] + e[3] for e in sel)
+        # Shared caps count every capped model's requests (paid ones excluded).
+        sh = [e for e in self.events if self._applies_star(e[1])]
+        r_min, t_min = agg(sh if "rpm" in self.shared else ev, m1)
+        r_day, t_day = agg(ev, d0)
+        a_day, _     = agg(self.events, d0)
+        if "rpd" in self.shared:
+            r_day, _ = agg(sh, d0)
+        fails = sum(1 for e in ev if e[0] >= d0 and e[4] == 429)
+        recent = [e[2] + e[3] for e in ev[-5:] if e[4] == 200]
+        avg_tok = int(sum(recent) / len(recent)) if recent else 0
+        c = self.caps(model, cfg)
+        left = {}
+        if c["rpm"]: left["rpm"] = c["rpm"] - r_min
+        if c["rpd"]: left["rpd"] = c["rpd"] - r_day
+        if avg_tok and c["tpm"]: left["tpm"] = (c["tpm"] - t_min) // avg_tok
+        if avg_tok and c["tpd"]: left["tpd"] = (c["tpd"] - t_day) // avg_tok
+        binding = min(left, key=left.get) if left else None
+        return {"model": model, "caps": c, "req_min": r_min, "tok_min": t_min,
+                "req_day": r_day, "tok_day": t_day, "req_day_all": a_day,
+                "throttled_today": fails, "avg_tok": avg_tok,
+                "turns_left": max(0, left[binding]) if binding else None,
+                "binding": binding, "day_resets_at": self.day_resets_at()}
+
+    def meters(self, model, cfg=None):
+        """Provider usage-hook shape: {"meters": [...]} for the status line."""
+        s = self.stats(model, cfg)
+        c = s["caps"]
+        ms = []
+        if c["rpm"]:
+            ms.append({"label": "min", "pct": 100.0 * s["req_min"] / c["rpm"]})
+        if c["tpm"]:
+            ms.append({"label": "tpm", "pct": 100.0 * s["tok_min"] / c["tpm"]})
+        if c["rpd"]:
+            ms.append({"label": "day", "pct": 100.0 * s["req_day"] / c["rpd"],
+                       "resets_at": s["day_resets_at"], "reset_on_warn": True})
+        if c["tpd"]:
+            ms.append({"label": "tpd", "pct": 100.0 * s["tok_day"] / c["tpd"],
+                       "resets_at": s["day_resets_at"]})
+        return {"meters": ms} if ms else None
+
+    def detail_lines(self, model, cfg=None):
+        s = self.stats(model, cfg)
+        c = s["caps"]
+        f = lambda v: "?" if not v else f"{v:,}"
+        src = "learned" if self.learned.get(model) else "published defaults"
+        out = [f"  rate      req {s['req_min']}/{f(c['rpm'])} per min   "
+               f"{s['req_day']}/{f(c['rpd'])} today   (all models today {s['req_day_all']})",
+               f"  tokens    {s['tok_min']:,}/{f(c['tpm'])} per min   "
+               f"{s['tok_day']:,}/{f(c['tpd'])} today   avg/turn {s['avg_tok']:,}"]
+        if s["turns_left"] is not None:
+            out.append(f"  predict   ~{s['turns_left']} more turns before the "
+                       f"{s['binding']} cap (caps: {src})")
+        if s["throttled_today"]:
+            out.append(f"  throttled {s['throttled_today']}x today (429)")
+        if s["day_resets_at"]:
+            out.append(f"  day resets {_fmt_reset(s['day_resets_at'])}")
+        return out
+
+    def rpm_wait(self, model, cfg=None):
+        """Seconds until one more request fits under the per-minute request cap
+        (0 if it fits now). Based on when the oldest in-window request ages out."""
+        rpm = self.caps(model, cfg).get("rpm")
+        if not rpm:
+            return 0.0
+        now = time.time()
+        pool = ([e for e in self.events if self._applies_star(e[1])]
+                if "rpm" in self.shared else [e for e in self.events if e[1] == model])
+        recent = sorted(e[0] for e in pool if e[0] >= now - 60 and e[4] != 429)
+        if len(recent) < rpm:
+            return 0.0
+        return max(0.0, recent[len(recent) - rpm] + 60.5 - now)
+
+    def preflight(self, model, cfg=None):
+        """A one-line warning when the NEXT send is predicted to hit a cap, else None."""
+        s = self.stats(model, cfg)
+        c = s["caps"]
+        if c["rpm"] and s["req_min"] >= c["rpm"]:
+            return f"per-minute request cap ({c['rpm']}) reached - expect a 429"
+        if c["rpd"] and s["req_day"] >= c["rpd"]:
+            return f"daily request cap ({c['rpd']}) reached - expect a 429 until reset"
+        if c["tpm"] and s["avg_tok"] and s["tok_min"] + s["avg_tok"] > c["tpm"]:
+            return (f"~{s['avg_tok']:,} tok turn would exceed the {c['tpm']:,} tokens/min cap "
+                    f"({s['tok_min']:,} used this minute) - expect a throttle")
+        return None
+
+
 def _fmt_args(args: dict) -> str:
     parts = []
     for k, v in args.items():
@@ -15163,9 +15633,12 @@ def handle_prompt_command(agent, cfg, arg):
 # granular editor for the rest of the persisted knobs.) kind: str|int|float|bool, or
 # a tuple of allowed values (picker).
 _SETTINGS_FIELDS = [
-    ("temperature", "temperature", "float"),
-    ("top_p", "top_p", "float"),
-    ("top_k", "top_k", "int"),
+    ("temperature", "temperature ('default' = model card)", "float_or_default"),
+    ("top_p", "top_p ('default' = model card)", "float_or_default"),
+    ("top_k", "top_k ('default' = model card)", "int_or_default"),
+    ("min_p", "min_p ('default' = model card)", "float_or_default"),
+    ("presence_penalty", "presence_penalty ('default' = model card)", "float_or_default"),
+    ("repeat_penalty", "repeat_penalty ('default' = model card)", "float_or_default"),
     ("worker_max_iterations", "max tool-call rounds per worker", "int"),
     ("worker_max_depth", "max worker tree depth (1 = fan-out only, no recursion)", "int"),
     ("worker_max_children", "max children any one worker may spawn (0 = none)", "int"),
@@ -15243,6 +15716,10 @@ def _coerce_setting(raw, kind):
         return int(raw)
     if kind == "float":
         return float(raw)
+    if kind in ("float_or_default", "int_or_default"):   # sampling: 'default' = unset
+        if raw is None or str(raw).strip().lower() in ("default", "none", "unset", "card", ""):
+            return None
+        return float(raw) if kind == "float_or_default" else int(raw)
     if kind == "bool":
         return raw.strip().lower() in ("1", "true", "yes", "on", "y")
     return raw
@@ -17287,6 +17764,9 @@ def handle_usage_command(agent, cfg, arg=""):
         if out:
             print(out if isinstance(out, str) else str(out))
             print(dim("  " + _think_line(cfg)))
+            _sl = _sampling_line(agent)
+            if _sl:
+                print(dim("  " + _sl))
             return
     # core default - works for any backend
     loc = _provider_label(cfg)
@@ -17303,6 +17783,9 @@ def handle_usage_command(agent, cfg, arg=""):
     if warm:
         print(dim(f"  loaded    {', '.join(warm)}"))
     print(dim("  " + _think_line(cfg)))
+    _sl = _sampling_line(agent)
+    if _sl:
+        print(dim("  " + _sl))
 
 
 def _index_pick(arg, items):
@@ -19004,6 +19487,11 @@ def _show_release_notes(cfg: Config):
                 print(dim(f"  {GLYPH['dot']} {ver}"))
                 for line in notes:
                     print("    " + line)
+            # One-time discovery hint (upgrades only, rides this once-per-update panel): an
+            # existing config isn't auto-seeded with the bundled lean-tools (that could undo
+            # a deliberate disable-all), so say they exist when NONE of them is on.
+            if not set(cfg.lean_tools_enabled or []) & set(_bundled_lean_tool_names()):
+                print(dim("  extra tools are off: /tools to enable web, workers, board, ssh"))
             print(dim("  /help for commands\n"))
         # Always advance the marker to this build (seed silently, or clear after showing).
         if cfg.last_seen_version != __version__:
@@ -19543,6 +20031,7 @@ def run_agent_brief(args) -> int:
         names = tuple(t.strip() for t in grant["tools"].split(",") if t.strip())
         if names:
             cfg.tool_allowlist = names
+            _grant_enable_tools(cfg, names)   # granted lean-tools load regardless of config
     def _grant_int(key, attr):
         # Apply an integer grant field onto cfg, ignoring a malformed value (keep default).
         if grant.get(key):
@@ -19590,11 +20079,16 @@ def run_agent_brief(args) -> int:
     if not cfg.cwd.is_dir():
         return _fail(f"cwd is not a directory: {cfg.cwd}")
 
+    global _active_agent
     try:
         _register_dir_providers(cfg)
         agent = Agent(cfg)
     except Exception as e:
         return _fail(f"worker failed to initialise (Agent build): {e}")
+    # Expose the worker's agent like repl() does: lean-tools read the live surface via
+    # active_tool_names()/tool_min_leash (a nested dispatch with tools=[...] fails closed
+    # without it), and active_remote() for routing.
+    _active_agent = agent
     # A worker is a full agent, so its enabled lean-tools need their setup() run too - the
     # REPL does this at startup, but the headless worker path skipped it, so a tool that
     # depends on setup() (e.g. `board` capturing its core hooks into _H) loaded but ran

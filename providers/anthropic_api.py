@@ -228,8 +228,67 @@ def _capabilities(model):
     if info.get("can_think"):
         caps["thinking"] = ["off", "adaptive", "max"]
     if info.get("can_effort"):
-        caps["effort"] = ["low", "med", "high"]
+        effort = ["low", "med", "high"]
+        if _has_xhigh(model):
+            effort += ["xhigh", "max"]
+        elif _has_max(model):
+            effort += ["max"]
+        caps["effort"] = effort
     return caps
+
+
+def _opus_minor(m):
+    try:
+        return int(m.split("opus-4-")[1].split("-")[0]) if "opus-4-" in m else 0  # sweep-ok
+    except (ValueError, IndexError):
+        return 0
+
+
+def _has_xhigh(model):
+    """xhigh effort: Opus 4.7+, Fable 5."""
+    m = (model or "").lower()
+    return "fable" in m or _opus_minor(m) >= 7  # sweep-ok
+
+
+def _has_max(model):
+    """max effort (and adaptive thinking for thinking=max): Opus 4.6+, Sonnet 4.6, Fable 5."""
+    m = (model or "").lower()
+    return _has_xhigh(model) or "sonnet-4-6" in m or _opus_minor(m) >= 6  # sweep-ok
+
+
+def _api_effort(val):
+    """Map the UI spelling to the API value ('med' -> 'medium')."""
+    val = val or "low"
+    return "medium" if val == "med" else val
+
+
+def _rl_only(headers):
+    """Keep only rate-limit headers (anthropic-ratelimit-*, retry-after)."""
+    return {k.lower(): v for k, v in (headers or {}).items()
+            if "ratelimit" in k.lower() or k.lower() == "retry-after"}
+
+
+_TOOL_ID_OK = re.compile(r"^[a-zA-Z0-9_-]+$")
+
+
+def _safe_tool_id(raw, msg_idx, pos):
+    """Anthropic requires tool ids matching ^[a-zA-Z0-9_-]+$. Fall back to a
+    deterministic id from (message index, call position) so a tool_use and its
+    paired tool_result regenerate the SAME string."""
+    if isinstance(raw, str) and _TOOL_ID_OK.match(raw):
+        return raw
+    return f"call_{msg_idx}_{pos}"
+
+
+def _thinking_replay(m):
+    """Signed thinking blocks captured from the stream, for replay first in the
+    assistant content. Unsigned blocks are dropped (the API would reject them)."""
+    out = []
+    for b in (m.get("thinking_blocks") or []):
+        if isinstance(b, dict) and b.get("signature"):
+            out.append({"type": "thinking", "thinking": b.get("thinking", ""),
+                        "signature": b["signature"]})
+    return out
 
 
 # ----------------------------------------------------------------------------
@@ -338,10 +397,10 @@ def _cvt_messages(messages):
             i += 1
 
         elif role == "assistant":
-            content = []
+            content = _thinking_replay(m)
             if m.get("content"):
                 content.append({"type": "text", "text": m["content"]})
-            for tc in (m.get("tool_calls") or []):
+            for k, tc in enumerate(m.get("tool_calls") or []):
                 fn   = tc.get("function", {})
                 args = fn.get("arguments", {})
                 if isinstance(args, str):
@@ -351,7 +410,7 @@ def _cvt_messages(messages):
                         args = {}
                 content.append({
                     "type":  "tool_use",
-                    "id":    tc.get("id", f"call_{i}"),
+                    "id":    _safe_tool_id(tc.get("id"), i, k),
                     "name":  fn.get("name", ""),
                     "input": args,
                 })
@@ -372,6 +431,7 @@ def _cvt_messages(messages):
                 tcid = r.get("tool_call_id", "")
                 if not tcid and ci < len(prev_calls):
                     tcid = prev_calls[ci].get("id", "")
+                tcid = _safe_tool_id(tcid, j, ci)
                 blocks.append({
                     "type":        "tool_result",
                     "tool_use_id": tcid,
@@ -448,6 +508,8 @@ class _ApiKeyClient:
 
     def _consume_urllib(self, resp, should_abort):
         content_parts = []
+        thinking_blocks = []
+        cur_think     = None
         tool_calls    = []
         cur_tool      = None
         cur_json      = []
@@ -483,10 +545,19 @@ class _ApiKeyClient:
                     if blk.get("type") == "tool_use":
                         cur_tool = {"id": blk.get("id", ""), "name": blk.get("name", "")}
                         cur_json = []
+                    elif blk.get("type") == "thinking":
+                        cur_think = {"type": "thinking",
+                                     "thinking": blk.get("thinking", "") or "",
+                                     "signature": blk.get("signature", "") or ""}
+                        thinking_blocks.append(cur_think)
 
                 elif etype == "content_block_delta":
                     delta = obj.get("delta", {})
-                    if delta.get("type") == "text_delta":
+                    if delta.get("type") == "thinking_delta" and cur_think is not None:
+                        cur_think["thinking"] += delta.get("thinking", "") or ""
+                    elif delta.get("type") == "signature_delta" and cur_think is not None:
+                        cur_think["signature"] += delta.get("signature", "") or ""
+                    elif delta.get("type") == "text_delta":
                         chunk = delta.get("text", "")
                         if chunk:
                             if not printed:
@@ -499,6 +570,7 @@ class _ApiKeyClient:
                         cur_json.append(delta.get("partial_json", ""))
 
                 elif etype == "content_block_stop":
+                    cur_think = None
                     if cur_tool:
                         try:
                             args = json.loads("".join(cur_json)) if cur_json else {}
@@ -544,6 +616,9 @@ class _ApiKeyClient:
         assistant = {"role": "assistant", "content": content}
         if tool_calls:
             assistant["tool_calls"] = tool_calls
+        _tb = [b for b in thinking_blocks if b.get("signature")]
+        if _tb and not aborted:
+            assistant["thinking_blocks"] = _tb
         return assistant, prompt_eval, aborted
 
     def _send(self, key, payload, should_abort):
@@ -566,7 +641,7 @@ class _ApiKeyClient:
                 with urllib.request.urlopen(
                         req,
                         timeout=(getattr(self.cfg, "gen_connect_timeout", None) or 600)) as resp:
-                    self._last_rl = {k.lower(): v for k, v in resp.headers.items()}
+                    self._last_rl = _rl_only(resp.headers)
                     return self._consume_urllib(resp, should_abort)
             except _TransientStreamError as e:
                 # A mid-stream overload/5xx SSE frame - retry like a 529 (it escaped the
@@ -581,7 +656,7 @@ class _ApiKeyClient:
                     continue
                 raise RuntimeError(f"API 529: {e}") from None
             except urllib.error.HTTPError as e:
-                self._last_rl = {k.lower(): v for k, v in (e.headers or {}).items()}
+                self._last_rl = _rl_only(e.headers)
                 body = e.read().decode(errors="replace")
                 # 429 -> chat()'s Haiku fallback; here only transient overloads.
                 if e.code in _RETRY_CODES and attempt < _MAX_RETRIES:
@@ -594,7 +669,9 @@ class _ApiKeyClient:
                         if not _interruptible_sleep(wait, should_abort):
                             raise RuntimeError("aborted during retry wait") from None
                         continue
-                raise RuntimeError(f"API {e.code}: {body[:400]}") from None
+                _err = RuntimeError(f"API {e.code}: {body[:400]}")
+                _err.status = e.code
+                raise _err from None
             except (urllib.error.URLError, ConnectionError, OSError) as e:
                 # Transport failure (dropped connection, TLS reset, DNS blip) - no
                 # HTTP status. Retry with backoff like a 5xx; a bad message never
@@ -655,6 +732,8 @@ class _ApiKeyClient:
         if not key:
             raise RuntimeError("no API key - use /provider login")
 
+        # Zero per-turn cache counters so a failed request does not re-add stale ones.
+        self.last_cache_read = self.last_cache_write = self.last_cache_write_1h = 0
         system, api_msgs = _cvt_messages(messages)
         api_tools        = sorted(_cvt_tools(tools), key=lambda t: t.get("name", "")) if tools else []
 
@@ -718,24 +797,30 @@ class _ApiKeyClient:
         _can_effort = minfo.get("can_effort",   False)
         _can_ctx    = minfo.get("can_ctx_mgmt", False)
         _thinking   = self.cfg.setting("thinking") or "off"
+        _effort     = _api_effort(self.cfg.setting("effort"))
         if _can_think and _thinking == "adaptive":
             payload["thinking"] = {"type": "adaptive"}
             if _can_ctx:
                 payload["context_management"] = {"edits": [{"type": "clear_thinking_20251015", "keep": {"type": "thinking_turns", "value": 1}}]}
         elif _can_think and _thinking == "max":
-            payload["thinking"] = {"type": "enabled", "budget_tokens": 16000}
+            if _has_max(cur_model):
+                # Adaptive-capable model: budget_tokens is deprecated there; max
+                # thinking = adaptive + effort max.
+                payload["thinking"] = {"type": "adaptive"}
+                _effort = "max"
+            else:
+                payload["thinking"] = {"type": "enabled", "budget_tokens": 16000}
             if _can_ctx:
                 payload["context_management"] = {"edits": [{"type": "clear_thinking_20251015", "keep": {"type": "thinking_turns", "value": 1}}]}
         if _can_effort:
-            payload["output_config"] = {"effort": self.cfg.setting("effort") or "low"}
+            payload["output_config"] = {"effort": _effort}
 
         try:
             result = self._send_retrying_empty(key, payload, should_abort)
         except RuntimeError as e:
-            if "429" in str(e):
-                result = self._on_error(key, payload, should_abort)
-            else:
-                raise
+            if getattr(e, "status", None) == 429:
+                self._on_error(key, payload, should_abort)   # always raises
+            raise
         self._sess_cache_read  += self.last_cache_read
         self._sess_cache_write += self.last_cache_write
         self._sess_cache_write_1h += self.last_cache_write_1h

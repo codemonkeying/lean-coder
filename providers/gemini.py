@@ -3,6 +3,7 @@ import getpass
 import json
 import os
 import re
+import secrets
 import sys
 import time
 import urllib.error
@@ -14,7 +15,7 @@ from pathlib import Path
 # Auth is an API key sent as the x-goog-api-key header (NOT Bearer; the key is
 # also accepted as a ?key= query param, but the header keeps it out of URLs/logs).
 _API_BASE    = "https://generativelanguage.googleapis.com/v1beta"  # sweep-ok
-_MAX_TOKENS  = 8192
+_MAX_TOKENS  = 65536
 _CTX_DEFAULT = 1_048_576   # Gemini chat models are ~1M; real value comes from /models
 _PROVIDER    = "gemini"    # sweep-ok
 
@@ -31,7 +32,72 @@ _SKIP_KEYS = ("tts", "image", "embedding", "lyria", "robotics", "banana", "-clip
 # Paid-tier families: NOT on the Gemini free tier (free_tier limit:0 -> a hard
 # billing-wall 429, never a transient throttle). This key is free-tier, so they're
 # kept out of the picker entirely. (If a paid key is ever used, drop this filter.)
-_PAID_KEYS = ("pro", "deep-research", "computer-use", "antigravity")  # sweep-ok
+_PAID_KEYS = ("-pro", "deep-research", "computer-use", "antigravity")  # sweep-ok
+
+# Free-tier caps (ai.google.dev/gemini-api/docs/rate-limits): per project, per
+# model. Gemini sends NO rate-limit headers; a 429 body names the exact quota it
+# hit (QuotaFailure.violations[].quotaId + quotaValue), which the ledger learns.
+# Requests/day reset at midnight US Pacific. Google adjusts these often.
+# Measured Oct 2026 on this key: gemini-2.5-flash = 5 req/min AND only 20
+# req/day (QuotaFailure quotaValue "20", PerDay) - far below the 1500/day that
+# third-party sites still quote. Defaults are the measured figures; real values
+# are learned from each model's first 429.
+_RATE_DEFAULTS = {
+    "*":          {"rpm": 5,  "rpd": 20, "tpm": 250000},
+    "flash-lite": {"rpm": 10, "rpd": 20, "tpm": 250000},
+}
+_LEDGER = None
+
+
+def _ledger():
+    global _LEDGER
+    if _LEDGER is None and _lc.get("RateLedger"):
+        _LEDGER = _lc["RateLedger"](_PROVIDER, _RATE_DEFAULTS, day_reset="pacific")
+    return _LEDGER
+
+
+def _learn_429(model, body):
+    """Learn the real cap from a 429's QuotaFailure details. Returns a short
+    label of which quota was hit ('per-day requests', ...) or ''."""
+    led = _ledger()
+    try:
+        det = json.loads(body).get("error", {}).get("details", []) or []
+    except Exception:
+        return ""
+    hit = ""
+    delay = None
+    for d in det:
+        if "RetryInfo" in str(d.get("@type", "")):
+            try:
+                delay = float(str(d.get("retryDelay", "")).rstrip("s"))
+            except ValueError:
+                pass
+    for d in det:
+        for v in (d.get("violations") or []):
+            qid = str(v.get("quotaId", ""))
+            try:
+                val = int(v.get("quotaValue"))
+            except (TypeError, ValueError):
+                val = None
+            per_day = "PerDay" in qid
+            toks    = "Token" in qid
+            key = ("tpd" if per_day else "tpm") if toks else ("rpd" if per_day else "rpm")
+            if led and val:
+                led.learn(model, **{key: val})
+            if led and per_day:
+                # Daily wall: block until reset so we stop resending into it.
+                until = time.time() + delay if delay else None
+                if not until:
+                    try:
+                        until = datetime.datetime.fromisoformat(
+                            led.day_resets_at().replace("Z", "+00:00")).timestamp()
+                    except Exception:
+                        until = time.time() + 3600
+                led.block(model, until, f"free daily quota ({val or '?'} requests/day) used up")
+            hit = {"rpm": "per-minute requests", "rpd": "per-day requests",
+                   "tpm": "per-minute tokens", "tpd": "per-day tokens"}[key]
+    return hit
+
 
 # Privacy posture shown at the point of use (on connect + in /usage).
 _PRIVACY    = "free-tier prompts ARE used to train Google models & may be human-reviewed - don't send confidential code"
@@ -93,19 +159,28 @@ def _can_think(model):
     return "gemini-3" in m or "2.5" in m  # sweep-ok
 
 
+def _is_pro(model):
+    """Token match on '-pro' (e.g. gemini-2.5-pro), not any 'pro' substring."""
+    return re.search(r"-pro(\b|-|$)", (model or "").lower()) is not None  # sweep-ok
+
+
 def _thinking_config(model, setting):
-    """Map lean-coder's off/dynamic/max onto Gemini's per-family thinking knob.
+    """Map lean-coder's thinking setting onto Gemini's per-family thinking knob.
     Returns a thinkingConfig dict, or None to let the model use its default
     (dynamic) budget. Avoids values a family rejects (e.g. budget 0 on *-pro)."""
     if setting in (None, "", "dynamic"):
         return None
     m = model.lower()  # sweep-ok
     if "gemini-3" in m:                      # gemini 3.x uses thinkingLevel  # sweep-ok
-        if setting == "off":  return {"thinkingLevel": "low"}   # 3.x can't fully disable
+        # 3.x can't fully disable; 'minimal' exists only on Flash
+        if setting == "off":
+            return {"thinkingLevel": "minimal" if "flash" in m else "low"}
+        if setting == "low":  return {"thinkingLevel": "low"}
+        if setting == "med":  return {"thinkingLevel": "medium"}
         if setting == "max":  return {"thinkingLevel": "high"}
         return None
     if "2.5" in m:                           # gemini 2.5 uses an int budget  # sweep-ok
-        is_pro = "pro" in m
+        is_pro = _is_pro(m)
         if setting == "off":  return {"thinkingBudget": 128 if is_pro else 0}
         if setting == "max":  return {"thinkingBudget": 32768 if is_pro else 24576}
         return {"thinkingBudget": -1}        # explicit dynamic
@@ -192,7 +267,10 @@ def _context_window(model):
 def _capabilities(model):
     caps = {"tier": ["all", "free"]}     # all (default) shows paid + free; free hides paid
     if _ensure_models().get(model, {}).get("can_think") or _can_think(model):
-        caps["thinking"] = ["off", "dynamic", "max"]
+        if "gemini-3" in (model or "").lower():  # sweep-ok
+            caps["thinking"] = ["off", "low", "med", "dynamic", "max"]
+        else:
+            caps["thinking"] = ["off", "dynamic", "max"]
     return caps
 
 
@@ -227,7 +305,22 @@ def _privacy_note():
 
 _MAX_RETRIES = 3
 _MAX_WAIT    = 75   # seconds; don't hang the REPL on a long throttle
-_RETRY_CODES = (429, 502, 503, 504)   # 429 throttle + transient server/gateway errors
+_RETRY_CODES = (429, 500, 502, 503, 504)   # 429 throttle + transient server/gateway errors
+_STREAM_IDLE_TIMEOUT = 90   # seconds of decode-phase silence before stream_tiered aborts
+
+
+def _note_empty_response(content, tool_calls, stop_reason):
+    """Tell the OPERATOR (never the model) that an empty assistant turn happened,
+    with Gemini's finishReason (e.g. SAFETY, RECITATION, MAX_TOKENS) as a fact."""
+    if content or tool_calls:
+        return
+    yellow = _lc.get("yellow") or _lc.get("dim") or (lambda s: s)
+    dim    = _lc.get("dim") or (lambda s: s)
+    warn   = (_lc.get("GLYPH") or {}).get("warn", "!")
+    sr = f"finishReason: {stop_reason}" if stop_reason else "no finishReason"
+    print(yellow(f"  {warn} the model returned no reply ({sr}) - possibly a safety block, "
+                 f"API congestion, or a network glitch.")
+          + dim("  retry, /rewind, or /model to switch backend."))
 
 
 def _backoff(attempt):
@@ -282,6 +375,14 @@ def _interruptible_sleep(secs, should_abort):
         time.sleep(chunk)
         waited += chunk
     return True
+
+
+def _visible_wait(secs, why, should_abort):
+    """Core's live countdown wait (falls back to a silent sleep on an old core)."""
+    vw = _lc.get("_visible_wait")
+    if vw:
+        return vw(secs, why, should_abort)
+    return _interruptible_sleep(secs, should_abort)
 
 
 # ----------------------------------------------------------------------------
@@ -394,6 +495,8 @@ def _cvt_messages(messages, vision=False):
                     name = prev_calls[ci].get("name", "")
                 if not name:
                     name = id2name.get(r.get("tool_call_id", ""), "") or r.get("name", "")
+                if not name:
+                    name = "tool"                      # an empty name 400s
                 content = r.get("content", "")
                 try:
                     parsed = json.loads(content)
@@ -420,7 +523,14 @@ def _cvt_messages(messages, vision=False):
         else:
             i += 1
 
-    return "\n".join(system), contents
+    # merge consecutive user turns (e.g. tool images followed by a user message)
+    merged = []
+    for c in contents:
+        if merged and c["role"] == "user" and merged[-1]["role"] == "user":
+            merged[-1]["parts"].extend(c["parts"])
+        else:
+            merged.append(c)
+    return "\n".join(system), merged
 
 
 # ----------------------------------------------------------------------------
@@ -433,6 +543,7 @@ class _GeminiClient:
     def __init__(self, cfg):
         self.cfg               = cfg
         self.last_out_tokens   = None
+        self.last_stop_reason  = None   # finishReason of the last reply
         self.last_cache_read   = 0    # cachedContentTokenCount from last turn
         self.last_cache_write  = 0    # Gemini implicit caching reports no write
         self._sess_cache_read  = 0
@@ -459,11 +570,13 @@ class _GeminiClient:
         printed       = False
         aborted       = False
         tc_idx        = 0
+        finish_reason = None
         md            = _lc["MarkdownStream"](sys.stdout.write)
 
         spin = _lc["Spinner"]("thinking", _lc["THINK_FRAMES"]).start()
         try:
-            for raw in _lc["stream_tiered"](resp, self.cfg):
+            for raw in _lc["stream_tiered"](resp, self.cfg, where="gemini",
+                                            idle=_STREAM_IDLE_TIMEOUT):
                 if should_abort and should_abort():
                     aborted = True
                     break
@@ -479,6 +592,8 @@ class _GeminiClient:
                     continue
 
                 for cand in obj.get("candidates", []):
+                    if cand.get("finishReason"):
+                        finish_reason = cand["finishReason"]
                     for part in cand.get("content", {}).get("parts", []):
                         if part.get("thought"):          # reasoning summary - not visible output
                             continue
@@ -494,7 +609,8 @@ class _GeminiClient:
                         elif "functionCall" in part:
                             fc = part["functionCall"]
                             tc = {
-                                "id": fc.get("id") or f"call_{tc_idx}_{fc.get('name', '')}",
+                                "id": fc.get("id") or (f"call_{tc_idx}_{fc.get('name', '')}_"
+                                                       f"{secrets.token_hex(3)}"),
                                 "function": {"name": fc.get("name", ""),
                                              "arguments": fc.get("args", {}) or {}},
                             }
@@ -526,6 +642,8 @@ class _GeminiClient:
 
         if out_tokens:
             self.last_out_tokens = out_tokens
+        self._last_in_total = prompt_total or 0
+        self.last_stop_reason = finish_reason   # operator-only; never sent to the model
         # Gemini's promptTokenCount INCLUDES cached tokens; core sums
         # prompt_eval + cache_read + cache_write, so return only the uncached
         # portion as prompt_eval to avoid double-counting the cache hit.
@@ -545,7 +663,31 @@ class _GeminiClient:
         url  = f"{_API_BASE}/models/{model}:streamGenerateContent?alt=sse"
         data = json.dumps(payload).encode()
         attempt = 0
+        led = _ledger()
+        blk = led.blocked(model) if led else None
+        if blk:
+            left, why = blk
+            h, m = int(left // 3600), int(left % 3600 // 60)
+            raise RuntimeError(
+                f"{model}: {why} - resets in {h}h{m:02d}m. Pick another model with "
+                f"/model (each Gemini model has its own daily quota, e.g. "
+                f"gemini-2.5-flash-lite) or /provider openrouter")
         while True:
+            # Pace to the free per-minute request cap instead of eating a 429:
+            # wait (visibly) until the oldest request in the window ages out.
+            if led:
+                w = led.rpm_wait(model, self.cfg)
+                if 0 < w <= _MAX_WAIT:
+                    rpm = led.caps(model, self.cfg).get("rpm")
+                    if not _visible_wait(w, f"{model} free tier is {rpm} requests/min",
+                                         should_abort):
+                        raise RuntimeError("aborted while waiting for the rate limit")
+                else:
+                    warn = led.preflight(model, self.cfg)
+                    if warn and attempt == 0:
+                        print(_lc["yellow"](f"[!] {model}: {warn}"))
+            self._last_in_total = 0
+            self.last_out_tokens = None
             req = urllib.request.Request(
                 url, data=data, method="POST",
                 headers={"Content-Type": "application/json", "x-goog-api-key": key},  # sweep-ok
@@ -554,9 +696,26 @@ class _GeminiClient:
                 with urllib.request.urlopen(
                         req,
                         timeout=(getattr(self.cfg, "gen_connect_timeout", None) or 600)) as resp:
-                    return self._consume(resp, should_abort)
+                    result = self._consume(resp, should_abort)
+                    if led:
+                        led.record(model, self._last_in_total, self.last_out_tokens or 0, 200)
+                    return result
             except urllib.error.HTTPError as e:
                 body = e.read().decode(errors="replace")
+                if led:
+                    led.record(model, 0, 0, e.code)
+                if e.code == 429:
+                    hit = _learn_429(model, body)
+                    blk = led.blocked(model) if led else None
+                    if blk:
+                        left, why = blk
+                        h, m = int(left // 3600), int(left % 3600 // 60)
+                        raise RuntimeError(
+                            f"{model}: {why} - resets in {h}h{m:02d}m. Pick another model "
+                            f"with /model (each Gemini model has its own daily quota, e.g. "
+                            f"gemini-2.5-flash-lite) or /provider openrouter") from None
+                    if hit:
+                        print(_lc["yellow"](f"[!] {model}: hit the {hit} quota"))
                 if e.code in _RETRY_CODES and attempt < _MAX_RETRIES:
                     hint = _retry_after_secs(e.headers or {}, body)  # None on a hard wall
                     if e.code == 429:
@@ -566,9 +725,8 @@ class _GeminiClient:
                     if wait is not None and wait <= _MAX_WAIT:
                         attempt += 1
                         reason = "rate limited" if e.code == 429 else f"unavailable ({e.code})"
-                        print(_lc["red"](f"[!] {model} {reason} - retry {attempt}/{_MAX_RETRIES} "
-                                         f"in {wait:.0f}s"))
-                        if not _interruptible_sleep(wait, should_abort):
+                        print(_lc["red"](f"[!] {model} {reason} - retry {attempt}/{_MAX_RETRIES}"))
+                        if not _visible_wait(wait, f"{model} {reason}", should_abort):
                             raise RuntimeError("aborted during retry wait") from None
                         continue
                 raise RuntimeError(f"API {e.code}: {body[:400]}") from None
@@ -600,7 +758,12 @@ class _GeminiClient:
         minfo     = _ensure_models().get(cur_model, {})
         max_out   = minfo.get("max_tokens", _MAX_TOKENS)
         max_in    = minfo.get("max_input_tokens", _CTX_DEFAULT)
-        _est_toks = len(json.dumps(messages)) // 4
+        # core's calibrated estimator when wired; crude chars/4 fallback otherwise
+        _mt = _lc.get("messages_tokens")
+        try:
+            _est_toks = _mt(messages, tools or []) if _mt else len(json.dumps(messages)) // 4
+        except Exception:
+            _est_toks = len(json.dumps(messages)) // 4
         if _est_toks > max_in:
             raise RuntimeError(
                 f"context too large for {cur_model} "
@@ -622,6 +785,10 @@ class _GeminiClient:
         result = self._send(key, cur_model, payload, should_abort)
         self._sess_cache_read  += self.last_cache_read
         self._sess_cache_write += self.last_cache_write
+        _a, _pe, _ab = result
+        if not _ab:
+            _note_empty_response((_a or {}).get("content"), (_a or {}).get("tool_calls"),
+                                 self.last_stop_reason)
         return result
 
 
@@ -700,10 +867,11 @@ def _clear(agent, cfg):
 
 
 def _usage(agent, cfg):
-    return None
+    led = _ledger()
+    return led.meters(cfg.active_model(), cfg) if led else None
 
 
-def _detail(agent, cfg):
+def _detail(agent, cfg, arg=""):
     bold = _lc["bold"]
     dim  = _lc["dim"]
 
@@ -718,7 +886,11 @@ def _detail(agent, cfg):
     cache_s = f"   cache r {_sn(cr)} w {_sn(cw)}" if (cr or cw) else ""
     lines.append(dim(f"\n  session   in {si:,}   out {so:,}   total {si + so:,}{cache_s}"))
     lines.append("\n" + _privacy_note())
-    lines.append(dim("  (Gemini API key - no subscription quota endpoint)"))
+    led = _ledger()
+    if led:
+        lines.append(dim("\n" + "\n".join(led.detail_lines(cur_model, cfg))))
+    lines.append(dim("  (Gemini API key - no quota endpoint or headers; counts are client-side,"
+                     " caps learned from 429s)"))
     return "\n".join(lines)
 
 

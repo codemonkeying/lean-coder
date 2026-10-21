@@ -124,6 +124,8 @@ A provider connects lean-coder to a model backend. Ollama is enabled by default 
 | `groq`          | Groq | [console.groq.com](https://console.groq.com/keys) |
 | `openai`        | OpenAI | [platform.openai.com](https://platform.openai.com/api-keys) |
 | `openrouter`    | OpenRouter | [openrouter.ai](https://openrouter.ai/keys) |
+| `kilo`          | Kilo gateway (free models) | none needed |
+| `ovh`           | OVHcloud AI Endpoints (free, 2 req/min per model) | none needed |
 
 ```
 /provider login anthropic_api      # prompts for the key, saves it, switches to it

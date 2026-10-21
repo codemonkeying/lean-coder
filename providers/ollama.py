@@ -77,6 +77,31 @@ def _parse_num_ctx(show: dict):
     return None, False
 
 
+_OLLAMA_PARAM_KEYS = {"temperature": "temperature", "top_p": "top_p", "top_k": "top_k",
+                      "min_p": "min_p", "presence_penalty": "presence_penalty",
+                      "repeat_penalty": "repeat_penalty"}
+
+
+def _parse_sampling(show: dict):
+    """Sampling PARAMETERs baked into the model's Modelfile (/api/show 'parameters'),
+    i.e. what ollama applies when a request omits them. {} if none (bare import ->
+    ollama's built-in temp 0.8). Pure function."""
+    card = {}
+    params = show.get("parameters")
+    if isinstance(params, str):
+        for line in params.splitlines():
+            parts = line.split()
+            if len(parts) >= 2 and parts[0] in _OLLAMA_PARAM_KEYS:
+                try:
+                    card[_OLLAMA_PARAM_KEYS[parts[0]]] = float(parts[1])
+                except ValueError:
+                    pass
+    return card
+
+
+_SAMP_CACHE = {}
+
+
 def cap_num_ctx(detected, cap: int = AUTO_CTX_CAP, pinned: bool = False):
     """Apply the auto-detect safety policy: never raise num_ctx above `cap`
     (a model's architectural max can be huge, e.g. 262144 -> OOM); only lower it
@@ -334,6 +359,28 @@ class OllamaClient:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read())
 
+    def _modelfile_card(self, model):
+        key = (getattr(self, "base", None) or getattr(self.cfg, "host", ""), model)
+        if key not in _SAMP_CACHE:
+            try:
+                _SAMP_CACHE[key] = _parse_sampling(
+                    self._get_json("/api/show", {"model": model}, timeout=8))
+            except Exception:
+                return None              # unreadable now: don't cache, table may apply
+        return _SAMP_CACHE[key]
+
+    def resolve_sampling(self, full=False, model=None):
+        """Effective sampling ({'params','source','sent'}); see llamacpp twin."""
+        model = model or self.cfg.active_model()
+        sf = (_lc or {}).get("sampling_for")
+        if sf is None:
+            return ({}, {}, "server built-in") if full else None
+        card = self._modelfile_card(model)
+        # {} = readable but no PARAMETERs -> table applies (pass None to sampling_for)
+        send, eff, src = sf(self.cfg, model, card or None, "Modelfile")
+        self.last_sampling = {"params": eff, "source": src, "sent": dict(send)}
+        return (send, eff, src) if full else self.last_sampling
+
     def detect_num_ctx(self):
         """Read the model's context window from `ollama show`. None on failure."""
         try:
@@ -415,13 +462,20 @@ class OllamaClient:
             return False
 
     def _build_payload(self, model, messages, tools):
+        # options: num_ctx + only user-set sampling (cfg.options() drops None), plus the
+        # family table when the Modelfile carries no card. Pre-0.10.86 this forced
+        # 0.7/0.8/20/1.05 over every Modelfile.
+        opts = self.cfg.options()
+        send, _eff, _src = self.resolve_sampling(full=True, model=model)
+        opts.update(send)
         payload = {
             "model": model,
             "stream": True,
-            "options": self.cfg.options(),
+            "options": opts,
             "messages": messages,
-            "tools": tools,
         }
+        if tools:
+            payload["tools"] = tools
         # `think` is a global toggle, but some models reject it outright
         # ("does not support thinking"). Skip it for any model we've seen
         # reject it this session so it Just Works without user fiddling.

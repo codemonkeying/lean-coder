@@ -22,14 +22,71 @@ import os
 import sys
 import urllib.error
 import urllib.request
+from pathlib import Path
 
 _PROVIDER    = "mlx"
 # Base URL of the running mlx_lm.server. Override per-box via env.
 _API_BASE    = os.environ.get("MLX_HOST", "http://127.0.0.1:8080")
 _CTX_DEFAULT = 32_768        # match the harness AUTO_CTX_CAP; MLX models often 256K-capable
-_OUT_CAP     = 4096
+# cfg.think level -> chat_template_kwargs.reasoning_effort (same map as llamacpp).
+_EFFORT    = {"low": "low", "medium": "medium", "med": "medium",
+              "high": "xhigh", "xhigh": "xhigh", "max": "xhigh"}
+_THINK_OFF = {"off", "false", "no", "0", "none", ""}
+
+
+# Reply-length guard for LOCAL models. A paid API is never capped (a cut reply
+# wastes the turn), but locally a runaway/looping model can grind the GPU for
+# many minutes with nothing else able to run. Default 32k is far above any real
+# reply; /set max_out <n> to change, /set max_out 0 for unlimited.
+_MAX_OUT_DEFAULT = 32_768
+
+
+def _max_out(cfg):
+    """Configured local reply cap: None = unlimited, else a positive int."""
+    try:
+        v = cfg.setting("max_out") if cfg is not None else None
+    except Exception:
+        v = None
+    if v in (None, ""):
+        return _MAX_OUT_DEFAULT
+    try:
+        v = int(v)
+    except (TypeError, ValueError):
+        return _MAX_OUT_DEFAULT
+    return v if v > 0 else None
+
+
+def _note_cut(cfg, finish):
+    """Tell the operator when OUR cap cut the reply (never silent truncation)."""
+    cap = _max_out(cfg)
+    if finish == "length" and cap:
+        print(_lc["yellow"](f"[!] reply hit max_out ({cap:,} tokens) and was cut off - "
+                            f"/set max_out <higher> or /set max_out 0 for unlimited"))
 
 _lc = {}
+
+
+def _headers():
+    h = {"Content-Type": "application/json"}
+    key = os.environ.get("MLX_API_KEY")
+    if key:
+        h["Authorization"] = f"Bearer {key}"
+    return h
+
+
+def _ctx_window(cfg=None):
+    """Context window: provider_settings.mlx 'ctx' or 'max_kv_size' (matching the
+    server's --max-kv-size), else _CTX_DEFAULT."""
+    cfg = cfg or _lc.get("_cfg")
+    try:
+        ps = (getattr(cfg, "provider_settings", None) or {}).get(_PROVIDER, {})
+        for k in ("ctx", "max_kv_size"):
+            v = ps.get(k)
+            if v:
+                return int(v)
+    except (TypeError, ValueError, AttributeError):
+        pass
+    return _CTX_DEFAULT
 
 
 def _base():
@@ -37,10 +94,41 @@ def _base():
     return os.environ.get("MLX_HOST", _API_BASE).rstrip("/")
 
 
+def _gen_config_card(model):
+    """Sampling defaults from the checkpoint's generation_config.json when the model
+    is a local path or a cached HF repo - what mlx_lm.server applies for omitted
+    fields. None when not found (remote server, unknown layout)."""
+    import glob
+    cands = []
+    if model:
+        p = Path(os.path.expanduser(model))
+        cands.append(p / "generation_config.json")
+        hub = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface")) / "hub"
+        cands += [Path(x) for x in glob.glob(
+            str(hub / ("models--" + model.replace("/", "--")) / "snapshots" / "*" /
+                "generation_config.json"))]
+    for c in cands:
+        try:
+            g = json.loads(c.read_text())
+        except (OSError, ValueError):
+            continue
+        card = {}
+        for src, k in (("temperature", "temperature"), ("top_p", "top_p"), ("top_k", "top_k"),
+                       ("min_p", "min_p"), ("presence_penalty", "presence_penalty"),
+                       ("repetition_penalty", "repeat_penalty")):
+            v = g.get(src)
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                card[k] = v
+        return card or None
+    return None
+
+
 class MLXClient:
     def __init__(self, cfg):
         self.cfg = cfg
         self.last_out_tokens = None
+        self.last_eval_ns = None
+        self.last_eval_tokens = None
         self._models = None
 
     def list_models(self):
@@ -48,7 +136,8 @@ class MLXClient:
         Duck-types OllamaClient.list_models so ensure_model()-style checks work."""
         if self._models is None:
             try:
-                req = urllib.request.Request(f"{_base()}/v1/models", method="GET")
+                req = urllib.request.Request(f"{_base()}/v1/models", headers=_headers(),
+                                             method="GET")
                 with urllib.request.urlopen(req, timeout=10) as r:
                     data = json.loads(r.read())
                 self._models = [m.get("id") for m in data.get("data", []) if m.get("id")]
@@ -60,12 +149,13 @@ class MLXClient:
         return []
 
     def detect_num_ctx(self):
-        return _CTX_DEFAULT
+        return _ctx_window(self.cfg)
 
     def _consume(self, resp, should_abort, tools=None):
         """Parse a streamed OpenAI SSE response, printing content as it arrives and
         accumulating any tool_calls. Returns (assistant_dict, prompt_tokens, aborted).
         Mirrors providers/openai.py::_consume."""
+        finish        = None
         content_parts = []
         tool_acc      = {}
         order         = []
@@ -94,6 +184,8 @@ class MLXClient:
                     continue
 
                 for ch in obj.get("choices", []):
+                    if ch.get("finish_reason"):
+                        finish = ch["finish_reason"]
                     delta = ch.get("delta", {})
                     # Reasoning trace (think ON): show it dimmed, do NOT store it -
                     # mirrors OllamaClient's handling of message.thinking. mlx_lm
@@ -120,7 +212,7 @@ class MLXClient:
                     for tcd in (delta.get("tool_calls") or []):
                         idx = tcd.get("index", 0)
                         if idx not in tool_acc:
-                            tool_acc[idx] = {"id": "", "name": "", "args": []}
+                            tool_acc[idx] = {"id": "", "name": "", "args": [], "args_obj": None}
                             order.append(idx)
                         slot = tool_acc[idx]
                         if tcd.get("id"):
@@ -128,8 +220,14 @@ class MLXClient:
                         fn = tcd.get("function", {})
                         if fn.get("name"):
                             slot["name"] = fn["name"]
-                        if fn.get("arguments"):
-                            slot["args"].append(fn["arguments"])
+                        _a = fn.get("arguments")
+                        if _a is not None and _a != "":
+                            # Some servers return arguments as a parsed object rather
+                            # than string fragments: concat strings, keep a dict whole.
+                            if isinstance(_a, str):
+                                slot["args"].append(_a)
+                            else:
+                                slot["args_obj"] = _a
 
                 um = obj.get("usage")
                 if um:
@@ -150,12 +248,16 @@ class MLXClient:
         tool_calls = []
         for idx in order:
             slot = tool_acc[idx]
-            try:
-                args = json.loads("".join(slot["args"])) if slot["args"] else {}
-            except Exception:
-                args = {}
+            if slot.get("args_obj") is not None:
+                args = slot["args_obj"]
+            else:
+                try:
+                    args = json.loads("".join(slot["args"])) if slot["args"] else {}
+                except Exception:
+                    args = {}
             tool_calls.append({
                 "id":       slot["id"] or f"call_{idx}",
+                "type":     "function",
                 "function": {"name": slot["name"], "arguments": args},
             })
 
@@ -187,7 +289,23 @@ class MLXClient:
         assistant = {"role": "assistant", "content": content}
         if tool_calls:
             assistant["tool_calls"] = tool_calls
+        if not aborted:
+            _note_cut(self.cfg, finish)
         return assistant, prompt_total, aborted
+
+    def resolve_sampling(self, full=False):
+        """Effective sampling ({'params','source','sent'}); see llamacpp twin."""
+        model = self.cfg.active_model() if self.cfg else ""
+        sf = _lc.get("sampling_for")
+        if sf is None:
+            return ({}, {}, "server built-in") if full else None
+        try:
+            card = _gen_config_card(model)
+        except Exception:
+            card = None
+        send, eff, src = sf(self.cfg, model, card, "generation_config.json")
+        self.last_sampling = {"params": eff, "source": src, "sent": dict(send)}
+        return (send, eff, src) if full else self.last_sampling
 
     def chat(self, messages, tools, should_abort=None):
         """POST /v1/chat/completions (streamed). messages/tools are already
@@ -196,39 +314,44 @@ class MLXClient:
         if should_abort and should_abort():
             return {"role": "assistant", "content": ""}, None, True
 
-        # Sampling options: mirror OllamaClient's cfg.options() so a run behaves
-        # identically across backends. mlx_lm.server reads these from the request
-        # body; OpenAI-shape names it does not understand are simply ignored, so it
-        # is safe to send the full set.
-        opts = self.cfg.options() if hasattr(self.cfg, "options") else {}
+        # Sampling: send only what the user set (or the family table when no card is
+        # known). Current mlx_lm / mlx-vlm servers apply the checkpoint's
+        # generation_config.json for omitted fields - forcing a global value here
+        # overrode the model card (pre-0.10.86 sent 0.7/0.8/20/1.05 every request).
+        send, _eff, _src = self.resolve_sampling(full=True)
         body = {
             "model":          self.cfg.active_model(),
             "messages":       messages,
-            "max_tokens":     _OUT_CAP,
-            "temperature":    opts.get("temperature", getattr(self.cfg, "temperature", 0.0)),
+            # Always send it: mlx_lm.server's own default when omitted is small.
+            # Unlimited (max_out 0) = the context window, the real ceiling.
+            "max_tokens":     _max_out(self.cfg) or _ctx_window(self.cfg),
             "stream":         True,
             "stream_options": {"include_usage": True},
         }
-        if opts.get("top_p") is not None:
-            body["top_p"] = opts["top_p"]
-        if opts.get("top_k") is not None:
-            body["top_k"] = opts["top_k"]
-        if opts.get("repeat_penalty") is not None:
-            body["repetition_penalty"] = opts["repeat_penalty"]
+        for k, v in send.items():
+            body["repetition_penalty" if k == "repeat_penalty" else k] = v
         # Think toggle. The clean cross-backend way to disable thinking is
         # chat_template_kwargs={"enable_thinking": False} in the request body (the
         # server merges it into apply_chat_template). Newer mlx_lm honours this
         # per-request; older builds only read the --chat-template-args launch flag,
         # so ALSO launch the server with '{"enable_thinking":false}' for gold certs.
-        if getattr(self.cfg, "think", None) is not None:
-            body["chat_template_kwargs"] = {"enable_thinking": bool(self.cfg.think)}
+        t = getattr(self.cfg, "think", None)
+        if t is not None:
+            if isinstance(t, str) and t.strip().lower() in _THINK_OFF:
+                t = False
+            kw = {"enable_thinking": bool(t)}
+            if isinstance(t, str):
+                eff = _EFFORT.get(t.strip().lower())
+                if eff:
+                    kw["reasoning_effort"] = eff
+            body["chat_template_kwargs"] = kw
         if tools:
             body["tools"] = tools
 
         req = urllib.request.Request(
             f"{_base()}/v1/chat/completions",
             data=json.dumps(body).encode(),
-            headers={"Content-Type": "application/json"},
+            headers=_headers(),
             method="POST")
         try:
             # Generous timeout: MLX cold-loads a model on first request (downloads
@@ -255,11 +378,12 @@ PROVIDER = {
     "description":    "MLX (Apple Silicon) via mlx_lm.server - local, OpenAI-compatible",
     "make_client":    _make_client,
     "list_models":    lambda: MLXClient(_lc.get("_cfg")).list_models() if _lc.get("_cfg") else [],
-    "context_window": lambda model: _CTX_DEFAULT,
+    "context_window": lambda model: _ctx_window(),
     "available":      lambda: True,   # local + free; always offerable (like ollama)
     "autostart":      lambda: False,  # don't auto-activate; operator selects it explicitly
     "tag":            "mlx",
-    "capabilities":   lambda model: {},
+    "capabilities":   lambda model: {"thinking": ["off", "on"]},
+    "warm_models":    lambda: [],
 }
 
 
