@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L1752   Lean-tools (plugin tools: discovery, manager)
-  L2139   MCP client (connection, manager, OAuth, discovery)
-  L2593   Providers (backend plugin registry)
-  L2815   Interactive pickers + menus (raw-mode UI engine)
-  L3164   Terminal styling (colors, formatting helpers)
-  L3458   Streaming + markdown render (model output)
-  L3950   Composer (pinned input line, editor, stdin)
-  L4907   Token accounting (calibrated context meter)
-  L5105   Config (dataclass, field registry, load/save)
-  L9055   Tool execution + text tool-call parsing
-  L9528   Remote workspace (executor client, /connect)
-  L11707  Context meter
-  L11802  Agent (turn loop, context mgmt, tool dispatch)
-  L19364  Slash-command handlers + dispatch table
-  L19506  REPL (interactive loop, session resume)
-  L19969  Worker agent (headless --agent-run)
-  L20654  Entry (CLI arg parsing, main)
+  L1756   Lean-tools (plugin tools: discovery, manager)
+  L2143   MCP client (connection, manager, OAuth, discovery)
+  L2597   Providers (backend plugin registry)
+  L2819   Interactive pickers + menus (raw-mode UI engine)
+  L3168   Terminal styling (colors, formatting helpers)
+  L3462   Streaming + markdown render (model output)
+  L3954   Composer (pinned input line, editor, stdin)
+  L4911   Token accounting (calibrated context meter)
+  L5109   Config (dataclass, field registry, load/save)
+  L9059   Tool execution + text tool-call parsing
+  L9532   Remote workspace (executor client, /connect)
+  L11711  Context meter
+  L11806  Agent (turn loop, context mgmt, tool dispatch)
+  L19373  Slash-command handlers + dispatch table
+  L19515  REPL (interactive loop, session resume)
+  L19978  Worker agent (headless --agent-run)
+  L20663  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -116,7 +116,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.10.86"
+__version__ = "0.10.87"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -124,6 +124,10 @@ __version__ = "0.10.86"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.10.87": [
+        "/background and /worker: newest entry is the last line, next to the prompt; the",
+        "  /worker usage hint moved up to the header.",
+    ],
     "0.10.86": [
         "sampling: local providers (llamacpp, mlx, ollama) no longer force temperature 0.7 /",
         "  top_p 0.8 / top_k 20 / repeat_penalty 1.05 on every request - the model card applies",
@@ -16007,7 +16011,7 @@ def handle_bg_command(agent, cfg, arg):
                       f"(start one with the `background` tool)"))
             return
         print(bold(f"background tasks (remote {remote.host}):"))
-        for r in rows:
+        for r in sorted(rows, key=lambda r: str(r.get("started", ""))):   # newest last
             st = r.get("state", "?")
             label = green("running") if st == "running" else (
                 green(st) if st == "exit 0" else red(st))
@@ -16027,17 +16031,22 @@ def handle_bg_command(agent, cfg, arg):
         print(dim("no background tasks running.  (start one with the `background` tool)"))
         return
     print(bold("background tasks:"))
-    for r in running:
-        tag = "" if r.get("owner") == me else dim("  (other session)")
-        print(f"  {bold(cyan(str(r.get('pid'))))}  {green('running')}  "
-              f"{dim(r.get('started', '?'))}  {r.get('cmd', '?')}{tag}")
-        print(dim(f"      log: {r.get('log', '?')}   ·   /bg kill {r.get('pid')}"))
-    for r in finished:
-        code = _bg_exit_code(r)
-        stat = green("exit 0") if code == "0" else red(f"exit {code}")
-        print(f"  {dim(str(r.get('pid')))}  {stat}  "
-              f"{dim(r.get('started', '?'))}  {r.get('cmd', '?')}")
-        print(dim(f"      log: {r.get('log', '?')}"))
+    # One chronological list, oldest first, so the NEWEST task sits at the bottom next
+    # to the prompt (same reading order as /worker). 'started' is %Y-%m-%d %H:%M:%S, so
+    # it sorts as a string.
+    _alive = {id(r) for r in running}
+    for r in sorted(running + finished, key=lambda r: str(r.get("started", ""))):
+        if id(r) in _alive:
+            tag = "" if r.get("owner") == me else dim("  (other session)")
+            print(f"  {bold(cyan(str(r.get('pid'))))}  {green('running')}  "
+                  f"{dim(r.get('started', '?'))}  {r.get('cmd', '?')}{tag}")
+            print(dim(f"      log: {r.get('log', '?')}   ·   /bg kill {r.get('pid')}"))
+        else:
+            code = _bg_exit_code(r)
+            stat = green("exit 0") if code == "0" else red(f"exit {code}")
+            print(f"  {dim(str(r.get('pid')))}  {stat}  "
+                  f"{dim(r.get('started', '?'))}  {r.get('cmd', '?')}")
+            print(dim(f"      log: {r.get('log', '?')}"))
 
 
 def handle_note_command(agent, cfg, arg):

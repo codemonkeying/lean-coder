@@ -1737,7 +1737,11 @@ def _worker_cmd(agent, cfg, arg):
         if n_inj:
             print(_H["dim"](f"  injects: {n_inj} delivered (last: {last_inj[:80]})"))
         return
-    print(_H["bold"]("workers:"))
+    # Usage hint goes UNDER the header, not at the bottom: as the last line it read like
+    # one more running task. The newest worker stays the last row, next to the prompt.
+    print(_H["bold"]("workers:") + _H["dim"](
+        "  /worker <pid> = full result + progress/intent · status [pid] · "
+        "cancel <pid> · inject/set_plan/add_note <pid> <text> · resume <pid> <steer>"))
     for pid, meta in workers.items():
         row = rows.get(pid)
         state = row["state"] if row else "gone"
@@ -1764,8 +1768,6 @@ def _worker_cmd(agent, cfg, arg):
                     bits.append(f"{n_inj} inject" + ("s" if n_inj > 1 else ""))
                 if bits:
                     print(_H["dim"]("        " + "  ".join(bits)))
-    print(_H["dim"]("  /worker <pid> = full result + progress/intent · status [pid] · "
-                    "cancel <pid> · inject/set_plan/add_note <pid> <text> · resume <pid> <steer>"))
 
 
 def _worker_completer(agent, cfg):
