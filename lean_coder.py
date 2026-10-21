@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L1766   Lean-tools (plugin tools: discovery, manager)
-  L2153   MCP client (connection, manager, OAuth, discovery)
-  L2607   Providers (backend plugin registry)
-  L2829   Interactive pickers + menus (raw-mode UI engine)
-  L3178   Terminal styling (colors, formatting helpers)
-  L3472   Streaming + markdown render (model output)
-  L3964   Composer (pinned input line, editor, stdin)
-  L4921   Token accounting (calibrated context meter)
-  L5151   Config (dataclass, field registry, load/save)
-  L9102   Tool execution + text tool-call parsing
-  L9575   Remote workspace (executor client, /connect)
-  L11754  Context meter
-  L11849  Agent (turn loop, context mgmt, tool dispatch)
-  L19448  Slash-command handlers + dispatch table
-  L19590  REPL (interactive loop, session resume)
-  L20053  Worker agent (headless --agent-run)
-  L20738  Entry (CLI arg parsing, main)
+  L1770   Lean-tools (plugin tools: discovery, manager)
+  L2157   MCP client (connection, manager, OAuth, discovery)
+  L2611   Providers (backend plugin registry)
+  L2833   Interactive pickers + menus (raw-mode UI engine)
+  L3182   Terminal styling (colors, formatting helpers)
+  L3476   Streaming + markdown render (model output)
+  L3968   Composer (pinned input line, editor, stdin)
+  L4933   Token accounting (calibrated context meter)
+  L5163   Config (dataclass, field registry, load/save)
+  L9114   Tool execution + text tool-call parsing
+  L9587   Remote workspace (executor client, /connect)
+  L11766  Context meter
+  L11861  Agent (turn loop, context mgmt, tool dispatch)
+  L19460  Slash-command handlers + dispatch table
+  L19602  REPL (interactive loop, session resume)
+  L20065  Worker agent (headless --agent-run)
+  L20750  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -116,7 +116,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.10.89"
+__version__ = "0.10.90"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -124,6 +124,10 @@ __version__ = "0.10.89"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.10.90": [
+        "gpg unlock notice only fires for commands that really use the ssh key (ssh/scp/sftp,",
+        "  rsync to a host, remote/signing git verbs) - not on every local git or ssh-named path.",
+    ],
     "0.10.89": [
         "a reply cut off at the output limit is now caught on every provider: unfinished tool",
         "  calls are dropped (never run half-written), and the model is told to continue.",
@@ -4815,7 +4819,15 @@ def composer_suspended():
 # runs never prompt, so this costs nothing then; it only matters on a cold cache. Remote/
 # executor run_commands are immune (they run over a pipe with no local tty), so callers
 # gate this on `self.remote is None`.
-_SSH_CRED_RE = re.compile(r'(?:^|[|&;]|\s)(?:ssh|scp|sftp|rsync|git)\b')
+# Only commands that actually USE a key: ssh/scp/sftp, rsync to a host:path, and git
+# verbs that talk to a remote or sign. Local git (log/diff/status/show/add...) never
+# touches the agent - matching bare `git` fired the unlock notice on every command.
+_SSH_CRED_RE = re.compile(
+    r'(?:^|[|&;(`]|\s)(?:'
+    r'(?:ssh|scp|sftp)(?![-\w.])'
+    r'|rsync\b[^|;&\n]*\s[\w.@-]+:'
+    r'|git\b[^|;&\n]*?\s(?:push|pull|fetch|clone|ls-remote|submodule|commit|tag|merge|rebase|am)\b'
+    r')')
 
 
 def _gpg_ssh_locked() -> bool:
