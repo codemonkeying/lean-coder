@@ -312,6 +312,7 @@ class LlamaCppClient:
 
         spin = _lc["Spinner"]("thinking", _lc["THINK_FRAMES"]).start()
         try:
+            self.last_truncated = False   # output-limit cut; read by core _reply_truncated
             for raw in _lc["stream_tiered"](resp, self.cfg):
                 if should_abort and should_abort():
                     aborted = True
@@ -428,6 +429,7 @@ class LlamaCppClient:
                 prompt_total = (timings.get("prompt_n") or 0) + (timings.get("cache_n") or 0)
         if out_tokens:
             self.last_out_tokens = out_tokens
+        self.last_truncated = (finish == "length")
 
         content = "".join(content_parts)
         # Text-tool-call fallback: only when the model emitted NO native tool_calls

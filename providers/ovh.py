@@ -17,7 +17,6 @@ from pathlib import Path
 _API_BASE      = "https://oai.endpoints.kepler.ai.cloud.ovh.net/v1"  # sweep-ok
 _MAX_TOKENS    = 8192
 _MIN_ROOM      = 1024        # below this much reply room, ask for /compact instead
-_OUT_CAP       = 32768       # per-turn reply ceiling even when /models reports far more
 _CTX_DEFAULT   = 131_072
 _PROVIDER      = "ovh"  # sweep-ok
 _DEFAULT_MODEL = "Qwen3.5-397B-A17B"     # biggest coder in the catalogue; ~2.6s tool call
@@ -618,44 +617,32 @@ class _OvhClient:
         if _MODEL_DATA and cur_model not in _MODEL_DATA:
             raise RuntimeError(f"{cur_model} is not in OVH's live model list (withdrawn?) - "
                                f"pick another with /model")
-        # Never cap a reply below what the model can produce; shrink only to fit.
-        max_out    = minfo.get("max_tokens") or _MAX_TOKENS
         max_in     = minfo.get("max_input_tokens", _CTX_DEFAULT)
         send_tools = tools if (tools and _tool_support(cur_model)) else None
         _mt        = _lc.get("messages_tokens")
         _est_toks  = _mt(messages, send_tools) if _mt else len(json.dumps(messages)) // 4
         if _mt is None and send_tools:
             _est_toks += len(json.dumps(send_tools)) // 4
-        # vLLM rejects prompt + max_tokens > window with a 400 that arrives over SSE as a
-        # bare [DONE] (empty stream). The local estimate runs low - up to ~1.8x on dense
-        # digit/punctuation text (measured: est ~4.5k, real 8,095) - so: cap the reply at
-        # _OUT_CAP (no turn needs the whole window; a /models max of 256k made us ask for
-        # 254k) AND keep a 2x + 4k margin under the window.
-        max_out = min(max_out, _OUT_CAP, max_in - _est_toks * 2 - 4096)
-        if max_out < _MIN_ROOM:
+        if _est_toks + _MIN_ROOM > max_in:
             raise RuntimeError(
                 f"context too large for {cur_model} "
                 f"(~{_est_toks:,} of {max_in:,} tokens used, no room to reply) - run /compact first")
+        # NO max_tokens: vLLM then sizes the reply from the REAL prompt (its own tokenizer)
+        # to fill the rest of the window. Sending window-minus-OUR-estimate overflowed
+        # whenever the estimate ran low (dense digits: ~1.8x) -> 400 -> bare [DONE].
         payload = {
             "model":          cur_model,
             "messages":       _cvt_messages(messages),
-            "max_tokens":     max_out,
             "stream":         True,
             "stream_options": {"include_usage": True},
         }
         if send_tools:
             payload["tools"] = _cvt_tools(send_tools)
-        def _empty(r):
-            a, _pe, ab = r
-            return (not ab and _pe is None and not (a.get("content") or "").strip()
-                    and not a.get("tool_calls") and not self.last_finish)
         result = self._send(payload, should_abort)
-        if _empty(result) and payload["max_tokens"] > _MIN_ROOM * 4:
-            # A bare [DONE] is almost always a rejected request (context overflow), not a
-            # silent model: retry once with a much smaller reply budget.
-            payload["max_tokens"] = max(_MIN_ROOM, payload["max_tokens"] // 8)
-            result = self._send(payload, should_abort)
-        if _empty(result):
+        a, _pe, ab = result
+        if not ab and _pe is None and not (a.get("content") or "").strip() \
+                and not a.get("tool_calls") and not self.last_finish:
+            # vLLM delivers a rejected request (4xx) over SSE as a bare [DONE].
             raise RuntimeError(f"{self.last_served or cur_model} returned an empty stream "
                                f"(no tokens, no finish reason) - likely the request was "
                                f"rejected (context too large?); try /compact, then retry")

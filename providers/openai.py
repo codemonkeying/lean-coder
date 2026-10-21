@@ -428,6 +428,7 @@ class _OpenAIClient:
 
         spin = _lc["Spinner"]("thinking", _lc["THINK_FRAMES"]).start()
         try:
+            self.last_truncated = False   # output-limit cut; read by core _reply_truncated
             for raw in _lc["stream_tiered"](resp, self.cfg):
                 if should_abort and should_abort():
                     aborted = True
@@ -444,6 +445,8 @@ class _OpenAIClient:
                     continue
 
                 for ch in obj.get("choices", []):
+                    if ch.get("finish_reason") == "length":
+                        self.last_truncated = True
                     delta = ch.get("delta", {})
                     txt   = delta.get("content")
                     if txt:

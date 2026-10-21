@@ -530,6 +530,7 @@ class OllamaClient:
         # reproduce the old single 600s socket timeout.
         try:
             with open_tiered(req, self.cfg) as resp:
+                self.last_truncated = False   # output-limit cut; read by core _reply_truncated
                 for raw in stream_tiered(resp, self.cfg, self.cfg.host):
                     if should_abort and should_abort():
                         aborted = True
@@ -587,6 +588,7 @@ class OllamaClient:
                     if obj.get("done"):
                         saw_done = True
                         done_reason = obj.get("done_reason")
+                        self.last_truncated = (done_reason == "length")
                         prompt_eval = obj.get("prompt_eval_count")
                         # report output tokens for the core session counter
                         self.last_out_tokens = obj.get("eval_count")

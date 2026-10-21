@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L1761   Lean-tools (plugin tools: discovery, manager)
-  L2148   MCP client (connection, manager, OAuth, discovery)
-  L2602   Providers (backend plugin registry)
-  L2824   Interactive pickers + menus (raw-mode UI engine)
-  L3173   Terminal styling (colors, formatting helpers)
-  L3467   Streaming + markdown render (model output)
-  L3959   Composer (pinned input line, editor, stdin)
-  L4916   Token accounting (calibrated context meter)
-  L5114   Config (dataclass, field registry, load/save)
-  L9065   Tool execution + text tool-call parsing
-  L9538   Remote workspace (executor client, /connect)
-  L11717  Context meter
-  L11812  Agent (turn loop, context mgmt, tool dispatch)
-  L19382  Slash-command handlers + dispatch table
-  L19524  REPL (interactive loop, session resume)
-  L19987  Worker agent (headless --agent-run)
-  L20672  Entry (CLI arg parsing, main)
+  L1766   Lean-tools (plugin tools: discovery, manager)
+  L2153   MCP client (connection, manager, OAuth, discovery)
+  L2607   Providers (backend plugin registry)
+  L2829   Interactive pickers + menus (raw-mode UI engine)
+  L3178   Terminal styling (colors, formatting helpers)
+  L3472   Streaming + markdown render (model output)
+  L3964   Composer (pinned input line, editor, stdin)
+  L4921   Token accounting (calibrated context meter)
+  L5151   Config (dataclass, field registry, load/save)
+  L9102   Tool execution + text tool-call parsing
+  L9575   Remote workspace (executor client, /connect)
+  L11754  Context meter
+  L11849  Agent (turn loop, context mgmt, tool dispatch)
+  L19448  Slash-command handlers + dispatch table
+  L19590  REPL (interactive loop, session resume)
+  L20053  Worker agent (headless --agent-run)
+  L20738  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -116,7 +116,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.10.88"
+__version__ = "0.10.89"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -124,6 +124,11 @@ __version__ = "0.10.88"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.10.89": [
+        "a reply cut off at the output limit is now caught on every provider: unfinished tool",
+        "  calls are dropped (never run half-written), and the model is told to continue.",
+        "ovh: no fixed reply budget; the server sizes the reply from the real prompt.",
+    ],
     "0.10.88": [
         "shell: model commands run under bash when installed (sh fallback); a command that",
         "  won't parse is rejected up front with the error instead of a background job vanishing.",
@@ -5041,6 +5046,38 @@ def _stub_tool_msgs(msgs, keep=None):
             if i in drop and isinstance(m.get("content"), str)
             and not m["content"].startswith("[trimmed") else m
             for i, m in enumerate(msgs)]
+
+
+TRUNC_NOTE = ("[lean-coder: your previous reply hit the output-token limit and was cut "
+              "off. Any tool call that was still being written was dropped and NOT run. "
+              "Continue from where you stopped, splitting large writes/edits into smaller "
+              "pieces.]")
+
+
+def _reply_truncated(client) -> bool:
+    """Did the last reply stop on the OUTPUT limit? Providers report it differently:
+    OpenAI-style finish_reason 'length' (last_finish), Anthropic stop_reason
+    'max_tokens' / Gemini 'MAX_TOKENS' (last_stop_reason), or an explicit
+    last_truncated flag. Unknown -> False (never invent a cut)."""
+    if getattr(client, "last_truncated", False) is True:
+        return True
+    if getattr(client, "last_finish", None) == "length":
+        return True
+    return str(getattr(client, "last_stop_reason", "") or "").lower() in ("max_tokens", "length")
+
+
+def _call_args_ok(call) -> bool:
+    """On a CUT reply: is this tool call complete? Providers collapse half-streamed JSON
+    args to {} (their json.loads fails -> {}), so an EMPTY or unparseable args value is
+    treated as incomplete. A genuinely zero-arg call in a cut reply gets dropped too -
+    harmless, the model is told to continue and re-issues it."""
+    a = (call.get("function") or {}).get("arguments", {}) if isinstance(call, dict) else None
+    if isinstance(a, str):
+        try:
+            a = json.loads(a) if a.strip() else {}
+        except (json.JSONDecodeError, ValueError):
+            return False
+    return isinstance(a, dict) and bool(a)
 
 
 def messages_tokens(messages, tools) -> int:
@@ -14364,9 +14401,29 @@ class Agent:
             if _ev_tok and _ev_ns:
                 self.session_eval_tokens += _ev_tok
                 self.session_eval_ns += _ev_ns
+            # Reply cut off at the provider's output limit: a tool call still streaming
+            # arrives with half its JSON. Drop those (never run a partial edit/write) and
+            # tell the model, instead of silently running it with {} args or ending.
+            cut = _reply_truncated(self.client)
+            dropped = 0
+            if cut and assistant.get("tool_calls"):
+                keep = [c for c in assistant["tool_calls"] if _call_args_ok(c)]
+                dropped = len(assistant["tool_calls"]) - len(keep)
+                if keep:
+                    assistant["tool_calls"] = keep
+                else:
+                    assistant.pop("tool_calls", None)
             self.messages.append(assistant)
             self._cap_begin_turn(assistant)   # training-capture: open turn record (no-op if off)
             calls = assistant.get("tool_calls")
+            if cut:
+                print(yellow(f"\n{GLYPH['warn']} reply hit the output limit"
+                             + (f"; dropped {dropped} incomplete tool call(s)" if dropped else "")
+                             + " - telling the model to continue in smaller pieces"))
+                if not calls:
+                    self.messages.append({"role": "user", "content": TRUNC_NOTE})
+                    self._cap_end_turn()
+                    continue
             # Normalize: a provider (esp. a text-parsed / OpenAI-compatible one)
             # can hand back a malformed tool_calls entry - a bare list, a string,
             # or a dict missing "function". One bad element must not crash the whole
@@ -14389,6 +14446,9 @@ class Agent:
             if (len(calls) > 1 and not self.remote
                     and all(self._parallel_safe(c) for c in calls)):
                 self._run_parallel(calls)
+                if cut and self.messages[-1].get("role") == "tool" \
+                        and isinstance(self.messages[-1].get("content"), str):
+                    self.messages[-1]["content"] += "\n\n" + TRUNC_NOTE
                 self._cap_end_turn()
                 if self._abort:
                     return
@@ -14397,6 +14457,12 @@ class Agent:
                 if self._abort:                 # ^C between tool calls
                     return
                 self._run_one_call(call)
+            if cut:
+                # Calls that DID complete ran; ride the notice on the last tool result so
+                # roles stay tool-after-assistant on every provider.
+                last = self.messages[-1]
+                if last.get("role") == "tool" and isinstance(last.get("content"), str):
+                    last["content"] += "\n\n" + TRUNC_NOTE
             self._cap_end_turn()   # training-capture: flush the turn record (no-op if off)
         self._hit_iteration_cap = True    # stopped on the budget, not a natural finish
         print(yellow(f"\n{GLYPH['warn']} hit {cap}-iteration cap; stopping this turn. "
