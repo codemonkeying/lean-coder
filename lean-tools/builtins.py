@@ -22,6 +22,7 @@
 import os
 import re
 import time
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -464,7 +465,11 @@ class Tools:
             # session detaches the child from the controlling TTY, so opening /dev/tty
             # fails and sudo dies FAST with 'a terminal is required' - a clear nudge to
             # use ask_user_to_run, instead of a 300s hang that eats your input.
+            serr = Tools._syntax_error(cmd)
+            if serr:
+                return serr
             r = subprocess.run(cmd, shell=True, cwd=self.cfg.cwd,
+                               executable=Tools._shell_exe(),
                                capture_output=True, text=True, timeout=to,
                                stdin=subprocess.DEVNULL, start_new_session=True)
         except subprocess.TimeoutExpired:
@@ -518,6 +523,9 @@ class Tools:
                             kill_on_max is False (then notify-only, keep running)."""
         if not cmd:
             return "error: nothing to run in the background"
+        serr = Tools._syntax_error(cmd)
+        if serr:
+            return serr
         cap = self.cfg.bg_max_concurrent
         if cap and len(_bg_running(kind=None)) >= cap:
             return (f"error: at the background-task limit ({cap} running). Free a slot by "
@@ -560,6 +568,39 @@ class Tools:
                 f"lean-coder)\noutput -> {log}\n"
                 f"track: background(pid={p.pid})  (exit code -> '{exitf}')  ·  "
                 f"stop: background(action='kill', pid={p.pid}){note}")
+
+    @staticmethod
+    def _shell_exe():
+        """The shell model commands run under (POSIX): bash when installed, because
+        models write bash (process substitution, [[ ]], brace expansion, pipefail) and
+        /bin/sh is often dash, which rejects it. None = fall back to shell=True's /bin/sh.
+        Windows: None (cmd.exe via shell=True, unchanged)."""
+        if os.name == "nt":
+            return None
+        return shutil.which("bash") or None
+
+    @staticmethod
+    def _syntax_error(cmd: str):
+        """Parse-only check (`<shell> -n -c cmd`: nothing runs) under the same shell the
+        command will use. Returns the shell's error text, or None if it parses (or the
+        check itself can't run). Matters most for background: a parse failure kills the
+        exit-recording wrapper too, so the task vanished with no exit code and no
+        notify - the model waited on a job that never started."""
+        if os.name == "nt":
+            return None
+        sh = Tools._shell_exe() or "/bin/sh"
+        try:
+            r = subprocess.run([sh, "-n", "-c", cmd], capture_output=True, text=True,
+                               timeout=5, stdin=subprocess.DEVNULL)
+        except Exception:
+            return None
+        if r.returncode == 0:
+            return None
+        name = os.path.basename(sh)
+        return (f"error: syntax error under {name} - nothing was run:\n"
+                f"{(r.stderr or r.stdout).strip()[:400]}"
+                + ("" if name == "bash" else
+                   "\n(this box has no bash: write POSIX sh - no >(...), [[ ]], {a,b}, pipefail)"))
 
     @staticmethod
     def _bg_wrap(cmd: str, exitf: str, leasef: str, idle_timeout=None,

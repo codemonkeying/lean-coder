@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L1756   Lean-tools (plugin tools: discovery, manager)
-  L2143   MCP client (connection, manager, OAuth, discovery)
-  L2597   Providers (backend plugin registry)
-  L2819   Interactive pickers + menus (raw-mode UI engine)
-  L3168   Terminal styling (colors, formatting helpers)
-  L3462   Streaming + markdown render (model output)
-  L3954   Composer (pinned input line, editor, stdin)
-  L4911   Token accounting (calibrated context meter)
-  L5109   Config (dataclass, field registry, load/save)
-  L9059   Tool execution + text tool-call parsing
-  L9532   Remote workspace (executor client, /connect)
-  L11711  Context meter
-  L11806  Agent (turn loop, context mgmt, tool dispatch)
-  L19373  Slash-command handlers + dispatch table
-  L19515  REPL (interactive loop, session resume)
-  L19978  Worker agent (headless --agent-run)
-  L20663  Entry (CLI arg parsing, main)
+  L1761   Lean-tools (plugin tools: discovery, manager)
+  L2148   MCP client (connection, manager, OAuth, discovery)
+  L2602   Providers (backend plugin registry)
+  L2824   Interactive pickers + menus (raw-mode UI engine)
+  L3173   Terminal styling (colors, formatting helpers)
+  L3467   Streaming + markdown render (model output)
+  L3959   Composer (pinned input line, editor, stdin)
+  L4916   Token accounting (calibrated context meter)
+  L5114   Config (dataclass, field registry, load/save)
+  L9065   Tool execution + text tool-call parsing
+  L9538   Remote workspace (executor client, /connect)
+  L11717  Context meter
+  L11812  Agent (turn loop, context mgmt, tool dispatch)
+  L19382  Slash-command handlers + dispatch table
+  L19524  REPL (interactive loop, session resume)
+  L19987  Worker agent (headless --agent-run)
+  L20672  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -116,7 +116,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.10.87"
+__version__ = "0.10.88"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -124,6 +124,11 @@ __version__ = "0.10.87"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.10.88": [
+        "shell: model commands run under bash when installed (sh fallback); a command that",
+        "  won't parse is rejected up front with the error instead of a background job vanishing.",
+        "ovh: reply budget capped so long prompts no longer fail with an empty stream.",
+    ],
     "0.10.87": [
         "/background and /worker: newest entry is the last line, next to the prompt; the",
         "  /worker usage hint moved up to the header.",
@@ -7627,6 +7632,7 @@ def _bg_spawn_detached(cmd, log, exitf, leasef, logf=None, idle_timeout=None,
                                            kill_on_max=kill_on_max,
                                            heartbeat_timeout=heartbeat_timeout)
         return subprocess.Popen(wrapped, shell=True,
+                                executable=_BUILTINS.Tools._shell_exe(),   # bash if present
                                 cwd=str(cwd) if cwd else None,
                                 stdout=f, stderr=subprocess.STDOUT,
                                 stdin=subprocess.DEVNULL,
@@ -12411,8 +12417,11 @@ class Agent:
         """The shell run_command executes under, for the model to target commands at.
         Remote: POSIX box -> sh, Windows box -> cmd.exe. Local: this box's os."""
         if self.remote is not None:
-            return "sh (POSIX)" if self.remote.remote_posix else "cmd.exe (Windows)"
-        return "cmd.exe (Windows)" if os.name == "nt" else "sh (POSIX)"
+            return ("bash (sh if the box has none)" if self.remote.remote_posix
+                    else "cmd.exe (Windows)")
+        if os.name == "nt":
+            return "cmd.exe (Windows)"
+        return "bash" if _BUILTINS.Tools._shell_exe() else "sh (POSIX, no bash)"
 
     def _session_env(self) -> str:
         """The uncached session-env reminder, riding the same tail as the plan. Normally
