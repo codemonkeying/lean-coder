@@ -145,7 +145,10 @@ def _push(worker, text):
         return False
 
 
-def _notify_assigner(board_name, tid, action, note, assigned_by, task_name):
+_PING_RESULT_MAX = 400
+
+
+def _notify_assigner(board_name, tid, action, note, assigned_by, task_name, result_ref=""):
     """Wake whoever assigned `tid` that it is now done/failed - the completion return leg
     (mirrors assign's outbound wake). Returns a short tail describing what happened (for the
     tool's reply), "" if there was nobody/nothing to do. Never raises. A spawned assigner is
@@ -160,6 +163,10 @@ def _notify_assigner(board_name, tid, action, note, assigned_by, task_name):
     verb = "done" if action == "done" else "FAILED"
     ping = (f"[board '{board_name}'] task {tid} ({task_name}) you assigned is now {verb}."
             + (f" Note: {note}" if note else "")
+            # The finisher's result often carries a reply or a question: show it, trimmed.
+            + ((f" Result: {result_ref[:_PING_RESULT_MAX]}"
+                + (" ...[cut; action='list' for the rest]"
+                   if len(result_ref) > _PING_RESULT_MAX else "")) if result_ref else "")
             + " React: fold it into your report / decide the next step (action='list' to see the board).")
     resolve = _H.get("_participant_resolve")
     res = resolve(handle) if resolve else {"state": "missing"}
@@ -610,7 +617,8 @@ def run(args, cwd):
         # assigner (don't wake yourself), or if nobody was recorded.
         msg += _notify_assigner(name, tid, action, note,
                                 (meta or {}).get("assigned_by", ""),
-                                (meta or {}).get("name", ""))
+                                (meta or {}).get("name", ""),
+                                result_ref=result_ref or "")
         # A FAIL makes any dependent un-runnable (its dep will never be 'done'). Warn the
         # owners of those now-dead dependents so a dead branch never goes unnoticed.
         if action == "fail":
