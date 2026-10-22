@@ -19,6 +19,20 @@ import subprocess
 import sys
 import time
 
+
+def _dbg_swallow():
+    """Debug bucket shim: hands a swallowed exception to lean-coder's _dbg_swallow
+    (a no-op unless LEANCODER_DEBUG=1). Never raises."""
+    for _m in ("__main__", "lean_coder"):
+        _f = getattr(sys.modules.get(_m), "_dbg_swallow", None)
+        if _f and _f is not _dbg_swallow:
+            try:
+                _f(2)
+            except Exception:
+                pass
+            return
+
+
 NOTIFY_AFTER = 8.0      # only ping for finished turns that actually took a while
 NOTIFY_ICON = "utilities-terminal"   # stock theme icon - present on every desktop
 NOTIFY_MS = 3000        # toast lifetime (ms)
@@ -36,7 +50,7 @@ def _ping(summary="lean-coder", body=""):
                 out.write("\a")
                 out.flush()
         except Exception:
-            pass
+            _dbg_swallow()
     try:
         if shutil.which("notify-send"):
             # name the app + icon + timeout so the desktop doesn't guess (KDE otherwise
@@ -50,7 +64,7 @@ def _ping(summary="lean-coder", body=""):
                             f"display notification {body!r} with title {summary!r}"],
                            timeout=5, capture_output=True)
     except Exception:
-        pass
+        _dbg_swallow()
 
 
 def setup(lc, cfg):

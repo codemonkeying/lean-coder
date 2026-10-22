@@ -33,6 +33,8 @@ NOTES.md
 # _smoketest_local.py is deliberately NOT published: it tests private providers
 # that are not shipped. _smoketest.py exec()s it when present.
 !/tests/_sweep.sh
+!/tests/_isolate.py
+!/tests/_debugrun.sh
 !/tests/fixtures/
 !/tests/fixtures/echo_mcp_server.py
 

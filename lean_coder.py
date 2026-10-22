@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L1770   Lean-tools (plugin tools: discovery, manager)
-  L2157   MCP client (connection, manager, OAuth, discovery)
-  L2611   Providers (backend plugin registry)
-  L2833   Interactive pickers + menus (raw-mode UI engine)
-  L3182   Terminal styling (colors, formatting helpers)
-  L3476   Streaming + markdown render (model output)
-  L3968   Composer (pinned input line, editor, stdin)
-  L4933   Token accounting (calibrated context meter)
-  L5163   Config (dataclass, field registry, load/save)
-  L9114   Tool execution + text tool-call parsing
-  L9587   Remote workspace (executor client, /connect)
-  L11766  Context meter
-  L11861  Agent (turn loop, context mgmt, tool dispatch)
-  L19460  Slash-command handlers + dispatch table
-  L19602  REPL (interactive loop, session resume)
-  L20065  Worker agent (headless --agent-run)
-  L20750  Entry (CLI arg parsing, main)
+  L1818   Lean-tools (plugin tools: discovery, manager)
+  L2205   MCP client (connection, manager, OAuth, discovery)
+  L2659   Providers (backend plugin registry)
+  L2881   Interactive pickers + menus (raw-mode UI engine)
+  L3230   Terminal styling (colors, formatting helpers)
+  L3524   Streaming + markdown render (model output)
+  L4016   Composer (pinned input line, editor, stdin)
+  L4983   Token accounting (calibrated context meter)
+  L5236   Config (dataclass, field registry, load/save)
+  L9218   Tool execution + text tool-call parsing
+  L9691   Remote workspace (executor client, /connect)
+  L11870  Context meter
+  L11965  Agent (turn loop, context mgmt, tool dispatch)
+  L19647  Slash-command handlers + dispatch table
+  L19789  REPL (interactive loop, session resume)
+  L20261  Worker agent (headless --agent-run)
+  L20949  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -57,7 +57,7 @@ import shutil
 import urllib.error
 import urllib.parse
 import urllib.request
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from difflib import unified_diff
 from pathlib import Path
@@ -77,6 +77,43 @@ CONFIG_DIR = CONFIG_PATH.parent                  # ~/.config/leancoder; provider
                                                  # this via lc["CONFIG_DIR"] for secrets
                                                  # /caches instead of hardcoding the path
 SESSIONS_DIR = CONFIG_DIR / "sessions"           # saved + autosaved conversations
+
+# Debug bucket. Best-effort code swallows its own failures (`except: pass`) so an extra
+# can never break a session - but then a broken extra fails invisibly. With
+# LEANCODER_DEBUG=1 each swallowed exception is appended to the bucket file
+# (LEANCODER_DEBUG_LOG, default CONFIG_DIR/debug.log): where, what, and the call site.
+# Off (the default) it's a single bool check and nothing is written. Never prints,
+# never raises; each call site logs at most 5 times per process so a polling loop
+# can't flood the file.
+_DEBUG = bool(os.environ.get("LEANCODER_DEBUG"))
+_DBG_SEEN: dict = {}
+
+
+def _dbg_swallow(depth: int = 1):
+    """Call inside an `except` block in place of a bare `pass`. `depth` = how many frames
+    up the real call site is (lean-tools/providers call via a 1-frame shim: depth=2)."""
+    if not _DEBUG:
+        return
+    try:
+        et, ev, tb = sys.exc_info()
+        if et is None:
+            return
+        while tb.tb_next:
+            tb = tb.tb_next
+        f = sys._getframe(depth)
+        site = f"{os.path.basename(f.f_code.co_filename)}:{f.f_lineno} {f.f_code.co_name}"
+        _DBG_SEEN[site] = _DBG_SEEN.get(site, 0) + 1
+        if _DBG_SEEN[site] > 5:
+            return
+        where = f"{os.path.basename(tb.tb_frame.f_code.co_filename)}:{tb.tb_lineno}"
+        path = os.environ.get("LEANCODER_DEBUG_LOG") or str(CONFIG_DIR / "debug.log")
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} pid={os.getpid()} "
+                     f"swallowed at {site}: {et.__name__}: {str(ev)[:300]} (raised {where})\n")
+    except BaseException:                        # incl. ^C mid-write: callers that swallowed
+        pass                                     # everything must still swallow everything
+
 HISTORY_PATH = CONFIG_DIR / "history"            # composer input history (one line per entry)
 HISTORY_MAX = 1000                               # trailing entries kept on disk
 AUTOSAVE_KEEP = 10               # rolling autosave sessions kept (oldest pruned)
@@ -116,7 +153,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.10.90"
+__version__ = "0.10.91"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -124,6 +161,18 @@ __version__ = "0.10.90"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.10.91": [
+        "first start without a backend now welcomes you and points at /provider.",
+        "run_command: a timeout shows the last output; progress bars (\\r) read cleanly;",
+        "  a process left running in the background is reported.",
+        "workers: a brief without a valid permission grant refuses to run.",
+        "ovh: clear rejections fail fast with the server's message; other errors retry.",
+        "Tab hints no longer reappear at the next prompt after Enter.",
+        "typing at the idle prompt survives a background wake.",
+        "LEANCODER_DEBUG=1 logs quietly-ignored errors to ~/.config/leancoder/debug.log.",
+        "tests run in a throwaway HOME and can no longer overwrite your config.toml.",
+        "--yolo removed (use --auto); internal flags hidden from --help; README trimmed.",
+    ],
     "0.10.90": [
         "gpg unlock notice only fires for commands that really use the ssh key (ssh/scp/sftp,",
         "  rsync to a host, remote/signing git verbs) - not on every local git or ssh-named path.",
@@ -1129,10 +1178,9 @@ COMPACT_INSTR = (
     "this conversation - capture everything future-you needs to continue without losing "
     "the thread.\n"
     "FIRST, if any durable fact needs to outlive this session (a decision, a design note, a "
-    "gotcha your future self can't re-derive from code/git), save it now with your tools to "
-    "wherever this project keeps such notes - and commit ONLY if this is already a git repo "
-    "and nothing tells you to hold (never init one). Skip this if there's nothing durable to "
-    "save or you have no write tools.\n"
+    "gotcha your future self can't re-derive from the code), save it now with your tools to "
+    "wherever this project keeps such notes. Skip this if there's nothing "
+    "durable to save or you have no write tools.\n"
     "THEN write these blocks IN THIS REPLY, using the exact markers, and STOP. The blocks "
     "must START with " + COMPACT_MARK + " - no narration or preamble before them (a durable-"
     "save tool call above is fine; just don't write prose first).\n"
@@ -1425,7 +1473,7 @@ def read_prompt(name):
         if f.is_file():
             return f.read_text()
     except OSError:
-        pass
+        _dbg_swallow()
     return BUILTIN_PROMPTS.get(name)
 
 
@@ -1440,7 +1488,7 @@ def list_prompts(all_builtins=False):
     try:
         custom = sorted(p.stem for p in PROMPTS_DIR.glob("*.txt"))
     except OSError:
-        pass
+        _dbg_swallow()
     builtins = sorted(BUILTIN_PROMPTS) if all_builtins \
         else sorted(n for n in BUILTIN_PROMPTS if prompt_file(n).is_file())
     return builtins, custom
@@ -1457,7 +1505,7 @@ def restore_prompt(name):
             f.unlink()
             return True
     except OSError:
-        pass
+        _dbg_swallow()
     return False
 
 
@@ -1470,7 +1518,7 @@ def seed_prompt_file(name):
             f.parent.mkdir(parents=True, exist_ok=True)
             f.write_text(read_prompt(name) or "")
     except OSError:
-        pass
+        _dbg_swallow()
     return f
 
 # The built-in tool schemas (read_file..run_command) + their implementations now live
@@ -2070,7 +2118,7 @@ def save_mcp_client(name, data):
     try:
         p.chmod(0o600)
     except OSError:
-        pass
+        _dbg_swallow()
 
 
 def delete_mcp_client(name):
@@ -2079,7 +2127,7 @@ def delete_mcp_client(name):
         try:
             p.unlink()
         except OSError:
-            pass
+            _dbg_swallow()
 
 
 _CURL_PATH = None   # cached: curl's presence on PATH is stable for the process lifetime
@@ -2230,7 +2278,7 @@ class MCPConnection:
                 except Exception:
                     self._proc.kill()
             except Exception:
-                pass
+                _dbg_swallow()
             self._proc = None
         self.connected = False
 
@@ -2396,7 +2444,7 @@ class MCPConnection:
                             k, _, v = line.partition(":")
                             headers[k.strip().lower()] = v.strip()
             except OSError:
-                pass
+                _dbg_swallow()
             finally:
                 try: os.remove(hf)
                 except OSError: pass
@@ -3504,7 +3552,7 @@ def _set_stream_read_timeout(resp, secs):
     try:
         resp.fp.raw._sock.settimeout(secs)
     except Exception:
-        pass
+        _dbg_swallow()
 
 class _TieredHTTPConnection(http.client.HTTPConnection):
     """An HTTPConnection that arms the TCP-connect phase with a short `connect_to`
@@ -3527,7 +3575,7 @@ class _TieredHTTPConnection(http.client.HTTPConnection):
             try:
                 self.sock.settimeout(self._read_to)
             except Exception:
-                pass
+                _dbg_swallow()
 
 
 class _TieredHTTPSConnection(http.client.HTTPSConnection):
@@ -3545,7 +3593,7 @@ class _TieredHTTPSConnection(http.client.HTTPSConnection):
             try:
                 self.sock.settimeout(self._read_to)
             except Exception:
-                pass
+                _dbg_swallow()
 
 
 class _TieredHTTPHandler(urllib.request.HTTPHandler):
@@ -3958,7 +4006,7 @@ def flush_stdin():
     try:
         termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
     except (termios.error, OSError):
-        pass
+        _dbg_swallow()
 
 
 _active_composer = None            # set while a Composer owns the terminal
@@ -4076,6 +4124,7 @@ class Composer:
                 return self._resolve(False)
             # any other key falls through and starts a new message (de-arms)
         if ch in ("\r", "\n"):
+            self.comp_display = []       # a stale Tab list must not outlive its line
             if self.buf:
                 self.queued.append(self.buf)
                 self._push_history(self.buf)
@@ -4187,7 +4236,7 @@ class Composer:
             path.write_text("\n".join(lines) + ("\n" if lines else ""),
                             encoding="utf-8")
         except OSError:
-            pass
+            _dbg_swallow()
 
     def _push_history(self, line: str):
         """Record a submitted line (skip blanks and immediate duplicates)."""
@@ -4475,11 +4524,11 @@ class Composer:
                 sys.stderr.write(dim(f"  composer: TTY setup failed, using classic "
                                      f"input ({type(e).__name__}: {e})\n"))
             except Exception:
-                pass
+                _dbg_swallow()
             try:
                 self._termios.tcsetattr(self._fd, self._termios.TCSADRAIN, self._old_term)
             except Exception:
-                pass
+                _dbg_swallow()
             return False
 
     def stop_tty(self):
@@ -4494,7 +4543,7 @@ class Composer:
             try:
                 signal.signal(signal.SIGWINCH, self._old_winch)
             except (ValueError, OSError):
-                pass
+                _dbg_swallow()
         self._old_winch = None
         try:
             self._out.write("\033[?2004l")                         # bracketed paste off
@@ -4505,11 +4554,11 @@ class Composer:
             self._out.write(f"\033[{top};1H")                      # cursor where output ended
             self._out.flush()
         except Exception:
-            pass
+            _dbg_swallow()
         try:
             self._termios.tcsetattr(self._fd, self._termios.TCSADRAIN, self._old_term)
         except Exception:
-            pass
+            _dbg_swallow()
         self.active = False
 
     def on_resize(self, *_):
@@ -4554,7 +4603,7 @@ class Composer:
                 self._redraw_locked()
                 self._out.flush()
             except Exception:
-                pass
+                _dbg_swallow()
 
     def read_line(self, prompt_status=None, wake_check=None):
         """Block at the IDLE prompt reading ONE submitted line, using the same
@@ -4577,6 +4626,7 @@ class Composer:
         # clearing here silently ate whatever the user was still typing when the
         # turn handed control back. Keep it and park the cursor at its end.
         self.cur = len(self.buf)
+        self.comp_display = []           # never reopen a prompt showing an old Tab list
         self._read_eof = False
         self._read_wake.clear()
         self._read_active = True
@@ -4677,7 +4727,7 @@ class Composer:
                         try:
                             self._out.flush()
                         except Exception:
-                            pass
+                            _dbg_swallow()
                 # Idle reader: a newly queued line ends this read_line() call.
                 if self._read_active and len(self.queued) > had:
                     self._read_wake.set()
@@ -4691,7 +4741,7 @@ class Composer:
             try:
                 self._out.flush()
             except Exception:
-                pass
+                _dbg_swallow()
 
     def _redraw_locked(self):
         if not self.active:
@@ -4726,7 +4776,7 @@ class Composer:
                 self._out.write(f"\033[{status_row + 1 + idx};1H\033[2K{line}")
             self._out.write(f"\033[{status_row + 1 + cur_row};{cur_col}H")
         except Exception:
-            pass
+            _dbg_swallow()
 
     # file-like: the agent's stdout is pointed here for the turn, so every print
     # lands above the input line (restore output pos -> write -> re-park -> redraw)
@@ -4741,7 +4791,7 @@ class Composer:
                 self._redraw_locked()
                 self._out.flush()
             except Exception:
-                pass
+                _dbg_swallow()
         return len(text)
 
     def isatty(self):
@@ -4754,7 +4804,7 @@ class Composer:
         try:
             self._out.flush()
         except Exception:
-            pass
+            _dbg_swallow()
 
 
 def _composer_ok(cfg) -> bool:
@@ -4850,7 +4900,7 @@ def _gpg_ssh_locked() -> bool:
         # unlocked, that one is (almost always) the key ssh uses, so no prompt comes.
         return bool(prot) and not any(f[6] == "1" for f in prot)
     except Exception:
-        pass
+        _dbg_swallow()
     return False
 
 
@@ -4943,7 +4993,7 @@ def set_tok_factor(f) -> None:
     try:
         _TOK_FACTOR = max(_TOK_FACTOR_MIN, min(_TOK_FACTOR_MAX, float(f)))
     except (TypeError, ValueError):
-        pass
+        _dbg_swallow()
 
 
 def calibrate_tokens(raw_estimate: int, actual: int) -> None:
@@ -5076,6 +5126,29 @@ def _reply_truncated(client) -> bool:
     if getattr(client, "last_finish", None) == "length":
         return True
     return str(getattr(client, "last_stop_reason", "") or "").lower() in ("max_tokens", "length")
+
+
+_FINISH_MAP = {
+    "stop": "stop", "end_turn": "stop", "stop_sequence": "stop", "eos": "stop",
+    "length": "length", "max_tokens": "length",
+    "tool_calls": "tool_calls", "tool_use": "tool_calls", "function_call": "tool_calls",
+    "content_filter": "content_filter", "safety": "content_filter",
+    "recitation": "content_filter", "blocklist": "content_filter",
+    "prohibited_content": "content_filter", "spii": "content_filter",
+    "refusal": "refusal", "error": "error",
+    "unload": "error", "load": "error",
+}
+
+
+def _finish_reason(client):
+    """Normalised stop reason of the client's last reply: stop | length | tool_calls |
+    content_filter | refusal | error | None (unknown / stream dropped with no finish).
+    Reads last_finish (OpenAI-style, ollama done_reason) or last_stop_reason
+    (Anthropic, Gemini). An unrecognised raw value maps to None, never guessed."""
+    raw = getattr(client, "last_finish", None) or getattr(client, "last_stop_reason", None)
+    if not raw:
+        return "length" if getattr(client, "last_truncated", False) is True else None
+    return _FINISH_MAP.get(str(raw).strip().lower())
 
 
 def _call_args_ok(call) -> bool:
@@ -5554,7 +5627,7 @@ class Config:
                     if live > 0:
                         return live
             except Exception:
-                pass
+                _dbg_swallow()
         return stored
 
     def compact_for(self, model: "str | None" = None):
@@ -5712,7 +5785,7 @@ def sampling_for(cfg, model, server_card=None, server_label="server"):
                          " - model cards warn it causes endless repetition; "
                          "/set temperature default to use the model card"))
         except Exception:
-            pass
+            _dbg_swallow()
     return send, eff, " + ".join(srcs)
 
 
@@ -5720,6 +5793,28 @@ def _fmt_sampling(eff):
     short = {"temperature": "temp", "top_p": "top_p", "top_k": "top_k", "min_p": "min_p",
              "presence_penalty": "presence", "repeat_penalty": "repeat"}
     return " ".join(f"{short[k]} {eff[k]:g}" for k in SAMPLING_KEYS if k in eff) or "(none sent)"
+
+
+HOSTED_SAMPLING_KEYS = ("temperature", "top_p", "top_k", "min_p")
+
+
+def hosted_sampling(cfg, supported=None):
+    """Sampling for a HOSTED OpenAI-compatible provider (ovh, kilo): send ONLY what the
+    user set (/set, CLI, headless cfg attr) - no family table, the vendor's model default
+    applies otherwise. `supported` (optional) = the keys this provider accepts; set keys
+    outside it are NOT sent (OVH 400s on top_k/min_p) and listed under "dropped" so a
+    benchmark stamp stays honest. Returns (send, last_sampling)."""
+    want = {k: getattr(cfg, k, None) for k in HOSTED_SAMPLING_KEYS}
+    want = {k: v for k, v in want.items() if v is not None}
+    send = {k: v for k, v in want.items() if supported is None or k in supported}
+    dropped = sorted(k for k in want if k not in send)
+    src = "sent by lean-coder" if send else "provider default (not sent)"
+    if dropped:
+        src += f"; dropped {', '.join(dropped)} (unsupported by provider; its default applies)"
+    out = {"params": dict(send), "source": src, "sent": dict(send)}
+    if dropped:
+        out["dropped"] = dropped
+    return send, out
 
 
 def effective_sampling(agent_or_client):
@@ -6140,14 +6235,14 @@ def load_config(args) -> Config:
         try:
             cfg.window_tokens = _coerce_setting(args.window_tokens, "int_or_auto")
         except ValueError:
-            pass                              # keep the default on a junk --window-tokens
+            _dbg_swallow()                              # keep the default on a junk --window-tokens
     if args.temperature is not None:    cfg.temperature = args.temperature
     if args.top_p is not None:          cfg.top_p = args.top_p
     if args.top_k is not None:          cfg.top_k = args.top_k
     if args.repeat_penalty is not None: cfg.repeat_penalty = args.repeat_penalty
     if getattr(args, "approval", None):
         cfg.approval = args.approval
-    elif args.auto or args.yolo:        # --auto (and the kept --yolo alias) = auto
+    elif args.auto:
         cfg.approval = "auto"
     if getattr(args, "no_composer", False):
         cfg.composer = False
@@ -6284,7 +6379,7 @@ def save_config(cfg: Config, quiet: bool = False):
             if "[providers.ollama]" not in old:
                 bak.write_text(old)
     except OSError:
-        pass
+        _dbg_swallow()
     name_of = {u: n for n, u in cfg.machines.items()}  # url -> name, for readability
     # cfg.hosts is the priority pool (config order). Persist the ORDER only - the
     # active pick (cfg.host) is a session override and is intentionally not saved as
@@ -6401,7 +6496,7 @@ def autosave_config(cfg: Config):
     try:
         save_config(cfg, quiet=True)
     except OSError:
-        pass
+        _dbg_swallow()
 
 
 # ----------------------------------------------------------------------------
@@ -6462,7 +6557,7 @@ def _atomic_write_text(path: Path, text: str):
         try:
             tmp.unlink(missing_ok=True)
         except OSError:
-            pass
+            _dbg_swallow()
         path.write_text(text)
 
 
@@ -6537,7 +6632,7 @@ def save_session(messages, cfg, name: str, remote=None, pinned_plan="", notes=No
             for k, v in captured.items():
                 meta[k] = v
     except Exception:
-        pass
+        _dbg_swallow()
     path = _session_path(safe)
     _atomic_write_text(path, json.dumps(_session_envelope(messages, meta), indent=2))
     return path, meta
@@ -6681,7 +6776,7 @@ def _session_live_worker(name: str):
                     and _bg_here(r) and _bg_alive(r) and r.get("pid") != os.getpid()):
                 return r.get("pid")
     except Exception:
-        pass
+        _dbg_swallow()
     return None
 def _write_lock(name: str):
     try:
@@ -6689,7 +6784,7 @@ def _write_lock(name: str):
         _lock_path(name).write_text(json.dumps(
             {"pid": os.getpid(), "host": _HOSTNAME, "ts": time.time()}))
     except OSError:
-        pass
+        _dbg_swallow()
 
 def _own_lock(name: str) -> bool:
     info = _read_lock(name)
@@ -6715,7 +6810,7 @@ def _release_lock(name: str):
         try:
             _lock_path(name).unlink()
         except OSError:
-            pass
+            _dbg_swallow()
 
 
 def _prune_stale_locks():
@@ -6735,7 +6830,7 @@ def _prune_stale_locks():
             try:
                 lk.unlink()
             except OSError:
-                pass
+                _dbg_swallow()
 
 
 def _prune_dead_tmp_writes():
@@ -6756,7 +6851,7 @@ def _prune_dead_tmp_writes():
             try:
                 f.unlink()
             except OSError:
-                pass
+                _dbg_swallow()
 
 
 def _session_stolen(agent, cfg) -> bool:
@@ -6813,7 +6908,7 @@ def autosave_session(agent, cfg):
         _write_lock(name)
         _prune_autosaves()
     except (ValueError, OSError):
-        pass
+        _dbg_swallow()
 
 
 def _prune_autosaves(keep: int = AUTOSAVE_KEEP):
@@ -6835,7 +6930,7 @@ def _prune_autosaves(keep: int = AUTOSAVE_KEEP):
             try:
                 p.unlink()
             except OSError:
-                pass
+                _dbg_swallow()
 
     # A precompact snapshot of an auto- session starts with AUTOSAVE_PREFIX too, so
     # match snapshots FIRST and exclude them from the autosave cap (else a snapshot
@@ -6942,7 +7037,7 @@ def _bg_write_rec(rec):
         tmp.write_text(json.dumps(rec))
         os.replace(tmp, p)
     except (OSError, KeyError):
-        pass
+        _dbg_swallow()
 
 
 def _bg_drop(rec):
@@ -6951,7 +7046,7 @@ def _bg_drop(rec):
     try:
         _bg_rec_path(rec.get("log", "")).unlink()
     except OSError:
-        pass
+        _dbg_swallow()
 
 
 def _bg_lease_path(log):
@@ -6973,7 +7068,7 @@ def _bg_bump_lease(rec):
     try:
         _bg_lease_path(log).touch()
     except OSError:
-        pass
+        _dbg_swallow()
 
 
 def _bg_load(owner_dir=None):
@@ -7033,7 +7128,7 @@ def _proc_alive(pid):
             state = f.read().rpartition(")")[2].split()[0]
         return state != "Z"
     except (OSError, ValueError, TypeError, IndexError):
-        pass
+        _dbg_swallow()
     try:
         os.kill(int(pid), 0)
         return True
@@ -7099,7 +7194,7 @@ def _kill_tree(pid, sig=None):
         os.killpg(int(pid), sig)
         return
     except (OSError, ValueError, TypeError, AttributeError):
-        pass
+        _dbg_swallow()
     if os.name == "nt":
         try:
             # CREATE_NO_WINDOW: a detached caller (the watchdog, once its executor and
@@ -7112,11 +7207,11 @@ def _kill_tree(pid, sig=None):
             if r.returncode == 0:
                 return
         except (OSError, ValueError, TypeError):
-            pass
+            _dbg_swallow()
     try:
         os.kill(int(pid), sig)
     except (OSError, ValueError, TypeError):
-        pass
+        _dbg_swallow()
 
 
 def _bg_kill(pid, sig=signal.SIGTERM):
@@ -7278,7 +7373,7 @@ def _drain_peer_inbox(name):
     try:
         p.unlink()
     except OSError:
-        pass
+        _dbg_swallow()
     msgs = [m.strip() for m in raw.split("\0") if m.strip()]
     return "\n\n".join(msgs)
 
@@ -7379,7 +7474,7 @@ def _bg_finished_here(owner):
         try:
             nlines = Path(log).read_text(errors="replace").count("\n") if log else 0
         except (OSError, ValueError):
-            pass
+            _dbg_swallow()
         out.append({"pid": pid, "cmd": r.get("cmd", "?"), "code": code,
                     "tail": _bg_log_tail(log, 20), "log": log, "lines": nlines,
                     "notify_on_exit": bool(r.get("notify_on_exit"))})
@@ -7478,7 +7573,7 @@ def _bg_alerts_here(owner):
                 try:
                     sc.unlink()
                 except OSError:
-                    pass
+                    _dbg_swallow()
                 continue
             out.append({"pid": pid, "cmd": r.get("cmd", "?"), "kind": akind,
                         "secs": secs, "tail": _bg_log_tail(log, 20), "log": log})
@@ -7514,7 +7609,7 @@ def _bg_clear_alert(log, akind):
     try:
         Path(str(log) + suffix).unlink()
     except OSError:
-        pass
+        _dbg_swallow()
 
 
 def _bg_status_items(owner, kind="task"):
@@ -7594,7 +7689,7 @@ def run_bg_child(cfg):
             with open(path, "w") as f:
                 f.write(str(text))
         except OSError:
-            pass
+            _dbg_swallow()
 
     def _mtime(path, default):
         try:
@@ -7607,7 +7702,7 @@ def run_bg_child(cfg):
         open(leasef, "a").close()
         os.utime(leasef, None)
     except OSError:
-        pass
+        _dbg_swallow()
     logdir = cfg.get("cwd")
     proc = subprocess.Popen(cmd, shell=True, cwd=logdir,
                             stdin=subprocess.DEVNULL, **_detached_popen_kwargs())
@@ -7878,7 +7973,7 @@ def _worker_brief_from_cmd(cmd):
         if "--brief-file" in parts:
             return parts[parts.index("--brief-file") + 1]
     except (ValueError, IndexError):
-        pass
+        _dbg_swallow()
     return None
 
 
@@ -7906,7 +8001,7 @@ def _clean_worker_sidecars(brief):
         try:
             Path(stamp + suf).unlink()
         except OSError:
-            pass
+            _dbg_swallow()
 
 def _bg_clean_sidecars(rec):
     """Remove a finished/killed task's sidecars so CONFIG_DIR doesn't grow without
@@ -7920,7 +8015,7 @@ def _bg_clean_sidecars(rec):
             try:
                 p.unlink()
             except OSError:
-                pass
+                _dbg_swallow()
     if rec.get("kind") == "worker":
         _clean_worker_sidecars(_worker_brief_from_cmd(rec.get("cmd")))
 
@@ -7949,7 +8044,7 @@ def _worker_dir_sweep():
         try:
             f.unlink()
         except OSError:
-            pass
+            _dbg_swallow()
 
 
 # ==========================================================================
@@ -8083,10 +8178,10 @@ def _board_teardown(session_id):
             try:
                 f.unlink()
             except OSError:
-                pass
+                _dbg_swallow()
         d.rmdir()
     except OSError:
-        pass
+        _dbg_swallow()
 
 
 def _board_sweep():
@@ -8103,7 +8198,7 @@ def _board_sweep():
     try:
         root.rmdir()
     except OSError:
-        pass
+        _dbg_swallow()
 
 
 # --- Task DAG board (Phase 2b) --------------------------------------------------------
@@ -8163,7 +8258,7 @@ def _taskboard_locked(name):
                         try:
                             fh.close()
                         except OSError:
-                            pass
+                            _dbg_swallow()
                     fh = None
         yield
     finally:
@@ -8171,11 +8266,11 @@ def _taskboard_locked(name):
             try:
                 fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
             except OSError:
-                pass
+                _dbg_swallow()
             try:
                 fh.close()
             except OSError:
-                pass
+                _dbg_swallow()
         tl.release()
 
 
@@ -8444,7 +8539,7 @@ def _participant_resolve(name):
                 if (time.time() - float(info.get("ts", 0))) <= _LOCK_STALE_SECS:
                     return {"state": "live-elsewhere", "host": host, "pid": pid}
             except (TypeError, ValueError):
-                pass
+                _dbg_swallow()
     # No live holder. Distinguish a dormant (spawnable) session from a deleted one.
     try:
         exists = _session_path(handle).is_file()
@@ -8541,7 +8636,7 @@ def _run_dir_owner(d) -> int:
     try:
         return int((Path(d) / ".owner").read_text().strip())
     except (OSError, ValueError):
-        pass
+        _dbg_swallow()
     pid = Path(d).name.rpartition("-")[2]
     return int(pid) if pid.isdigit() else -1
 
@@ -8557,7 +8652,7 @@ def _run_owned_dirs(owner=None):
             if d.is_dir() and host == _HOSTNAME and _run_dir_owner(d) == owner:
                 out.append(d)
     except OSError:
-        pass
+        _dbg_swallow()
     return out
 
 
@@ -8649,7 +8744,7 @@ def _bg_legacy_cleanup():
             if _bg_here(r) and (_proc_alive(r.get("owner")) or _proc_alive(r.get("pid"))):
                 live_logs.add(Path(r.get("log", "")).name)
     except OSError:
-        pass
+        _dbg_swallow()
     for f in bg.iterdir():
         if f.name == "tasks.jsonl":
             continue
@@ -8660,16 +8755,16 @@ def _bg_legacy_cleanup():
         try:
             f.unlink()
         except OSError:
-            pass
+            _dbg_swallow()
     if not live_logs:
         try:
             reg.unlink()
         except OSError:
-            pass
+            _dbg_swallow()
     try:
         bg.rmdir()                       # only succeeds once empty
     except OSError:
-        pass
+        _dbg_swallow()
 
 
 def _bg_kill_session():
@@ -8840,12 +8935,12 @@ def _coerce_args_to_schema(name, args, schemas):
             try:
                 args[k] = int(s)
             except ValueError:
-                pass
+                _dbg_swallow()
         elif typ == "number":
             try:
                 args[k] = float(s)
             except ValueError:
-                pass
+                _dbg_swallow()
     return args
 
 
@@ -8881,7 +8976,7 @@ def _json_objects_from_text(text):
                         try:
                             yield json.loads(blob), i, j + 1
                         except (json.JSONDecodeError, ValueError):
-                            pass
+                            _dbg_swallow()
                         break
             j += 1
         i = j + 1
@@ -9041,6 +9136,15 @@ def set_approval(cfg, mode):
     _session_approved = False
 
 
+def _show_ctrl(text: str) -> str:
+    """Make control characters VISIBLE in an approval preview: an ESC/CR/backspace in a
+    command could otherwise redraw the line so you approve something you didn't see.
+    Newlines and tabs stay (multi-line commands remain readable); everything else in
+    C0/DEL/C1 becomes \\xNN."""
+    return "".join(c if c in "\n\t" or not (ord(c) < 32 or 127 <= ord(c) < 160)
+                   else f"\\x{ord(c):02x}" for c in str(text))
+
+
 def _confirm_action(cfg, kind: str, **info) -> bool:
     """The single confirm POLICY for a tool's side effect, keyed by capability kind.
     A tool supplies only the PREVIEW content; this owns the auto-approve short-circuit,
@@ -9070,7 +9174,7 @@ def _confirm_action(cfg, kind: str, **info) -> bool:
     if kind == "exec":
         if auto_approved(cfg):
             return True
-        print(yellow(f"\n$ {info['cmd']}"))
+        print(yellow(f"\n$ {_show_ctrl(info['cmd'])}"))
         return ask_action(cfg, "run this command?")
     if kind == "read":
         if auto_approved(cfg):
@@ -9340,7 +9444,7 @@ def _encode_image_block(path, max_edge=1568):
         img.save(buf, format=fmt)
         return media, base64.b64encode(buf.getvalue()).decode()
     except Exception:
-        pass
+        _dbg_swallow()
 
     # PIL absent (or failed): send raw bytes, detecting the type from magic bytes.
     media = _sniff_image_media_type(raw)
@@ -9418,14 +9522,14 @@ def _arm_self_wipe():
     try:
         Path(lease).touch()
     except OSError:
-        pass
+        _dbg_swallow()
     # kill any prior watchdog bound to this reused dir (one watchdog invariant)
     try:
         old = int(Path(pidf).read_text().strip())
         if old != os.getpid():
             _kill_tree(old, signal.SIGTERM)
     except (OSError, ValueError):
-        pass
+        _dbg_swallow()
     # Detached watchdog: a Python child (own session/process group, so it outlives
     # this executor and the ssh channel) that rm -rf's the dir once the lease goes
     # unbumped for TTL. Pure-Python + shutil.rmtree so it runs identically on POSIX
@@ -9446,7 +9550,7 @@ def _arm_self_wipe():
             try:
                 os.utime(lease, None)
             except OSError:
-                pass
+                _dbg_swallow()
             time.sleep(chk)
     threading.Thread(target=_bump, daemon=True).start()
 
@@ -9473,7 +9577,7 @@ def run_wipe_watchdog(cfg):
                 try:
                     _run_teardown(_run_owned_dirs(owner))
                 except Exception:
-                    pass
+                    _dbg_swallow()
             return
         # One watchdog per pushed dir: the pid file names the CURRENT one. A newer
         # executor re-arming replaces it, so a stale watchdog (from a previous session on
@@ -9482,7 +9586,7 @@ def run_wipe_watchdog(cfg):
             if int(Path(pidf).read_text().strip()) != me:
                 return
         except (OSError, ValueError):
-            pass
+            _dbg_swallow()
         now = time.time()
         try:
             m = os.path.getmtime(lease)
@@ -9498,7 +9602,7 @@ def run_wipe_watchdog(cfg):
                 try:
                     _run_teardown(_run_owned_dirs(int(cfg["owner"])))
                 except Exception:
-                    pass
+                    _dbg_swallow()
             shutil.rmtree(d, ignore_errors=True)
             return
         time.sleep(chk)
@@ -9518,7 +9622,7 @@ def run_tool_executor(cwd, lean_tools_dir=None):
         try:
             _s.reconfigure(encoding="utf-8", errors="replace")
         except (AttributeError, ValueError):
-            pass
+            _dbg_swallow()
     proto = sys.stdout
     sys.stdout = sys.stderr            # keep real stdout clean for the protocol
     _EXEC_ROLE["on"] = True
@@ -9677,7 +9781,7 @@ class ExecutorClient:
         try:
             self.proc.stdin.close()
         except OSError:
-            pass
+            _dbg_swallow()
         try:
             self.proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
@@ -9833,14 +9937,14 @@ def _posix_embed_cache_download(fn: str, url: str, sha: str) -> Path:
         try:
             tmp.unlink()
         except OSError:
-            pass
+            _dbg_swallow()
         raise ConnectionError(f"failed to download embeddable Python ({url}): {e}")
     got = _sha(tmp)
     if got != sha:
         try:
             tmp.unlink()
         except OSError:
-            pass
+            _dbg_swallow()
         raise ConnectionError(
             f"embeddable Python tarball sha256 mismatch: got {got}, expected {sha}")
     tmp.replace(dest)
@@ -9949,7 +10053,7 @@ def _runtime_dir() -> Path:
     try:
         d.chmod(0o700)
     except OSError:
-        pass
+        _dbg_swallow()
     _reap_dead_sockets(d)
     return d
 
@@ -9971,7 +10075,7 @@ def run_dir() -> Path:
         try:
             d.chmod(0o700)
         except OSError:
-            pass
+            _dbg_swallow()
         return d
 
 
@@ -9996,7 +10100,7 @@ def _run_dead_dirs():
             if int(pid) != os.getpid() and not _proc_alive(int(pid)):
                 out.append(d)
     except OSError:
-        pass
+        _dbg_swallow()
     return out
 
 
@@ -10021,9 +10125,9 @@ def _reap_dead_sockets(d: Path) -> None:
             except ProcessLookupError:
                 p.unlink(missing_ok=True)  # dead -> reap
             except (PermissionError, OSError):
-                pass                     # exists but not ours to signal -> leave
+                _dbg_swallow()                     # exists but not ours to signal -> leave
     except Exception:
-        pass
+        _dbg_swallow()
 
 
 def _ctl_path(host: str) -> str:
@@ -10063,7 +10167,7 @@ def _refresh_gpg_agent_tty():
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                            timeout=5, env=env)
     except Exception:
-        pass                                 # any failure -> degrade to prior behaviour
+        _dbg_swallow()                                 # any failure -> degrade to prior behaviour
     return env
 
 
@@ -10106,7 +10210,7 @@ def _clear_master(host, ctl):
     try:
         Path(ctl).unlink()
     except OSError:
-        pass
+        _dbg_swallow()
 
 
 def _ssh_master_alive(host, ctl) -> bool:
@@ -10335,7 +10439,7 @@ class RemoteWorkspace:
                                     capture_output=True, text=True, timeout=30)
                 uname_out, uname_err = _p.stdout, _p.stderr
             except (subprocess.SubprocessError, OSError):
-                pass
+                _dbg_swallow()
             self.remote_posix = _remote_is_posix(uname_out)
             if self.remote_posix:
                 label = _remote_os_label(uname_out)
@@ -10575,7 +10679,7 @@ class RemoteWorkspace:
             try:
                 os.unlink(tf.name)
             except OSError:
-                pass
+                _dbg_swallow()
         got = self._remote_sha256(remote_path)
         if got != want:
             raise ConnectionError(
@@ -10844,7 +10948,7 @@ class RemoteWorkspace:
             if mb.strip():
                 size = f" ({mb.strip()} MB on disk)"
         except Exception:
-            pass
+            _dbg_swallow()
         print(dim(f"  provisioned embeddable Python at {out}{size}"))
         return quoted
 
@@ -10889,7 +10993,7 @@ class RemoteWorkspace:
             try:
                 self.client.request(BG_TEARDOWN, deadline=time.monotonic() + 5)
             except Exception:
-                pass
+                _dbg_swallow()
             self.client.close()
         # Only tear down a master we OWN. An attached worker rides its parent's
         # master - killing it would drop the parent's live connection.
@@ -10917,7 +11021,7 @@ class RemoteWorkspace:
             subprocess.run(_ssh_run_argv(self.host, self.ctl, _win_ps(cmd)),
                            capture_output=True, timeout=30, start_new_session=True)
         except BaseException:
-            pass
+            _dbg_swallow()
 
     def _wipe_posix_embed(self):
         """Ephemeral teardown (POSIX only): remove the pushed embeddable-Python runtime
@@ -10933,7 +11037,7 @@ class RemoteWorkspace:
             subprocess.run(_ssh_run_argv(self.host, self.ctl, cmd),
                            capture_output=True, timeout=30, start_new_session=True)
         except BaseException:
-            pass
+            _dbg_swallow()
 
     def _wipe_remote(self):
         """Zero-trace teardown: delete the pushed executor dir (agent.py + bundled
@@ -10994,7 +11098,7 @@ class RemoteWorkspace:
             subprocess.run(_ssh_run_argv(self.host, self.ctl, cmd),
                            capture_output=True, timeout=30, start_new_session=True)
         except BaseException:
-            pass
+            _dbg_swallow()
 
 
 # ----------------------------------------------------------------------------
@@ -11049,7 +11153,7 @@ def _sync_local_items(cfg):
         try:
             email = (json.loads(f.read_text()).get("account") or {}).get("email_address") or ""
         except (OSError, ValueError):
-            pass
+            _dbg_swallow()
         out["providers"].append({"kind": "providers", "name": f"login: {label}", "path": f,
                                  "private": False, "rel": f.name, "parent": "oauth_prov",
                                  "detail": email, "secret": True})
@@ -11151,7 +11255,7 @@ class _SyncHost(RemoteWorkspace):
             try:
                 os.unlink(tf.name)
             except OSError:
-                pass
+                _dbg_swallow()
         rc, _, err = self._run(f'src=$(wslpath -u {shlex.quote(wfile)}) && '
                                f'cp "$src" {shlex.quote(remote_path)} && rm -f "$src"')
         if rc != 0:
@@ -11162,7 +11266,7 @@ class _SyncHost(RemoteWorkspace):
             subprocess.run(["ssh", "-o", f"ControlPath={self.ctl}", "-O", "exit", self.host],
                            capture_output=True, timeout=10)
         except (OSError, subprocess.SubprocessError):
-            pass
+            _dbg_swallow()
 
     def rpath(self, rel):
         sep = self._remote_sep()
@@ -11349,7 +11453,7 @@ def _sync_run(sh, cfg, verb, one, force, preselect):
             try:
                 loc_hash[r["rel"]] = hashlib.sha256(Path(r["path"]).read_bytes()).hexdigest()
             except OSError:
-                pass
+                _dbg_swallow()
     src, dst_hash = (local, sh.remote_hashes) if verb == "push" else (remote, loc_hash)
     for rows in src.values():
         for r in rows:
@@ -11871,7 +11975,7 @@ def _set_proc_title(name):
         with open(f"/proc/{pid}/task/{pid}/comm", "w") as f:
             f.write(f"lc:{name}"[:15])
     except OSError:
-        pass
+        _dbg_swallow()
     # Also set the terminal tab title (OSC 0) so it updates at once on /load etc. -
     # Konsole caches the process name; its %w shows this. TTY only (never into a pipe).
     try:
@@ -11879,7 +11983,488 @@ def _set_proc_title(name):
             sys.stdout.write(f"\033]0;lc:{name}\007")
             sys.stdout.flush()
     except (OSError, ValueError):
-        pass
+        _dbg_swallow()
+
+
+class TrainingCapture:
+    """Opt-in training-data capture for one Agent (docs/design/training-capture.md).
+    Split out of Agent: owns all capture state + the sidecar JSONL writer. Reads the
+    agent's cfg/session name/client through the properties below. Every method is
+    best-effort and MUST NOT raise into the turn loop."""
+
+    def __init__(self, agent):
+        self.agent = agent
+        self._cap_turn = None            # training-capture: the in-progress turn record
+                                         # (None unless capture_training is on). See
+                                         # docs/design/training-capture.md.
+        self._cap_turn_index = 0         # monotonic captured-turn counter (session-scoped)
+        self._cap_sha = None             # cached best-effort git HEAD short sha
+        # v2 run-turn boundary state: a run_turn_id stable per user REQUEST (stamped on
+        # every captured turn), plus a one-shot pending opening-user-prompt segment that
+        # the next _cap_begin_turn folds into the first turn of the request. See run_turn.
+        self._cap_run_turn_seq = 0       # monotonic per-request counter (session-scoped)
+        self._cap_run_turn_id = None     # current request's run_turn_id ('' until first turn)
+        self._cap_pending_user = None    # {text, is_model_generated} to inject once, or None
+        # per-EXCHANGE outcome accumulator (STaR accept/reject signal). Rolls up the tool
+        # results of the current run_turn_id; emitted as a separate 'exchange_outcome'
+        # sidecar record when the NEXT run_turn opens (so user_followup can be classified
+        # from the next turn) or at session exit. {run_turn_id, had_error, final_exit_ok}.
+        self._cap_exchange = None
+
+    cfg = property(lambda s: s.agent.cfg)
+    client = property(lambda s: getattr(s.agent, "client", None))
+    autosave_name = property(lambda s: s.agent.autosave_name)
+    last_prompt_tokens = property(lambda s: getattr(s.agent, "last_prompt_tokens", 0))
+
+
+    def _cap_on(self) -> bool:
+        """True iff training capture is active for THIS agent right now. Off by
+        default; suppressed for incognito and for workers (never a real session)."""
+        return bool(getattr(self.cfg, "capture_training", False)
+                    and not getattr(self.cfg, "incognito", False)
+                    and not getattr(self.cfg, "worker_depth", 0))
+
+    def _cap_path(self):
+        """Sidecar path <dir>/<session_id>.jsonl (dir override or CONFIG_DIR/training/)."""
+        d = getattr(self.cfg, "capture_training_dir", "") or ""
+        base = Path(d).expanduser() if d else (CONFIG_DIR / "training")
+        return base / f"{self.autosave_name}.jsonl"
+
+    def _cap_head_sha(self) -> str:
+        """Best-effort short git sha of the running tree (cached; '' if unknown)."""
+        if self._cap_sha is not None:
+            return self._cap_sha
+        sha = ""
+        try:
+            out = subprocess.run(["git", "-C", str(Path(__file__).resolve().parent),
+                                  "rev-parse", "--short", "HEAD"],
+                                 capture_output=True, text=True, timeout=5)
+            if out.returncode == 0:
+                sha = out.stdout.strip()
+        except Exception:
+            sha = ""
+        self._cap_sha = sha
+        return sha
+
+    def _cap_new_run_turn(self, user_text, is_model_generated: bool):
+        """v2: mark the start of a NEW user REQUEST. Allocates a fresh run_turn_id and
+        queues the opening user-prompt segment so the next _cap_begin_turn folds it into
+        the first turn of the request. Best-effort; no-op when capture is off. Called from
+        run_turn (real user turns + autostart self-prompts). `is_model_generated` is True
+        for synthetic self-prompts (autostart/===NEXT===), False for genuine user input."""
+        if not self._cap_on():
+            self._cap_pending_user = None
+            return
+        try:
+            text = user_text if isinstance(user_text, str) else str(user_text or "")
+            # close the PREVIOUS exchange first: this incoming user turn IS its followup,
+            # so classify + flush it now (unless the incoming turn is itself a synthetic
+            # self-prompt - an autostart/===NEXT=== is not operator feedback, treat as
+            # 'continuation' so it neither accepts nor rejects on false signal).
+            fu = "continuation" if is_model_generated else self._cap_classify_followup(text)
+            self._cap_flush_exchange(fu)
+            self._cap_run_turn_seq += 1
+            self._cap_run_turn_id = f"{self.autosave_name}:{self._cap_run_turn_seq}"
+            self._cap_pending_user = {"text": text,
+                                      "is_model_generated": bool(is_model_generated)}
+            # open a fresh outcome accumulator for the exchange we're beginning
+            self._cap_exchange = {"run_turn_id": self._cap_run_turn_id,
+                                  "had_error": False, "final_exit_ok": None}
+        except Exception:
+            self._cap_pending_user = None
+            self._cap_exchange = None
+
+    def _cap_begin_turn(self, assistant: dict):
+        """Open a per-turn capture record from the just-appended assistant message
+        (its reasoning + tool_calls). No-op when capture is off."""
+        if not self._cap_on():
+            self._cap_turn = None
+            return
+        try:
+            segs = []
+            # v2: fold the opening user-prompt of a NEW request into its first turn.
+            # _cap_new_run_turn (called from run_turn) queues this; consumed once here so
+            # subsequent turns of the same request don't repeat it. Text is captured RAW,
+            # exactly like reasoning/tool_result below (core does no redaction on write -
+            # personal-machine capture; the leangym consumer re-redacts on ingest).
+            pend = self._cap_pending_user
+            if pend is not None:
+                self._cap_pending_user = None
+                segs.append({"role": "user", "kind": "user_prompt",
+                             "text": pend.get("text", ""),
+                             "is_model_generated": bool(pend.get("is_model_generated")),
+                             "captured_at": "ingestion"})
+            text = assistant.get("content")
+            if isinstance(text, str) and text.strip():
+                segs.append({"role": "assistant", "kind": "reasoning", "text": text,
+                             "is_model_generated": True, "captured_at": "ingestion"})
+            for c in (assistant.get("tool_calls") or []):
+                fn = c.get("function", {}) or {}
+                args = fn.get("arguments", {})
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except json.JSONDecodeError:
+                        _dbg_swallow()
+                segs.append({"role": "assistant", "kind": "tool_call",
+                             "tool": fn.get("name", ""), "args": args,
+                             "call_id": c.get("id", ""),
+                             "is_model_generated": True, "captured_at": "ingestion"})
+            self._cap_turn = {
+                "schema": "leancoder.training.v2",
+                "session_id": self.autosave_name,
+                "turn_index": self._cap_turn_index,
+                # v2: run_turn_id is stable per user REQUEST (set by _cap_new_run_turn),
+                # stamped on EVERY turn so the consumer splits tasks exactly instead of
+                # inferring from finish_reason. run_turn_start flags the request's first
+                # turn (the one carrying the user_prompt segment). '' id only if a turn is
+                # ever captured before any run_turn opened (shouldn't happen via run_turn).
+                "run_turn_id": self._cap_run_turn_id or "",
+                "run_turn_start": pend is not None,
+                "ts_start": time.time(), "ts_end": None,
+                "leancoder_version": __version__,
+                "leancoder_sha": self._cap_head_sha(),
+                # The ACTIVE model, not the bare cfg.model (which is the top-level
+                # config default - usually the ollama one). A capture must name the
+                # model that actually produced the trajectory, or the training data
+                # is mislabelled the moment you switch provider/account.
+                "model": (self.cfg.active_model() if hasattr(self.cfg, "active_model")
+                          else getattr(self.cfg, "model", "")) or "",
+                "provider": getattr(self.cfg, "provider", "") or "",
+                "segments": segs,
+                "finish_reason": "tool_calls" if assistant.get("tool_calls") else "stop",
+                "tokens": {"in": getattr(self, "last_prompt_tokens", 0) or 0,
+                           "out": getattr(self.client, "last_out_tokens", 0) or 0},
+                "outcome_hints": {"any_tool_error": False, "reverted_later": None},
+            }
+        except Exception:
+            self._cap_turn = None
+
+    def _cap_add_result(self, name, call_id, result):
+        """Add a tool_result segment with the FULL ingested body. No-op when off."""
+        if self._cap_turn is None:
+            return
+        try:
+            if isinstance(result, dict) and "text" in result:
+                content = str(result.get("text", ""))
+            else:
+                content = result if isinstance(result, str) else str(result)
+            exit_code = result.get("exit_code") if isinstance(result, dict) else None
+            error = result.get("error") if isinstance(result, dict) else None
+            err = bool(error) or (isinstance(exit_code, int) and exit_code != 0) \
+                or content[:64].lower().startswith("error")
+            if err:
+                self._cap_turn["outcome_hints"]["any_tool_error"] = True
+            # per-EXCHANGE roll-up: OR-in any tool error across the whole run_turn, and
+            # track the LAST exit-code-bearing command's success (final_exit_ok). A result
+            # with no exit_code (pure read / non-command tool) doesn't move final_exit_ok.
+            if self._cap_exchange is not None:
+                if err:
+                    self._cap_exchange["had_error"] = True
+                if isinstance(exit_code, int):
+                    self._cap_exchange["final_exit_ok"] = (exit_code == 0)
+            self._cap_turn["segments"].append({
+                "role": "tool", "kind": "tool_result", "tool": name,
+                "call_id": call_id or "", "content": content,
+                "exit_code": exit_code, "error": error,
+                "is_model_generated": False, "captured_at": "ingestion"})
+        except Exception:
+            _dbg_swallow()
+
+    def _cap_end_turn(self):
+        """Stamp ts_end and append the record as one JSONL line. No-op when off."""
+        if self._cap_turn is None:
+            return
+        rec = self._cap_turn
+        self._cap_turn = None
+        try:
+            rec["ts_end"] = time.time()
+            p = self._cap_path()
+            p.parent.mkdir(parents=True, exist_ok=True)
+            with p.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            self._cap_turn_index += 1
+        except Exception:
+            _dbg_swallow()
+
+    # --- per-exchange OUTCOME signal (STaR accept/reject; see docs CORE_OUTCOME_SIGNAL) ---
+    # Coarse + grounded ONLY: exit-code roll-ups + a cheap next-turn keyword heuristic. No
+    # LLM judge here - the leangym loop owns any smarter scoring on top of these primitives.
+    _CAP_CORRECTION_RE = re.compile(
+        r"\b(no+|nope|wrong|incorrect|that'?s not|not what|didn'?t work|doesn'?t work|"
+        r"broke|broken|still (?:fail|error|broken)|revert|undo|redo|fix (?:it|that|this)|"
+        r"that'?s wrong|you (?:missed|broke|forgot)|actually,? no|not right|mistake)\b",
+        re.IGNORECASE)
+    _CAP_SATISFIED_RE = re.compile(
+        r"\b(thanks?|thank you|nice|perfect|great|awesome|lgtm|ship it|looks good|"
+        r"works?|working|cool|excellent|beautiful|love it|good job|well done)\b",
+        re.IGNORECASE)
+
+    def _cap_classify_followup(self, next_user_text: str) -> str:
+        """Classify the NEXT operator turn as the prior exchange's outcome signal:
+        correction | satisfied | continuation. Correction wins over satisfied (a mixed
+        'thanks but this is wrong' is a correction). Pure heuristic; leangym can refine."""
+        t = (next_user_text or "").strip()
+        if not t:
+            return "continuation"
+        if self._CAP_CORRECTION_RE.search(t):
+            return "correction"
+        if self._CAP_SATISFIED_RE.search(t) and len(t) < 80:
+            return "satisfied"
+        return "continuation"
+
+    def _cap_flush_exchange(self, user_followup: str):
+        """Emit the accumulated per-exchange outcome as a 'exchange_outcome' sidecar record
+        (keyed by run_turn_id) into the SAME JSONL. Called when the next run_turn opens
+        (followup known) or at session exit (followup='none'). No-op when off / nothing
+        accumulated. Separate record kind so the append-only turn stream is untouched."""
+        ex = self._cap_exchange
+        self._cap_exchange = None
+        if not self._cap_on() or ex is None:
+            return
+        try:
+            rec = {
+                "kind": "exchange_outcome",
+                "schema": "leancoder.training.outcome.v1",
+                "session_id": self.autosave_name,
+                "run_turn_id": ex.get("run_turn_id", ""),
+                "final_exit_ok": ex.get("final_exit_ok"),      # bool | null
+                "exchange_had_error": bool(ex.get("had_error")),
+                "user_followup": user_followup,                # correction|continuation|satisfied|none
+                "ts": time.time(),
+            }
+            p = self._cap_path()
+            p.parent.mkdir(parents=True, exist_ok=True)
+            with p.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        except Exception:
+            _dbg_swallow()
+
+
+class CompactionTail:
+    """Compaction's tail selection, split out of Agent: which recent turns survive a
+    compaction (by turn count, message count or token budget), and trimming one turn
+    to fit. Pure over the message list; reads only cfg / tool_defs / the system prompt
+    through the agent."""
+
+    def __init__(self, agent):
+        self.agent = agent
+
+    cfg = property(lambda s: s.agent.cfg)
+    tool_defs = property(lambda s: s.agent.tool_defs)
+    _compact_target = property(lambda s: getattr(s.agent, "_compact_target", None))
+
+    def _system(self):
+        return self.agent._system()
+
+    def _keep_tail_turns(self, msgs, keep_turns):
+        """Index into `msgs` where a tail of the last `keep_turns` TURNS begins (a turn
+        = a user message + the run answering it). Used by compaction to decide how much
+        recent verbatim thread to keep after the summary (per-mode keep_last, design
+        decision 4). Returns None when keep_turns<=0 (a clean [system, summary] cut) or
+        no user boundary is found. The tail always starts on a user message so a
+        tool_result is never orphaned from its tool_call."""
+        if keep_turns <= 0:
+            return None
+        head = 1 if (msgs and msgs[0].get("role") == "system") else 0
+        user_idx = [i for i, m in enumerate(msgs) if i >= head and m.get("role") == "user"]
+        if not user_idx:
+            return None
+        if len(user_idx) <= keep_turns:
+            return user_idx[0]
+        return user_idx[-keep_turns]
+
+    def _keep_tail_start(self, msgs, max_msgs):
+        """Index into `msgs` where the kept tail begins: the first user-message
+        boundary within the last `max_msgs` (so a tool_result is never orphaned from
+        its tool_call, and the kept slice starts a clean turn). None when no windowing
+        applies - disabled, history already within bound, or no clean boundary in
+        range. Shared by the send-window and by compaction (what to keep vs summarize)."""
+        if max_msgs <= 0 or len(msgs) <= max_msgs:
+            return None
+        head = 1 if (msgs and msgs[0].get("role") == "system") else 0
+        tail = msgs[head:][-max_msgs:]
+        base = len(msgs) - len(tail)          # index in msgs of tail[0]
+        for i, m in enumerate(tail):
+            if m.get("role") == "user":
+                return base + i
+        return None
+
+    def _split_into_turns(self, msgs):
+        """Partition `msgs` (excluding a leading system message) into TURNS - each a list
+        starting on a user message and running up to the next user message. Any orphan
+        prefix before the first user message (rare: a hand-edited/loaded history) folds
+        into the first turn so nothing is lost. Returns [] when there's no user message.
+        Pure -> tested. The unit for compaction keep: a whole turn is the smallest slice
+        that never orphans a tool_result from its tool_call."""
+        head = 1 if (msgs and msgs[0].get("role") == "system") else 0
+        body = msgs[head:]
+        starts = [i for i, m in enumerate(body) if m.get("role") == "user"]
+        if not starts:
+            return []
+        # Fold any pre-first-user orphan into the first turn (start the first slice at 0).
+        starts[0] = 0
+        turns = []
+        for j, s in enumerate(starts):
+            e = starts[j + 1] if j + 1 < len(starts) else len(body)
+            turns.append(body[s:e])
+        return turns
+
+    def _keep_budget(self, summary_text):
+        """Token budget for the verbatim tail kept after a compaction, computed against the
+        REAL post-summary headroom (no guessing - the summary already exists here). NO floor:
+        if the summary itself eats the window (small local models) headroom<=0 -> budget 0 ->
+        keep nothing but the summary. keep_budget = min(headroom * frac, keep_cap), with a
+        bigger fraction kept when there's little room and a hard absolute cap so a huge window
+        never hoards raw tail the summary already distilled. Pure-ish (reads cfg + meter)."""
+        window     = self.cfg.ctx_window() or 0
+        compact_at = self.cfg.compact_for().get("hard", self.cfg.compact_at)
+        # compact_at is the TRIGGER; here it only serves as the ceiling the kept tail must
+        # stay under (never refill to the line that fires the next compaction). A one-off
+        # `/compact <k>` puts k - the FINAL size wanted - in that slot and fills to it
+        # (no frac, no keep_cap: the operator chose the size). The trigger is untouched.
+        target = getattr(self, "_compact_target", None)
+        if target and window:
+            compact_at = target / window
+        fixed = messages_tokens(
+            [{"role": "system", "content": self._system()}], self.tool_defs)
+        summary_tok = messages_tokens(
+            [{"role": "user", "content": summary_text}], None)
+        headroom = int(window * compact_at) - fixed - summary_tok
+        if headroom <= 0:
+            return 0
+        if target:
+            return headroom                 # fill to the chosen size
+        frac = KEEP_FRAC_LO if headroom > KEEP_FRAC_THRESHOLD else KEEP_FRAC_HI
+        # keep_cap is the TOTAL post-compaction size (system + tools + summary + tail),
+        # so the tail gets what's left after the fixed parts; the frac share of the
+        # compact_at headroom still bounds it on small windows (never refill to the trigger).
+        total_room = int(getattr(self.cfg, "keep_cap", 25000)) - fixed - summary_tok
+        return max(0, min(int(headroom * frac), total_room))
+
+    def _keep_tail_by_budget(self, pre, summary_text):
+        """The verbatim tail kept after a compaction, filled RIGHT UP TO the token budget
+        (keep_cap - system - tools - summary; see _keep_budget). One adaptive pass:
+          1. every tool body is sized STUBBED; walk turns newest->oldest keeping each that
+             fits - no turn-count ceiling, so many small turns or a few big ones;
+          2. the first turn that won't fit whole is trimmed to the space left
+             (_trim_turn_to_budget) and the walk STOPS - no gaps in the kept thread;
+          3. the leftover goes to restoring full tool results, newest first, capped at
+             COMPACT_TOOL_FRAC of the budget - conversation carries most of the context,
+             so one giant dump can never eat the whole tail.
+        Returns the FINAL tail (already stubbed; _finish_compact leaves it as is)."""
+        budget = self._keep_budget(summary_text)
+        if budget <= 0:
+            return []
+        turns = self._split_into_turns(_stub_tool_msgs(pre, 0))
+        orig = self._split_into_turns(pre)
+        if not turns:
+            return []
+        kept, kept_orig = [], []
+        pairs = list(zip(reversed(turns), reversed(orig)))
+        pos = 0
+
+        def walk(room, trim):
+            # Keep whole (stubbed) turns newest->oldest while they fit; the first that
+            # won't is trimmed to the space left and the walk ends (no gaps). -> room left
+            nonlocal kept, kept_orig, pos
+            while pos < len(pairs):
+                turn, oturn = pairs[pos]
+                cost = messages_tokens(turn, None)
+                if cost <= room:
+                    kept, kept_orig = turn + kept, oturn + kept_orig
+                    room -= cost
+                    pos += 1
+                    continue
+                if not trim:
+                    return room                     # pass 1: stop, older turns come later
+                trimmed = self._trim_turn_to_budget(turn, room)
+                if trimmed:
+                    kept = trimmed + kept
+                    kept_orig = [None] * len(trimmed) + kept_orig   # trimmed: no restores
+                    room -= messages_tokens(trimmed, None)
+                pos = len(pairs)
+            return room
+
+        # 1. conversation first, with the tool share held back; 2. restore full tool
+        # bodies newest-first inside that share (+ any slack); 3. hand whatever the tool
+        # share didn't need back to older turns.
+        frac = min(1.0, max(0.0, float(getattr(self.cfg, "compact_tool_frac", COMPACT_TOOL_FRAC))))
+        reserve = int(budget * frac)
+        room = walk(budget - reserve, False) + reserve
+        allow = min(room, reserve)                  # tool bodies never exceed their share
+        for i in range(len(kept) - 1, -1, -1):
+            o = kept_orig[i]
+            if o is None or o.get("role") != "tool" or o is kept[i]:
+                continue
+            # Per-message delta by chars (NOT messages_tokens([x]): its cache is keyed on
+            # id(list), and throwaway 1-item lists reuse ids -> stale sizes).
+            extra = int(((len(str(o.get("content") or "")) + 3) // 4
+                         - (len(str(kept[i].get("content") or "")) + 3) // 4) * _TOK_FACTOR)
+            if 0 < extra <= allow:
+                kept[i] = o
+                allow -= extra
+        # Restored bodies shift nothing positionally; older turns prepend safely.
+        walk(room - (min(room, reserve) - allow), True)
+        return kept
+
+    def _trim_turn_to_budget(self, turn, budget):
+        """Shrink a single over-budget TURN to fit `budget` tokens while staying coherent:
+        keep the first message (the user ask) + the last assistant message (latest state)
+        as non-negotiable anchors, then drop the OLDEST tool_call/tool_result pairs from the
+        middle until it fits, replacing the dropped span with one tiny marker so the model
+        isn't confused by the jump. If dropping the whole droppable middle still overflows
+        (giant final tool result), stub the remaining tool bodies (_trim_tool_indices-style).
+        Returns the trimmed message list, or None if even the anchors can't fit `budget`
+        (caller drops the whole turn). Never orphans a tool_result from its tool_call."""
+        if not turn:
+            return None
+        if messages_tokens(turn, None) <= budget:
+            return list(turn)
+        # Anchor indices: the user ask (0) + the latest assistant message. These are kept
+        # verbatim; everything between them is the droppable middle.
+        last_assist = next((i for i in range(len(turn) - 1, -1, -1)
+                            if turn[i].get("role") == "assistant"), None)
+        anchors = {0}
+        if last_assist is not None:
+            anchors.add(last_assist)
+        # Middle in chronological order; drop it oldest-first, whole messages at a time.
+        # A cut must NOT split a tool_call from its tool_result: dropping an assistant
+        # tool_call while keeping its tool answer leaves an orphan tool_result at the head
+        # of the kept tail, which the API rejects (messages.N: unexpected tool_use_id in
+        # tool_result). So skip any cut whose first KEPT middle message is a tool result -
+        # advance the cut until the boundary lands on a non-tool message (or the middle is
+        # fully dropped). (Historically this was assumed impossible; it wedged a session.)
+        middle = [i for i in range(len(turn)) if i not in anchors]
+        for cut in range(len(middle) + 1):
+            # A boundary that keeps a tool_result whose tool_call was just dropped orphans
+            # it - not a coherent candidate. Skip (a larger cut will drop it too).
+            if cut < len(middle) and turn[middle[cut]].get("role") == "tool":
+                continue
+            # Drop the oldest `cut` middle messages; keep anchors + the rest of the middle.
+            dropped_set = set(middle[:cut])
+            kept_idx = [i for i in range(len(turn)) if i not in dropped_set]
+            marker = ([{"role": "user", "content": f"[{cut} intermediate step(s) omitted]"}]
+                      if cut else [])
+            cand = ([turn[kept_idx[0]]] + marker + [turn[i] for i in kept_idx[1:]])
+            if messages_tokens(cand, None) <= budget:
+                return cand
+        # Whole middle dropped and still over budget -> only anchors left, too big
+        # (a giant final tool/assistant message). Stub any tool bodies among the anchors.
+        kept_idx = sorted(anchors)
+        marker = ([{"role": "user", "content": f"[{len(middle)} intermediate step(s) omitted]"}]
+                  if middle else [])
+        anchor_msgs = [dict(turn[i]) for i in kept_idx]      # copy: we may stub in place
+        for m in anchor_msgs:
+            if m.get("role") == "tool" and isinstance(m.get("content"), str) \
+                    and not m["content"].startswith("[trimmed"):
+                n = len(m["content"].splitlines())
+                m["content"] = f"[trimmed {m.get('tool_name', 'tool')} result - {n} lines]"
+                m.pop("image_path", None)
+        cand = [anchor_msgs[0]] + marker + anchor_msgs[1:]
+        if messages_tokens(cand, None) <= budget:
+            return cand
+        return None
 
 
 class Agent:
@@ -11949,22 +12534,7 @@ class Agent:
                                          # travels with /load and a pushed session - resume 1:1.
         self.pinned_plan = ""            # goal + TODO the model maintains; rides an uncached
         self.autosave_name = _new_autosave_name()   # rolling autosave target this launch
-        self._cap_turn = None            # training-capture: the in-progress turn record
-                                         # (None unless capture_training is on). See
-                                         # docs/design/training-capture.md.
-        self._cap_turn_index = 0         # monotonic captured-turn counter (session-scoped)
-        self._cap_sha = None             # cached best-effort git HEAD short sha
-        # v2 run-turn boundary state: a run_turn_id stable per user REQUEST (stamped on
-        # every captured turn), plus a one-shot pending opening-user-prompt segment that
-        # the next _cap_begin_turn folds into the first turn of the request. See run_turn.
-        self._cap_run_turn_seq = 0       # monotonic per-request counter (session-scoped)
-        self._cap_run_turn_id = None     # current request's run_turn_id ('' until first turn)
-        self._cap_pending_user = None    # {text, is_model_generated} to inject once, or None
-        # per-EXCHANGE outcome accumulator (STaR accept/reject signal). Rolls up the tool
-        # results of the current run_turn_id; emitted as a separate 'exchange_outcome'
-        # sidecar record when the NEXT run_turn opens (so user_followup can be classified
-        # from the next turn) or at session exit. {run_turn_id, had_error, final_exit_ok}.
-        self._cap_exchange = None
+        self.capture = TrainingCapture(self)   # training-capture state + writer (opt-in)
         self._tool_calls = []            # ring (cap 100) of {id,name,args} for /expand:
                                          # the full args of recent tool calls, so the
                                          # operator can view what was truncated on-screen
@@ -11974,7 +12544,6 @@ class Agent:
         self._bg_announced = set()       # (host,pid) of finished bg tasks already surfaced to the
                                          # model, so a completed long-run job is reported once
         self.dirty = False               # conversation changed since last save/load
-        self.autosave_name = _new_autosave_name()   # rolling autosave target this launch
 
     def use_client(self, client):
         """Swap the active model client and refresh num_ctx for it via the active
@@ -11991,7 +12560,7 @@ class Agent:
                 st = self.cfg.provider_settings.setdefault(self.cfg.provider, {})
                 st["num_ctx"] = int(spec["context_window"](self.cfg.active_model()))
             except Exception:
-                pass
+                _dbg_swallow()
 
     def active_provider(self):
         """The normalized spec of the live backend, or None only when NO provider is
@@ -12023,7 +12592,7 @@ class Agent:
         try:
             st["num_ctx"] = int(spec["context_window"](model))
         except Exception:
-            pass
+            _dbg_swallow()
         self.client = spec["make_client"](self.cfg)
         self.last_prompt_tokens = None
         spec["on_activate"](self, self.cfg)
@@ -12039,7 +12608,7 @@ class Agent:
         try:
             spec["on_deactivate"](self, self.cfg)
         except Exception:
-            pass
+            _dbg_swallow()
         self._last_provider = self.cfg.provider   # remember it for '/provider on'
         if get_provider("ollama"):
             self.activate_provider("ollama")
@@ -12068,7 +12637,7 @@ class Agent:
             try:
                 ws.close()
             except Exception:
-                pass
+                _dbg_swallow()
         if self.remote is not None and self.remote.host == host:
             self.set_remote(None)            # back to local (rebuilds surface + cwd)
 
@@ -12095,7 +12664,7 @@ class Agent:
             try:
                 ws.close()
             except Exception:
-                pass
+                _dbg_swallow()
         self.remotes.clear()
         self.remote = None
 
@@ -12346,7 +12915,7 @@ class Agent:
             signal.signal(signal.SIGINT, handler)
             installed = True
         except (ValueError, OSError):
-            pass  # non-main thread / unsupported - cooperative check still works
+            _dbg_swallow()  # non-main thread / unsupported - cooperative check still works
         try:
             yield
         except _TurnAbort:
@@ -12567,7 +13136,7 @@ class Agent:
                 if r.get("owner") == me and r.get("idle_timeout"):
                     _bg_bump_lease(r)
         except Exception:
-            pass
+            _dbg_swallow()
 
     def _bg_finished_note(self, only_notify=False) -> str:
         """A one-time notice for background tasks THIS session started that have
@@ -12632,7 +13201,7 @@ class Agent:
                         or r.get("max_runtime")):
                     return True
         except Exception:
-            pass
+            _dbg_swallow()
         # A session registered as a board PARTICIPANT can be pinged by a peer/driver into
         # its inbox; arm the idle wake so it picks that up (see bg_wake_turn's inbox drain).
         try:
@@ -12641,7 +13210,7 @@ class Agent:
                     and _is_board_participant(_sname):
                 return True
         except Exception:
-            pass
+            _dbg_swallow()
         return False
 
     def bg_wake_turn(self):
@@ -12712,6 +13281,7 @@ class Agent:
 
     def reset(self):
         self.messages = [{"role": "system", "content": self._system()}]
+        self.finish_reasons = []         # parallel to this session's assistant turns
         self.last_prompt_tokens = None
         self.session_in = self.session_out = 0
         self.session_eval_tokens = self.session_eval_ns = 0
@@ -12739,7 +13309,7 @@ class Agent:
         body = [m for m in messages
                 if isinstance(m, dict) and m.get("role") and m.get("role") != "system"]
         self.messages = [{"role": "system", "content": self._system()}] + body
-        self.last_prompt_tokens = None
+        self.finish_reasons = []         # per-turn stop reasons aren't saved in sessions
         self.last_prompt_tokens = None
         self.tools.changed_files.clear()
         self.dirty = False               # now showing a saved session, not unsaved work
@@ -12968,214 +13538,20 @@ class Agent:
         except Exception:
             return ""
 
-    def _keep_tail_turns(self, msgs, keep_turns):
-        """Index into `msgs` where a tail of the last `keep_turns` TURNS begins (a turn
-        = a user message + the run answering it). Used by compaction to decide how much
-        recent verbatim thread to keep after the summary (per-mode keep_last, design
-        decision 4). Returns None when keep_turns<=0 (a clean [system, summary] cut) or
-        no user boundary is found. The tail always starts on a user message so a
-        tool_result is never orphaned from its tool_call."""
-        if keep_turns <= 0:
-            return None
-        head = 1 if (msgs and msgs[0].get("role") == "system") else 0
-        user_idx = [i for i, m in enumerate(msgs) if i >= head and m.get("role") == "user"]
-        if not user_idx:
-            return None
-        if len(user_idx) <= keep_turns:
-            return user_idx[0]
-        return user_idx[-keep_turns]
+    # ---- Compaction tail selection: lives in CompactionTail (self.tail). ----
+    @property
+    def tail(self):
+        t = self.__dict__.get("_tail")
+        if t is None:
+            t = self.__dict__["_tail"] = CompactionTail(self)
+        return t
 
-    def _keep_tail_start(self, msgs, max_msgs):
-        """Index into `msgs` where the kept tail begins: the first user-message
-        boundary within the last `max_msgs` (so a tool_result is never orphaned from
-        its tool_call, and the kept slice starts a clean turn). None when no windowing
-        applies - disabled, history already within bound, or no clean boundary in
-        range. Shared by the send-window and by compaction (what to keep vs summarize)."""
-        if max_msgs <= 0 or len(msgs) <= max_msgs:
-            return None
-        head = 1 if (msgs and msgs[0].get("role") == "system") else 0
-        tail = msgs[head:][-max_msgs:]
-        base = len(msgs) - len(tail)          # index in msgs of tail[0]
-        for i, m in enumerate(tail):
-            if m.get("role") == "user":
-                return base + i
-        return None
-
-    def _split_into_turns(self, msgs):
-        """Partition `msgs` (excluding a leading system message) into TURNS - each a list
-        starting on a user message and running up to the next user message. Any orphan
-        prefix before the first user message (rare: a hand-edited/loaded history) folds
-        into the first turn so nothing is lost. Returns [] when there's no user message.
-        Pure -> tested. The unit for compaction keep: a whole turn is the smallest slice
-        that never orphans a tool_result from its tool_call."""
-        head = 1 if (msgs and msgs[0].get("role") == "system") else 0
-        body = msgs[head:]
-        starts = [i for i, m in enumerate(body) if m.get("role") == "user"]
-        if not starts:
-            return []
-        # Fold any pre-first-user orphan into the first turn (start the first slice at 0).
-        starts[0] = 0
-        turns = []
-        for j, s in enumerate(starts):
-            e = starts[j + 1] if j + 1 < len(starts) else len(body)
-            turns.append(body[s:e])
-        return turns
-
-    def _keep_budget(self, summary_text):
-        """Token budget for the verbatim tail kept after a compaction, computed against the
-        REAL post-summary headroom (no guessing - the summary already exists here). NO floor:
-        if the summary itself eats the window (small local models) headroom<=0 -> budget 0 ->
-        keep nothing but the summary. keep_budget = min(headroom * frac, keep_cap), with a
-        bigger fraction kept when there's little room and a hard absolute cap so a huge window
-        never hoards raw tail the summary already distilled. Pure-ish (reads cfg + meter)."""
-        window     = self.cfg.ctx_window() or 0
-        compact_at = self.cfg.compact_for().get("hard", self.cfg.compact_at)
-        # compact_at is the TRIGGER; here it only serves as the ceiling the kept tail must
-        # stay under (never refill to the line that fires the next compaction). A one-off
-        # `/compact <k>` puts k - the FINAL size wanted - in that slot and fills to it
-        # (no frac, no keep_cap: the operator chose the size). The trigger is untouched.
-        target = getattr(self, "_compact_target", None)
-        if target and window:
-            compact_at = target / window
-        fixed = messages_tokens(
-            [{"role": "system", "content": self._system()}], self.tool_defs)
-        summary_tok = messages_tokens(
-            [{"role": "user", "content": summary_text}], None)
-        headroom = int(window * compact_at) - fixed - summary_tok
-        if headroom <= 0:
-            return 0
-        if target:
-            return headroom                 # fill to the chosen size
-        frac = KEEP_FRAC_LO if headroom > KEEP_FRAC_THRESHOLD else KEEP_FRAC_HI
-        # keep_cap is the TOTAL post-compaction size (system + tools + summary + tail),
-        # so the tail gets what's left after the fixed parts; the frac share of the
-        # compact_at headroom still bounds it on small windows (never refill to the trigger).
-        total_room = int(getattr(self.cfg, "keep_cap", 25000)) - fixed - summary_tok
-        return max(0, min(int(headroom * frac), total_room))
-
-    def _keep_tail_by_budget(self, pre, summary_text):
-        """The verbatim tail kept after a compaction, filled RIGHT UP TO the token budget
-        (keep_cap - system - tools - summary; see _keep_budget). One adaptive pass:
-          1. every tool body is sized STUBBED; walk turns newest->oldest keeping each that
-             fits - no turn-count ceiling, so many small turns or a few big ones;
-          2. the first turn that won't fit whole is trimmed to the space left
-             (_trim_turn_to_budget) and the walk STOPS - no gaps in the kept thread;
-          3. the leftover goes to restoring full tool results, newest first, capped at
-             COMPACT_TOOL_FRAC of the budget - conversation carries most of the context,
-             so one giant dump can never eat the whole tail.
-        Returns the FINAL tail (already stubbed; _finish_compact leaves it as is)."""
-        budget = self._keep_budget(summary_text)
-        if budget <= 0:
-            return []
-        turns = self._split_into_turns(_stub_tool_msgs(pre, 0))
-        orig = self._split_into_turns(pre)
-        if not turns:
-            return []
-        kept, kept_orig = [], []
-        pairs = list(zip(reversed(turns), reversed(orig)))
-        pos = 0
-
-        def walk(room, trim):
-            # Keep whole (stubbed) turns newest->oldest while they fit; the first that
-            # won't is trimmed to the space left and the walk ends (no gaps). -> room left
-            nonlocal kept, kept_orig, pos
-            while pos < len(pairs):
-                turn, oturn = pairs[pos]
-                cost = messages_tokens(turn, None)
-                if cost <= room:
-                    kept, kept_orig = turn + kept, oturn + kept_orig
-                    room -= cost
-                    pos += 1
-                    continue
-                if not trim:
-                    return room                     # pass 1: stop, older turns come later
-                trimmed = self._trim_turn_to_budget(turn, room)
-                if trimmed:
-                    kept = trimmed + kept
-                    kept_orig = [None] * len(trimmed) + kept_orig   # trimmed: no restores
-                    room -= messages_tokens(trimmed, None)
-                pos = len(pairs)
-            return room
-
-        # 1. conversation first, with the tool share held back; 2. restore full tool
-        # bodies newest-first inside that share (+ any slack); 3. hand whatever the tool
-        # share didn't need back to older turns.
-        frac = min(1.0, max(0.0, float(getattr(self.cfg, "compact_tool_frac", COMPACT_TOOL_FRAC))))
-        reserve = int(budget * frac)
-        room = walk(budget - reserve, False) + reserve
-        allow = min(room, reserve)                  # tool bodies never exceed their share
-        for i in range(len(kept) - 1, -1, -1):
-            o = kept_orig[i]
-            if o is None or o.get("role") != "tool" or o is kept[i]:
-                continue
-            # Per-message delta by chars (NOT messages_tokens([x]): its cache is keyed on
-            # id(list), and throwaway 1-item lists reuse ids -> stale sizes).
-            extra = int(((len(str(o.get("content") or "")) + 3) // 4
-                         - (len(str(kept[i].get("content") or "")) + 3) // 4) * _TOK_FACTOR)
-            if 0 < extra <= allow:
-                kept[i] = o
-                allow -= extra
-        # Restored bodies shift nothing positionally; older turns prepend safely.
-        walk(room - (min(room, reserve) - allow), True)
-        return kept
-
-    def _trim_turn_to_budget(self, turn, budget):
-        """Shrink a single over-budget TURN to fit `budget` tokens while staying coherent:
-        keep the first message (the user ask) + the last assistant message (latest state)
-        as non-negotiable anchors, then drop the OLDEST tool_call/tool_result pairs from the
-        middle until it fits, replacing the dropped span with one tiny marker so the model
-        isn't confused by the jump. If dropping the whole droppable middle still overflows
-        (giant final tool result), stub the remaining tool bodies (_trim_tool_indices-style).
-        Returns the trimmed message list, or None if even the anchors can't fit `budget`
-        (caller drops the whole turn). Never orphans a tool_result from its tool_call."""
-        if not turn:
-            return None
-        if messages_tokens(turn, None) <= budget:
-            return list(turn)
-        # Anchor indices: the user ask (0) + the latest assistant message. These are kept
-        # verbatim; everything between them is the droppable middle.
-        last_assist = next((i for i in range(len(turn) - 1, -1, -1)
-                            if turn[i].get("role") == "assistant"), None)
-        anchors = {0}
-        if last_assist is not None:
-            anchors.add(last_assist)
-        # Middle in chronological order; drop it oldest-first, whole messages at a time.
-        # A cut must NOT split a tool_call from its tool_result: dropping an assistant
-        # tool_call while keeping its tool answer leaves an orphan tool_result at the head
-        # of the kept tail, which the API rejects (messages.N: unexpected tool_use_id in
-        # tool_result). So skip any cut whose first KEPT middle message is a tool result -
-        # advance the cut until the boundary lands on a non-tool message (or the middle is
-        # fully dropped). (Historically this was assumed impossible; it wedged a session.)
-        middle = [i for i in range(len(turn)) if i not in anchors]
-        for cut in range(len(middle) + 1):
-            # A boundary that keeps a tool_result whose tool_call was just dropped orphans
-            # it - not a coherent candidate. Skip (a larger cut will drop it too).
-            if cut < len(middle) and turn[middle[cut]].get("role") == "tool":
-                continue
-            # Drop the oldest `cut` middle messages; keep anchors + the rest of the middle.
-            dropped_set = set(middle[:cut])
-            kept_idx = [i for i in range(len(turn)) if i not in dropped_set]
-            marker = ([{"role": "user", "content": f"[{cut} intermediate step(s) omitted]"}]
-                      if cut else [])
-            cand = ([turn[kept_idx[0]]] + marker + [turn[i] for i in kept_idx[1:]])
-            if messages_tokens(cand, None) <= budget:
-                return cand
-        # Whole middle dropped and still over budget -> only anchors left, too big
-        # (a giant final tool/assistant message). Stub any tool bodies among the anchors.
-        kept_idx = sorted(anchors)
-        marker = ([{"role": "user", "content": f"[{len(middle)} intermediate step(s) omitted]"}]
-                  if middle else [])
-        anchor_msgs = [dict(turn[i]) for i in kept_idx]      # copy: we may stub in place
-        for m in anchor_msgs:
-            if m.get("role") == "tool" and isinstance(m.get("content"), str) \
-                    and not m["content"].startswith("[trimmed"):
-                n = len(m["content"].splitlines())
-                m["content"] = f"[trimmed {m.get('tool_name', 'tool')} result - {n} lines]"
-                m.pop("image_path", None)
-        cand = [anchor_msgs[0]] + marker + anchor_msgs[1:]
-        if messages_tokens(cand, None) <= budget:
-            return cand
-        return None
+    _keep_tail_turns = property(lambda s: s.tail._keep_tail_turns)
+    _keep_tail_start = property(lambda s: s.tail._keep_tail_start)
+    _split_into_turns = property(lambda s: s.tail._split_into_turns)
+    _keep_budget = property(lambda s: s.tail._keep_budget)
+    _keep_tail_by_budget = property(lambda s: s.tail._keep_tail_by_budget)
+    _trim_turn_to_budget = property(lambda s: s.tail._trim_turn_to_budget)
 
     # (_auto_evict removed - design decision 8. The universal ingestion cap
     # (_ingest_cap) supersedes continuous eviction; _trim_tool_indices still backs
@@ -13245,7 +13621,7 @@ class Agent:
             cid = self.record_tool_call("compaction", {})
             self.record_tool_result(cid, full)
         except Exception:
-            pass
+            _dbg_swallow()
         width = max(20, _term_cols() - 1)
         if len(line) > width and cid:
             more = f"… /expand {cid}"
@@ -13386,7 +13762,7 @@ class Agent:
             save_session(pre, self.cfg, _precompact_name(origin, existing),
                          remote=rhost, pinned_plan=pre_plan, notes=getattr(self, "notes", None))
         except Exception:
-            pass
+            _dbg_swallow()
         # Now that the summary exists we know its exact token cost, so budget the verbatim
         # keep against the REAL post-summary headroom (soft/hard/manual; emergency already
         # set a fixed minimal tail above). No summary-size guess, no floor.
@@ -13553,7 +13929,7 @@ class Agent:
                 if f.get("name") == name:
                     return list((f.get("parameters") or {}).get("properties", {}))
         except Exception:
-            pass
+            _dbg_swallow()
         return []
 
     def _ingest_cap(self, text: str, label: str):
@@ -13803,235 +14179,37 @@ class Agent:
         for e in reversed(self._tool_calls):
             if e["id"] == call_id:
                 e["result"] = text
-                e["result"] = text
                 return
 
-    # ---- Training-data capture (opt-in; see docs/design/training-capture.md) ----
-    # RAW per-turn trajectory capture at the INGESTION seam (pre-stub/pre-compact).
-    # Every method is best-effort and MUST NOT raise into the turn loop.
+    # ---- Training-data capture: lives in TrainingCapture (self.capture). These thin
+    # delegators keep the call sites + tests on the old _cap_* names. ----
+    @property
+    def capture(self):
+        c = self.__dict__.get("_capture")
+        if c is None:                    # created lazily: also covers objects built
+            c = self.__dict__["_capture"] = TrainingCapture(self)   # without __init__
+        return c
 
-    def _cap_on(self) -> bool:
-        """True iff training capture is active for THIS agent right now. Off by
-        default; suppressed for incognito and for workers (never a real session)."""
-        return bool(getattr(self.cfg, "capture_training", False)
-                    and not getattr(self.cfg, "incognito", False)
-                    and not getattr(self.cfg, "worker_depth", 0))
+    @capture.setter
+    def capture(self, v):
+        self.__dict__["_capture"] = v
 
-    def _cap_path(self):
-        """Sidecar path <dir>/<session_id>.jsonl (dir override or CONFIG_DIR/training/)."""
-        d = getattr(self.cfg, "capture_training_dir", "") or ""
-        base = Path(d).expanduser() if d else (CONFIG_DIR / "training")
-        return base / f"{self.autosave_name}.jsonl"
-
-    def _cap_head_sha(self) -> str:
-        """Best-effort short git sha of the running tree (cached; '' if unknown)."""
-        if self._cap_sha is not None:
-            return self._cap_sha
-        sha = ""
-        try:
-            out = subprocess.run(["git", "-C", str(Path(__file__).resolve().parent),
-                                  "rev-parse", "--short", "HEAD"],
-                                 capture_output=True, text=True, timeout=5)
-            if out.returncode == 0:
-                sha = out.stdout.strip()
-        except Exception:
-            sha = ""
-        self._cap_sha = sha
-        return sha
-
-    def _cap_new_run_turn(self, user_text, is_model_generated: bool):
-        """v2: mark the start of a NEW user REQUEST. Allocates a fresh run_turn_id and
-        queues the opening user-prompt segment so the next _cap_begin_turn folds it into
-        the first turn of the request. Best-effort; no-op when capture is off. Called from
-        run_turn (real user turns + autostart self-prompts). `is_model_generated` is True
-        for synthetic self-prompts (autostart/===NEXT===), False for genuine user input."""
-        if not self._cap_on():
-            self._cap_pending_user = None
-            return
-        try:
-            text = user_text if isinstance(user_text, str) else str(user_text or "")
-            # close the PREVIOUS exchange first: this incoming user turn IS its followup,
-            # so classify + flush it now (unless the incoming turn is itself a synthetic
-            # self-prompt - an autostart/===NEXT=== is not operator feedback, treat as
-            # 'continuation' so it neither accepts nor rejects on false signal).
-            fu = "continuation" if is_model_generated else self._cap_classify_followup(text)
-            self._cap_flush_exchange(fu)
-            self._cap_run_turn_seq += 1
-            self._cap_run_turn_id = f"{self.autosave_name}:{self._cap_run_turn_seq}"
-            self._cap_pending_user = {"text": text,
-                                      "is_model_generated": bool(is_model_generated)}
-            # open a fresh outcome accumulator for the exchange we're beginning
-            self._cap_exchange = {"run_turn_id": self._cap_run_turn_id,
-                                  "had_error": False, "final_exit_ok": None}
-        except Exception:
-            self._cap_pending_user = None
-            self._cap_exchange = None
-
-    def _cap_begin_turn(self, assistant: dict):
-        """Open a per-turn capture record from the just-appended assistant message
-        (its reasoning + tool_calls). No-op when capture is off."""
-        if not self._cap_on():
-            self._cap_turn = None
-            return
-        try:
-            segs = []
-            # v2: fold the opening user-prompt of a NEW request into its first turn.
-            # _cap_new_run_turn (called from run_turn) queues this; consumed once here so
-            # subsequent turns of the same request don't repeat it. Text is captured RAW,
-            # exactly like reasoning/tool_result below (core does no redaction on write -
-            # personal-machine capture; the leangym consumer re-redacts on ingest).
-            pend = self._cap_pending_user
-            if pend is not None:
-                self._cap_pending_user = None
-                segs.append({"role": "user", "kind": "user_prompt",
-                             "text": pend.get("text", ""),
-                             "is_model_generated": bool(pend.get("is_model_generated")),
-                             "captured_at": "ingestion"})
-            text = assistant.get("content")
-            if isinstance(text, str) and text.strip():
-                segs.append({"role": "assistant", "kind": "reasoning", "text": text,
-                             "is_model_generated": True, "captured_at": "ingestion"})
-            for c in (assistant.get("tool_calls") or []):
-                fn = c.get("function", {}) or {}
-                args = fn.get("arguments", {})
-                if isinstance(args, str):
-                    try:
-                        args = json.loads(args)
-                    except json.JSONDecodeError:
-                        pass
-                segs.append({"role": "assistant", "kind": "tool_call",
-                             "tool": fn.get("name", ""), "args": args,
-                             "call_id": c.get("id", ""),
-                             "is_model_generated": True, "captured_at": "ingestion"})
-            self._cap_turn = {
-                "schema": "leancoder.training.v2",
-                "session_id": self.autosave_name,
-                "turn_index": self._cap_turn_index,
-                # v2: run_turn_id is stable per user REQUEST (set by _cap_new_run_turn),
-                # stamped on EVERY turn so the consumer splits tasks exactly instead of
-                # inferring from finish_reason. run_turn_start flags the request's first
-                # turn (the one carrying the user_prompt segment). '' id only if a turn is
-                # ever captured before any run_turn opened (shouldn't happen via run_turn).
-                "run_turn_id": self._cap_run_turn_id or "",
-                "run_turn_start": pend is not None,
-                "ts_start": time.time(), "ts_end": None,
-                "leancoder_version": __version__,
-                "leancoder_sha": self._cap_head_sha(),
-                # The ACTIVE model, not the bare cfg.model (which is the top-level
-                # config default - usually the ollama one). A capture must name the
-                # model that actually produced the trajectory, or the training data
-                # is mislabelled the moment you switch provider/account.
-                "model": (self.cfg.active_model() if hasattr(self.cfg, "active_model")
-                          else getattr(self.cfg, "model", "")) or "",
-                "provider": getattr(self.cfg, "provider", "") or "",
-                "segments": segs,
-                "finish_reason": "tool_calls" if assistant.get("tool_calls") else "stop",
-                "tokens": {"in": getattr(self, "last_prompt_tokens", 0) or 0,
-                           "out": getattr(self.client, "last_out_tokens", 0) or 0},
-                "outcome_hints": {"any_tool_error": False, "reverted_later": None},
-            }
-        except Exception:
-            self._cap_turn = None
-
-    def _cap_add_result(self, name, call_id, result):
-        """Add a tool_result segment with the FULL ingested body. No-op when off."""
-        if self._cap_turn is None:
-            return
-        try:
-            if isinstance(result, dict) and "text" in result:
-                content = str(result.get("text", ""))
-            else:
-                content = result if isinstance(result, str) else str(result)
-            exit_code = result.get("exit_code") if isinstance(result, dict) else None
-            error = result.get("error") if isinstance(result, dict) else None
-            err = bool(error) or (isinstance(exit_code, int) and exit_code != 0) \
-                or content[:64].lower().startswith("error")
-            if err:
-                self._cap_turn["outcome_hints"]["any_tool_error"] = True
-            # per-EXCHANGE roll-up: OR-in any tool error across the whole run_turn, and
-            # track the LAST exit-code-bearing command's success (final_exit_ok). A result
-            # with no exit_code (pure read / non-command tool) doesn't move final_exit_ok.
-            if self._cap_exchange is not None:
-                if err:
-                    self._cap_exchange["had_error"] = True
-                if isinstance(exit_code, int):
-                    self._cap_exchange["final_exit_ok"] = (exit_code == 0)
-            self._cap_turn["segments"].append({
-                "role": "tool", "kind": "tool_result", "tool": name,
-                "call_id": call_id or "", "content": content,
-                "exit_code": exit_code, "error": error,
-                "is_model_generated": False, "captured_at": "ingestion"})
-        except Exception:
-            pass
-
-    def _cap_end_turn(self):
-        """Stamp ts_end and append the record as one JSONL line. No-op when off."""
-        if self._cap_turn is None:
-            return
-        rec = self._cap_turn
-        self._cap_turn = None
-        try:
-            rec["ts_end"] = time.time()
-            p = self._cap_path()
-            p.parent.mkdir(parents=True, exist_ok=True)
-            with p.open("a", encoding="utf-8") as f:
-                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-            self._cap_turn_index += 1
-        except Exception:
-            pass
-
-    # --- per-exchange OUTCOME signal (STaR accept/reject; see docs CORE_OUTCOME_SIGNAL) ---
-    # Coarse + grounded ONLY: exit-code roll-ups + a cheap next-turn keyword heuristic. No
-    # LLM judge here - the leangym loop owns any smarter scoring on top of these primitives.
-    _CAP_CORRECTION_RE = re.compile(
-        r"\b(no+|nope|wrong|incorrect|that'?s not|not what|didn'?t work|doesn'?t work|"
-        r"broke|broken|still (?:fail|error|broken)|revert|undo|redo|fix (?:it|that|this)|"
-        r"that'?s wrong|you (?:missed|broke|forgot)|actually,? no|not right|mistake)\b",
-        re.IGNORECASE)
-    _CAP_SATISFIED_RE = re.compile(
-        r"\b(thanks?|thank you|nice|perfect|great|awesome|lgtm|ship it|looks good|"
-        r"works?|working|cool|excellent|beautiful|love it|good job|well done)\b",
-        re.IGNORECASE)
-
-    def _cap_classify_followup(self, next_user_text: str) -> str:
-        """Classify the NEXT operator turn as the prior exchange's outcome signal:
-        correction | satisfied | continuation. Correction wins over satisfied (a mixed
-        'thanks but this is wrong' is a correction). Pure heuristic; leangym can refine."""
-        t = (next_user_text or "").strip()
-        if not t:
-            return "continuation"
-        if self._CAP_CORRECTION_RE.search(t):
-            return "correction"
-        if self._CAP_SATISFIED_RE.search(t) and len(t) < 80:
-            return "satisfied"
-        return "continuation"
-
-    def _cap_flush_exchange(self, user_followup: str):
-        """Emit the accumulated per-exchange outcome as a 'exchange_outcome' sidecar record
-        (keyed by run_turn_id) into the SAME JSONL. Called when the next run_turn opens
-        (followup known) or at session exit (followup='none'). No-op when off / nothing
-        accumulated. Separate record kind so the append-only turn stream is untouched."""
-        ex = self._cap_exchange
-        self._cap_exchange = None
-        if not self._cap_on() or ex is None:
-            return
-        try:
-            rec = {
-                "kind": "exchange_outcome",
-                "schema": "leancoder.training.outcome.v1",
-                "session_id": self.autosave_name,
-                "run_turn_id": ex.get("run_turn_id", ""),
-                "final_exit_ok": ex.get("final_exit_ok"),      # bool | null
-                "exchange_had_error": bool(ex.get("had_error")),
-                "user_followup": user_followup,                # correction|continuation|satisfied|none
-                "ts": time.time(),
-            }
-            p = self._cap_path()
-            p.parent.mkdir(parents=True, exist_ok=True)
-            with p.open("a", encoding="utf-8") as f:
-                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-        except Exception:
-            pass
+    _cap_add_result = property(lambda s: s.capture._cap_add_result)
+    _cap_begin_turn = property(lambda s: s.capture._cap_begin_turn)
+    _cap_classify_followup = property(lambda s: s.capture._cap_classify_followup)
+    _cap_end_turn = property(lambda s: s.capture._cap_end_turn)
+    _cap_flush_exchange = property(lambda s: s.capture._cap_flush_exchange)
+    _cap_head_sha = property(lambda s: s.capture._cap_head_sha)
+    _cap_new_run_turn = property(lambda s: s.capture._cap_new_run_turn)
+    _cap_on = property(lambda s: s.capture._cap_on)
+    _cap_path = property(lambda s: s.capture._cap_path)
+    _cap_exchange = property(lambda s: getattr(s.capture, "_cap_exchange"), lambda s, v: setattr(s.capture, "_cap_exchange", v))
+    _cap_pending_user = property(lambda s: getattr(s.capture, "_cap_pending_user"), lambda s, v: setattr(s.capture, "_cap_pending_user", v))
+    _cap_run_turn_id = property(lambda s: getattr(s.capture, "_cap_run_turn_id"), lambda s, v: setattr(s.capture, "_cap_run_turn_id", v))
+    _cap_run_turn_seq = property(lambda s: getattr(s.capture, "_cap_run_turn_seq"), lambda s, v: setattr(s.capture, "_cap_run_turn_seq", v))
+    _cap_sha = property(lambda s: getattr(s.capture, "_cap_sha"), lambda s, v: setattr(s.capture, "_cap_sha", v))
+    _cap_turn = property(lambda s: getattr(s.capture, "_cap_turn"), lambda s, v: setattr(s.capture, "_cap_turn", v))
+    _cap_turn_index = property(lambda s: getattr(s.capture, "_cap_turn_index"), lambda s, v: setattr(s.capture, "_cap_turn_index", v))
 
     def _maybe_auto_expand(self, name, call_id):
         """Auto-print the full args right after the call line when `name` is in the
@@ -14266,7 +14444,7 @@ class Agent:
             try:
                 self.cfg.set_setting("num_ctx", int(spec["context_window"](name)))
             except Exception:
-                pass
+                _dbg_swallow()
         # The new model may differ in tool-support (a chat-only model exposes NO tools
         # regardless of leash; a tool-capable one restores them). Rebuild the surface so
         # a same-provider /model switch - or a 404 fallback - doesn't leave it stale
@@ -14295,7 +14473,7 @@ class Agent:
                 acct = (self.cfg.setting("account") or "").strip()
                 who += f" (account {acct})" if acct else ""
             except Exception:
-                pass
+                _dbg_swallow()
             print(yellow(f"\n{GLYPH['warn']} {who}: {m.group(1) if m else 'permission denied'} - "
                          f"a new login won't fix this; check the account/org, or switch "
                          f"account/backend (/provider)"))
@@ -14344,7 +14522,7 @@ class Agent:
                 if recover(self, self.cfg, err):
                     return True
             except Exception:
-                pass
+                _dbg_swallow()
         return self._offer_login_on_auth_error(err)
 
     def _loop(self):
@@ -14366,7 +14544,7 @@ class Agent:
                 try:
                     _hook()
                 except Exception:
-                    pass
+                    _dbg_swallow()
             # Periodic in-turn status: a constantly-iterating model can run many
             # loops without ever returning to the prompt (where the status block
             # normally prints), so ctx/quota/perms go stale on screen. When
@@ -14413,6 +14591,15 @@ class Agent:
             if _ev_tok and _ev_ns:
                 self.session_eval_tokens += _ev_tok
                 self.session_eval_ns += _ev_ns
+            # Per-turn stop reason (read-only; for harnesses/scoring - a deliberate stop or
+            # refusal vs a dropped stream). Kept on the Agent, NOT on the message: several
+            # providers forward message dicts raw and strict APIs 400 on unknown keys.
+            # finish_reasons: this session's per-turn stop reasons, oldest first (kept
+            # across compaction; reset by /clear and on load).
+            self.last_finish_reason = _finish_reason(self.client)
+            if not hasattr(self, "finish_reasons"):
+                self.finish_reasons = []
+            self.finish_reasons.append(self.last_finish_reason)
             # Reply cut off at the provider's output limit: a tool call still streaming
             # arrives with half its JSON. Drop those (never run a partial edit/write) and
             # tell the model, instead of silently running it with {} args or ending.
@@ -14743,7 +14930,7 @@ class RateLedger:
             self.events  = d.get("events", [])
             self.learned = d.get("learned", {})
         except Exception:
-            pass
+            _dbg_swallow()
 
     def _save(self):
         try:
@@ -14752,7 +14939,7 @@ class RateLedger:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             self.path.write_text(json.dumps({"events": self.events, "learned": self.learned}))
         except Exception:
-            pass
+            _dbg_swallow()
 
     # -- recording --
     def record(self, model, in_tok=0, out_tok=0, status=200):
@@ -14834,7 +15021,7 @@ class RateLedger:
                     if v not in (None, ""):
                         out[k] = int(v)
                 except Exception:
-                    pass
+                    _dbg_swallow()
         return out
 
     def _applies_star(self, model):
@@ -15475,7 +15662,7 @@ def _provider_label(cfg) -> str:
             if lbl:
                 return lbl
         except Exception:
-            pass
+            _dbg_swallow()
     return cfg.provider or "no provider"
 
 
@@ -15529,15 +15716,15 @@ HELP_COMMANDS = [
     ("/new [name]", "start a separate session"),
     ("/rewind [N] [prompt]", "drop the last N user turns (refusal/derail escape); does NOT revert files"),
     ("/trim [keep]", "programmatic: stub old tool outputs, keep newest [keep] (no LLM)"),
-    ("/compact [k|to]", "agentic: summarize + commit docs, replace history (k = one-off target, e.g. 100 = ~100k)"),
-    ("/compact_at [frac]", "set THE auto-compaction lever (fill fraction; no arg shows zones)"),
+    ("/compact [k|to]", "model saves durable notes, writes a summary, replaces history (k = one-off target, e.g. 100 = ~100k)"),
+    ("/compact_at [frac]", "set the auto-compaction fill fraction (no arg shows zones)"),
     ("/save [name]", "name the current session"),
     ("/load [name]", "resume a session (no arg = picker)"),
     ("/session", "list | delete <name>"),
-    ("/prompt [name]", "fire a saved prompt as your next turn (no arg = picker; edit/reset to manage)"),
+    ("/prompt [name]", "send a saved prompt as your next turn (no arg = picker; new/edit/reset <name> to manage)"),
     ("/sh [cmd]", "run a command in a terminal (no arg: drop into your $SHELL)"),
     ("/connect [host]", "run tools on a remote over SSH"),
-    ("/machines", "manage saved remote hosts (list; remove <name>)"),
+    ("/machines", "list saved remote hosts; remove <name> (add via the config [machines] table)"),
     ("/local [host]", "detach the active remote"),
     ("/tools", "enable/disable lean-tools"),
     ("/push [file] [host]", "copy your providers/lean-tools/prompts/logins TO another box (menus)"),
@@ -16814,7 +17001,7 @@ def _setup_readline(agent, cfg):
     try:
         readline.parse_and_bind("set enable-bracketed-paste on")
     except Exception:
-        pass
+        _dbg_swallow()
 
 
 def handle_save_command(agent, cfg, arg):
@@ -17075,7 +17262,7 @@ def _restore_session_state(agent, cfg, meta):
         if spec and spec.get("restore_settings"):
             spec["restore_settings"](agent, cfg)
     except Exception:
-        pass
+        _dbg_swallow()
     # Un-stage account from cfg so it can't leak to the global config.toml default. The live
     # account now lives in the provider module (set by restore_settings); the session meta
     # keeps it via capture_settings on the next save. Restore cfg's prior account state
@@ -17416,7 +17603,7 @@ def _mark_connect_used(cfg, rhost):
         cfg.connect_used[rhost] = int(time.time())
         save_config(cfg)
     except Exception:
-        pass
+        _dbg_swallow()
 
 
 def _do_connect(agent, cfg, rhost, rpath=".", offer_save=False, ephemeral=False):
@@ -18495,7 +18682,7 @@ def _host_platform_kind():
             if any(x in os.uname().release.lower() for x in ("microsoft", "wsl")):
                 return "wsl"
         except Exception:
-            pass
+            _dbg_swallow()
         try:
             data = {}
             with open("/etc/os-release") as fh:
@@ -18513,7 +18700,7 @@ def _host_platform_kind():
             if "alpine" in ident:
                 return "alpine"
         except Exception:
-            pass
+            _dbg_swallow()
         return "linux"
     return "unknown"
 
@@ -19595,7 +19782,7 @@ def _show_release_notes(cfg: Config):
             cfg._defaults["last_seen_version"] = __version__
             save_config(cfg, quiet=True)
     except Exception:
-        pass
+        _dbg_swallow()
 
 
 # ==========================================================================
@@ -19656,7 +19843,7 @@ def repl(cfg: Config, resume=None):
         try:
             signal.signal(signal.SIGHUP, lambda *_: sys.exit(129))
         except (ValueError, OSError):
-            pass
+            _dbg_swallow()
 
     # The active backend is ALWAYS a provider now. Any pre-activation transport
     # setup (e.g. the ollama provider's tiered host failover + per-host default
@@ -19665,12 +19852,10 @@ def repl(cfg: Config, resume=None):
     prov = _maybe_autostart_provider(agent, cfg)
 
     if prov is None:
-        print(yellow("No model backend is active yet. To get started:"))
-        print(dim("  /provider            list backends and enable one (Anthropic, "
-                  "Gemini, Groq, OpenRouter, ...)"))
-        print(dim("  /provider login <name>   paste an API key for a hosted backend"))
-        print(dim("  or run a local model with Ollama (https://ollama.com), then relaunch"))
-        print(dim("  /model               pick a model once a backend is up   "
+        print(bold(green("Welcome to lean-coder.")) + " Pick a model backend to get started:")
+        print(dim("  /provider            choose a backend (a hosted one asks you to log in "
+                  "the first time you use it)"))
+        print(dim("  /model               then pick a model   "
                   f"{GLYPH['dot']}  /help  all commands"))
         ctx_note, capped_from = "-", None
     elif prov["name"] == "ollama":
@@ -19961,6 +20146,17 @@ def repl(cfg: Config, resume=None):
         if use_composer:
             comp = Composer()
             comp.remote = bool(agent.remote)   # mid-turn input row shows » when remote
+            # Hand the idle partial line to the turn composer, so a turn that starts
+            # while you're typing (a bg task/worker finishing wakes one) keeps showing
+            # and editing the WHOLE line, instead of an empty box that only collects
+            # the keystrokes after the wake.
+            if idle_comp is not None:
+                # Under the idle composer's lock: its reader thread may still be draining
+                # a final keystroke (stop_tty joins with a timeout), so check+swap atomically.
+                with (getattr(idle_comp, "_lock", None) or nullcontext()):
+                    if idle_comp.buf:
+                        comp.buf, comp.cur = idle_comp.buf, idle_comp.cur
+                        idle_comp.buf, idle_comp.cur = "", 0
             interrupted = False
             with composer_session(comp) as engaged:
                 try:
@@ -19982,7 +20178,7 @@ def repl(cfg: Config, resume=None):
             # the throwaway turn-composer into the persistent idle composer, so it
             # survives the turn->idle handoff instead of being eaten with `comp`. The
             # idle composer's read_line() preserves + redraws whatever is in its buf.
-            _partial = comp.buf if engaged else ""
+            _partial = comp.buf     # (not engaged: still the handed-over idle line)
             if _partial and idle_comp is not None:
                 idle_comp.buf = (idle_comp.buf + _partial) if idle_comp.buf else _partial
                 idle_comp.cur = len(idle_comp.buf)
@@ -20052,7 +20248,7 @@ def _parse_grant(text: str) -> dict:
             continue
         k, _, v = line.partition(":")
         k, v = k.strip().lower(), v.strip()
-        if k and v:
+        if k and v and k not in grant:   # first wins: the trusted keys are written first
             grant[k] = v
     return grant
 
@@ -20082,7 +20278,7 @@ def run_agent_brief(args) -> int:
         try:
             Path(resultf).write_text(f"{RESULT_MARK}\nERROR: {msg}\n{RESULT_MARK}\n")
         except OSError:
-            pass
+            _dbg_swallow()
         return code
 
     if not brief_file:
@@ -20116,8 +20312,11 @@ def run_agent_brief(args) -> int:
     # would fast-fail an interactive turn on a transient throttle should instead wait
     # it out (providers back off 429 in worker mode).
     os.environ["LEANCODER_HEADLESS_WORKER"] = "1"
-    if grant.get("leash"):
-        cfg.leash = _norm_leash(grant["leash"]) or cfg.leash
+    # A grant missing leash/cwd means the brief was malformed or forged: never fall
+    # back to this process's default leash (rwe) - refuse instead.
+    if not grant.get("leash") or not _norm_leash(grant["leash"]) or not grant.get("cwd"):
+        raise SystemExit("worker brief has no valid leash/cwd grant - refusing to run")
+    cfg.leash = _norm_leash(grant["leash"])
     # Per-worker tool allowlist: the parent may grant a NARROWED toolset (a comma list
     # of tool names in the grant). Absent -> None -> the full leash-permitted surface
     # (today's behaviour). The meta tools are always kept regardless (enforced in
@@ -20134,7 +20333,7 @@ def run_agent_brief(args) -> int:
             try:
                 setattr(cfg, attr, int(grant[key]))
             except ValueError:
-                pass
+                _dbg_swallow()
 
     _grant_int("max_iterations", "max_iterations")
     # Safe-recursion governor: the grant carries this worker's DEPTH in the tree and the
@@ -20358,7 +20557,7 @@ def run_agent_brief(args) -> int:
                 with _inject_log.open("a") as f:
                     f.write(f"{int(time.time())} consumed: {msg[:120]}\n")
             except OSError:
-                pass
+                _dbg_swallow()
 
     def _drain_plan():
         # A parent set_plan: the LAST written plan wins (it's a full replacement, not a
@@ -20393,7 +20592,7 @@ def run_agent_brief(args) -> int:
             with _inject_log.open("a") as f:
                 f.write(f"{int(time.time())} plan set: {plan[:120]}\n")
         except Exception:
-            pass
+            _dbg_swallow()
 
     def _drain_notes():
         # A parent add_note: append each queued note to the worker's notebook (tagged so
@@ -20416,7 +20615,7 @@ def run_agent_brief(args) -> int:
                 with _inject_log.open("a") as f:
                     f.write(f"{int(time.time())} note added: {msg[:120]}\n")
             except Exception:
-                pass
+                _dbg_swallow()
         # Visibility: a note only enters context if the worker CHOOSES to read its
         # notebook - it may run a long time and never look. So also surface each new note
         # inline on the inject channel (a user turn), guaranteeing the worker sees it now.
@@ -20470,7 +20669,7 @@ def run_agent_brief(args) -> int:
             elif _planview_path.exists():
                 _planview_path.unlink()   # plan cleared; don't leave a stale view
         except Exception:
-            pass
+            _dbg_swallow()
 
     def _write_checkpoint():
         # Dump the live transcript so a dead worker can be resumed (action='resume').
@@ -20504,7 +20703,7 @@ def run_agent_brief(args) -> int:
             tmp.write_text(json.dumps(_session_envelope(agent.messages, meta)))
             tmp.replace(_checkpoint_path)
         except Exception:
-            pass
+            _dbg_swallow()
 
     def _pre_iter():
         _witer["n"] += 1
@@ -20741,7 +20940,7 @@ def run_agent_brief(args) -> int:
             f"in={int(getattr(agent, 'session_in', 0) or 0)} "
             f"out={int(getattr(agent, 'session_out', 0) or 0)}\n")
     except OSError:
-        pass
+        _dbg_swallow()
     print(dim(f"agent-run: done -> {resultf}"))
     return 0
 
@@ -20753,16 +20952,16 @@ def run_agent_brief(args) -> int:
 def main():
     ap = argparse.ArgumentParser(
         prog="lean-coder",
-        description="Lean terminal coding agent over Ollama native tool calling.")
-    ap.add_argument("--host", help="Ollama base URL (env OLLAMA_HOST)")
+        description="Terminal coding agent with native tool calling. Backends: the bundled providers or your own (see /provider).")
+    ap.add_argument("--host", help="ollama base URL (env OLLAMA_HOST); used by the ollama provider")
     ap.add_argument("--model", help="model name (env LEANCODER_MODEL)")
     ap.add_argument("--provider", help="active backend provider (must be enabled)")
     ap.add_argument("--num-ctx", type=int, dest="num_ctx",
-                    help="context window (default 32768)")
+                    help="context window in tokens (default: detected from the backend; 32768 if detection fails)")
     ap.add_argument("--keep-alive", dest="keep_alive",
                     help="ollama model resident time, e.g. 10m, 30m, -1 (default 10m)")
     ap.add_argument("--window-messages", type=int, dest="window_messages",
-                    help="send only the last N messages per request (default 30; 0 = unbounded)")
+                    help="send only the last N messages per request (default 0 = off)")
     ap.add_argument("--window-tokens", dest="window_tokens",
                     help="cap each send by tokens: 'auto' (=ctx-reserve), an int (hard cap), or 0 (off)")
     ap.add_argument("--cwd", help="project directory (default: current dir)")
@@ -20772,7 +20971,6 @@ def main():
                     help="approval mode: ask | session (default) | auto")
     ap.add_argument("--auto", action="store_true",
                     help="auto-approve writes and commands (same as --approval auto)")
-    ap.add_argument("--yolo", action="store_true", help=argparse.SUPPRESS)  # alias for --auto
     ap.add_argument("--no-composer", dest="no_composer", action="store_true",
                     help="disable the pinned bottom input line (use the classic prompt)")
     ap.add_argument("--no-autosave", dest="no_autosave", action="store_true",
@@ -20793,29 +20991,23 @@ def main():
     ap.add_argument("--top-k", type=int, dest="top_k")
     ap.add_argument("--repeat-penalty", type=float, dest="repeat_penalty")
     ap.add_argument("--bg-run", dest="bg_run",
-                    help="(internal) detached backgrounded-command runner: JSON cfg; "
-                         "the cross-platform twin of the POSIX shell bg wrapper")
+                    help=argparse.SUPPRESS)
     ap.add_argument("--wipe-watch", dest="wipe_watch",
-                    help="(internal) detached self-wipe watchdog for a pushed remote "
-                         "executor: JSON cfg (dir/ttl/chk); cross-platform")
+                    help=argparse.SUPPRESS)
     ap.add_argument("--tool-exec", action="store_true", dest="tool_exec",
-                    help="run as a hermetic tool executor (JSON over stdio); internal")
+                    help=argparse.SUPPRESS)
     ap.add_argument("--lean-tools", dest="lean_tools_exec",
-                    help="(executor) directory of lean-tools to load; internal")
+                    help=argparse.SUPPRESS)
     ap.add_argument("--agent-run", action="store_true", dest="agent_run",
-                    help="run headless as a worker agent: execute one brief, write the "
-                         "result, exit; internal (spawned by the dispatch_worker tool)")
+                    help=argparse.SUPPRESS)
     ap.add_argument("--brief-file", dest="brief_file",
-                    help="(agent-run) path to the brief file to execute; internal")
+                    help=argparse.SUPPRESS)
     ap.add_argument("--result-file", dest="result_file",
-                    help="(agent-run) where to write the ===RESULT===; "
-                         "default <brief-file>.result; internal")
+                    help=argparse.SUPPRESS)
     ap.add_argument("--remote-host", dest="remote_host",
-                    help="(agent-run) attach the worker's tools to this remote host, "
-                         "reusing the parent's ssh master; internal")
+                    help=argparse.SUPPRESS)
     ap.add_argument("--remote-ctl", dest="remote_ctl",
-                    help="(agent-run) ControlPath of the parent's ssh master to reuse; "
-                         "internal")
+                    help=argparse.SUPPRESS)
     ap.add_argument("--enable", action="append", default=[], metavar="KIND:NAME",
                     help="enable a provider or lean-tool in the config and exit "
                          "(provider:<name> | tool:<name>; repeatable). /push runs this on the "
@@ -20845,7 +21037,7 @@ def main():
         try:
             run_wipe_watchdog(json.loads(args.wipe_watch))
         except Exception:
-            pass
+            _dbg_swallow()
         return
     if args.tool_exec:                 # hermetic executor role: no config, no model
         run_tool_executor(args.cwd or ".", args.lean_tools_exec)
@@ -20870,7 +21062,7 @@ def main():
             if _tty_in.isatty():
                 sys.stdin = _tty_in
         except OSError:
-            pass
+            _dbg_swallow()
 
     cfg = load_config(args)
     if not cfg.cwd.is_dir():

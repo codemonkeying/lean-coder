@@ -26,6 +26,21 @@ import shutil
 import subprocess
 from pathlib import Path
 
+import sys
+
+def _dbg_swallow():
+    """Debug bucket shim: hands a swallowed exception to lean-coder's _dbg_swallow
+    (a no-op unless LEANCODER_DEBUG=1). Never raises."""
+    for _m in ("__main__", "lean_coder"):
+        _f = getattr(sys.modules.get(_m), "_dbg_swallow", None)
+        if _f and _f is not _dbg_swallow:
+            try:
+                _f(2)
+            except Exception:
+                pass
+            return
+
+
 # Invisible / zero-width / format-control chars that carry NO visible meaning but can
 # smuggle a fingerprint/watermark (or arrive as copy-paste cruft) into files the model
 # writes. We strip these from model-supplied text before it lands on disk. Deliberately
@@ -224,7 +239,7 @@ class Tools:
                             if x.is_dir() and not x.is_symlink() and not self.ignore.ignored(x):
                                 unlisted.append(_rel(x))
                         except OSError:
-                            pass
+                            _dbg_swallow()
                     return
                 if self.ignore.ignored(e):
                     hidden += 1
@@ -468,12 +483,68 @@ class Tools:
             serr = Tools._syntax_error(cmd)
             if serr:
                 return serr
-            r = subprocess.run(cmd, shell=True, cwd=self.cfg.cwd,
-                               executable=Tools._shell_exe(),
-                               capture_output=True, text=True, timeout=to,
-                               stdin=subprocess.DEVNULL, start_new_session=True)
-        except subprocess.TimeoutExpired:
-            return (f"error: command timed out after {to}s (no output captured). "
+            # Capture to temp FILES, not pipes, and wait on the top-level shell only. A
+            # backgrounded child (`cd X && srv &`, `(srv &)`, `srv & disown`) inherits the
+            # capture fds; with pipes, waiting for EOF blocked until that child died (i.e.
+            # the timeout). With files, the shell's exit ends the call.
+            import tempfile, signal
+            def _kill_group(proc):
+                # The shell leads its own process group (start_new_session), so killpg
+                # also takes `make && ./srv`, `cmd | tee` etc. - p.kill() alone orphans them.
+                if os.name == "posix":
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except (ProcessLookupError, PermissionError):
+                        _dbg_swallow()
+                else:
+                    proc.kill()
+            def _rd(f, cap=4 << 20):
+                # Head+tail only: a chatty command can write far more than we'd ever show.
+                size = f.seek(0, 2)
+                if size <= cap:
+                    f.seek(0)
+                    b = f.read()
+                else:
+                    f.seek(0)
+                    b = f.read(cap // 2) + b"\n...[output truncated]...\n"
+                    f.seek(size - cap // 2)
+                    b += f.read()
+                return b.decode("utf-8", "replace").replace("\r\n", "\n").replace("\r", "\n")
+            with tempfile.TemporaryFile() as fo, tempfile.TemporaryFile() as fe:
+                p = subprocess.Popen(cmd, shell=True, cwd=self.cfg.cwd,
+                                     executable=Tools._shell_exe(),
+                                     stdout=fo, stderr=fe,
+                                     stdin=subprocess.DEVNULL, start_new_session=True)
+                try:
+                    rc = p.wait(timeout=to)
+                except BaseException as _ex:     # timeout, or ^C during the wait
+                    _kill_group(p)
+                    p.wait()
+                    if isinstance(_ex, subprocess.TimeoutExpired):
+                        _ex.partial = (_rd(fo) + _rd(fe)).strip()[-2000:]
+                    raise
+                # A backgrounded child still alive in the group holds these (soon deleted)
+                # temp files and keeps writing to an invisible file. Tell the model.
+                bg_left = False
+                if os.name == "posix":
+                    try:
+                        os.killpg(p.pid, 0)
+                        bg_left = True
+                    except (ProcessLookupError, PermissionError):
+                        _dbg_swallow()
+                r = subprocess.CompletedProcess(cmd, rc, _rd(fo), _rd(fe))
+                if bg_left:
+                    # The survivor may still hold these (about to be deleted) files: cut
+                    # them to 0 so its further output can't pile up unseen on disk.
+                    for f in (fo, fe):
+                        try:
+                            f.truncate(0)
+                        except OSError:
+                            _dbg_swallow()
+        except subprocess.TimeoutExpired as _te:
+            _tail = getattr(_te, "partial", "")
+            return (f"error: command timed out after {to}s"
+                    + (f"; last output:\n{_tail}\n" if _tail else " (no output captured). ") +
                     f"For a long-running command, rerun with background=true - it "
                     f"detaches and returns a pid immediately; check/stop it with the "
                     f"background tool (background(pid=...) / action='kill').")
@@ -486,6 +557,10 @@ class Tools:
             out += ("\n[stderr]\n" if out else "") + r.stderr
         out = _truncate_output(out.rstrip())
         result = f"exit {r.returncode}\n{out}" if out else f"exit {r.returncode} (no output)"
+        if bg_left:
+            result += ("\n\n[note] A process this command started is still running. If you "
+                       "did not redirect its output, anything it prints from now on is "
+                       "discarded; for servers/daemons prefer background=true.")
         # If the command failed because it needed the terminal we deliberately withheld
         # (sudo/ssh/gpg read /dev/tty, not stdin - run_command is non-interactive by
         # design), tell the model WHY and where to go, so it re-routes instead of retrying

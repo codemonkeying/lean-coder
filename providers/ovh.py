@@ -6,6 +6,20 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+
+def _dbg_swallow():
+    """Debug bucket shim: hands a swallowed exception to lean-coder's _dbg_swallow
+    (a no-op unless LEANCODER_DEBUG=1). Never raises."""
+    for _m in ("__main__", "lean_coder"):
+        _f = getattr(sys.modules.get(_m), "_dbg_swallow", None)
+        if _f and _f is not _dbg_swallow:
+            try:
+                _f(2)
+            except Exception:
+                pass
+            return
+
+
 # OVHcloud AI Endpoints - OpenAI-compatible Chat Completions, ANONYMOUS free lane.
 #   No account and NO API KEY, ever: this provider never sends an Authorization
 #   header, so nothing can be billed (a keyed OVH project is pay-as-you-go; the
@@ -60,7 +74,7 @@ def _sync_ledger():
         try:
             led._load()
         except Exception:
-            pass
+            _dbg_swallow()
     return led
 
 
@@ -123,6 +137,11 @@ def _next_free_model(model, cfg, tried=()):
     return None
 
 
+# OVH AI Endpoints accepts only the standard OpenAI sampling fields; extras get
+# HTTP 400 "feature 'extra arguments: {...}' is not currently supported" (t19 live).
+_SAMPLING_OK = ("temperature", "top_p")
+
+
 class _UpstreamError(Exception):
     """An error delivered INSIDE a 200 stream (the gateway forwards an upstream
     provider's 429/5xx as an error chunk / finish_reason "error")."""
@@ -153,7 +172,7 @@ def _save_state(data):
         _state_path().parent.mkdir(parents=True, exist_ok=True)
         _state_path().write_text(json.dumps(data, indent=2))
     except OSError:
-        pass
+        _dbg_swallow()
 
 
 # ----------------------------------------------------------------------------
@@ -191,10 +210,10 @@ def _fetch_models():
                 _models_cache_path().parent.mkdir(parents=True, exist_ok=True)
                 _models_cache_path().write_text(json.dumps({"models": out}))
             except Exception:
-                pass
+                _dbg_swallow()
             return out
     except Exception:
-        pass
+        _dbg_swallow()
     return _load_models_cache()
 
 
@@ -266,7 +285,7 @@ def _retry_after_secs(headers):
             try:
                 return float(v)
             except (TypeError, ValueError):
-                pass
+                _dbg_swallow()
     return None
 
 
@@ -412,6 +431,8 @@ class _OvhClient:
         reason_chars = 0
         self.last_finish = None
         self.last_served = None
+        self.last_http_status = getattr(resp, "status", None)
+        self.last_stream_junk = []        # lines that weren't a recognised chunk (capped)
         try:
             for raw in _lc["stream_tiered"](resp, self.cfg):
                 if should_abort and should_abort():
@@ -419,6 +440,8 @@ class _OvhClient:
                     break
                 line = raw.decode(errors="replace").strip()
                 if not line.startswith("data:"):     # skip keep-alives / comments
+                    if line and not line.startswith(":") and len(self.last_stream_junk) < 5:
+                        self.last_stream_junk.append(line[:400])
                     continue
                 data = line[5:].strip()
                 if data == "[DONE]":
@@ -431,6 +454,16 @@ class _OvhClient:
                 # Upstream failure smuggled into a 200 stream: a top-level "error"
                 # chunk, or a choice with finish_reason "error" + choice.error.
                 err = obj.get("error")
+                # vLLM/OVH reject over SSE with a bare {"message": ...} (no choices).
+                if not err and "choices" not in obj and (obj.get("message") or obj.get("detail")):
+                    _m = str(obj.get("message") or obj.get("detail") or "").lower()
+                    _rej = any(w in _m for w in ("not supported", "not currently supported",
+                                                 "invalid", "unsupported", "too long", "exceed"))
+                    err = {"code": obj.get("code") or (400 if _rej else 502),
+                           "message": str(obj.get("message") or obj.get("detail"))}
+                if not err and "choices" not in obj and "usage" not in obj \
+                        and len(self.last_stream_junk) < 5:
+                    self.last_stream_junk.append(data[:400])
                 if not err:
                     for ch in obj.get("choices", []):
                         if ch.get("finish_reason") == "error" or ch.get("error"):
@@ -565,6 +598,9 @@ class _OvhClient:
                     return result
             except _UpstreamError as e:
                 _record(model, 0, 0, e.code)
+                if 400 <= e.code < 500 and e.code != 429:
+                    raise RuntimeError(f"{model} rejected the request (HTTP {e.code}): "
+                                       f"{str(e)[:400]}") from None
                 if attempt < _MAX_RETRIES:
                     attempt += 1
                     self._wait(_backoff(attempt - 1),
@@ -636,6 +672,20 @@ class _OvhClient:
             "stream":         True,
             "stream_options": {"include_usage": True},
         }
+        # Sampling: only what the user set; None = send nothing (vendor default).
+        _samp, self.last_sampling = _lc["hosted_sampling"](self.cfg, _SAMPLING_OK)
+        payload.update(_samp)
+        # Thinking: OVH does not forward chat_template_kwargs (roadmap #1170), and a
+        # top-level reasoning_effort is unverified - so send nothing and stamp honestly.
+        # think off can't be honoured: warn once instead of silently running full think.
+        _th = getattr(self.cfg, "think", None)
+        self.last_sampling["think"] = "provider default (always on; not controllable on OVH)"
+        if _th is not None:
+            self.last_sampling["think_requested"] = _th
+        if _th in (False, "off") and not getattr(self, "_think_warned", False):
+            self._think_warned = True
+            print(_lc["yellow"]("[!] ovh: thinking can't be turned off here "
+                                "(OVH ignores the template switch) - running with it on"))
         if send_tools:
             payload["tools"] = _cvt_tools(send_tools)
         result = self._send(payload, should_abort)
@@ -643,9 +693,13 @@ class _OvhClient:
         if not ab and _pe is None and not (a.get("content") or "").strip() \
                 and not a.get("tool_calls") and not self.last_finish:
             # vLLM delivers a rejected request (4xx) over SSE as a bare [DONE].
+            junk = " | ".join(getattr(self, "last_stream_junk", []) or [])
             raise RuntimeError(f"{self.last_served or cur_model} returned an empty stream "
-                               f"(no tokens, no finish reason) - likely the request was "
-                               f"rejected (context too large?); try /compact, then retry")
+                               f"(HTTP {getattr(self, 'last_http_status', None)}, no tokens, "
+                               f"no finish reason)"
+                               + (f"; server said: {junk[:600]}" if junk else
+                                  " - likely the request was rejected (context too large?); "
+                                  "try /compact, then retry"))
         a, _pe, ab = result
         served = self.last_served or cur_model
         if served != cur_model:
@@ -718,7 +772,7 @@ def _clear(agent, cfg):
         if _state_path().is_file():
             _state_path().unlink()
     except OSError:
-        pass
+        _dbg_swallow()
 
 
 def _usage(agent, cfg):

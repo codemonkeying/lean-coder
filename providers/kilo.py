@@ -8,6 +8,20 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+
+def _dbg_swallow():
+    """Debug bucket shim: hands a swallowed exception to lean-coder's _dbg_swallow
+    (a no-op unless LEANCODER_DEBUG=1). Never raises."""
+    for _m in ("__main__", "lean_coder"):
+        _f = getattr(sys.modules.get(_m), "_dbg_swallow", None)
+        if _f and _f is not _dbg_swallow:
+            try:
+                _f(2)
+            except Exception:
+                pass
+            return
+
+
 # Kilo Code gateway - OpenRouter-compatible Chat Completions, ANONYMOUS free lane.
 #   No account and no API key: free (:free / kilo-auto/free) models answer keyless.
 #   Published cap: 200 requests/hour per IP. Same free model pool as OpenRouter
@@ -183,7 +197,7 @@ def _save_cred(data):
     try:
         _cred_path().chmod(0o600)
     except OSError:
-        pass
+        _dbg_swallow()
 
 def _clear_cred():
     if _cred_path().is_file():
@@ -234,10 +248,10 @@ def _fetch_models(key):
                 _models_cache_path().parent.mkdir(parents=True, exist_ok=True)
                 _models_cache_path().write_text(json.dumps({"models": out}))
             except Exception:
-                pass
+                _dbg_swallow()
             return out
     except Exception:
-        pass
+        _dbg_swallow()
     return _load_models_cache()
 
 
@@ -377,7 +391,7 @@ def _retry_after_secs(headers, body):
         try:
             return float(ra)
         except (TypeError, ValueError):
-            pass
+            _dbg_swallow()
     try:
         meta = json.loads(body).get("error", {}).get("metadata", {}) or {}
         if meta.get("retry_after_seconds") is not None:
@@ -386,7 +400,7 @@ def _retry_after_secs(headers, body):
         if h.get("Retry-After"):
             return float(h["Retry-After"])
     except Exception:
-        pass
+        _dbg_swallow()
     return None
 
 
@@ -797,6 +811,9 @@ class _KiloClient:
             "stream":        True,
             "stream_options": {"include_usage": True},
         }
+        # Sampling: only what the user set; None = send nothing (vendor default).
+        _samp, self.last_sampling = _lc["hosted_sampling"](self.cfg)
+        payload.update(_samp)
         # Models whose /models entry lacks "tools" in supported_parameters 400 on a
         # tools array; send none so they answer chat-only (flagged in /model).
         if send_tools:
@@ -935,7 +952,7 @@ def _sync_ledger():
         try:
             led._load()
         except Exception:
-            pass
+            _dbg_swallow()
     return led
 
 

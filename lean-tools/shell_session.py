@@ -42,6 +42,21 @@ import signal
 import subprocess
 import time
 
+import sys
+
+def _dbg_swallow():
+    """Debug bucket shim: hands a swallowed exception to lean-coder's _dbg_swallow
+    (a no-op unless LEANCODER_DEBUG=1). Never raises."""
+    for _m in ("__main__", "lean_coder"):
+        _f = getattr(sys.modules.get(_m), "_dbg_swallow", None)
+        if _f and _f is not _dbg_swallow:
+            try:
+                _f(2)
+            except Exception:
+                pass
+            return
+
+
 TOOL = {
     "name": "shell_session",
     "description": (
@@ -288,11 +303,11 @@ def _reap(sid, sess):
     try:
         tail = _drain(sess["fd"], 0.2)
     except Exception:
-        pass
+        _dbg_swallow()
     try:
         os.close(sess["fd"])
     except OSError:
-        pass
+        _dbg_swallow()
     _SESSIONS.pop(sid, None)
     return tail
 
@@ -461,14 +476,14 @@ def _close(args, cwd):
             try:
                 proc.terminate()
             except OSError:
-                pass
+                _dbg_swallow()
         try:
             proc.wait(timeout=3)
         except subprocess.TimeoutExpired:
             try:
                 os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
             except OSError:
-                pass
+                _dbg_swallow()
     _reap(sid, sess)
     return f"session {sid} closed."
 
@@ -505,7 +520,7 @@ def _close_all():
         try:
             _close({"id": sid}, None)
         except Exception:
-            pass
+            _dbg_swallow()
 
 
 def setup(lc, cfg):
@@ -526,4 +541,4 @@ def setup(lc, cfg):
         import atexit
         atexit.register(_close_all)
     except Exception:
-        pass
+        _dbg_swallow()

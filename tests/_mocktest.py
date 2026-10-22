@@ -10,6 +10,8 @@ import json, shutil, sys, tempfile, threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # repo root (this file lives in tests/)
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # tests/
+import _isolate  # noqa: F401  - MUST precede lean_coder: HOME -> /tmp for the whole run
 import lean_coder as lc
 
 # Redirect CONFIG_PATH to a throwaway temp file BEFORE any test runs. Scenarios build

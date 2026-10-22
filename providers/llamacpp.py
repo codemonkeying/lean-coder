@@ -47,6 +47,20 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+
+def _dbg_swallow():
+    """Debug bucket shim: hands a swallowed exception to lean-coder's _dbg_swallow
+    (a no-op unless LEANCODER_DEBUG=1). Never raises."""
+    for _m in ("__main__", "lean_coder"):
+        _f = getattr(sys.modules.get(_m), "_dbg_swallow", None)
+        if _f and _f is not _dbg_swallow:
+            try:
+                _f(2)
+            except Exception:
+                pass
+            return
+
+
 _PROVIDER    = "llamacpp"
 _DEFAULT_HOST = "http://127.0.0.1:8080"
 
@@ -313,6 +327,7 @@ class LlamaCppClient:
         spin = _lc["Spinner"]("thinking", _lc["THINK_FRAMES"]).start()
         try:
             self.last_truncated = False   # output-limit cut; read by core _reply_truncated
+            self.last_finish = None
             for raw in _lc["stream_tiered"](resp, self.cfg):
                 if should_abort and should_abort():
                     aborted = True
@@ -430,6 +445,7 @@ class LlamaCppClient:
         if out_tokens:
             self.last_out_tokens = out_tokens
         self.last_truncated = (finish == "length")
+        self.last_finish = finish
 
         content = "".join(content_parts)
         # Text-tool-call fallback: only when the model emitted NO native tool_calls
@@ -622,7 +638,7 @@ def _set_host(agent, cfg, url, persist=True):
     try:
         cfg.provider_settings.setdefault("llamacpp", {})["host"] = url
     except Exception:
-        pass
+        _dbg_swallow()
     # Drop any cached model list on the live llama.cpp client so /model re-reads.
     client = getattr(agent, "client", None)
     if isinstance(client, LlamaCppClient) and client._models is not None:

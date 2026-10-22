@@ -20,6 +20,21 @@ import urllib.request
 from pathlib import Path
 from urllib.parse import urlencode
 
+import sys
+
+def _dbg_swallow():
+    """Debug bucket shim: hands a swallowed exception to lean-coder's _dbg_swallow
+    (a no-op unless LEANCODER_DEBUG=1). Never raises."""
+    for _m in ("__main__", "lean_coder"):
+        _f = getattr(sys.modules.get(_m), "_dbg_swallow", None)
+        if _f and _f is not _dbg_swallow:
+            try:
+                _f(2)
+            except Exception:
+                pass
+            return
+
+
 TOOL = {
     "name": "brave_search",
     "description": "Web search: returns title/url/snippet for the top hits; web_fetch one to read it.",
@@ -107,7 +122,7 @@ def run(args, cwd):
         try:
             params["offset"] = max(0, int(offset))
         except (TypeError, ValueError):
-            pass
+            _dbg_swallow()
     url = BRAVE_URL + "?" + urlencode(params)
     req = urllib.request.Request(url, headers={
         "Accept": "application/json",

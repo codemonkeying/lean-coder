@@ -30,9 +30,9 @@ Context overhead (system prompt + tool schemas), checked by the test suite:
 | Always-on (core tools) | 2500 |
 | Every bundled lean-tool enabled | 6500 |
 
-Optional lean-tools are off by default and add nothing until enabled.
+A lean-tool adds nothing to the context until it is enabled.
 
-- Runs against local models (Ollama, llama.cpp, MLX) or hosted APIs.
+- Runs against local models or hosted APIs, through bundled or your own providers.
 - When the context window fills, the agent updates its docs, pins a goal and plan, and
   continues from a summary ([compaction](#compaction)).
 - Can dispatch background worker agents for sub-tasks (`dispatch_worker` lean-tool).
@@ -79,13 +79,12 @@ Or run from a clone without installing:
 git clone https://github.com/codemonkeying/lean-coder
 cd lean-coder
 ./install.sh --dry-run                          # show what it would do, change nothing
-python3 lean_coder.py                            # local Ollama, default model
-python3 lean_coder.py --host http://box:11434 --model qwen3-coder:30b
+python3 lean_coder.py
 ```
 
 **Runtime:** Python 3.11+, no third-party packages for the core. Some opt-in lean-tools
 have their own deps (e.g. `web_screenshot` needs Playwright) and say so when enabled.
-`/connect` needs an `ssh` client. The Anthropic subscription provider needs `node`.
+`/connect` needs an `ssh` client. A provider that needs more says so when enabled.
 
 **Updating:** re-run the installer, or `git pull && ./install.sh`. With the `update`
 lean-tool enabled, `/update` pulls a newer `lean_coder.py` (`update_track` = `stable` or
@@ -95,11 +94,12 @@ lean-tool enabled, `/update` pulls a newer `lean_coder.py` (`update_track` = `st
 ## Quick start
 
 ```bash
-lean_coder                       # uses your config, or localhost Ollama + default model
+lean_coder
 ```
 
-Type a request. The agent shows a diff before each edit and confirms before running
-commands (unless approval is `session` or `auto`). `/help` lists commands.
+On first start, pick a backend with `/provider` (hosted ones ask you to log in the first
+time they're used), then a model with `/model`. Type a request. The agent shows a diff
+before each edit and confirms per your `/approve` setting. `/help` lists commands.
 
 ```
 $ lean_coder
@@ -113,39 +113,24 @@ lean-coder  <your-model> @ <your-provider>
 
 ## Providers
 
-A provider connects lean-coder to a model backend. Ollama is enabled by default and uses
-`localhost:11434`. Hosted providers ship disabled until you log in:
-
-| Provider        | Backend | Get a key |
-|-----------------|---------|-----------|
-| `ollama`        | Local / self-hosted Ollama (default) | none needed |
-| `anthropic_api` | Anthropic API (Claude) | [console.anthropic.com](https://console.anthropic.com) |
-| `gemini`        | Google Gemini | [aistudio.google.com](https://aistudio.google.com/apikey) |
-| `groq`          | Groq | [console.groq.com](https://console.groq.com/keys) |
-| `openai`        | OpenAI | [platform.openai.com](https://platform.openai.com/api-keys) |
-| `openrouter`    | OpenRouter | [openrouter.ai](https://openrouter.ai/keys) |
-| `kilo`          | Kilo gateway (free models) | none needed |
-| `ovh`           | OVHcloud AI Endpoints (free, 2 req/min per model) | none needed |
-
-```
-/provider login anthropic_api      # prompts for the key, saves it, switches to it
-```
+A provider connects lean-coder to a model backend: a local server or a hosted API. Use one
+of the bundled providers (`/provider` lists them and switches; `/provider login <name>`
+stores a key) or write your own: copy
+[`examples/providers/example.py`](examples/providers/example.py) into `providers/` and see
+[PROVIDER_API.md](PROVIDER_API.md). `/model` lists and switches models across enabled
+providers. Sessions work across providers.
 
 Keys are stored in a `chmod 600` file under `~/.config/leancoder/`, never in
-`config.toml`. An env var (e.g. `ANTHROPIC_API_KEY`) is used instead if set. `/provider`
-switches backends; `/model` lists and switches models across enabled providers.
-
-For another backend, copy [`examples/providers/example.py`](examples/providers/example.py)
-into `providers/`; see [PROVIDER_API.md](PROVIDER_API.md). Sessions work across providers.
+`config.toml`; a provider's env var is used instead if set.
 
 ## Safety
 
 Two independent settings:
 
-- **`/leash`** - which tools the model gets (default `rwe`):
+- **`/leash`** - which tools the model gets:
   `chat` (none) · `r` (read files) · `rw` (+ edit files) · `rwe` (+ run commands).
   The model is told its level.
-- **`/approve`** - when to confirm (default `session`):
+- **`/approve`** - when to confirm:
   `ask` (every edit/command) · `session` (once per run) · `auto` (never).
 
 Examples: `leash r` for unattended analysis; `leash rw` + `approve auto` for unattended
@@ -154,51 +139,18 @@ editing. OS file permissions still apply. `/incognito` writes nothing to disk;
 
 ## Tools
 
-### Always-on
+### Core
 
-Eight file/shell tools in `lean-tools/builtins.py`:
+File, search, edit and shell tools are always present, along with a pinned plan
+(`update_plan`), a session notebook (`note`), and `ask_user_to_run`, which hands you a
+command that needs sudo, a prompt or a password; only the command and exit code return to
+the model. Read-only calls in one turn run concurrently.
 
-| Tool            | What it does |
-|-----------------|--------------|
-| `read_file`     | Line-numbered file contents; optional line range; large files truncated. |
-| `list_files`    | Directory listing, honoring ignore rules. |
-| `search_files`  | Regex search -> `file:line` matches (capped). |
-| `apply_diff`    | Preferred edit tool: SEARCH/REPLACE blocks. |
-| `replace_lines` | Replace a line range by number. |
-| `write_file`    | Create or overwrite a whole file. |
-| `run_command`   | Run a foreground shell command; output truncated. |
-| `background`    | Run and manage long-lived tasks (`run` / `status` / `kill`). |
+### Lean-tools
 
-Also always present: `update_plan` (a pinned goal + TODO that survives compaction),
-`note` (a session notebook), and, by default, `ask_user_to_run`, which hands a command to
-you when it needs sudo, an interactive prompt, or a password. Only the command and exit
-code return to the model. Read-only calls in one turn run concurrently.
-
-### Opt-in lean-tools
-
-A lean-tool is one `.py` file with a `TOOL` schema and a `run` function. Bundled ones are
-in [`lean-tools/`](lean-tools/), off by default; enable them with `/tools`.
-
-| Lean-tool         | Adds |
-|-------------------|------|
-| `dispatch_worker` | Run a sub-task in a background worker agent and collect its result. Workers can be steered, restricted to fewer tools, and assigned to a `board`. With `worker_checkpoint` on, a stopped worker can be resumed, and `pause` saves one as a session to continue later. Adds `/worker`. |
-| `board`           | A task board: a dependency graph of tasks the driver assigns to workers. Stored on disk. |
-| `web_fetch`       | Read a URL as text. |
-| `web_screenshot`  | Screenshot a URL with a headless browser and return the page text. Needs [Playwright](https://playwright.dev/python/). |
-| `brave_search`    | Web search (Brave API key). |
-| `git_summary`     | Read-only git status, diffstat, recent commits. |
-| `diagnostics`     | Lint/typecheck with whatever is installed (pyright, ruff, tsc, eslint, shellcheck, …), falling back to `py_compile` / `bash -n`. |
-| `symbols`         | Outline Python classes/functions or find a definition (stdlib `ast`). |
-| `shell_session`   | A persistent interactive shell (REPL, ssh, …). |
-| `ssh`             | One-shot `ssh host cmd`. |
-| `notify`          | Desktop notification when a long task finishes. |
-| `provision`       | `/provision`: install lean-coder on another box over SSH. |
-| `update`          | `/update`: self-update `lean_coder.py`. |
-| `word_count`      | Count lines / words / chars in a file. |
-
-`brave_search` needs a [Brave Search API key](https://search.brave.com/app/keys) in
-`~/.config/leancoder/brave.key` or `LEANCODER_BRAVE_KEY`. See [LEAN_TOOLS.md](LEAN_TOOLS.md);
-[`examples/lean-tools/`](examples/lean-tools/) has templates. There is no LSP integration.
+A lean-tool is one `.py` file with a `TOOL` schema and a `run` function. Bundled ones live
+in [`lean-tools/`](lean-tools/); `/tools` shows them and turns them on or off. Write your
+own from [`examples/lean-tools/`](examples/lean-tools/); see [LEAN_TOOLS.md](LEAN_TOOLS.md).
 
 ### MCP servers
 
@@ -257,41 +209,27 @@ told to re-read the file.
 
 On `/compact`, or automatically, the model gets one turn to:
 
-1. Update the project's docs (and commit them in a git repo).
+1. Update the project's docs.
 2. Write a summary: goal, decisions, state, next step.
 3. Pin a goal + TODO.
 4. Write the next instruction for itself.
 
-Older history is replaced by the summary (the last `compact_keep` turns, default 3, stay
-verbatim). The next instruction is then sent as a new turn after a 5-second `^C` window.
+Older history is replaced by the summary (the most recent turns stay verbatim), and the
+next instruction is sent as a new turn after a short `^C` window. Compaction is nudged,
+then forced, as the window fills; thresholds and prompts are settings (`/set`, `/prompt`).
 
-Thresholds: a nudge near ~70% full, forced compaction at `compact_at` (~90%), emergency
-compaction at ~100%. A loop guard limits it to about once a minute. `auto_compact`,
-`autostart_after_compact`, `compact_emergency`, and the prompts are configurable.
-
-- **Wake on background finish** (on by default): a finished background task or worker
-  starts a turn when the prompt is idle. `wake_on_bg_finish = false` disables it.
-- **Send window** (off by default): `window_messages = N` sends only the last N messages,
-  cut at a turn boundary. For very small models.
+- **Wake on background finish:** a finished background task or worker can start a turn
+  when the prompt is idle (`wake_on_bg_finish`).
+- **Send window:** `window_messages = N` sends only the last N messages, cut at a turn
+  boundary. For very small models.
 
 ## Configuration
 
-Precedence: **CLI flag > env var > config file > default**.
+Precedence: **CLI flag > env var > config file > default**. `lean_coder --help` lists the
+flags; `/set` shows and edits every setting with its current value.
 
-| Setting         | Flag                   | Env               | Default                   |
-|-----------------|------------------------|-------------------|---------------------------|
-| Ollama endpoint | `--host`               | `OLLAMA_HOST`     | `http://localhost:11434`  |
-| Model           | `--model`              | `LEANCODER_MODEL` | `qwen3-coder:30b`         |
-| Context window  | `--num-ctx`            | -                 | auto-detect, capped 32768 |
-| Project dir     | `--cwd`                | -                 | current directory         |
-| Approval mode   | `--approval` / `--auto`| -                 | `session` (ask once)      |
-| Capability      | `--leash`              | -                 | `rwe`                     |
-| Resume session  | `--resume <name>`      | -                 | auto-load last for cwd    |
-
-Config is `~/.config/leancoder/config.toml` and saves automatically on any change. It also
-holds host failover, named machines, per-machine default models, and saved `/connect`
-targets. Auto-detect only lowers the context window (capped 32768); use `--num-ctx` to go
-higher.
+Config is `~/.config/leancoder/config.toml` and saves automatically on any change. The
+context window is read from the backend; `--num-ctx` overrides it.
 
 **What stays on disk.** Only things you named: config, sessions (`~/.config/leancoder/sessions`),
 and task boards. Everything else a running lean-coder creates (background task logs, worker
@@ -303,48 +241,10 @@ longer than `LEANCODER_REMOTE_IDLE_TTL` (default 30 min).
 
 ## Slash commands
 
-```
-/clear             wipe conversation, stay in this session
-/new [name]        start a separate session
-/trim [keep]       stub old tool outputs, keep newest [keep] in full (no LLM)
-/compact [k|to]    agent commits durable docs, writes a future-self summary, replaces history
-                   (k = compact to ~k thousand tokens this once; `to` prompts for it)
-/save [name]       name the current session
-/load [name]       resume a session (no arg = picker)
-/session           list | delete <name>
-/prompt [name]     view/edit prompt files (/prompt use <name> = fire one as a turn)
-/sh [cmd]          run a command yourself in a terminal (no arg = your $SHELL)
-/connect [host]    run tools on a remote box over SSH (no arg = pick saved/open)
-/local [host]      detach the active remote (keep it open to switch back)
-/machines          manage saved remote hosts (list/add/remove)
-/tools             enable/disable lean-tools
-/mcp               manage MCP servers (add/remove/reconnect; no arg = enable/disable menu)
-/reload            reload lean-tools + pick up prompt edits
-/model [name]      switch model across enabled providers (no arg = list)
-/provider [name]   switch/manage the model provider
-/usage             session tokens + context / provider usage
-/think [level]     set thinking level (no arg = menu)
-/effort [level]    set reasoning effort (no arg = menu)
-/set [key val]     edit app config (config.toml knobs; no arg = menu)
-/provider set [k v] get/set a backend-specific provider knob
-/approve [mode]    confirm cadence: ask | session | auto
-/leash [level]     capability ceiling: chat | r | rw | rwe
-/autosave [on|off] autosave + auto-load last on start
-/incognito [on|off]don't save the session locally
-/askread [on|off]  confirm read tools too
-/bg [kill <pid>]   list/kill background tasks
-/info              live session read-out
-/activity [n|all]  what the system did automatically (compaction, trim, fallback, …)
-/expand [N]        show a tool call's full (untruncated) args
-/help              list commands
-/quit              exit
-```
+`/help` lists every command; `/<cmd> ?` explains one. Tab completion and history work when
+`readline` is available; menus are arrow-key navigable.
 
-`/<cmd> ?` shows help for a command. Tab completion and history work when `readline` is
-available; menus are arrow-key navigable.
-
-`/prompt` edits the built-in prompts (`system`, `compact`, `auto_compact`,
-`compact_nudge`; `/prompt reset <name>` reverts). `/prompt new <name>` creates your own,
+`/prompt` edits the built-in prompts (`/prompt reset <name>` reverts). `/prompt new <name>` creates your own,
 and `/prompt use <name>` sends one as a turn.
 
 ## Remote workspace

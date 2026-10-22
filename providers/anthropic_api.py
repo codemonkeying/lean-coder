@@ -9,6 +9,20 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+
+def _dbg_swallow():
+    """Debug bucket shim: hands a swallowed exception to lean-coder's _dbg_swallow
+    (a no-op unless LEANCODER_DEBUG=1). Never raises."""
+    for _m in ("__main__", "lean_coder"):
+        _f = getattr(sys.modules.get(_m), "_dbg_swallow", None)
+        if _f and _f is not _dbg_swallow:
+            try:
+                _f(2)
+            except Exception:
+                pass
+            return
+
+
 _API_BASE       = "https://api.anthropic.com"  # sweep-ok
 _MAX_TOKENS     = 16384
 _CTX_DEFAULT    = 200_000
@@ -47,7 +61,7 @@ def _retry_after_secs(headers):
         try:
             return float(ra)
         except (TypeError, ValueError):
-            pass
+            _dbg_swallow()
     return None
 
 
@@ -143,7 +157,7 @@ def _save_cred(data):
     try:
         _cred_path().chmod(0o600)
     except OSError:
-        pass
+        _dbg_swallow()
 
 def _clear_cred():
     if _cred_path().is_file():
@@ -194,10 +208,10 @@ def _fetch_models(key):
                 _models_cache_path().parent.mkdir(parents=True, exist_ok=True)
                 _models_cache_path().write_text(json.dumps({"models": out}))
             except Exception:
-                pass
+                _dbg_swallow()
             return out
     except Exception:
-        pass
+        _dbg_swallow()
     return _load_models_cache()
 
 
@@ -968,7 +982,7 @@ def _detail(agent, cfg):
                         f"  {dim(f'{_sn(rv)}/{_sn(lv)} remaining{rst_s}')}"
                     )
                 except (ValueError, ZeroDivisionError):
-                    pass
+                    _dbg_swallow()
 
     if not rl:
         lines.append(dim("\n  (rate limit data available after first inference)"))

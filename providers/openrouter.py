@@ -8,6 +8,20 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+
+def _dbg_swallow():
+    """Debug bucket shim: hands a swallowed exception to lean-coder's _dbg_swallow
+    (a no-op unless LEANCODER_DEBUG=1). Never raises."""
+    for _m in ("__main__", "lean_coder"):
+        _f = getattr(sys.modules.get(_m), "_dbg_swallow", None)
+        if _f and _f is not _dbg_swallow:
+            try:
+                _f(2)
+            except Exception:
+                pass
+            return
+
+
 # OpenRouter - an OpenAI-compatible Chat Completions gateway over many providers.
 #   docs: https://openrouter.ai/docs/api-reference/chat-completion  # sweep-ok
 # Auth is a Bearer key (sk-or-v1-...). Because the wire format is OpenAI-compatible
@@ -109,7 +123,7 @@ def _save_cred(data):
     try:
         _cred_path().chmod(0o600)
     except OSError:
-        pass
+        _dbg_swallow()
 
 def _clear_cred():
     if _cred_path().is_file():
@@ -160,10 +174,10 @@ def _fetch_models(key):
                 _models_cache_path().parent.mkdir(parents=True, exist_ok=True)
                 _models_cache_path().write_text(json.dumps({"models": out}))
             except Exception:
-                pass
+                _dbg_swallow()
             return out
     except Exception:
-        pass
+        _dbg_swallow()
     return _load_models_cache()
 
 
@@ -280,7 +294,7 @@ def _daily_cap_msg(body):
             try:
                 when = " - resets " + time.strftime("%H:%M %d%b", time.localtime(int(reset) / 1000.0))
             except Exception:
-                pass
+                _dbg_swallow()
         cap = f" ({lim}/day)" if lim else ""
         return (f"OpenRouter free daily limit reached{cap}{when}. Add credits at "
                 f"openrouter.ai/credits for 1000/day, or switch to groq (/provider groq).")
@@ -294,7 +308,7 @@ def _retry_after_secs(headers, body):
         try:
             return float(ra)
         except (TypeError, ValueError):
-            pass
+            _dbg_swallow()
     try:
         meta = json.loads(body).get("error", {}).get("metadata", {}) or {}
         if meta.get("retry_after_seconds") is not None:
@@ -303,7 +317,7 @@ def _retry_after_secs(headers, body):
         if h.get("Retry-After"):
             return float(h["Retry-After"])
     except Exception:
-        pass
+        _dbg_swallow()
     return None
 
 
@@ -879,7 +893,7 @@ def _usage(agent, cfg):
             try:
                 resets_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(reset / 1000.0))
             except Exception:
-                pass
+                _dbg_swallow()
         day = {"label": "day", "pct": max(0.0, (lim - rem) / lim * 100.0),
                "resets_at": resets_at, "reset_on_warn": True}
         ms = [m for m in (out or {}).get("meters", []) if m["label"] != "day"] + [day]

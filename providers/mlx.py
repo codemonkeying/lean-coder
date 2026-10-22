@@ -24,6 +24,20 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+
+def _dbg_swallow():
+    """Debug bucket shim: hands a swallowed exception to lean-coder's _dbg_swallow
+    (a no-op unless LEANCODER_DEBUG=1). Never raises."""
+    for _m in ("__main__", "lean_coder"):
+        _f = getattr(sys.modules.get(_m), "_dbg_swallow", None)
+        if _f and _f is not _dbg_swallow:
+            try:
+                _f(2)
+            except Exception:
+                pass
+            return
+
+
 _PROVIDER    = "mlx"
 # Base URL of the running mlx_lm.server. Override per-box via env.
 _API_BASE    = os.environ.get("MLX_HOST", "http://127.0.0.1:8080")
@@ -85,7 +99,7 @@ def _ctx_window(cfg=None):
             if v:
                 return int(v)
     except (TypeError, ValueError, AttributeError):
-        pass
+        _dbg_swallow()
     return _CTX_DEFAULT
 
 
@@ -169,6 +183,7 @@ class MLXClient:
         spin = _lc["Spinner"]("thinking", _lc["THINK_FRAMES"]).start()
         try:
             self.last_truncated = False   # output-limit cut; read by core _reply_truncated
+            self.last_finish = None
             for raw in _lc["stream_tiered"](resp, self.cfg):
                 if should_abort and should_abort():
                     aborted = True
@@ -265,6 +280,7 @@ class MLXClient:
         if out_tokens:
             self.last_out_tokens = out_tokens
         self.last_truncated = (finish == "length")
+        self.last_finish = finish
 
         content = "".join(content_parts)
         # Text-tool-call fallback: only when the model emitted NO native tool_calls

@@ -18,6 +18,21 @@ import socket
 import subprocess
 from pathlib import Path
 
+import sys
+
+def _dbg_swallow():
+    """Debug bucket shim: hands a swallowed exception to lean-coder's _dbg_swallow
+    (a no-op unless LEANCODER_DEBUG=1). Never raises."""
+    for _m in ("__main__", "lean_coder"):
+        _f = getattr(sys.modules.get(_m), "_dbg_swallow", None)
+        if _f and _f is not _dbg_swallow:
+            try:
+                _f(2)
+            except Exception:
+                pass
+            return
+
+
 
 def _lan_ips():
     """This box's LAN IPv4 addresses, primary first. Best-effort, never raises."""
@@ -28,7 +43,7 @@ def _lan_ips():
         ips.append(s.getsockname()[0])
         s.close()
     except OSError:
-        pass
+        _dbg_swallow()
     try:
         out = subprocess.run(["ip", "-o", "-4", "addr", "show", "scope", "global"],
                              capture_output=True, text=True, timeout=3).stdout
@@ -39,7 +54,7 @@ def _lan_ips():
                 if ip not in ips:
                     ips.append(ip)
     except (OSError, ValueError):
-        pass
+        _dbg_swallow()
     return ips
 
 

@@ -8,6 +8,20 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+
+def _dbg_swallow():
+    """Debug bucket shim: hands a swallowed exception to lean-coder's _dbg_swallow
+    (a no-op unless LEANCODER_DEBUG=1). Never raises."""
+    for _m in ("__main__", "lean_coder"):
+        _f = getattr(sys.modules.get(_m), "_dbg_swallow", None)
+        if _f and _f is not _dbg_swallow:
+            try:
+                _f(2)
+            except Exception:
+                pass
+            return
+
+
 # Groq - an OpenAI-compatible inference API (very fast; free tier is generous but
 # rate-limited). docs: https://console.groq.com/docs/openai  # sweep-ok
 # Auth is a Bearer key (gsk_...). Wire format is OpenAI-compatible, so conversion
@@ -107,7 +121,7 @@ def _save_cred(data):
     try:
         _cred_path().chmod(0o600)
     except OSError:
-        pass
+        _dbg_swallow()
 
 def _clear_cred():
     if _cred_path().is_file():
@@ -129,14 +143,14 @@ def _retry_after_secs(headers, body):
         try:
             return float(ra)
         except (TypeError, ValueError):
-            pass
+            _dbg_swallow()
     try:                                   # Groq embeds "try again in 7.66s" in the message
         msg = json.loads(body).get("error", {}).get("message", "")
         m = re.search(r"in ([\d.]+)s", msg)  # sweep-ok
         if m:
             return float(m.group(1))
     except Exception:
-        pass
+        _dbg_swallow()
     return None
 
 
@@ -209,10 +223,10 @@ def _fetch_models(key):
                 _models_cache_path().parent.mkdir(parents=True, exist_ok=True)
                 _models_cache_path().write_text(json.dumps({"models": out}))
             except Exception:
-                pass
+                _dbg_swallow()
             return out
     except Exception:
-        pass
+        _dbg_swallow()
     return _load_models_cache()
 
 
@@ -392,6 +406,7 @@ class _GroqClient:
         spin = _lc["Spinner"]("thinking", _lc["THINK_FRAMES"]).start()
         try:
             self.last_truncated = False   # output-limit cut; read by core _reply_truncated
+            self.last_finish = None        # raw finish_reason; core normalises
             for raw in _lc["stream_tiered"](resp, self.cfg):
                 if should_abort and should_abort():
                     aborted = True
@@ -408,6 +423,10 @@ class _GroqClient:
                     continue
 
                 for ch in obj.get("choices", []):
+                    if ch.get("finish_reason"):
+                        self.last_finish = ch["finish_reason"]
+                    if (ch.get("delta") or {}).get("refusal"):
+                        self.last_finish = "refusal"
                     if ch.get("finish_reason") == "length":
                         self.last_truncated = True
                     delta = ch.get("delta", {})

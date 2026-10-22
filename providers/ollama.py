@@ -34,6 +34,20 @@ import re
 import sys
 import threading
 
+
+def _dbg_swallow():
+    """Debug bucket shim: hands a swallowed exception to lean-coder's _dbg_swallow
+    (a no-op unless LEANCODER_DEBUG=1). Never raises."""
+    for _m in ("__main__", "lean_coder"):
+        _f = getattr(sys.modules.get(_m), "_dbg_swallow", None)
+        if _f and _f is not _dbg_swallow:
+            try:
+                _f(2)
+            except Exception:
+                pass
+            return
+
+
 # --- core namespace, populated by setup(lc, cfg) ----------------------------
 # _cfg: the live Config (PROVIDER callables with no cfg arg read it).
 # _lc:  core's globals() dict - the live source for mutable state (_active_composer).
@@ -95,7 +109,7 @@ def _parse_sampling(show: dict):
                 try:
                     card[_OLLAMA_PARAM_KEYS[parts[0]]] = float(parts[1])
                 except ValueError:
-                    pass
+                    _dbg_swallow()
     return card
 
 
@@ -345,7 +359,7 @@ class OllamaClient:
                 print(dim(f"note: {model} doesn't support thinking - "
                           f"continuing without it (think stays off for it)."))
             except Exception:
-                pass
+                _dbg_swallow()
 
     def _get_json(self, path, body=None, timeout=10):
         """Non-streaming JSON request; GET if body is None, else POST."""
@@ -531,6 +545,7 @@ class OllamaClient:
         try:
             with open_tiered(req, self.cfg) as resp:
                 self.last_truncated = False   # output-limit cut; read by core _reply_truncated
+                self.last_finish = None
                 for raw in stream_tiered(resp, self.cfg, self.cfg.host):
                     if should_abort and should_abort():
                         aborted = True
@@ -589,6 +604,7 @@ class OllamaClient:
                         saw_done = True
                         done_reason = obj.get("done_reason")
                         self.last_truncated = (done_reason == "length")
+                        self.last_finish = done_reason
                         prompt_eval = obj.get("prompt_eval_count")
                         # report output tokens for the core session counter
                         self.last_out_tokens = obj.get("eval_count")
@@ -635,7 +651,7 @@ class OllamaClient:
                 try:
                     self._preload(model)
                 except Exception:
-                    pass
+                    _dbg_swallow()
                 return self._stream_chat(model, messages, tools, should_abort,
                                          _cold_retried=_cold_retried, _stall_retried=True)
             # Map to ConnectionError so core's graceful next-model failover handles it

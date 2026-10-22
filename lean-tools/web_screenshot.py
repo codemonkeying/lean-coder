@@ -42,6 +42,20 @@ from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
 
+
+def _dbg_swallow():
+    """Debug bucket shim: hands a swallowed exception to lean-coder's _dbg_swallow
+    (a no-op unless LEANCODER_DEBUG=1). Never raises."""
+    for _m in ("__main__", "lean_coder"):
+        _f = getattr(sys.modules.get(_m), "_dbg_swallow", None)
+        if _f and _f is not _dbg_swallow:
+            try:
+                _f(2)
+            except Exception:
+                pass
+            return
+
+
 TOOL = {
     "name": "web_screenshot",
     "description": (
@@ -283,13 +297,13 @@ def _capture_one(browser, ctx_args, url, full_page, wait_for, want_dom, out_path
         try:
             page.goto(url, wait_until="load", timeout=timeout)
         except PWTimeout:
-            pass
+            _dbg_swallow()
 
     if wait_for:
         try:
             page.wait_for_selector(wait_for, timeout=5_000)
         except PWTimeout:
-            pass
+            _dbg_swallow()
 
     title = page.title() or "(no title)"
     final_url = page.url

@@ -48,6 +48,20 @@ import sys
 import time
 from pathlib import Path
 
+
+def _dbg_swallow():
+    """Debug bucket shim: hands a swallowed exception to lean-coder's _dbg_swallow
+    (a no-op unless LEANCODER_DEBUG=1). Never raises."""
+    for _m in ("__main__", "lean_coder"):
+        _f = getattr(sys.modules.get(_m), "_dbg_swallow", None)
+        if _f and _f is not _dbg_swallow:
+            try:
+                _f(2)
+            except Exception:
+                pass
+            return
+
+
 # Built-in ceiling defaults (last resort: env var > live cfg > this - see docstring).
 _DEFAULTS = {"max_concurrent": 10, "idle_timeout": 1800, "max_iterations": 30,
              "max_depth": 1, "max_children": 0}
@@ -196,7 +210,7 @@ def _ceiling(key):
         try:
             return int(env)
         except ValueError:
-            pass
+            _dbg_swallow()
     cfg = _H.get("cfg")
     val = getattr(cfg, f"worker_{key}", None) if cfg else None
     if isinstance(val, int):
@@ -284,6 +298,14 @@ def _compose_brief(task, model, cwd, max_iter, leash="r", provider="", brain_hos
     = 1); `child_budget` is how many children it may itself spawn (0 = none) - both drive
     the safe-recursion governor."""
     B, G = _H["BRIEF_MARK"], _H["GRANT_MARK"]
+    # Model-written fields must never forge a grant: a GRANT marker inside the task or
+    # seed text (parsed LAST-pair-wins) or a newline inside a grant value (a second
+    # 'leash:' line) would otherwise override the capped leash/cwd.
+    _defang = lambda t: (t or "").replace(G, "=== GRANT ===")
+    _one = lambda v: _defang(str(v).replace("\r", " ").replace("\n", " ")) if v else v
+    task, context, plan, notes = _defang(task), _defang(context), _defang(plan), _defang(notes)
+    model, provider, brain_host, tools, cwd = map(_one, (model, provider, brain_host, tools, cwd))
+    taskboard, leash, resume = _one(taskboard), _one(leash), _one(resume)
     grant = [f"leash: {leash}", f"cwd: {cwd}", f"max_iterations: {max_iter}"]
     if model:
         grant.append(f"model: {model}")
@@ -593,7 +615,7 @@ def run(args, cwd):
                     cap_note += (f" (iterations {_ri} capped to the {_ceil_iter} ceiling - "
                                  f"raise via /set worker_max_iterations)")
         except (TypeError, ValueError):
-            pass
+            _dbg_swallow()
     idle_timeout = _ceiling("idle_timeout")
     # Progress-staleness watchdog: bark (alert the parent), never bite. The worker bumps
     # its .progress file every iteration, so if that mtime goes stale the worker is stuck
@@ -711,7 +733,7 @@ def _read_usage(result_path):
             elif k == "out":
                 vout = int(v)
         except ValueError:
-            pass
+            _dbg_swallow()
     return vin, vout
 
 
@@ -823,7 +845,7 @@ def _finished_notice():
                 try:
                     ping("lean-coder worker", f"worker {pid} finished")
                 except Exception:
-                    pass
+                    _dbg_swallow()
             continue
         # No result. Only a FAILURE if the process is actually gone (a running worker
         # just hasn't written yet - leave it). A missing bg_status row => proc gone.
@@ -842,7 +864,7 @@ def _finished_notice():
             try:
                 ping("lean-coder worker", f"worker {pid} FAILED (no result)")
             except Exception:
-                pass
+                _dbg_swallow()
     if not just_finished:
         return ""
     total = len(workers)
@@ -854,7 +876,7 @@ def _finished_notice():
             try:
                 ping("lean-coder workers", f"all {total} workers finished")
             except Exception:
-                pass
+                _dbg_swallow()
     return "[" + "\n\n".join(lines) + "]"
 
 

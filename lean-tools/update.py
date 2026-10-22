@@ -37,6 +37,20 @@ import tempfile
 import urllib.request
 from pathlib import Path
 
+
+def _dbg_swallow():
+    """Debug bucket shim: hands a swallowed exception to lean-coder's _dbg_swallow
+    (a no-op unless LEANCODER_DEBUG=1). Never raises."""
+    for _m in ("__main__", "lean_coder"):
+        _f = getattr(sys.modules.get(_m), "_dbg_swallow", None)
+        if _f and _f is not _dbg_swallow:
+            try:
+                _f(2)
+            except Exception:
+                pass
+            return
+
+
 REPO = "codemonkeying/lean-coder"
 # The branch each update track fetches from: stable = main, beta = a pre-release branch.
 TRACK_BRANCH = {"stable": "main", "beta": "beta"}
@@ -208,7 +222,7 @@ def _notes_from_source(py_path):
                 val = ast.literal_eval(node.value)
                 return val if isinstance(val, dict) else {}
     except Exception:
-        pass
+        _dbg_swallow()
     return {}
 
 
@@ -315,7 +329,7 @@ def _apply(cfg, dest_root, dim, green, yellow, red, ask=None):
                         if rel.endswith(".py"):
                             dst.chmod(dst.stat().st_mode | 0o111)
                 except OSError:
-                    pass
+                    _dbg_swallow()
             print(red(f"new build failed to import ({why}); rolled back - "
                       "nothing changed. Your install is untouched."))
             return False

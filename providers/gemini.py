@@ -10,6 +10,20 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+
+def _dbg_swallow():
+    """Debug bucket shim: hands a swallowed exception to lean-coder's _dbg_swallow
+    (a no-op unless LEANCODER_DEBUG=1). Never raises."""
+    for _m in ("__main__", "lean_coder"):
+        _f = getattr(sys.modules.get(_m), "_dbg_swallow", None)
+        if _f and _f is not _dbg_swallow:
+            try:
+                _f(2)
+            except Exception:
+                pass
+            return
+
+
 # Google Generative Language (Gemini) REST API.
 #   docs: https://ai.google.dev/api/generate-content  # sweep-ok
 # Auth is an API key sent as the x-goog-api-key header (NOT Bearer; the key is
@@ -71,7 +85,7 @@ def _learn_429(model, body):
             try:
                 delay = float(str(d.get("retryDelay", "")).rstrip("s"))
             except ValueError:
-                pass
+                _dbg_swallow()
     for d in det:
         for v in (d.get("violations") or []):
             qid = str(v.get("quotaId", ""))
@@ -142,7 +156,7 @@ def _save_cred(data):
     try:
         _cred_path().chmod(0o600)
     except OSError:
-        pass
+        _dbg_swallow()
 
 def _clear_cred():
     if _cred_path().is_file():
@@ -231,10 +245,10 @@ def _fetch_models(key):
                 _models_cache_path().parent.mkdir(parents=True, exist_ok=True)
                 _models_cache_path().write_text(json.dumps({"models": out}))
             except Exception:
-                pass
+                _dbg_swallow()
             return out
     except Exception:
-        pass
+        _dbg_swallow()
     return _load_models_cache()
 
 
@@ -354,13 +368,13 @@ def _retry_after_secs(headers, body):
                 if rd.endswith("s"):
                     return float(rd[:-1] or 0)
     except Exception:
-        pass
+        _dbg_swallow()
     ra = headers.get("Retry-After") or headers.get("retry-after")
     if ra:
         try:
             return float(ra)
         except (TypeError, ValueError):
-            pass
+            _dbg_swallow()
     return None
 
 
