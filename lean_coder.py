@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L1852   Lean-tools (plugin tools: discovery, manager)
-  L2239   MCP client (connection, manager, OAuth, discovery)
-  L2693   Providers (backend plugin registry)
-  L2970   Interactive pickers + menus (raw-mode UI engine)
-  L3333   Terminal styling (colors, formatting helpers)
-  L3627   Streaming + markdown render (model output)
-  L4392   Composer (pinned input line, editor, stdin)
-  L5359   Token accounting (calibrated context meter)
-  L5612   Config (dataclass, field registry, load/save)
-  L9594   Tool execution + text tool-call parsing
-  L10067  Remote workspace (executor client, /connect)
-  L12258  Context meter
-  L12353  Agent (turn loop, context mgmt, tool dispatch)
-  L20047  Slash-command handlers + dispatch table
-  L20189  REPL (interactive loop, session resume)
-  L20661  Worker agent (headless --agent-run)
-  L21349  Entry (CLI arg parsing, main)
+  L1855   Lean-tools (plugin tools: discovery, manager)
+  L2242   MCP client (connection, manager, OAuth, discovery)
+  L2696   Providers (backend plugin registry)
+  L2973   Interactive pickers + menus (raw-mode UI engine)
+  L3336   Terminal styling (colors, formatting helpers)
+  L3630   Streaming + markdown render (model output)
+  L4399   Composer (pinned input line, editor, stdin)
+  L5366   Token accounting (calibrated context meter)
+  L5619   Config (dataclass, field registry, load/save)
+  L9601   Tool execution + text tool-call parsing
+  L10074  Remote workspace (executor client, /connect)
+  L12265  Context meter
+  L12360  Agent (turn loop, context mgmt, tool dispatch)
+  L20054  Slash-command handlers + dispatch table
+  L20196  REPL (interactive loop, session resume)
+  L20668  Worker agent (headless --agent-run)
+  L21356  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -154,7 +154,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.10.98"
+__version__ = "0.10.99"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -162,6 +162,9 @@ __version__ = "0.10.98"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.10.99": [
+        "Stored replies keep their leading newlines; only the screen trims them.",
+    ],
     "0.10.98": [
         "Internal test tidy only; no behaviour change.",
     ],
@@ -3908,6 +3911,7 @@ def consume_openai_stream(client, resp, should_abort=None, tools=None, *,
     def show_text(txt):
         if not txt:
             return
+        st["content_parts"].append(txt)          # stored verbatim; only the SCREEN trims
         if not st["printed"]:
             txt = txt.lstrip("\n")              # no blank line after the bullet
             if not txt:
@@ -3918,7 +3922,6 @@ def consume_openai_stream(client, resp, should_abort=None, tools=None, *,
             sys.stdout.write(blue(GLYPH["bullet"] + " "))
             st["printed"] = True
         md.feed(txt)
-        st["content_parts"].append(txt)
 
     try:
         for raw in stream_tiered(resp, cfg):
@@ -4019,6 +4022,10 @@ def consume_openai_stream(client, resp, should_abort=None, tools=None, *,
     client.last_finish = st["finish"]
 
     content = "".join(st["content_parts"])
+    if split.thought:
+        # The newlines right after </think> are the template's separator, not answer
+        # text; a plain reply's own leading newlines are kept verbatim.
+        content = content.lstrip("\n")
     if text_fallback and not tool_calls and not st["aborted"]:
         known, schemas = _schemas_of(tools)
         parsed, cleaned = parse_text_tool_calls(content, known_names=known or None,
