@@ -1742,7 +1742,9 @@ def _worker_cmd(agent, cfg, arg):
             print(_H["dim"](f"no worker with pid {pid} this session."))
             return
         res = _read_result(meta["result"])
-        print(_H["bold"](f"worker {pid}") + _H["dim"](f"  {meta['task'][:80]}"))
+        _fit = _H.get("_fit_line") or (lambda x, **k: x)
+        print(_fit(_H["bold"](f"worker {pid}") + _H["dim"]("  " + " ".join(meta['task'].split())),
+                   ellipsis=True))
         if res:
             print(res)
         else:
@@ -1770,8 +1772,10 @@ def _worker_cmd(agent, cfg, arg):
         runtime = row["runtime"] if row else "?"
         done = _read_result(meta["result"]) is not None
         tag = _H["green"]("result ready") if done else _H["dim"](state)
-        print(f"  {_H['cyan'](str(pid))}  {tag}  (ran {runtime})  "
-              f"{meta['model']}  {_H['dim'](meta['task'][:56])}")
+        _fit = _H.get("_fit_line") or (lambda x, **k: x)
+        _1l = _H.get("_one_line") or (lambda x: " ".join(str(x).split()))
+        print(_fit(f"  {_H['cyan'](str(pid))}  {tag}  (ran {runtime})  "
+                   f"{meta['model']}  {_H['dim'](_1l(meta['task']))}", ellipsis=True))
         if not done:
             # Compact heartbeat only (iter + last tool); full progress + intent via
             # /worker <pid>. Keep it to one short line so the list stays scannable.
@@ -1784,12 +1788,12 @@ def _worker_cmd(agent, cfg, arg):
                 if first.startswith("iter "):
                     bits.append(first)
                 if pl.get("last"):
-                    bits.append("last " + pl["last"][:40])
+                    bits.append("last " + pl["last"])
                 n_inj, _last = _inject_count(meta["result"])
                 if n_inj:
                     bits.append(f"{n_inj} inject" + ("s" if n_inj > 1 else ""))
                 if bits:
-                    print(_H["dim"]("        " + "  ".join(bits)))
+                    print(_fit(_H["dim"]("        " + "  ".join(bits)), ellipsis=True))
 
 
 def _worker_completer(agent, cfg):
@@ -1813,7 +1817,7 @@ def setup(lc, cfg):
               "active_tool_names", "tool_min_leash", "resolve_host", "_norm_host",
               "_board_claim", "_board_release", "_board_read_claims",
               "save_session", "load_envelope",
-              "dim", "bold", "green", "cyan"):
+              "dim", "bold", "green", "cyan", "_fit_line", "_one_line"):
         if k in lc:
             _H[k] = lc[k]
     _H["__file__"] = lc.get("__file__")     # the CORE module file, for the worker argv

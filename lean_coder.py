@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L1818   Lean-tools (plugin tools: discovery, manager)
-  L2205   MCP client (connection, manager, OAuth, discovery)
-  L2659   Providers (backend plugin registry)
-  L2881   Interactive pickers + menus (raw-mode UI engine)
-  L3230   Terminal styling (colors, formatting helpers)
-  L3524   Streaming + markdown render (model output)
-  L4016   Composer (pinned input line, editor, stdin)
-  L4983   Token accounting (calibrated context meter)
-  L5236   Config (dataclass, field registry, load/save)
-  L9218   Tool execution + text tool-call parsing
-  L9691   Remote workspace (executor client, /connect)
-  L11870  Context meter
-  L11965  Agent (turn loop, context mgmt, tool dispatch)
-  L19647  Slash-command handlers + dispatch table
-  L19789  REPL (interactive loop, session resume)
-  L20261  Worker agent (headless --agent-run)
-  L20949  Entry (CLI arg parsing, main)
+  L1824   Lean-tools (plugin tools: discovery, manager)
+  L2211   MCP client (connection, manager, OAuth, discovery)
+  L2665   Providers (backend plugin registry)
+  L2887   Interactive pickers + menus (raw-mode UI engine)
+  L3250   Terminal styling (colors, formatting helpers)
+  L3544   Streaming + markdown render (model output)
+  L4265   Composer (pinned input line, editor, stdin)
+  L5232   Token accounting (calibrated context meter)
+  L5485   Config (dataclass, field registry, load/save)
+  L9467   Tool execution + text tool-call parsing
+  L9940   Remote workspace (executor client, /connect)
+  L12119  Context meter
+  L12214  Agent (turn loop, context mgmt, tool dispatch)
+  L19900  Slash-command handlers + dispatch table
+  L20042  REPL (interactive loop, session resume)
+  L20514  Worker agent (headless --agent-run)
+  L21202  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -153,7 +153,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.10.91"
+__version__ = "0.10.92"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -161,6 +161,12 @@ __version__ = "0.10.91"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.10.92": [
+        "mlx + llama.cpp now share one stream reader in core (less duplicated code).",
+        "reasoning sent inline as <think>...</think> is shown dimmed and no longer saved",
+        "  to history; a tool call a small model writes only inside its reasoning still runs.",
+        "/worker, /bg, /session, /activity, /machines, /board: rows fill the width, then '…'.",
+    ],
     "0.10.91": [
         "first start without a backend now welcomes you and points at /provider.",
         "run_command: a timeout shows the last output; progress bars (\\r) read cleanly;",
@@ -2939,14 +2945,28 @@ def _term_cols():
         return 80
 
 
-def _fit_line(s, width=None):
+def _visible_len(s):
+    """Display length of `s` with ANSI colour codes stripped."""
+    return len(_ANSI_RE.sub("", s))
+
+
+def _one_line(s):
+    """Collapse a value onto one line (newlines/tabs -> spaces) for list rows."""
+    return " ".join(str(s).split())
+
+
+def _fit_line(s, width=None, ellipsis=False):
     """Truncate a display string to `width` VISIBLE columns (ANSI colour codes don't
     count), so a picker row can NEVER wrap onto a second physical line - wrapping is
     what desyncs the cursor-up redraw math and smears the menu. Any colour left open
     at the cut is closed with a reset. `width` defaults to the terminal width minus 1
-    (leave the last column free so no terminal auto-wraps on the final glyph)."""
+    (leave the last column free so no terminal auto-wraps on the final glyph).
+    ellipsis=True ends a cut line with '…' so you can see it was shortened - for list
+    output (/worker, /bg): fill to the edge, then show it continues."""
     if width is None:
         width = max(1, _term_cols() - 1)
+    if ellipsis and _visible_len(s) > width:
+        return _fit_line(s, max(0, width - 1)) + "…"
     out, vis, i, n, truncated = [], 0, 0, len(s), False
     while i < n:
         m = _ANSI_RE.match(s, i)
@@ -3669,6 +3689,235 @@ def stream_tiered(resp, cfg, where="", idle=None):
             got_first = True
             _set_stream_read_timeout(resp, idle)   # None = keep ttft (prod)
         yield raw
+
+
+def _schemas_of(tools):
+    """(known tool names, {name: properties}) from an OpenAI-shaped tool list - the
+    guard args parse_text_tool_calls needs so a tool merely quoted in prose isn't run."""
+    known, schemas = set(), {}
+    for t in (tools or []):
+        fn = t.get("function") or t
+        nm = fn.get("name")
+        if nm:
+            known.add(nm)
+            props = (fn.get("parameters") or {}).get("properties")
+            if isinstance(props, dict):
+                schemas[nm] = props
+    return known, schemas
+
+
+class ThinkSplitter:
+    """Streaming splitter for reasoning sent INLINE in the content channel as
+    <think>...</think> (e.g. older mlx_lm.server, some llama/vLLM templates). feed()
+    returns [(is_think, text), ...]; a tag split across chunks is held back until it
+    is complete, so it never leaks as text. flush() releases what's held at the end."""
+    OPEN, CLOSE = "<think>", "</think>"
+
+    def __init__(self):
+        self.in_think = False
+        self.held = ""
+        self.thought = []                    # all reasoning seen (for the fallback)
+
+    def feed(self, txt):
+        out, s = [], self.held + txt
+        self.held = ""
+        while s:
+            tag = self.CLOSE if self.in_think else self.OPEN
+            i = s.find(tag)
+            if i >= 0:
+                if i:
+                    out.append((self.in_think, s[:i]))
+                s = s[i + len(tag):]
+                self.in_think = not self.in_think
+                continue
+            # keep back a tail that could be the start of the tag
+            k = next((n for n in range(min(len(tag) - 1, len(s)), 0, -1)
+                      if tag.startswith(s[-n:])), 0)
+            if len(s) > k:
+                out.append((self.in_think, s[:len(s) - k]))
+            self.held = s[len(s) - k:] if k else ""
+            break
+        for t, x in out:
+            if t:
+                self.thought.append(x)
+        return out
+
+    def flush(self):
+        x, self.held = self.held, ""
+        if x and self.in_think:
+            self.thought.append(x)
+        return [(self.in_think, x)] if x else []
+
+
+def consume_openai_stream(client, resp, should_abort=None, tools=None, *,
+                          think_keys=("reasoning_content", "reasoning", "thinking"),
+                          on_obj=None, on_done=None, text_fallback=True):
+    """THE shared reader for OpenAI-style streamed chat replies (SSE `data:` lines of
+    chat.completion.chunk objects). Providers call this instead of keeping their own
+    copy. It renders as it goes (spinner -> dim reasoning -> styled content), assembles
+    content, reasoning-free text and streamed tool calls (string fragments OR a whole
+    parsed object - llama.cpp #20198), records usage and the finish reason, and falls
+    back to text-encoded tool calls when the model sent no native ones.
+
+    Hooks (both optional) for what is really provider-specific:
+      on_obj(obj, st)  - every parsed chunk, after the core handled it. Read extra
+                         fields (timings, an in-band {message} error) or raise to fail.
+      on_done(st)      - once the stream ends, before results are recorded; may adjust
+                         st["prompt_total"] / st["out_tokens"] (e.g. from timings).
+    `st` is a plain dict: finish, content_parts, prompt_total, out_tokens, aborted,
+    printed, printed_think, chunks (count of parsed chunks).
+
+    Sets on `client`: last_truncated, last_finish, last_out_tokens.
+    Returns (assistant_dict, prompt_tokens_or_None, aborted)."""
+    st = {"finish": None, "content_parts": [], "prompt_total": None, "out_tokens": None,
+          "aborted": False, "printed": False, "printed_think": False, "chunks": 0}
+    tool_acc, order = {}, []
+    cfg = getattr(client, "cfg", None)
+    client.last_truncated = False                # output-limit cut; read by _reply_truncated
+    client.last_finish = None
+    client.last_out_tokens = None
+    md = MarkdownStream(sys.stdout.write)
+    spin = Spinner("thinking", THINK_FRAMES).start()
+    split = ThinkSplitter()
+
+    def show_think(think):                   # reasoning: shown dimmed, never stored
+        if not st["printed_think"] and not st["printed"]:
+            spin.stop()
+            sys.stdout.write(dim(GLYPH["think"] + " "))
+            st["printed_think"] = True
+        sys.stdout.write(dim(think))
+        sys.stdout.flush()
+
+    def show_text(txt):
+        if not txt:
+            return
+        if not st["printed"]:
+            txt = txt.lstrip("\n")              # no blank line after the bullet
+            if not txt:
+                return
+            spin.stop()
+            if st["printed_think"]:
+                sys.stdout.write("\n")
+            sys.stdout.write(blue(GLYPH["bullet"] + " "))
+            st["printed"] = True
+        md.feed(txt)
+        st["content_parts"].append(txt)
+
+    try:
+        for raw in stream_tiered(resp, cfg):
+            if should_abort and should_abort():
+                st["aborted"] = True
+                break
+            line = raw.decode(errors="replace").strip() if isinstance(raw, bytes) else raw.strip()
+            if not line.startswith("data:"):
+                continue
+            data = line[5:].strip()
+            if data == "[DONE]":
+                break
+            try:
+                obj = json.loads(data)
+            except (ValueError, RecursionError):
+                continue
+            if not isinstance(obj, dict):
+                continue
+            st["chunks"] += 1
+            for ch in obj.get("choices") or []:
+                if ch.get("finish_reason"):
+                    st["finish"] = ch["finish_reason"]
+                delta = ch.get("delta") or {}
+                # Reasoning channel: shown dimmed, never stored (not part of content).
+                think = next((delta[k] for k in think_keys
+                              if isinstance(delta.get(k), str) and delta[k]), None)
+                if think:
+                    show_think(think)
+                txt = delta.get("content")
+                if txt and isinstance(txt, str):
+                    # Inline <think>...</think> in content goes to the reasoning channel.
+                    for is_think, piece in split.feed(txt):
+                        (show_think if is_think else show_text)(piece)
+                for tcd in (delta.get("tool_calls") or []):
+                    idx = tcd.get("index", 0)
+                    if idx not in tool_acc:
+                        tool_acc[idx] = {"id": "", "name": "", "args": [], "args_obj": None}
+                        order.append(idx)
+                    slot = tool_acc[idx]
+                    if tcd.get("id"):
+                        slot["id"] = tcd["id"]
+                    fn = tcd.get("function") or {}
+                    if fn.get("name"):
+                        slot["name"] = fn["name"]
+                    a = fn.get("arguments")
+                    if a is not None and a != "":
+                        if isinstance(a, str):
+                            slot["args"].append(a)     # fragments: concatenate
+                        else:
+                            slot["args_obj"] = a       # already parsed: keep whole
+            um = obj.get("usage")
+            if um:
+                st["prompt_total"] = um.get("prompt_tokens", st["prompt_total"])
+                st["out_tokens"] = um.get("completion_tokens", st["out_tokens"])
+            if on_obj:
+                on_obj(obj, st)
+        for is_think, piece in split.flush():
+            (show_think if is_think else show_text)(piece)
+    finally:
+        spin.stop()
+
+    if st["printed"]:
+        md.flush()
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+    elif st["printed_think"]:                    # reasoning-only turn: close the dim line
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+
+    tool_calls = []
+    for idx in order:
+        slot = tool_acc[idx]
+        if slot["args_obj"] is not None:
+            args = slot["args_obj"]
+        else:
+            try:
+                args = json.loads("".join(slot["args"])) if slot["args"] else {}
+            except ValueError:
+                args = {}
+        tool_calls.append({"id": slot["id"] or f"call_{idx}", "type": "function",
+                           "function": {"name": slot["name"], "arguments": args}})
+
+    if on_done:
+        on_done(st)
+    if st["out_tokens"]:
+        client.last_out_tokens = st["out_tokens"]
+    client.last_truncated = (st["finish"] == "length")
+    client.last_finish = st["finish"]
+
+    content = "".join(st["content_parts"])
+    if text_fallback and not tool_calls and not st["aborted"]:
+        known, schemas = _schemas_of(tools)
+        parsed, cleaned = parse_text_tool_calls(content, known_names=known or None,
+                                                schemas=schemas or None)
+        if parsed:
+            print(dim(f"(parsed {len(parsed)} tool call(s) from text)"))
+            tool_calls, content = parsed, cleaned
+        elif not content.strip() and split.thought:
+            # Small models sometimes write the call INSIDE <think> and then stop: with no
+            # answer at all, run a well-formed call for a KNOWN tool found there.
+            parsed, _ = parse_text_tool_calls("".join(split.thought),
+                                              known_names=known or None,
+                                              schemas=schemas or None)
+            if parsed and known:
+                print(dim(f"(parsed {len(parsed)} tool call(s) from the reasoning)"))
+                tool_calls = parsed
+
+    assistant = {"role": "assistant", "content": content}
+    if tool_calls:
+        # Strict OpenAI shape on EVERY call (native + text fallback): servers that
+        # re-validate replayed history (llama-server --jinja) 500 without id/type.
+        for i, tc in enumerate(tool_calls):
+            tc.setdefault("id", f"call_{i}")
+            tc.setdefault("type", "function")
+        assistant["tool_calls"] = tool_calls
+    return assistant, st["prompt_total"], st["aborted"]
 
 
 _OUTPUT_WRAP_WIDTH = 0     # live prose-wrap width; core refreshes it from cfg.output_wrap
@@ -16099,7 +16348,7 @@ def _settings_sessions_view(agent, cfg):
         when = meta.get("saved_at", "?")
         turns = meta.get("turns", "?")
         age = f"{_fmt_age(now - mtime)} ago" if mtime else "?"
-        print(f"  {bold(cyan(name))}  {dim(f'{when} {d} {age} {d} {turns} msgs')}")
+        print(_fit_line(f"  {bold(cyan(name))}  {dim(f'{when} {d} {age} {d} {turns} msgs')}", ellipsis=True))
     name = _session_picker("load session (enter to skip):")
     if name:
         _load_session_into(agent, cfg, name)
@@ -16289,8 +16538,9 @@ def handle_bg_command(agent, cfg, arg):
             st = r.get("state", "?")
             label = green("running") if st == "running" else (
                 green(st) if st == "exit 0" else red(st))
-            print(f"  {bold(cyan(str(r.get('pid'))))}  {label}  "
-                  f"(ran {r.get('runtime', '?')})  {r.get('cmd', '?')}")
+            print(_fit_line(f"  {bold(cyan(str(r.get('pid'))))}  {label}  "
+                            f"(ran {r.get('runtime', '?')})  {_one_line(r.get('cmd', '?'))}",
+                            ellipsis=True))
             if st == "running":
                 print(dim(f"      /bg kill {r.get('pid')}"))
         return
@@ -16312,15 +16562,18 @@ def handle_bg_command(agent, cfg, arg):
     for r in sorted(running + finished, key=lambda r: str(r.get("started", ""))):
         if id(r) in _alive:
             tag = "" if r.get("owner") == me else dim("  (other session)")
-            print(f"  {bold(cyan(str(r.get('pid'))))}  {green('running')}  "
-                  f"{dim(r.get('started', '?'))}  {r.get('cmd', '?')}{tag}")
-            print(dim(f"      log: {r.get('log', '?')}   ·   /bg kill {r.get('pid')}"))
+            print(_fit_line(f"  {bold(cyan(str(r.get('pid'))))}  {green('running')}  "
+                            f"{dim(r.get('started', '?'))}{tag}  {_one_line(r.get('cmd', '?'))}",
+                            ellipsis=True))
+            print(_fit_line(dim(f"      /bg kill {r.get('pid')}   ·   log: {r.get('log', '?')}"),
+                            ellipsis=True))
         else:
             code = _bg_exit_code(r)
             stat = green("exit 0") if code == "0" else red(f"exit {code}")
-            print(f"  {dim(str(r.get('pid')))}  {stat}  "
-                  f"{dim(r.get('started', '?'))}  {r.get('cmd', '?')}")
-            print(dim(f"      log: {r.get('log', '?')}"))
+            print(_fit_line(f"  {dim(str(r.get('pid')))}  {stat}  "
+                            f"{dim(r.get('started', '?'))}  {_one_line(r.get('cmd', '?'))}",
+                            ellipsis=True))
+            print(_fit_line(dim(f"      log: {r.get('log', '?')}"), ellipsis=True))
 
 
 def handle_note_command(agent, cfg, arg):
@@ -16485,7 +16738,7 @@ def handle_board_command(agent, cfg, arg):
             csum = ", ".join(f"{k}:{v}" for k, v in counts.items() if v) or "empty"
             when = meta.get("updated_at", "")
             when = dim(f"  {when}") if when else ""
-            print(f"  {cyan(name)}  " + dim(f"({csum})") + when)
+            print(_fit_line(f"  {cyan(name)}  " + dim(f"({csum})") + when, ellipsis=True))
         print(dim("`/board <name>` to view one."))
         return
 
@@ -17575,7 +17828,7 @@ def handle_session_command(agent, cfg, arg):
             turns = meta.get("turns", "?")
             title = meta.get("title", "")
             age = f"{_fmt_age(now - mtime)} ago" if mtime else "?"
-            print(f"  {bold(cyan(name))}  {dim(f'{when} {d} {age} {d} {turns} msgs {d} {title}')}")
+            print(_fit_line(f"  {bold(cyan(name))}  {dim(f'{when} {d} {age} {d} {turns} msgs {d} {title}')}", ellipsis=True))
         if hidden:
             print(dim(f"  ({hidden} pre-compact snapshot(s) hidden; "
                       f"/set show_snapshots true to show)"))
@@ -18845,7 +19098,7 @@ def handle_machines_command(agent, cfg, arg):
         return
     print(bold("machines:"))
     for name, url in sorted(cfg.machines.items()):
-        print(f"  {cyan(name)}  {dim(url)}")
+        print(_fit_line(f"  {cyan(name)}  {dim(url)}", ellipsis=True))
     print(dim("  /machines remove <name> forgets one"))
 
 
@@ -19470,7 +19723,7 @@ def handle_activity_command(agent, cfg, arg):
                + (f", showing last {len(shown)}" if hidden > 0 else "") + "):"))
     for e in shown:
         ts = time.strftime("%H:%M:%S", time.localtime(e["t"]))
-        print(f"  {dim(ts)}  {yellow(e['kind'])}  {e['summary']}")
+        print(_fit_line(f"  {dim(ts)}  {yellow(e['kind'])}  {e['summary']}", ellipsis=True))
         if e.get("detail"):
             print(dim(f"           {e['detail']}"))
     if hidden > 0:

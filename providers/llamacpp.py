@@ -307,181 +307,34 @@ class LlamaCppClient:
         return (send, eff, src) if full else self.last_sampling
 
     def _consume(self, resp, should_abort, tools=None):
-        """Parse a streamed OpenAI SSE response, printing content as it arrives and
-        accumulating any tool_calls. Returns (assistant_dict, prompt_tokens, aborted).
-        Mirrors providers/openai.py::_consume."""
-        finish        = None
-        content_parts = []
-        tool_acc      = {}
-        order         = []
-        prompt_total  = None
-        timings       = None
-        self.last_out_tokens = self.last_eval_tokens = self.last_eval_ns = None
-        self.last_cache_n = None
-        out_tokens    = None
-        printed       = False
-        printed_think = False
-        aborted       = False
-        md            = _lc["MarkdownStream"](sys.stdout.write)
+        """Read the streamed reply with core's shared OpenAI-style reader, plus
+        llama-server's per-chunk `timings` (decode speed, cache hits, and a token count
+        when the server omits `usage`). Returns (assistant_dict, prompt_tokens, aborted)."""
+        self.last_eval_tokens = self.last_eval_ns = self.last_cache_n = None
+        timings = {}
 
-        spin = _lc["Spinner"]("thinking", _lc["THINK_FRAMES"]).start()
-        try:
-            self.last_truncated = False   # output-limit cut; read by core _reply_truncated
-            self.last_finish = None
-            for raw in _lc["stream_tiered"](resp, self.cfg):
-                if should_abort and should_abort():
-                    aborted = True
-                    break
-                line = raw.decode(errors="replace").strip()
-                if not line.startswith("data:"):
-                    continue
-                data = line[5:].strip()
-                if data == "[DONE]":
-                    break
-                try:
-                    obj = json.loads(data)
-                except Exception:
-                    continue
+        def on_obj(obj, st):
+            tm = obj.get("timings")
+            if isinstance(tm, dict):
+                timings.clear()
+                timings.update(tm)               # last one wins
 
-                for ch in obj.get("choices", []):
-                    if ch.get("finish_reason"):
-                        finish = ch["finish_reason"]
-                    delta = ch.get("delta", {})
-                    # Thinking channel: stock llama-server streams reasoning on
-                    # delta.reasoning_content (some builds/models use delta.thinking).
-                    # Dim it like ollama, and keep it OUT of content_parts so an
-                    # all-reasoning span never inflates the (possibly empty) content.
-                    think = delta.get("reasoning_content") or delta.get("thinking")
-                    if think:
-                        if not printed_think and not printed:
-                            spin.stop()
-                            sys.stdout.write(_lc["dim"](_lc["GLYPH"]["think"] + " "))
-                            printed_think = True
-                        sys.stdout.write(_lc["dim"](think))
-                        sys.stdout.flush()
-                    txt   = delta.get("content")
-                    if txt:
-                        if not printed:
-                            spin.stop()
-                            if printed_think:
-                                sys.stdout.write("\n")
-                            sys.stdout.write(_lc["blue"]((_lc.get("GLYPH") or {}).get("bullet", "*") + " "))
-                            printed = True
-                        md.feed(txt)
-                        content_parts.append(txt)
-                    for tcd in (delta.get("tool_calls") or []):
-                        idx = tcd.get("index", 0)
-                        if idx not in tool_acc:
-                            tool_acc[idx] = {"id": "", "name": "", "args": [], "args_obj": None}
-                            order.append(idx)
-                        slot = tool_acc[idx]
-                        if tcd.get("id"):
-                            slot["id"] = tcd["id"]
-                        fn = tcd.get("function", {})
-                        if fn.get("name"):
-                            slot["name"] = fn["name"]
-                        _a = fn.get("arguments")
-                        if _a is not None and _a != "":
-                            # llama.cpp #20198: recent llama-server returns arguments
-                            # as an already-parsed JSON OBJECT, whereas OpenAI/ollama
-                            # stream it as string fragments. Keep string deltas for
-                            # concatenation; stash a dict/list whole (last-wins).
-                            if isinstance(_a, str):
-                                slot["args"].append(_a)
-                            else:
-                                slot["args_obj"] = _a
-
-                # llama-server's per-chunk timings (timings_per_token); last one wins.
-                tm = obj.get("timings")
-                if isinstance(tm, dict):
-                    timings = tm
-                um = obj.get("usage")
-                if um:
-                    prompt_total = um.get("prompt_tokens", prompt_total)
-                    out_tokens   = um.get("completion_tokens", out_tokens)
-        finally:
-            spin.stop()
-
-        if printed:
-            md.flush()
-            sys.stdout.write("\n")
-            sys.stdout.flush()
-        elif printed_think:
-            # thinking-only turn (no content channel yet): close the dim reasoning
-            # line so the next thing printed isn't glued to it.
-            sys.stdout.write("\n")
-            sys.stdout.flush()
-
-        tool_calls = []
-        for idx in order:
-            slot = tool_acc[idx]
-            if slot.get("args_obj") is not None:
-                # Server already handed us a parsed object (llama.cpp #20198).
-                args = slot["args_obj"]
-            else:
-                try:
-                    args = json.loads("".join(slot["args"])) if slot["args"] else {}
-                except Exception:
-                    args = {}
-            tool_calls.append({
-                "id":       slot["id"] or f"call_{idx}",
-                # OpenAI spec requires "type":"function" on assistant tool_calls.
-                # Stock llama-server (--jinja) strictly re-validates this when the
-                # assistant message is REPLAYED in history on turn 2+; omitting it
-                # 500s ("Missing tool call type"). A fresh turn-1 call works either
-                # way, which is why the bug only shows on multi-turn tool use.
-                "type":     "function",
-                "function": {"name": slot["name"], "arguments": args},
-            })
-
-        if timings:
+        def on_done(st):
+            if not timings:
+                return
             self.last_eval_tokens = timings.get("predicted_n") or None
             self.last_eval_ns = int((timings.get("predicted_ms") or 0) * 1e6) or None
             self.last_cache_n = timings.get("cache_n")
-            if not out_tokens:
-                out_tokens = self.last_eval_tokens
-            if prompt_total is None and timings.get("prompt_n") is not None:
-                prompt_total = (timings.get("prompt_n") or 0) + (timings.get("cache_n") or 0)
-        if out_tokens:
-            self.last_out_tokens = out_tokens
-        self.last_truncated = (finish == "length")
-        self.last_finish = finish
+            if not st["out_tokens"]:
+                st["out_tokens"] = self.last_eval_tokens
+            if st["prompt_total"] is None and timings.get("prompt_n") is not None:
+                st["prompt_total"] = (timings.get("prompt_n") or 0) + (timings.get("cache_n") or 0)
 
-        content = "".join(content_parts)
-        # Text-tool-call fallback: only when the model emitted NO native tool_calls
-        # (small GGUF models, or a server started without --jinja). Matches
-        # OllamaClient.chat - guard against firing on a tool merely quoted in prose.
-        if not tool_calls and not aborted:
-            parse = _lc.get("parse_text_tool_calls")
-            if parse:
-                known = {(_t.get("function") or _t).get("name") for _t in (tools or [])}
-                known.discard(None)
-                _schemas = {}
-                for _t in (tools or []):
-                    _fn = _t.get("function") or _t
-                    _nm = _fn.get("name")
-                    _props = (_fn.get("parameters") or {}).get("properties")
-                    if _nm and isinstance(_props, dict):
-                        _schemas[_nm] = _props
-                parsed, cleaned = parse(content, known_names=known or None,
-                                        schemas=_schemas or None)
-                if parsed:
-                    print(_lc["dim"](f"(parsed {len(parsed)} tool call(s) from text)"))
-                    tool_calls = parsed
-                    content = cleaned
-
-        assistant = {"role": "assistant", "content": content}
-        if tool_calls:
-            # Normalize EVERY tool_call (native + text-fallback) to the strict OpenAI
-            # shape - id + type:function - so it survives being replayed in history to
-            # a --jinja llama-server on later turns (see the type note above).
-            for _i, _tc in enumerate(tool_calls):
-                _tc.setdefault("id", f"call_{_i}")
-                _tc.setdefault("type", "function")
-            assistant["tool_calls"] = tool_calls
-        if not aborted:
-            _note_cut(self.cfg, finish)
-        return assistant, prompt_total, aborted
+        out = _lc["consume_openai_stream"](self, resp, should_abort, tools,
+                                           on_obj=on_obj, on_done=on_done)
+        if not out[2]:
+            _note_cut(self.cfg, self.last_finish)
+        return out
 
     def _swap_hint(self, model):
         """Router mode: when the model changes and the server reports it isn't loaded
