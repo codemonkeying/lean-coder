@@ -150,6 +150,52 @@ The client holds the `cfg` it was built with and reads, at send time:
 
 It does **not** mutate `cfg`.
 
+### Streaming: use the shared reader
+
+If your backend streams OpenAI-style chunks (`data: {...chat.completion.chunk...}` SSE
+lines, ending in `data: [DONE]`), don't write your own loop. Call core's reader from
+`chat()` on the open response:
+
+```python
+out = lc["consume_openai_stream"](client, resp, should_abort, tools,
+                                  on_line=..., on_obj=..., on_done=...,
+                                  text_fallback=False, split_think=False)
+return out        # (assistant_dict, prompt_eval|None, aborted)
+```
+
+It renders as it goes (spinner, then reasoning dimmed, then the answer), never stores
+reasoning (`reasoning_content` / `reasoning` / `thinking` fields), joins streamed tool
+calls (string fragments or a whole parsed object), polls `should_abort`, and sets
+`client.last_finish`, `last_truncated` (finish `length`) and `last_out_tokens`.
+
+Options:
+
+- `text_fallback` - when the model sent no native tool calls, parse text-encoded ones
+  (`<tool_call>{...}</tool_call>` etc.) from the answer. On for local servers whose small
+  models do this; **off for a hosted API**, so text that merely looks like a call stays text.
+- `split_think` - move inline `<think>...</think>` out of the answer into the dim reasoning
+  line. On only where models send thinking as raw tags (local servers); off elsewhere, so
+  a literal `<think>` in prose or code is kept.
+
+Hooks, for what is specific to your backend (all optional):
+
+- `on_line(line, obj, st)` - every non-blank line before core handles it; `obj` is the
+  parsed chunk, or `None` for a non-`data:` line / bad JSON. Return `True` to stop
+  reading, or raise to fail the request. Pair it with `lc["upstream_error_of"](obj)` to
+  catch an upstream error sent inside a 200 stream: raise (so your retry logic runs)
+  when `not st["printed"] and not st["tool_acc"]`, else warn and return `True` to keep
+  the partial reply.
+- `on_obj(obj, st)` - every parsed chunk, after core: read extra fields (served model,
+  cache counts, timings).
+- `on_done(st)` - once, after the stream: adjust `st["prompt_total"]` /
+  `st["out_tokens"]` / `st["finish"]` (e.g. subtract cached tokens; mark a refusal).
+
+`st` is a plain dict: `finish`, `content_parts`, `prompt_total`, `out_tokens`,
+`aborted`, `printed`, `printed_think`, `chunks`, `tool_acc`. The bundled `openai`,
+`groq`, `openrouter`, `kilo`, `ovh`, `llamacpp` and `mlx` providers all use it; the
+template [`examples/providers/example.py`](examples/providers/example.py) shows the
+minimal form.
+
 ## Settings & capabilities
 
 `capabilities(model)` returns `{setting_key: [choices]}`. `thinking` and `effort` are

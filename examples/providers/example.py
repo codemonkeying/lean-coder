@@ -129,7 +129,30 @@ def _clear(agent, cfg):
 class ExampleClient:
     def __init__(self, cfg):
         self.cfg = cfg
-        self.last_out_tokens = None      # core reads this after each call (optional)
+        self.last_out_tokens = None      # core reads these after each call (optional)
+        self.last_cache_read = 0
+        self.last_cache_write = 0
+
+    def _consume(self, resp, should_abort):
+        """Read the streamed reply with core's shared OpenAI-style reader. It renders as it
+        goes, shows reasoning dimmed (never stored), joins streamed tool calls, polls
+        should_abort, and sets last_finish / last_truncated / last_out_tokens. You add only
+        what's specific to YOUR backend, through hooks - here, the prompt-cache split."""
+        extra = {"cached": 0}
+
+        def on_obj(obj, st):             # every parsed chunk: read extra fields
+            det = (obj.get("usage") or {}).get("prompt_tokens_details") or {}
+            extra["cached"] = det.get("cached_tokens", extra["cached"]) or 0
+
+        def on_done(st):                 # once at the end: adjust the counts
+            if st["prompt_total"] is not None:   # core adds the cache back itself
+                st["prompt_total"] = max(st["prompt_total"] - extra["cached"], 0)
+
+        out = _lc["consume_openai_stream"](self, resp, should_abort, None,
+                                           on_obj=on_obj, on_done=on_done,
+                                           text_fallback=False, split_think=False)
+        self.last_cache_read = extra["cached"]
+        return out
 
     def chat(self, messages, tools, should_abort=None):
         """Return (assistant_message_dict, prompt_eval_tokens_or_None, aborted_bool).
@@ -140,12 +163,9 @@ class ExampleClient:
 
         should_abort: an optional zero-arg predicate core passes so a turn stays
         ^C-able. It goes true when the user hits Ctrl-C mid-request. Check it BEFORE
-        the network call (cheap early-out, done below); and if you STREAM the reply
-        (the bundled providers do - see openai.py's _consume), poll should_abort()
-        inside the read loop and stop as soon as it returns true. Returning
-        aborted=True (the 3rd tuple slot) tells core to drop the half-turn cleanly.
-        A single blocking urlopen like this template can't be interrupted mid-flight,
-        so we at least honour it at the boundary.
+        the network call (cheap early-out, done below); the shared stream reader
+        (_consume) then polls it between chunks. Returning aborted=True (the 3rd tuple
+        slot) tells core to drop the half-turn cleanly.
         """
         if should_abort and should_abort():
             return {"role": "assistant", "content": ""}, None, True
@@ -161,6 +181,8 @@ class ExampleClient:
             "model":      self.cfg.active_model(),
             "messages":   messages,
             "max_tokens": _OUT_CAP,
+            "stream":     True,
+            "stream_options": {"include_usage": True},   # token counts in the last chunk
         }
         if tools:
             body["tools"] = tools
@@ -173,7 +195,7 @@ class ExampleClient:
             method="POST")
         try:
             with urllib.request.urlopen(req, timeout=120) as resp:
-                payload = json.loads(resp.read())
+                return self._consume(resp, should_abort)
         except urllib.error.HTTPError as e:
             detail = e.read().decode("utf-8", "replace")[:300]
             # 401/403 = bad/expired key: raise so core offers login + retries this turn.
@@ -181,14 +203,8 @@ class ExampleClient:
                 raise RuntimeError(f"API {e.code} {e.reason} - key rejected; /provider login\n{detail}")
             return {"role": "assistant",
                     "content": f"example provider: HTTP {e.code} {e.reason}\n{detail}"}, None, False
-        except (urllib.error.URLError, OSError, ValueError) as e:
+        except (urllib.error.URLError, OSError) as e:
             return {"role": "assistant", "content": f"example provider: request failed: {e}"}, None, False
-
-        choice = (payload.get("choices") or [{}])[0]
-        msg = choice.get("message") or {"role": "assistant", "content": ""}
-        usage = payload.get("usage") or {}
-        self.last_out_tokens = usage.get("completion_tokens")
-        return msg, usage.get("prompt_tokens"), False
 
 
 # ----------------------------------------------------------------------------
@@ -214,7 +230,8 @@ PROVIDER = {
 def setup(lc, cfg):
     """OPTIONAL, helpers-only. The manager calls this then registers PROVIDER itself -
     do NOT call register_provider here. Grab the config dir so secrets resolve to the
-    right place; you could also register bespoke slash commands (e.g. a /example_login)."""
+    right place, and keep `lc` for its helpers (consume_openai_stream, colours, ...).
+    You could also register bespoke slash commands here (e.g. a /example_login)."""
     global _CONFIG_DIR
     _lc.update(lc)
     _CONFIG_DIR = lc.get("CONFIG_DIR")
