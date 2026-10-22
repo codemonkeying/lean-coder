@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L1849   Lean-tools (plugin tools: discovery, manager)
-  L2236   MCP client (connection, manager, OAuth, discovery)
-  L2690   Providers (backend plugin registry)
-  L2967   Interactive pickers + menus (raw-mode UI engine)
-  L3330   Terminal styling (colors, formatting helpers)
-  L3624   Streaming + markdown render (model output)
-  L4389   Composer (pinned input line, editor, stdin)
-  L5356   Token accounting (calibrated context meter)
-  L5609   Config (dataclass, field registry, load/save)
-  L9591   Tool execution + text tool-call parsing
-  L10064  Remote workspace (executor client, /connect)
-  L12255  Context meter
-  L12350  Agent (turn loop, context mgmt, tool dispatch)
-  L20044  Slash-command handlers + dispatch table
-  L20186  REPL (interactive loop, session resume)
-  L20658  Worker agent (headless --agent-run)
-  L21346  Entry (CLI arg parsing, main)
+  L1852   Lean-tools (plugin tools: discovery, manager)
+  L2239   MCP client (connection, manager, OAuth, discovery)
+  L2693   Providers (backend plugin registry)
+  L2970   Interactive pickers + menus (raw-mode UI engine)
+  L3333   Terminal styling (colors, formatting helpers)
+  L3627   Streaming + markdown render (model output)
+  L4392   Composer (pinned input line, editor, stdin)
+  L5359   Token accounting (calibrated context meter)
+  L5612   Config (dataclass, field registry, load/save)
+  L9594   Tool execution + text tool-call parsing
+  L10067  Remote workspace (executor client, /connect)
+  L12258  Context meter
+  L12353  Agent (turn loop, context mgmt, tool dispatch)
+  L20047  Slash-command handlers + dispatch table
+  L20189  REPL (interactive loop, session resume)
+  L20661  Worker agent (headless --agent-run)
+  L21349  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -154,7 +154,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.10.97"
+__version__ = "0.10.98"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -162,6 +162,9 @@ __version__ = "0.10.97"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.10.98": [
+        "Internal test tidy only; no behaviour change.",
+    ],
     "0.10.97": [
         "Resuming a worker now re-checks its grant against your CURRENT limits: leash,",
         "  iteration ceiling and tool set are re-capped (and reported) like a fresh dispatch.",
