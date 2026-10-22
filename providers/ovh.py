@@ -417,146 +417,61 @@ class _OvhClient:
         return _context_window(self._model())
 
     def _consume(self, resp, should_abort):
-        content_parts = []
-        tool_acc      = {}     # index -> {id, name, args}
-        order         = []     # tool-call indices in arrival order
-        prompt_total  = None
-        cached        = 0
-        out_tokens    = None
-        printed       = False
-        aborted       = False
-        md            = _lc["MarkdownStream"](sys.stdout.write)
-
-        spin = _lc["Spinner"]("thinking", _lc["THINK_FRAMES"]).start()
-        reason_chars = 0
-        self.last_finish = None
+        """Read the streamed reply with core's shared OpenAI-style reader. Provider
+        extras: an upstream error inside the 200 stream - including vLLM's bare
+        {"message": ...} rejection - raises _UpstreamError before anything is shown, or
+        ends the stream with a warning after part of a reply; unrecognised lines are
+        kept (last_stream_junk, capped) with the HTTP status for chat()'s empty-stream
+        error; last_served records the answering model; prompt-cache hits are split
+        out of the prompt count. Native tool calls only; no inline <think> splitting
+        (content is kept verbatim, as before)."""
+        extra = {"cached": 0}
         self.last_served = None
         self.last_http_status = getattr(resp, "status", None)
         self.last_stream_junk = []        # lines that weren't a recognised chunk (capped)
-        try:
-            for raw in _lc["stream_tiered"](resp, self.cfg):
-                if should_abort and should_abort():
-                    aborted = True
-                    break
-                line = raw.decode(errors="replace").strip()
-                if not line.startswith("data:"):     # skip keep-alives / comments
-                    if line and not line.startswith(":") and len(self.last_stream_junk) < 5:
-                        self.last_stream_junk.append(line[:400])
-                    continue
-                data = line[5:].strip()
-                if data == "[DONE]":
-                    break
-                try:
-                    obj = json.loads(data)
-                except Exception:
-                    continue
 
-                # Upstream failure smuggled into a 200 stream: a top-level "error"
-                # chunk, or a choice with finish_reason "error" + choice.error.
-                err = obj.get("error")
-                # vLLM/OVH reject over SSE with a bare {"message": ...} (no choices).
-                if not err and "choices" not in obj and (obj.get("message") or obj.get("detail")):
-                    _m = str(obj.get("message") or obj.get("detail") or "").lower()
-                    _rej = any(w in _m for w in ("not supported", "not currently supported",
-                                                 "invalid", "unsupported", "too long", "exceed"))
-                    err = {"code": obj.get("code") or (400 if _rej else 502),
-                           "message": str(obj.get("message") or obj.get("detail"))}
-                if not err and "choices" not in obj and "usage" not in obj \
-                        and len(self.last_stream_junk) < 5:
-                    self.last_stream_junk.append(data[:400])
-                if not err:
-                    for ch in obj.get("choices", []):
-                        if ch.get("finish_reason") == "error" or ch.get("error"):
-                            err = ch.get("error") or {"message": "upstream error"}
-                            break
-                if err:
-                    try:
-                        code = int(err.get("code")) if isinstance(err, dict) else 0
-                    except (TypeError, ValueError):
-                        code = 0
-                    msg = err.get("message", "") if isinstance(err, dict) else str(err)
-                    if not printed and not tool_acc:
-                        raise _UpstreamError(code or 502, msg or "upstream error")
-                    # Already streamed part of a reply: keep it, tell the operator.
-                    print(_lc["yellow"](f"\n[!] stream cut by upstream error {code}: {msg[:120]}"))
-                    break
+        def junk(text):
+            if len(self.last_stream_junk) < 5:
+                self.last_stream_junk.append(text[:400])
 
-                if obj.get("model"):
-                    self.last_served = obj["model"]
-                for ch in obj.get("choices", []):
-                    delta = ch.get("delta", {})
-                    if ch.get("finish_reason"):
-                        self.last_finish = ch["finish_reason"]
-                    # Reasoning streams before any visible text; show progress on
-                    # the spinner so a long think isn't a frozen screen.
-                    rz = delta.get("reasoning") or delta.get("reasoning_content")
-                    if rz and not printed:
-                        reason_chars += len(rz)
-                        spin.label = f"reasoning ~{reason_chars // 4:,} tok"
-                    txt   = delta.get("content")
-                    if txt:
-                        if not printed:
-                            spin.stop()
-                            sys.stdout.write(_lc["blue"]((_lc.get("GLYPH") or {}).get("bullet", "*") + " "))
-                            printed = True
-                        md.feed(txt)
-                        content_parts.append(txt)
-                    for tcd in (delta.get("tool_calls") or []):
-                        idx = tcd.get("index", 0)
-                        if idx not in tool_acc:
-                            tool_acc[idx] = {"id": "", "name": "", "args": []}
-                            order.append(idx)
-                        slot = tool_acc[idx]
-                        if tcd.get("id"):
-                            slot["id"] = tcd["id"]
-                        fn = tcd.get("function", {})
-                        if fn.get("name"):
-                            slot["name"] = fn["name"]
-                        if fn.get("arguments"):
-                            slot["args"].append(fn["arguments"])
+        def on_line(line, obj, st):
+            if obj is None:
+                if not line.startswith(":") and not line.startswith("data:"):
+                    junk(line)                # skip keep-alives / comments
+                return False
+            err = _lc["upstream_error_of"](obj, bare_message=True)
+            if not err:
+                if "choices" not in obj and "usage" not in obj:
+                    junk(line[5:].strip())
+                return False
+            code, msg = err
+            if not st["printed"] and not st["tool_acc"]:
+                raise _UpstreamError(code or 502, msg)
+            # Already streamed part of a reply: keep it, tell the operator.
+            print(_lc["yellow"](f"\n[!] stream cut by upstream error {code}: {msg[:120]}"))
+            return True
 
-                um = obj.get("usage")
-                if um:
-                    prompt_total = um.get("prompt_tokens", prompt_total)
-                    out_tokens   = um.get("completion_tokens", out_tokens)
-                    det          = um.get("prompt_tokens_details") or {}
-                    cached       = det.get("cached_tokens", cached) or 0
-        finally:
-            spin.stop()
+        def on_obj(obj, st):
+            if obj.get("model"):
+                self.last_served = obj["model"]
+            um = obj.get("usage")
+            if um:
+                det = um.get("prompt_tokens_details") or {}
+                extra["cached"] = det.get("cached_tokens", extra["cached"]) or 0
 
-        if printed:
-            md.flush()
-            sys.stdout.write("\n")
-            sys.stdout.flush()
+        def on_done(st):
+            self._last_in_total = st["prompt_total"] or 0
+            # prompt_tokens includes any cache hit; core sums prompt_eval + cache, so
+            # return only the uncached part.
+            if st["prompt_total"] is not None:
+                st["prompt_total"] = max(st["prompt_total"] - extra["cached"], 0)
 
-        tool_calls = []
-        for idx in order:
-            slot = tool_acc[idx]
-            try:
-                args = json.loads("".join(slot["args"])) if slot["args"] else {}
-            except Exception:
-                args = {}
-            tool_calls.append({
-                "id":       slot["id"] or f"call_{idx}",
-                "function": {"name": slot["name"], "arguments": args},
-            })
-
-        if out_tokens:
-            self.last_out_tokens = out_tokens
-        self._last_in_total = prompt_total or 0
-        # prompt_tokens is the FULL input incl. cache hits; core sums
-        # prompt_eval + cache_read + cache_write, so return only the uncached part.
-        self.last_cache_read  = cached
-        self.last_cache_write = 0
-        prompt_eval = None
-        if prompt_total is not None:
-            prompt_eval = max(prompt_total - cached, 0)
-
-        content   = "".join(content_parts)
-        assistant = {"role": "assistant", "content": content}
-        if tool_calls:
-            assistant["tool_calls"] = tool_calls
-        return assistant, prompt_eval, aborted
+        self.last_cache_read, self.last_cache_write = 0, 0
+        out = _lc["consume_openai_stream"](self, resp, should_abort, None,
+                                           on_line=on_line, on_obj=on_obj, on_done=on_done,
+                                           text_fallback=False, split_think=False)
+        self.last_cache_read = extra["cached"]
+        return out
 
     def _wait(self, secs, why, should_abort):
         print(_lc["yellow"](f"[!] {why} - waiting {_fmt_secs(secs)}"))

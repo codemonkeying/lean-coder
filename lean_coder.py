@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L1829   Lean-tools (plugin tools: discovery, manager)
-  L2216   MCP client (connection, manager, OAuth, discovery)
-  L2670   Providers (backend plugin registry)
-  L2892   Interactive pickers + menus (raw-mode UI engine)
-  L3255   Terminal styling (colors, formatting helpers)
-  L3549   Streaming + markdown render (model output)
-  L4271   Composer (pinned input line, editor, stdin)
-  L5238   Token accounting (calibrated context meter)
-  L5491   Config (dataclass, field registry, load/save)
-  L9473   Tool execution + text tool-call parsing
-  L9946   Remote workspace (executor client, /connect)
-  L12125  Context meter
-  L12220  Agent (turn loop, context mgmt, tool dispatch)
-  L19906  Slash-command handlers + dispatch table
-  L20048  REPL (interactive loop, session resume)
-  L20520  Worker agent (headless --agent-run)
-  L21208  Entry (CLI arg parsing, main)
+  L1833   Lean-tools (plugin tools: discovery, manager)
+  L2220   MCP client (connection, manager, OAuth, discovery)
+  L2674   Providers (backend plugin registry)
+  L2896   Interactive pickers + menus (raw-mode UI engine)
+  L3259   Terminal styling (colors, formatting helpers)
+  L3553   Streaming + markdown render (model output)
+  L4318   Composer (pinned input line, editor, stdin)
+  L5285   Token accounting (calibrated context meter)
+  L5538   Config (dataclass, field registry, load/save)
+  L9520   Tool execution + text tool-call parsing
+  L9993   Remote workspace (executor client, /connect)
+  L12172  Context meter
+  L12267  Agent (turn loop, context mgmt, tool dispatch)
+  L19953  Slash-command handlers + dispatch table
+  L20095  REPL (interactive loop, session resume)
+  L20567  Worker agent (headless --agent-run)
+  L21255  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -153,7 +153,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.10.93"
+__version__ = "0.10.94"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -161,6 +161,10 @@ __version__ = "0.10.93"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.10.94": [
+        "openrouter, kilo + ovh now use the shared stream reader: reasoning is shown dimmed",
+        "  (not saved) instead of a spinner count; in-stream upstream errors handled the same.",
+    ],
     "0.10.93": [
         "openai + groq now use the shared stream reader; a refusal stays marked as one,",
         "  and hosted reasoning (e.g. groq gpt-oss) is shown dimmed instead of dropped.",
@@ -3754,9 +3758,37 @@ class ThinkSplitter:
         return [(self.in_think, x)] if x else []
 
 
+def upstream_error_of(obj, bare_message=False):
+    """An upstream failure smuggled into a 200 OpenAI-style stream, as (code, message),
+    else None. Covers a top-level "error" chunk and a choice with finish_reason "error"
+    or choice.error. bare_message=True also treats a choice-less {"message"|"detail"}
+    chunk as a rejection (vLLM/OVH): code 400 when it reads like a bad request, else 502.
+    code is 0 when the server gave none."""
+    err = obj.get("error")
+    if not err and bare_message and "choices" not in obj and (obj.get("message") or obj.get("detail")):
+        msg = str(obj.get("message") or obj.get("detail"))
+        rej = any(w in msg.lower() for w in ("not supported", "not currently supported",
+                                             "invalid", "unsupported", "too long", "exceed"))
+        err = {"code": obj.get("code") or (400 if rej else 502), "message": msg}
+    if not err:
+        for ch in obj.get("choices") or []:
+            if ch.get("finish_reason") == "error" or ch.get("error"):
+                err = ch.get("error") or {"message": "upstream error"}
+                break
+    if not err:
+        return None
+    try:
+        code = int(err.get("code")) if isinstance(err, dict) else 0
+    except (TypeError, ValueError):
+        code = 0
+    msg = (err.get("message", "") if isinstance(err, dict) else str(err)) or "upstream error"
+    return code, msg
+
+
 def consume_openai_stream(client, resp, should_abort=None, tools=None, *,
                           think_keys=("reasoning_content", "reasoning", "thinking"),
-                          on_obj=None, on_done=None, text_fallback=True, split_think=True):
+                          on_obj=None, on_done=None, on_line=None,
+                          text_fallback=True, split_think=True):
     """THE shared reader for OpenAI-style streamed chat replies (SSE `data:` lines of
     chat.completion.chunk objects). Providers call this instead of keeping their own
     copy. It renders as it goes (spinner -> dim reasoning -> styled content), assembles
@@ -3764,19 +3796,25 @@ def consume_openai_stream(client, resp, should_abort=None, tools=None, *,
     parsed object - llama.cpp #20198), records usage and the finish reason, and falls
     back to text-encoded tool calls when the model sent no native ones.
 
-    Hooks (both optional) for what is really provider-specific:
+    Hooks (all optional) for what is really provider-specific:
+      on_line(line, obj, st) - every non-blank line BEFORE the core looks at it; obj is
+                         the parsed chunk (None for a non-data line or bad JSON). Return
+                         True to end the stream here (e.g. an upstream error after part
+                         of a reply), or raise to fail the request.
       on_obj(obj, st)  - every parsed chunk, after the core handled it. Read extra
-                         fields (timings, an in-band {message} error) or raise to fail.
+                         fields (timings, x_groq usage, the served model).
       on_done(st)      - once the stream ends, before results are recorded; may adjust
                          st["prompt_total"] / st["out_tokens"] (e.g. from timings).
     `st` is a plain dict: finish, content_parts, prompt_total, out_tokens, aborted,
-    printed, printed_think, chunks (count of parsed chunks).
+    printed, printed_think, chunks (count of parsed chunks), tool_acc (streamed tool
+    calls so far; truthy once any has started).
 
     Sets on `client`: last_truncated, last_finish, last_out_tokens.
     Returns (assistant_dict, prompt_tokens_or_None, aborted)."""
     st = {"finish": None, "content_parts": [], "prompt_total": None, "out_tokens": None,
           "aborted": False, "printed": False, "printed_think": False, "chunks": 0}
     tool_acc, order = {}, []
+    st["tool_acc"] = tool_acc
     cfg = getattr(client, "cfg", None)
     client.last_truncated = False                # output-limit cut; read by _reply_truncated
     client.last_finish = None
@@ -3814,16 +3852,22 @@ def consume_openai_stream(client, resp, should_abort=None, tools=None, *,
                 st["aborted"] = True
                 break
             line = raw.decode(errors="replace").strip() if isinstance(raw, bytes) else raw.strip()
-            if not line.startswith("data:"):
+            if not line:
                 continue
-            data = line[5:].strip()
-            if data == "[DONE]":
+            obj = None
+            if line.startswith("data:"):
+                data = line[5:].strip()
+                if data == "[DONE]":
+                    break
+                try:
+                    obj = json.loads(data)
+                except (ValueError, RecursionError):
+                    obj = None
+                if not isinstance(obj, dict):
+                    obj = None
+            if on_line and on_line(line, obj, st):
                 break
-            try:
-                obj = json.loads(data)
-            except (ValueError, RecursionError):
-                continue
-            if not isinstance(obj, dict):
+            if obj is None:
                 continue
             st["chunks"] += 1
             for ch in obj.get("choices") or []:
@@ -3867,6 +3911,9 @@ def consume_openai_stream(client, resp, should_abort=None, tools=None, *,
             (show_think if is_think else show_text)(piece)
     finally:
         spin.stop()
+        if st["printed_think"] and not st["printed"] and sys.exc_info()[0] is not None:
+            sys.stdout.write("\n")               # a raise after reasoning: close the dim line
+            sys.stdout.flush()
 
     if st["printed"]:
         md.flush()
