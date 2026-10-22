@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L1859   Lean-tools (plugin tools: discovery, manager)
-  L2246   MCP client (connection, manager, OAuth, discovery)
-  L2700   Providers (backend plugin registry)
-  L2977   Interactive pickers + menus (raw-mode UI engine)
-  L3340   Terminal styling (colors, formatting helpers)
-  L3634   Streaming + markdown render (model output)
-  L4403   Composer (pinned input line, editor, stdin)
-  L5370   Token accounting (calibrated context meter)
-  L5623   Config (dataclass, field registry, load/save)
-  L9605   Tool execution + text tool-call parsing
-  L10078  Remote workspace (executor client, /connect)
-  L12269  Context meter
-  L12364  Agent (turn loop, context mgmt, tool dispatch)
-  L20058  Slash-command handlers + dispatch table
-  L20200  REPL (interactive loop, session resume)
-  L20672  Worker agent (headless --agent-run)
-  L21360  Entry (CLI arg parsing, main)
+  L1864   Lean-tools (plugin tools: discovery, manager)
+  L2251   MCP client (connection, manager, OAuth, discovery)
+  L2705   Providers (backend plugin registry)
+  L2982   Interactive pickers + menus (raw-mode UI engine)
+  L3357   Terminal styling (colors, formatting helpers)
+  L3651   Streaming + markdown render (model output)
+  L4420   Composer (pinned input line, editor, stdin)
+  L5387   Token accounting (calibrated context meter)
+  L5640   Config (dataclass, field registry, load/save)
+  L9622   Tool execution + text tool-call parsing
+  L10095  Remote workspace (executor client, /connect)
+  L12286  Context meter
+  L12381  Agent (turn loop, context mgmt, tool dispatch)
+  L20074  Slash-command handlers + dispatch table
+  L20216  REPL (interactive loop, session resume)
+  L20688  Worker agent (headless --agent-run)
+  L21376  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -154,7 +154,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.10.100"
+__version__ = "0.10.101"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -162,6 +162,11 @@ __version__ = "0.10.100"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.10.101": [
+        "One-line rows share one fit rule (_fit_tail): tool call lines, result previews,",
+        "  worker/bg/board notices, approval prompts and the autostart preview fill to the",
+        "  terminal edge and always keep their tag (#N, /expand N, /worker N).",
+    ],
     "0.10.100": [
         "Board: when a task is marked done, the assigner's ping now includes the",
         "  finisher's result (first 400 chars), so replies and questions aren't missed.",
@@ -3043,6 +3048,18 @@ def _visible_len(s):
 def _one_line(s):
     """Collapse a value onto one line (newlines/tabs -> spaces) for list rows."""
     return " ".join(str(s).split())
+
+
+def _fit_tail(body, tail="", width=None):
+    """ONE display line that fills to the terminal edge: `body` is cut with '…' so the
+    `tail` (a '#N' tag, '+N more; /expand N', ...) ALWAYS survives on the right. The
+    shared rule for every one-line tool/wake/peer row. ANSI codes count 0 columns."""
+    if width is None:
+        width = max(1, _term_cols() - 1)
+    room = width - _visible_len(tail)
+    if _visible_len(body) <= room:
+        return body + tail
+    return _fit_line(body, max(1, room), ellipsis=True) + tail
 
 
 def _fit_line(s, width=None, ellipsis=False):
@@ -9566,7 +9583,7 @@ def _confirm_action(cfg, kind: str, **info) -> bool:
     if kind == "read":
         if auto_approved(cfg):
             return True
-        print(yellow(f"\n{info['name']}({info.get('args_fmt', '')})"))
+        print("\n" + yellow(_fit_tail(f"{info['name']}({info.get('args_fmt', '')}", ")")))
         return ask_action(cfg, f"allow read {info['name']}?")
     return ask_action(cfg, "proceed?")          # unknown kind: prompt to be safe
 
@@ -12009,7 +12026,7 @@ def confirm_remote_tool(cfg, host, name, args, safe=False, fetch=None):
         else:
             print(dim(diff[:1000]))      # fallback: show the raw blocks
         return ask_action(cfg, f"apply this diff on {host}?")
-    print(f"\n{label} {cyan(name)}({_fmt_args(args)})")
+    print("\n" + _fit_args_line(f"{label} {cyan(name)}(", args))
     return ask_action(cfg, f"run {name} on {host}?")
 
 
@@ -13162,7 +13179,7 @@ class Agent:
         # reading files without an OK. auto/session-armed approval still skips it.
         if (self.cfg.confirm_reads and (name in SAFE_TOOLS or safe)
                 and not auto_approved(self.cfg)):
-            if not _confirm_action(self.cfg, "read", name=name, args_fmt=_fmt_args(args)):
+            if not _confirm_action(self.cfg, "read", name=name, args_fmt=_fmt_args(args, max(1, _term_cols() - 4 - len(name)))):
                 return "operator declined the read"
         return None
 
@@ -13229,13 +13246,13 @@ class Agent:
             return self._route_remote(name, args, safe)
         # local: a non-safe lean-tool still confirms (core tools confirm in Tools)
         if plug and not safe and not auto_approved(self.cfg):
-            print(yellow(f"\nlean-tool {name}({_fmt_args(args)})"))
+            print("\n" + yellow(_fit_args_line(f"lean-tool {name}(", args)))
             if not ask_action(self.cfg, f"run lean-tool {name}?"):
                 return "operator declined the lean-tool"
         # MCP tools run on the DRIVER (never the remote executor) and may have side
         # effects, so they confirm like a non-safe lean-tool unless approval is armed.
         if is_mcp and not auto_approved(self.cfg):
-            print(yellow(f"\nMCP {name}({_fmt_args(args)})"))
+            print("\n" + yellow(_fit_args_line(f"MCP {name}(", args)))
             if not ask_action(self.cfg, f"run MCP tool {name}?"):
                 return "operator declined the MCP tool"
         return self._dispatch(name, args)
@@ -14773,10 +14790,9 @@ class Agent:
         without handing the real terminal back a ^C would be swallowed by the composer
         (never reaching us as KeyboardInterrupt) AND the \\r redraw would garble through
         the pinned-line renderer. Suspending restores cooked mode + echo + real stdout."""
-        preview = sp.replace("\n", " ")
-        preview = preview[:80] + "…" if len(preview) > 80 else preview
         with composer_suspended():
-            print(dim(f"  {GLYPH['dot']} autostarting (^C to cancel): {preview}"))
+            print(dim(_fit_tail(f"  {GLYPH['dot']} autostarting (^C to cancel): "
+                                + " ".join(sp.split()))))
             try:
                 for n in range(secs, 0, -1):
                     sys.stdout.write(dim(f"\r  {n}… "))
@@ -15526,14 +15542,37 @@ class RateLedger:
         return None
 
 
-def _fmt_args(args: dict) -> str:
-    parts = []
+def _fmt_args(args: dict, budget: int = 0) -> str:
+    """ONE-LINE args string, shared by tool call lines and approval prompts. Large
+    content blobs collapse to a size hint; with a `budget` (visible columns, 0 = no
+    limit) short args show whole and long ones split what's left evenly, so the line
+    fills the terminal without pushing sibling args off the edge."""
+    fixed, vals = {}, {}
     for k, v in args.items():
-        s = str(v).replace("\n", GLYPH["ret"])
-        if len(s) > 50:
-            s = s[:50] + "…"
-        parts.append(f"{k}={s}")
-    return ", ".join(parts)
+        if k in _BLOB_ARGS:
+            sv = str(v)
+            fixed[k] = f"{k}=…{len(sv)}c/{sv.count(chr(10)) + 1}L"
+        else:
+            vals[k] = str(v).replace("\n", GLYPH["ret"])
+    if budget > 0 and vals:
+        room = budget - sum(len(x) for x in fixed.values()) - 2 * (len(args) - 1) \
+            - sum(len(k) + 1 for k in vals)
+        left = sorted(vals, key=lambda k: len(vals[k]))
+        while left:
+            share = max(1, room // len(left))
+            k = left.pop(0)
+            c = min(len(vals[k]), share)
+            if len(vals[k]) > c:
+                vals[k] = vals[k][:max(0, c - 1)] + "…"
+            room -= c
+    return ", ".join(fixed[k] if k in fixed else f"{k}={vals[k]}" for k in args)
+
+
+def _fit_args_line(prefix: str, args: dict, suffix: str = ")") -> str:
+    """`prefix` + args + `suffix` filled to the terminal edge (approval prompts)."""
+    width = max(1, _term_cols() - 1)
+    budget = max(1, width - _visible_len(prefix) - _visible_len(suffix))
+    return _fit_tail(prefix + _fmt_args(args, budget), suffix, width)
 
 
 # Arg keys that carry a large content BLOB (file bodies, diffs, plans). On a call
@@ -15547,7 +15586,7 @@ _BLOB_ARGS = frozenset({
 _PATH_ARGS = ("path", "file_path", "filename", "file", "target")
 
 
-def _fmt_call_args(name: str, args: dict) -> str:
+def _fmt_call_args(name: str, args: dict, budget: int = 0) -> str:
     """Category-aware TERSE args for a tool CALL line (not /expand, which is full).
     WRITE-tier tools (write_file, apply_diff, …) collapse to just the target's
     basename - the path + fact-of-write live on the result line, repeating them on
@@ -15560,17 +15599,7 @@ def _fmt_call_args(name: str, args: dict) -> str:
             if args.get(k):
                 return os.path.basename(str(args[k]).rstrip("/")) or str(args[k])
         # no recognisable path arg - fall through to the generic (blob-collapsed) form
-    parts = []
-    for k, v in args.items():
-        if k in _BLOB_ARGS:
-            s = str(v)
-            parts.append(f"{k}=…{len(s)}c/{s.count(chr(10)) + 1}L")
-            continue
-        s = str(v).replace("\n", GLYPH["ret"])
-        if len(s) > 50:
-            s = s[:50] + "…"
-        parts.append(f"{k}={s}")
-    return ", ".join(parts)
+    return _fmt_args(args, budget)
 
 
 def _is_bg_call(name: str, args: dict) -> bool:
@@ -15642,7 +15671,19 @@ def _is_peer_turn(text: str) -> bool:
     return (text or "").lstrip().startswith("[peer message")
 
 
-_WAKE_DISPLAY_CAP = 200   # chars of a wake/finish turn shown inline; full via /expand
+def _headline_fit(body: str, full_cmd, noun: str, lead: int = 2) -> str:
+    """First line of a wake/peer notice, filled to the terminal edge (after a `lead`-
+    column accent bar) via the shared _fit_tail rule, with the '…[+N chars; <cmd> for
+    the full <noun>]' pointer always kept on the right."""
+    first = body.splitlines()[0] if body.splitlines() else body
+    width = max(1, _term_cols() - 1 - lead)
+    tail_for = lambda n: (f" …[+{n} chars; {full_cmd} for the full {noun}]" if full_cmd
+                          else f" …[+{n} chars]")
+    if len(first) == len(body) and len(first) <= width:
+        return first
+    room = max(1, width - len(tail_for(len(body))))
+    shown = first[:room].rstrip()
+    return shown + tail_for(len(body) - len(shown))
 
 
 def _wake_display_body(text: str) -> str:
@@ -15692,26 +15733,12 @@ def _wake_turn_lines(text: str, agent=None) -> str:
             cid = None
     # Show only the FIRST line, hard-capped - a wake turn is a headline, not the whole
     # payload (that's what /expand is for). Keeps it to one tidy row in scrollback.
-    first = body.splitlines()[0] if body.splitlines() else body
-    shown = first
-    extra_lines = max(0, len(body.splitlines()) - 1)
-    if len(shown) > _WAKE_DISPLAY_CAP:
-        shown = shown[:_WAKE_DISPLAY_CAP].rstrip()
-    hidden = len(body) - len(shown)
-    if hidden > 0:
-        # Point at the command that renders the FULL result. A worker's full output
-        # lives in its result file (not this notice), so /worker <pid> is the real
-        # source; fall back to /expand for a plain (non-worker) wake turn.
-        m = re.match(r"worker\s+(\d+)", body.lstrip())
-        if m:
-            full_cmd = f"/worker {m.group(1)}"
-        elif cid:
-            full_cmd = f"/expand {cid}"
-        else:
-            full_cmd = None
-        tail = f" …[+{hidden} chars; {full_cmd} for the full result]" if full_cmd \
-            else f" …[+{hidden} chars]"
-        shown = shown + tail
+    # Point at the command that renders the FULL result. A worker's full output
+    # lives in its result file (not this notice), so /worker <pid> is the real
+    # source; fall back to /expand for a plain (non-worker) wake turn.
+    m = re.match(r"worker\s+(\d+)", body.lstrip())
+    full_cmd = f"/worker {m.group(1)}" if m else (f"/expand {cid}" if cid else None)
+    shown = _headline_fit(body, full_cmd, "result")
     bar = cyan(GLYPH["userbar"])
     tag = dim(f"  #{cid}") if cid else ""
     head = f"{bar} {cyan(bold(label + ' finished'))}{tag}"
@@ -15757,16 +15784,7 @@ def _peer_turn_lines(text: str, agent=None) -> str:
             agent.record_tool_result(cid, body)
         except Exception:
             cid = None
-    first = body.splitlines()[0] if body.splitlines() else body
-    shown = first
-    if len(shown) > _WAKE_DISPLAY_CAP:
-        shown = shown[:_WAKE_DISPLAY_CAP].rstrip()
-    hidden = len(body) - len(shown)
-    if hidden > 0:
-        full_cmd = f"/expand {cid}" if cid else None
-        tail = f" …[+{hidden} chars; {full_cmd} for the full message]" if full_cmd \
-            else f" …[+{hidden} chars]"
-        shown = shown + tail
+    shown = _headline_fit(body, f"/expand {cid}" if cid else None, "message")
     bar = magenta(GLYPH["userbar"])
     tag = dim(f"  #{cid}") if cid else ""
     head = f"{bar} {magenta(bold(label + ' message'))}{tag}"
@@ -15810,17 +15828,14 @@ def _tool_call_line(name: str, args: dict, call_id: int = 0) -> str:
     >0) is shown as a '#N' tag so `/expand N` can re-render the full (untruncated)
     args; bare `/expand` targets the newest."""
     tag = "  (background)" if _is_bg_call(name, args) else ""
-    body = dim(f"  {_tool_glyph(name, args)} {name}({_fmt_call_args(name, args)}){tag}")
-    if not call_id:
-        return _fit_line(body)
-    # Pin '#N' to the right INSIDE the width budget: reserve its visible width
-    # ("  #N"), fit the rest to width-minus-that, then append it. So on a narrow
-    # line the args truncate with '…' but the '#N' (how /expand targets a call)
-    # always survives - it never orphans onto a wrapped second physical line.
-    idt = dim(f"  #{call_id}")
-    reserve = len(f"  #{call_id}")
+    idt = f"  #{call_id}" if call_id else ""
+    head = f"  {_tool_glyph(name, args)} {name}("
+    tail = f"){tag}{idt}"
     width = max(1, _term_cols() - 1)
-    return _fit_line(body, max(1, width - reserve)) + idt
+    budget = max(1, width - _visible_len(head) - _visible_len(tail))
+    # Fill to the edge (shared _fit_tail rule); '#N' (how /expand targets a call) and
+    # the background tag always survive on the right.
+    return dim(_fit_tail(head + _fmt_call_args(name, args, budget), tail, width))
 
 
 def _result_status(text: str):
@@ -15867,10 +15882,11 @@ def _tool_result_preview(name: str, result, call_id: int = 0) -> str:
     lines = [ln for ln in text.splitlines() if not _EXIT_LINE_RE.match(ln.strip())]
     line_count = len(lines)
     body = first if first else dim("(no output)")
+    hint = ""
     if first and line_count > 1:
-        body += dim(f"  (+{line_count - 1} more; /expand{f' {call_id}' if call_id else ''})")
+        hint = dim(f"  (+{line_count - 1} more; /expand{f' {call_id}' if call_id else ''})")
     lead = "  " + color(GLYPH[key]) + " "
-    return "\r" + _fit_line(lead + body) + "\033[K"
+    return "\r" + _fit_tail(lead + body, hint) + "\033[K"
 
 
 EXPAND_MAX_CHARS = 4000     # cap on /expand output so it can't flood/hang the terminal
