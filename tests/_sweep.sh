@@ -88,6 +88,15 @@ report "MAC addresses" \
 _PRIVATE_MARKER='NEVER-PUBLISH'   # sweep-ok
 report "private file is git-tracked (would leak on publish)" \
   "$(grep -rnl "Never committed to public\|$_PRIVATE_MARKER" "${FILES[@]}" | nosweep)"
+
+# --- private-name guard ------------------------------------------------------
+# Names of unpublished providers live ONLY in the gitignored tests/.private_names
+# (one per line), so not even this guard reveals them. Any TRACKED file (code, docs,
+# .gitignore, anything) that mentions one fails. A public checkout has no list: skip.
+if [ -f tests/.private_names ] && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  report "private provider name in a tracked file" \
+    "$(git ls-files -z | xargs -0 grep -nIiF -f <(grep -v '^[[:space:]]*$' tests/.private_names) 2>/dev/null)"
+fi
 echo
 if [ "$fails" -eq 0 ]; then
   echo "SWEEP CLEAN"

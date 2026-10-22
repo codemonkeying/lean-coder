@@ -101,7 +101,7 @@ def _pinned(cfg):
 def _pin_wait(cfg, why, secs, should_abort):
     """Pinned 429: wait visibly (countdown) and retry the SAME model."""
     secs = max(5, int(secs))
-    vw = _lc.get("_visible_wait")
+    vw = _lc.get("visible_wait")
     if vw:
         return vw(secs, f"kilo_pin: {why}", should_abort) is not False
     return _interruptible_sleep(secs, should_abort, f"kilo_pin: {why}")
@@ -405,7 +405,7 @@ def _retry_after_secs(headers, body):
 
 
 def _interruptible_sleep(secs, should_abort, why="waiting"):
-    vw = _lc.get("_visible_wait")
+    vw = _lc.get("visible_wait")
     if vw:      # live countdown, so a wait is never a silent blank screen
         return vw(secs, why, should_abort)
     return _plain_sleep(secs, should_abort)
@@ -900,8 +900,8 @@ def _hour_count():
 
 
 def _usage(agent, cfg):
-    # The published cap is HOURLY per IP, shared by all free models; meter it like
-    # 5h usage window (rolling, so 'resets' = when the oldest slot frees).
+    # The published cap is HOURLY per IP, shared by all free models; meter it as a
+    # rolling window (rolling, so 'resets' = when the oldest slot frees).
     n, rst = _hour_window()
     return {"meters": [{"label": "hr", "pct": 100.0 * n / _HOURLY_CAP,
                         "resets_at": rst, "reset_on_warn": True}]}

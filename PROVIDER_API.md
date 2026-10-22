@@ -53,12 +53,32 @@ PROVIDER = {                       # module-level; the ProviderManager reads + r
     "prepare":        lambda agent, cfg: None,         # pre-activation transport setup (below)
     "on_conn_error":  lambda agent, cfg, err: False,   # send-failure recovery; True = retry the turn
     "system_addendum": lambda agent, cfg: "",          # extra system-prompt text for the active model
+    "login_files":    "auth*.json",                    # its login files in the config dir: /push + /pull list them under it
 }
 
 def setup(lc, cfg):               # OPTIONAL, helpers-only - do NOT register_provider here
-    _lc.update(lc)                # grab display helpers (Spinner, colours, MarkdownStream, ...)
+    _lc.update(lc)                # the provider API (see "What lc contains" below)
     lc["register_command"]("/cloud_push", _push)   # bespoke provider commands are still fine
 ```
+
+### What `lc` contains
+
+`setup(lc, cfg)` receives the **provider API**: a read-only mapping of exactly these core
+names, and nothing else (core's internals are not reachable, and a provider can't
+write into core). Look a name up as `lc["dim"]`; an unknown name raises `KeyError`.
+Keep your own state (e.g. the `cfg`) in your module.
+
+| Group | Names |
+|---|---|
+| Display | `green` `red` `yellow` `dim` `bold` `blue` `glyph` `GLYPH` `Spinner` `THINK_FRAMES` `MarkdownStream` |
+| Streaming | `consume_openai_stream` `upstream_error_of` `stream_tiered` `open_tiered` `StreamStall` `parse_text_tool_calls` `messages_tokens` `encode_image_block` |
+| Config + limits | `CONFIG_DIR` `save_config` `autosave_config` `sampling_for` `hosted_sampling` `RateLedger` `log_system_activity` |
+| Commands + prompts | `register_command` `register_provider` `pick_one` `pick_model_menu` `model_available` `handle_model_command` `handle_sync_command` `ask` `menu_index` `visible_wait` `TurnAbort` `TTY` |
+| Hosts | `resolve_host` `host_label` `valid_host` `norm_host` |
+| Live state | `active_composer()` - the input composer owning the terminal, or `None` |
+
+The bundled providers use nothing outside this list (a test enforces it). Need
+something that isn't here? Ask for it to be added rather than reaching into core.
 
 **Opt-in hooks are absent-safe:** implement only what you want; omitting a hook costs
 nothing (core degrades gracefully). A hosted single-endpoint API returns `[]` from

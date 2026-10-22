@@ -30,8 +30,8 @@ NOTES.md
 /tests/fixtures/*
 !/tests/_smoketest.py
 !/tests/_mocktest.py
-# _smoketest_local.py is deliberately NOT published: it tests private providers
-# that are not shipped. _smoketest.py exec()s it when present.
+# _smoketest_local.py is deliberately NOT published: it tests unpublished providers.
+# _smoketest.py exec()s it when present.
 !/tests/_sweep.sh
 !/tests/_isolate.py
 !/tests/_debugrun.sh
@@ -68,7 +68,7 @@ NOTES.md
 # Live providers working dir. Same pattern: ignore the contents, re-include the
 # bundled providers that ship enabled/available out of the box. Your own local
 # provider drop-ins (which may carry credentials) stay untracked automatically.
-# PRIVATE/NEVER-SHIP providers are covered
+# Unpublished providers are covered
 # by the /providers/* ignore below and are deliberately NOT on the re-include
 # allowlist - keep it that way so they can never be committed.
 /providers/*

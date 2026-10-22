@@ -393,7 +393,7 @@ def _interruptible_sleep(secs, should_abort):
 
 def _visible_wait(secs, why, should_abort):
     """Core's live countdown wait (falls back to a silent sleep on an old core)."""
-    vw = _lc.get("_visible_wait")
+    vw = _lc.get("visible_wait")
     if vw:
         return vw(secs, why, should_abort)
     return _interruptible_sleep(secs, should_abort)
@@ -523,7 +523,7 @@ def _cvt_messages(messages, vision=False):
                 # inline_data part. Built ONLY in this transient conversion; history
                 # keeps image_path as a sibling key and is never mutated.
                 if vision and r.get("image_path"):
-                    enc = _lc.get("_encode_image_block")
+                    enc = _lc.get("encode_image_block")
                     got = enc(r["image_path"]) if enc else None
                     if got:
                         media, data = got

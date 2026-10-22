@@ -376,7 +376,7 @@ def _tool_result_content(r):
     ip   = r.get("image_path")
     if not ip:
         return text
-    enc = _lc.get("_encode_image_block")
+    enc = _lc.get("encode_image_block")
     got = enc(ip) if enc else None
     if not got:
         return text

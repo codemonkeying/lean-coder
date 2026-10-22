@@ -383,7 +383,7 @@ def _cvt_messages(messages, vision=False):
                 # keeps image_path as a sibling key and is never mutated, so the
                 # pairing guard + compaction are untouched.
                 if vision and r.get("image_path"):
-                    enc = _lc.get("_encode_image_block")
+                    enc = _lc.get("encode_image_block")
                     got = enc(r["image_path"]) if enc else None
                     if got:
                         media, data = got

@@ -139,8 +139,8 @@ If the gateway has no DCR endpoint, the walkthrough falls back to asking for the
 pre-existing OAuth client secret) belongs in an **environment variable** referenced by
 `token_env` / `client_secret_env` - never written to disk by lean-coder. Anything
 lean-coder *mints itself* (a DCR client secret, cached access tokens) goes in the
-**0600 sidecar** under the config dir, the same convention other OAuth providers
-uses for `auth.json`. Either way, `config.toml` stays free of secrets.
+**0600 sidecar** under the config dir, the same convention providers use for their
+login files. Either way, `config.toml` stays free of secrets.
 
 The sidecar (`~/.config/leancoder/mcp_auth/<server>.json`) holds
 `{client_id, client_secret, token_endpoint, registration_endpoint, scope}` plus the

@@ -159,7 +159,7 @@ def _backoff(attempt):
 
 
 def _interruptible_sleep(secs, should_abort, why="waiting"):
-    vw = _lc.get("_visible_wait")
+    vw = _lc.get("visible_wait")
     if vw:      # live countdown, so a wait is never a silent blank screen
         return vw(secs, why, should_abort)
     return _plain_sleep(secs, should_abort)

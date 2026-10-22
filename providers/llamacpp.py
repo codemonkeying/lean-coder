@@ -101,6 +101,7 @@ def _note_cut(cfg, finish):
                             f"/set max_out <higher> or /set max_out 0 for unlimited"))
 
 _lc = {}
+_CFG = None      # the live cfg, kept from setup()
 # Active base URL, resolved at setup() from (in precedence order) the provider-scoped
 # 'host' setting (config.toml [providers.llamacpp].host, or a session override), then
 # the LLAMACPP_HOST env, then the default. /llamacpp host updates this + persists.
@@ -164,7 +165,7 @@ def _ctx_window(model):
     if hit and (hit[1] is None or _t.monotonic() < hit[1]):
         return hit[0]
     n = None
-    cfg = _lc.get("_cfg")
+    cfg = _CFG
     st = LlamaCppClient(cfg).model_status(timeout=3).get(model) if (cfg and model) else None
     if st in (None, "loaded"):          # single-model server (no status) or loaded
         n = _props_ctx(base, model)
@@ -216,7 +217,7 @@ def _server_card(model):
     hit = _SAMP_CACHE.get(key)
     if hit and (hit[1] is None or _t.monotonic() < hit[1]):
         return hit[0]
-    cfg = _lc.get("_cfg")
+    cfg = _CFG
     st = LlamaCppClient(cfg).model_status(timeout=3).get(model) if (cfg and model) else None
     card = _props_card(_base(), model) if st in (None, "loaded") else None
     # A router preset that isn't loaded yet can't be read without a swap: retry later.
@@ -432,14 +433,14 @@ PROVIDER = {
     "name":           _PROVIDER,
     "description":    "llama.cpp (llama-server) - local GGUF, OpenAI-compatible",
     "make_client":    _make_client,
-    "list_models":    lambda: LlamaCppClient(_lc.get("_cfg")).list_models() if _lc.get("_cfg") else [],
+    "list_models":    lambda: LlamaCppClient(_CFG).list_models() if _CFG else [],
     "context_window": lambda model: _ctx_window(model),
     "available":      lambda: True,    # local + free
     "autostart":      lambda: False,   # explicit selection only
     "tag":            "gguf",
     "capabilities":   lambda model: {"thinking": ["off", "on"]},
     # Router mode: loaded model(s) get the green dot in /model; [] otherwise.
-    "warm_models":    lambda: LlamaCppClient(_lc.get("_cfg")).running_models() if _lc.get("_cfg") else [],
+    "warm_models":    lambda: LlamaCppClient(_CFG).running_models() if _CFG else [],
 }
 
 
@@ -513,7 +514,7 @@ def _switch_host(agent, cfg, arg):
     prompt for a new one. Probes the target BEFORE committing so a typo or a dead box
     isn't silently adopted: an unreachable host asks 'use anyway?' (it may just not be
     up yet), otherwise the host is left unchanged."""
-    ask = _lc.get("_ask")
+    ask = _lc.get("ask")
     if not arg:
         print(_lc["dim"](f"current llama-server host: {_base()}"))
         if not ask:
@@ -582,9 +583,9 @@ def setup(lc, cfg):
     """Helpers-only hook: stash the core namespace + cfg, seed the active host from the
     provider-scoped 'host' setting (falls back to LLAMACPP_HOST env / default via
     _base), and register the /llamacpp command. The manager registers PROVIDER."""
-    global _lc, _HOST
+    global _lc, _HOST, _CFG
     _lc = dict(lc)
-    _lc["_cfg"] = cfg
+    _CFG = cfg
     try:
         # Read the llamacpp bucket BY NAME, not cfg.setting() (which reads the
         # active provider's bucket): setup() runs for every enabled provider, so if

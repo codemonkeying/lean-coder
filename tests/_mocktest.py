@@ -337,7 +337,7 @@ cfg = lc.Config(cwd=FIX, approval="auto", host=f"http://127.0.0.1:{port}")
 # no longer creates one - the provider does, at activation, in production).
 import pathlib as _plib
 olm = lc._load_lean_tool(_plib.Path(__file__).resolve().parent.parent / "providers" / "ollama.py")
-olm.setup(lc.__dict__, cfg)
+olm.setup(lc.provider_api(), cfg)
 def mk_agent(c):
     a = lc.Agent(c)
     a.client = olm.OllamaClient(a.cfg)

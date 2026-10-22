@@ -78,6 +78,7 @@ def _note_cut(cfg, finish):
                             f"/set max_out <higher> or /set max_out 0 for unlimited"))
 
 _lc = {}
+_CFG = None      # the live cfg, kept from setup()
 
 
 def _headers():
@@ -91,7 +92,7 @@ def _headers():
 def _ctx_window(cfg=None):
     """Context window: provider_settings.mlx 'ctx' or 'max_kv_size' (matching the
     server's --max-kv-size), else _CTX_DEFAULT."""
-    cfg = cfg or _lc.get("_cfg")
+    cfg = cfg or _CFG
     try:
         ps = (getattr(cfg, "provider_settings", None) or {}).get(_PROVIDER, {})
         for k in ("ctx", "max_kv_size"):
@@ -258,7 +259,7 @@ PROVIDER = {
     "name":           _PROVIDER,
     "description":    "MLX (Apple Silicon) via mlx_lm.server - local, OpenAI-compatible",
     "make_client":    _make_client,
-    "list_models":    lambda: MLXClient(_lc.get("_cfg")).list_models() if _lc.get("_cfg") else [],
+    "list_models":    lambda: MLXClient(_CFG).list_models() if _CFG else [],
     "context_window": lambda model: _ctx_window(),
     "available":      lambda: True,   # local + free; always offerable (like ollama)
     "autostart":      lambda: False,  # don't auto-activate; operator selects it explicitly
@@ -271,6 +272,6 @@ PROVIDER = {
 def setup(lc, cfg):
     """Helpers-only hook. Stash core namespace + live cfg so list_models can build a
     client outside a chat turn. Do NOT call register_provider here (the manager does)."""
-    global _lc
+    global _lc, _CFG
     _lc = dict(lc)
-    _lc["_cfg"] = cfg
+    _CFG = cfg

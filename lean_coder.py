@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L1837   Lean-tools (plugin tools: discovery, manager)
-  L2224   MCP client (connection, manager, OAuth, discovery)
-  L2678   Providers (backend plugin registry)
-  L2900   Interactive pickers + menus (raw-mode UI engine)
-  L3263   Terminal styling (colors, formatting helpers)
-  L3557   Streaming + markdown render (model output)
-  L4322   Composer (pinned input line, editor, stdin)
-  L5289   Token accounting (calibrated context meter)
-  L5542   Config (dataclass, field registry, load/save)
-  L9524   Tool execution + text tool-call parsing
-  L9997   Remote workspace (executor client, /connect)
-  L12176  Context meter
-  L12271  Agent (turn loop, context mgmt, tool dispatch)
-  L19957  Slash-command handlers + dispatch table
-  L20099  REPL (interactive loop, session resume)
-  L20571  Worker agent (headless --agent-run)
-  L21259  Entry (CLI arg parsing, main)
+  L1845   Lean-tools (plugin tools: discovery, manager)
+  L2232   MCP client (connection, manager, OAuth, discovery)
+  L2686   Providers (backend plugin registry)
+  L2963   Interactive pickers + menus (raw-mode UI engine)
+  L3326   Terminal styling (colors, formatting helpers)
+  L3620   Streaming + markdown render (model output)
+  L4385   Composer (pinned input line, editor, stdin)
+  L5352   Token accounting (calibrated context meter)
+  L5605   Config (dataclass, field registry, load/save)
+  L9587   Tool execution + text tool-call parsing
+  L10060  Remote workspace (executor client, /connect)
+  L12251  Context meter
+  L12346  Agent (turn loop, context mgmt, tool dispatch)
+  L20040  Slash-command handlers + dispatch table
+  L20182  REPL (interactive loop, session resume)
+  L20654  Worker agent (headless --agent-run)
+  L21342  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -38,6 +38,7 @@ except ImportError:                    # non-POSIX: cross-process board locking 
     fcntl = None
 import inspect
 import itertools
+import collections.abc
 import json
 import os
 import re
@@ -153,7 +154,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.10.95"
+__version__ = "0.10.96"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -161,6 +162,13 @@ __version__ = "0.10.95"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.10.96": [
+        "Providers get an explicit API: setup(lc, cfg) now receives a read-only mapping of",
+        "  the names listed in PROVIDER_API.md, not core's globals. Third-party providers:",
+        "  _ask/_visible_wait/_encode_image_block/... are now ask/visible_wait/...,",
+        "  _active_composer is active_composer(), and other core names raise KeyError.",
+        "/model <id>: an id offered by several providers now stays on the current one.",
+    ],
     "0.10.95": [
         "Provider docs: PROVIDER_API.md explains the shared stream reader and its hooks;",
         "  the example provider template now streams through it.",
@@ -2103,7 +2111,7 @@ def _mcp_result_text(result):
 # MCP OAuth: sidecar credential store + discovery + dynamic client registration
 #
 # A DCR-minted client_secret and cached tokens are MACHINE-obtained, so - matching
-# the provider's auth.json - they live in a mode-0600 sidecar under the
+# a provider's login file - they live in a mode-0600 sidecar under the
 # config dir, NOT in config.toml and NOT in an env var. config.toml just carries
 # `auth = { type = "oauth" }`; the sidecar mcp_auth/<name>.json holds
 # {client_id, client_secret, token_endpoint, registration_endpoint, scope} plus a
@@ -2678,6 +2686,61 @@ def _provider_dirs(cfg):
 # SECTION: Providers (backend plugin registry)
 # ==========================================================================
 
+# The provider contract: the ONLY core names a provider's setup(lc, cfg) receives.
+# Public name -> core object. A provider gets a fresh dict built from this each time,
+# never core's globals(), so it can't reach (or overwrite) anything else. Adding a
+# lookup in a provider means adding it here; the smoketest fails otherwise.
+PROVIDER_API_NAMES = (
+    # display
+    "green", "red", "yellow", "dim", "bold", "blue", "glyph", "GLYPH",
+    "Spinner", "THINK_FRAMES", "MarkdownStream",
+    # streaming + parsing
+    "consume_openai_stream", "upstream_error_of", "stream_tiered", "open_tiered",
+    "StreamStall", "parse_text_tool_calls", "messages_tokens",
+    # config, sampling, rate limits
+    "CONFIG_DIR", "save_config", "autosave_config", "sampling_for", "hosted_sampling",
+    "RateLedger", "log_system_activity",
+    # commands + menus
+    "register_command", "register_provider", "pick_one", "pick_model_menu",
+    "model_available", "handle_model_command", "handle_sync_command",
+    # hosts (ollama)
+    "resolve_host", "host_label", "valid_host",
+)
+_PROVIDER_API_ALIASES = {          # public name -> core's internal name
+    "ask": "_ask", "visible_wait": "_visible_wait", "encode_image_block": "_encode_image_block",
+    "TurnAbort": "_TurnAbort", "menu_index": "_menu_index", "norm_host": "_norm_host",
+    "TTY": "_TTY",
+}
+
+
+class _ProviderAPI(collections.abc.Mapping):
+    """Read-only view of the provider contract: each lookup resolves the core name at
+    that moment (a provider that keeps the mapping sees later rebinds; one that copies
+    it at setup has a snapshot, as before), but only contract names exist."""
+    def __getitem__(self, k):
+        if k == "active_composer":
+            return lambda: _active_composer
+        if k in PROVIDER_API_NAMES:
+            return globals()[k]
+        if k in _PROVIDER_API_ALIASES:
+            return globals()[_PROVIDER_API_ALIASES[k]]
+        raise KeyError(f"{k!r} is not in the provider API (see PROVIDER_API.md)")
+
+    def __iter__(self):
+        yield from PROVIDER_API_NAMES
+        yield from _PROVIDER_API_ALIASES
+        yield "active_composer"
+
+    def __len__(self):
+        return len(PROVIDER_API_NAMES) + len(_PROVIDER_API_ALIASES) + 1
+
+
+def provider_api():
+    """The provider contract handed to setup(lc, cfg): a read-only live mapping of the
+    names in PROVIDER_API_NAMES (+ public aliases, + active_composer())."""
+    return _ProviderAPI()
+
+
 class ProviderManager:
     """Discovers provider plugins in the providers/ dir - each a `.py` with a
     module-level PROVIDER dict (the spec) and an optional helpers-only
@@ -2742,7 +2805,7 @@ class ProviderManager:
             _registering_owner = name      # attribute any /commands this provider adds
             try:
                 if callable(p["setup"]):
-                    p["setup"](globals(), cfg)     # helpers-only: populate _lc, register commands
+                    p["setup"](provider_api(), cfg)   # the contract only, never globals()
                 register_provider(p["spec"])       # the manager owns registration (Option A)
                 done.append(name)
             except Exception as e:
@@ -11430,11 +11493,23 @@ def _sync_is_private(path):
         return False
 
 
+def _login_owner(fname):
+    """Name of the registered provider whose spec "login_files" glob matches this
+    login file (e.g. "auth*.json"), else None (the row is listed on its own). Grouping
+    needs the owning provider enabled on THIS box."""
+    import fnmatch
+    for name, spec in _providers.items():
+        pat = spec.get("login_files")
+        if pat and fnmatch.fnmatch(fname, pat):
+            return name
+    return None
+
+
 def _sync_local_items(cfg):
     """{kind: [item]} of what THIS box can push. item = dict(kind, name, rel, path,
     private, parent). rel is the path under the config dir (the SAME on the other box),
     so push and pull share one layout. Provider logins (auth*.json) are listed under the
-    OAuth provider they belong to (parent=that provider)."""
+    provider that claims them (spec "login_files"; see _login_owner)."""
     out = {k: [] for k in SYNC_KINDS}
     bundled = {"providers": _bundled_dir("providers"), "lean-tools": _bundled_dir("lean-tools")}
     seen = set()
@@ -11461,7 +11536,7 @@ def _sync_local_items(cfg):
         except (OSError, ValueError):
             _dbg_swallow()
         out["providers"].append({"kind": "providers", "name": f"login: {label}", "path": f,
-                                 "private": False, "rel": f.name, "parent": "oauth_prov",
+                                 "private": False, "rel": f.name, "parent": _login_owner(f.name),
                                  "detail": email, "secret": True})
     for f in sorted(PROMPTS_DIR.glob("*.txt")):
         out["prompts"].append({"kind": "prompts", "name": f.stem, "path": f, "private": False,
@@ -11619,7 +11694,7 @@ class _SyncHost(RemoteWorkspace):
                 label = name[len("auth"):-len(".json")].lstrip("-_") or "default"
                 out_d["providers"].append({"kind": "providers", "name": f"login: {label}",
                                            "rel": rel, "path": self.rpath(rel), "private": False,
-                                           "parent": "oauth_prov", "secret": True})
+                                           "parent": _login_owner(name), "secret": True})
         return {k: v for k, v in out_d.items() if v}
 
     def read_bytes(self, rel):
@@ -15868,6 +15943,8 @@ def register_provider(spec):
       on_deactivate   (agent, cfg) -> None
       usage           (agent, cfg) -> {"meters":[...], "note": str} or None
       status_line     (agent, cfg) -> str   raw-string escape hatch
+      login_files     glob of its login files in the config dir (e.g. "auth*.json"):
+                      /push and /pull list them under this provider
       login           (agent, cfg) -> bool  auth flow; enables /provider login
       clear           (agent, cfg) -> None  wipe credentials; enables /provider clear
       detail          (agent, cfg) -> str   full usage view for /usage
@@ -15893,6 +15970,7 @@ def register_provider(spec):
         "on_deactivate": spec.get("on_deactivate") or (lambda a, c: None),
         "usage": spec.get("usage"),
         "status_line": spec.get("status_line"),
+        "login_files": spec.get("login_files"),
         "login": spec.get("login"),
         "clear": spec.get("clear"),
         "detail": spec.get("detail"),
@@ -18391,7 +18469,8 @@ def _index_pick(arg, items):
 
 def _model_rows(agent, cfg):
     """Every selectable backend/model across all enabled providers, with display
-    metadata. Each row: {provider, model, tag, warm, status, available, current}.
+    metadata. Each row: {provider, model, tag, warm, status, available, current,
+    current_provider (model rows: this row's provider is the active one)}.
     An unavailable (e.g. logged-out) provider yields a single model=None row so the
     menu can offer to log it in. Pure w.r.t. the terminal - the provider hooks are
     faked in tests - so it's unit-tested headless."""
@@ -18433,7 +18512,8 @@ def _model_rows(agent, cfg):
                     status = None
             rows.append({"provider": pname, "model": m, "tag": tag,
                          "warm": m in warm, "status": status, "available": True,
-                         "current": pname == cur_p and m == cur_m})
+                         "current": pname == cur_p and m == cur_m,
+                         "current_provider": pname == cur_p})
     return rows
 
 
@@ -18454,12 +18534,15 @@ def _resolve_model_arg(arg, sel_rows):
             cand = [r for r in sel_rows if r["provider"] == p and r["model"] == m]
             if cand:
                 return cand[0]
+    # The same id can exist on several providers (e.g. an openrouter model also on
+    # kilo): the CURRENT provider wins, then list order.
+    def _pick(rows):
+        return next((r for r in rows if r.get("current_provider")), None) or (rows[0] if rows else None)
     exact = [r for r in sel_rows if r["model"] == arg]
     if exact:
-        return exact[0]
-    # tag-aware (bare name vs :latest), preferring the current provider
-    loose = [r for r in sel_rows if model_available(arg, [r["model"]])]
-    return loose[0] if loose else None
+        return _pick(exact)
+    # tag-aware (bare name vs :latest), same preference
+    return _pick([r for r in sel_rows if model_available(arg, [r["model"]])])
 
 
 def _select_model_row(agent, cfg, row):
@@ -20620,7 +20703,7 @@ def run_agent_brief(args) -> int:
     cfg.auto_compact = False             # one brief, no self-compaction compaction
     # Mark this process a headless worker: no human is watching, so a provider that
     # would fast-fail an interactive turn on a transient throttle should instead wait
-    # it out (providers back off 429 in worker mode).
+    # it out (a provider can check this env and back off 429 in worker mode).
     os.environ["LEANCODER_HEADLESS_WORKER"] = "1"
     # A grant missing leash/cwd means the brief was malformed or forged: never fall
     # back to this process's default leash (rwe) - refuse instead.

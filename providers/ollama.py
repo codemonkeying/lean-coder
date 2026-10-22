@@ -9,7 +9,7 @@
 # primitives, host config helpers, save_config, _ask) live in core and are handed
 # to setup(lc, cfg) as the `lc` namespace; setup() injects the stable ones into
 # this module's globals so the moved code resolves them as plain names, and reads
-# genuinely-mutable core state (_active_composer) live via `_lc`.
+# genuinely-mutable core state (active_composer()) live via `_lc`.
 #
 # Transport config (host / hosts / machines / num_ctx / host_models) stays
 # top-level in config.toml and is read straight off cfg here - it is connection
@@ -50,21 +50,22 @@ def _dbg_swallow():
 
 # --- core namespace, populated by setup(lc, cfg) ----------------------------
 # _cfg: the live Config (PROVIDER callables with no cfg arg read it).
-# _lc:  core's globals() dict - the live source for mutable state (_active_composer).
+# _lc:  the provider API dict from core - active_composer() reads live state.
 _cfg = None
 _lc = None
 
 # Names injected from core into this module's globals at setup() time. Stable
 # (functions / constants / one-shot flags); mutable state is read via _lc instead.
-_INJECT = (
-    "green", "red", "yellow", "dim", "bold", "blue",
-    "Spinner", "THINK_FRAMES", "GLYPH", "MarkdownStream",
-    "parse_text_tool_calls", "_TurnAbort",
-    "_menu_index", "pick_model_menu", "model_available",
-    "_norm_host", "resolve_host", "host_label", "valid_host",
-    "_ask", "save_config", "_TTY",
-    "stream_tiered", "StreamStall", "open_tiered",
-)
+_INJECT = {   # module name -> provider API name (see core's provider_api())
+    "green": "green", "red": "red", "yellow": "yellow", "dim": "dim", "bold": "bold",
+    "blue": "blue", "Spinner": "Spinner", "THINK_FRAMES": "THINK_FRAMES", "GLYPH": "GLYPH",
+    "MarkdownStream": "MarkdownStream", "parse_text_tool_calls": "parse_text_tool_calls",
+    "_TurnAbort": "TurnAbort", "_menu_index": "menu_index", "pick_model_menu": "pick_model_menu",
+    "model_available": "model_available", "_norm_host": "norm_host", "resolve_host": "resolve_host",
+    "host_label": "host_label", "valid_host": "valid_host", "_ask": "ask",
+    "save_config": "save_config", "_TTY": "TTY", "stream_tiered": "stream_tiered",
+    "StreamStall": "StreamStall", "open_tiered": "open_tiered",
+}
 
 
 # ----------------------------------------------------------------------------
@@ -573,7 +574,7 @@ class OllamaClient:
                     think = msg.get("thinking")
                     if think:                       # reasoning - show, don't store
                         if not printed_think:
-                            if _lc["_active_composer"] is None:   # composer: keep status up
+                            if _lc["active_composer"]() is None:   # composer: keep status up
                                 spin.stop()
                             sys.stdout.write(dim(GLYPH["think"] + " "))
                             printed_think = True
@@ -582,7 +583,7 @@ class OllamaClient:
                     chunk = msg.get("content")
                     if chunk:
                         if not printed_any:
-                            if _lc["_active_composer"] is None:   # composer: keep status up
+                            if _lc["active_composer"]() is None:   # composer: keep status up
                                 spin.stop()
                             if printed_think:
                                 sys.stdout.write("\n")
@@ -1117,9 +1118,8 @@ def setup(lc, cfg):
     global _cfg, _lc
     _cfg, _lc = cfg, lc
     g = globals()
-    for k in _INJECT:
-        if k in lc:
-            g[k] = lc[k]
+    for local, api_name in _INJECT.items():
+        g[local] = lc[api_name]
     lc["register_command"]("/ollama", _handle_ollama,
                            "ollama: host|model|failover|reset|priority (no arg = pick host+model)",
                            completer=_ollama_completer)
