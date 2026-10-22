@@ -369,6 +369,15 @@ def _cvt_messages(messages):
 # Client
 # ----------------------------------------------------------------------------
 
+def _user_cap(cfg):
+    """The operator's reply cap (provider setting max_out): a positive int, else None."""
+    try:
+        v = int(cfg.setting("max_out") or 0) if cfg is not None else 0
+    except (TypeError, ValueError, AttributeError):
+        v = 0
+    return v if v > 0 else None
+
+
 class _GroqClient:
     uncapped_ctx = True
 
@@ -393,109 +402,47 @@ class _GroqClient:
         return _context_window(self._model())
 
     def _consume(self, resp, should_abort):
-        content_parts = []
-        tool_acc      = {}
-        order         = []
-        prompt_total  = None
-        cached        = 0
-        out_tokens    = None
-        printed       = False
-        aborted       = False
-        md            = _lc["MarkdownStream"](sys.stdout.write)
+        out = self._consume_stream(resp, should_abort)
+        cap = getattr(self, "_sent_cap", None)
+        if cap and not out[2] and self.last_finish == "length":
+            print(_lc["yellow"](f"[!] reply hit max_out ({cap:,} tokens) and was cut off - "
+                                f"/provider set max_out <higher> or 0 for no cap"))
+        return out
 
-        spin = _lc["Spinner"]("thinking", _lc["THINK_FRAMES"]).start()
-        try:
-            self.last_truncated = False   # output-limit cut; read by core _reply_truncated
-            self.last_finish = None        # raw finish_reason; core normalises
-            for raw in _lc["stream_tiered"](resp, self.cfg):
-                if should_abort and should_abort():
-                    aborted = True
-                    break
-                line = raw.decode(errors="replace").strip()
-                if not line.startswith("data:"):
-                    continue
-                data = line[5:].strip()
-                if data == "[DONE]":
-                    break
-                try:
-                    obj = json.loads(data)
-                except Exception:
-                    continue
+    def _consume_stream(self, resp, should_abort):
+        """Read the streamed reply with core's shared OpenAI-style reader. Provider
+        extras: a delta.refusal marks the turn a refusal; prompt-cache hits
+        (prompt_tokens_details.cached_tokens) are split out of the prompt count; usage may arrive under x_groq.usage.
+        Native tool calls only (no text-encoded fallback on a hosted API)."""
+        extra = {"cached": 0, "refusal": False}
 
-                for ch in obj.get("choices", []):
-                    if ch.get("finish_reason"):
-                        self.last_finish = ch["finish_reason"]
-                    if (ch.get("delta") or {}).get("refusal"):
-                        self.last_finish = "refusal"
-                    if ch.get("finish_reason") == "length":
-                        self.last_truncated = True
-                    delta = ch.get("delta", {})
-                    txt   = delta.get("content")
-                    if txt:
-                        if not printed:
-                            spin.stop()
-                            sys.stdout.write(_lc["blue"]((_lc.get("GLYPH") or {}).get("bullet", "*") + " "))
-                            printed = True
-                        md.feed(txt)
-                        content_parts.append(txt)
-                    for tcd in (delta.get("tool_calls") or []):
-                        idx = tcd.get("index", 0)
-                        if idx not in tool_acc:
-                            tool_acc[idx] = {"id": "", "name": "", "args": []}
-                            order.append(idx)
-                        slot = tool_acc[idx]
-                        if tcd.get("id"):
-                            slot["id"] = tcd["id"]
-                        fn = tcd.get("function", {})
-                        if fn.get("name"):
-                            slot["name"] = fn["name"]
-                        if fn.get("arguments"):
-                            slot["args"].append(fn["arguments"])
+        def on_obj(obj, st):
+            for ch in obj.get("choices") or []:
+                if (ch.get("delta") or {}).get("refusal"):
+                    extra["refusal"] = True
+            um = obj.get("usage") or (obj.get("x_groq") or {}).get("usage")
+            if um and not obj.get("usage"):
+                st["prompt_total"] = um.get("prompt_tokens", st["prompt_total"])
+                st["out_tokens"] = um.get("completion_tokens", st["out_tokens"])
+            if um:
+                det = um.get("prompt_tokens_details") or {}
+                extra["cached"] = det.get("cached_tokens", extra["cached"]) or 0
 
-                # Groq returns usage in the final chunk under x_groq.usage (and
-                # sometimes a top-level usage); check both.
-                um = obj.get("usage") or (obj.get("x_groq") or {}).get("usage")
-                if um:
-                    prompt_total = um.get("prompt_tokens", prompt_total)
-                    out_tokens   = um.get("completion_tokens", out_tokens)
-                    det          = um.get("prompt_tokens_details") or {}
-                    cached       = det.get("cached_tokens", cached) or 0
-        finally:
-            spin.stop()
+        def on_done(st):
+            if extra["refusal"]:
+                st["finish"] = "refusal"
+            self._last_in_total = st["prompt_total"] or 0
+            # prompt_tokens includes any cache hit; core sums prompt_eval + cache, so
+            # return only the uncached part.
+            if st["prompt_total"] is not None:
+                st["prompt_total"] = max(st["prompt_total"] - extra["cached"], 0)
 
-        if printed:
-            md.flush()
-            sys.stdout.write("\n")
-            sys.stdout.flush()
-
-        tool_calls = []
-        for idx in order:
-            slot = tool_acc[idx]
-            try:
-                args = json.loads("".join(slot["args"])) if slot["args"] else {}
-            except Exception:
-                args = {}
-            tool_calls.append({
-                "id":       slot["id"] or f"call_{idx}",
-                "function": {"name": slot["name"], "arguments": args},
-            })
-
-        if out_tokens:
-            self.last_out_tokens = out_tokens
-        self._last_in_total = prompt_total or 0
-        # prompt_tokens includes any cache hit; core sums prompt_eval + cache, so
-        # return only the uncached part.
-        self.last_cache_read  = cached
-        self.last_cache_write = 0
-        prompt_eval = None
-        if prompt_total is not None:
-            prompt_eval = max(prompt_total - cached, 0)
-
-        content   = "".join(content_parts)
-        assistant = {"role": "assistant", "content": content}
-        if tool_calls:
-            assistant["tool_calls"] = tool_calls
-        return assistant, prompt_eval, aborted
+        self.last_cache_read, self.last_cache_write = 0, 0
+        out = _lc["consume_openai_stream"](self, resp, should_abort, None,
+                                           on_obj=on_obj, on_done=on_done,
+                                           text_fallback=False)
+        self.last_cache_read = extra["cached"]
+        return out
 
     def _send(self, key, payload, should_abort):
         data    = json.dumps(payload).encode()
@@ -596,6 +543,13 @@ class _GroqClient:
                 f"context too large for {cur_model} "
                 f"(~{_est_toks:,} of {max_in:,} tokens used, no room to reply) - run /compact first"
             )
+
+        # Optional user reply cap (same knob as llamacpp/mlx; unset/0 = no cap). Applied
+        # after the room checks, so a small cap never trips the "no room" errors.
+        cap = _user_cap(self.cfg)
+        if cap:
+            max_out = min(max_out, cap)
+        self._sent_cap = cap
 
         payload = {
             "model":          cur_model,

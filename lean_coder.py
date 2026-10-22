@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L1824   Lean-tools (plugin tools: discovery, manager)
-  L2211   MCP client (connection, manager, OAuth, discovery)
-  L2665   Providers (backend plugin registry)
-  L2887   Interactive pickers + menus (raw-mode UI engine)
-  L3250   Terminal styling (colors, formatting helpers)
-  L3544   Streaming + markdown render (model output)
-  L4265   Composer (pinned input line, editor, stdin)
-  L5232   Token accounting (calibrated context meter)
-  L5485   Config (dataclass, field registry, load/save)
-  L9467   Tool execution + text tool-call parsing
-  L9940   Remote workspace (executor client, /connect)
-  L12119  Context meter
-  L12214  Agent (turn loop, context mgmt, tool dispatch)
-  L19900  Slash-command handlers + dispatch table
-  L20042  REPL (interactive loop, session resume)
-  L20514  Worker agent (headless --agent-run)
-  L21202  Entry (CLI arg parsing, main)
+  L1829   Lean-tools (plugin tools: discovery, manager)
+  L2216   MCP client (connection, manager, OAuth, discovery)
+  L2670   Providers (backend plugin registry)
+  L2892   Interactive pickers + menus (raw-mode UI engine)
+  L3255   Terminal styling (colors, formatting helpers)
+  L3549   Streaming + markdown render (model output)
+  L4271   Composer (pinned input line, editor, stdin)
+  L5238   Token accounting (calibrated context meter)
+  L5491   Config (dataclass, field registry, load/save)
+  L9473   Tool execution + text tool-call parsing
+  L9946   Remote workspace (executor client, /connect)
+  L12125  Context meter
+  L12220  Agent (turn loop, context mgmt, tool dispatch)
+  L19906  Slash-command handlers + dispatch table
+  L20048  REPL (interactive loop, session resume)
+  L20520  Worker agent (headless --agent-run)
+  L21208  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -153,7 +153,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.10.92"
+__version__ = "0.10.93"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -161,6 +161,11 @@ __version__ = "0.10.92"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.10.93": [
+        "openai + groq now use the shared stream reader; a refusal stays marked as one,",
+        "  and hosted reasoning (e.g. groq gpt-oss) is shown dimmed instead of dropped.",
+        "groq: optional reply cap - /provider set max_out <n> (unset/0 = no cap).",
+    ],
     "0.10.92": [
         "mlx + llama.cpp now share one stream reader in core (less duplicated code).",
         "reasoning sent inline as <think>...</think> is shown dimmed and no longer saved",
@@ -3751,7 +3756,7 @@ class ThinkSplitter:
 
 def consume_openai_stream(client, resp, should_abort=None, tools=None, *,
                           think_keys=("reasoning_content", "reasoning", "thinking"),
-                          on_obj=None, on_done=None, text_fallback=True):
+                          on_obj=None, on_done=None, text_fallback=True, split_think=True):
     """THE shared reader for OpenAI-style streamed chat replies (SSE `data:` lines of
     chat.completion.chunk objects). Providers call this instead of keeping their own
     copy. It renders as it goes (spinner -> dim reasoning -> styled content), assembles
@@ -3833,7 +3838,7 @@ def consume_openai_stream(client, resp, should_abort=None, tools=None, *,
                 txt = delta.get("content")
                 if txt and isinstance(txt, str):
                     # Inline <think>...</think> in content goes to the reasoning channel.
-                    for is_think, piece in split.feed(txt):
+                    for is_think, piece in (split.feed(txt) if split_think else [(False, txt)]):
                         (show_think if is_think else show_text)(piece)
                 for tcd in (delta.get("tool_calls") or []):
                     idx = tcd.get("index", 0)
@@ -3884,11 +3889,12 @@ def consume_openai_stream(client, resp, should_abort=None, tools=None, *,
         tool_calls.append({"id": slot["id"] or f"call_{idx}", "type": "function",
                            "function": {"name": slot["name"], "arguments": args}})
 
+    truncated = (st["finish"] == "length")      # from the raw finish, before any hook
     if on_done:
         on_done(st)
     if st["out_tokens"]:
         client.last_out_tokens = st["out_tokens"]
-    client.last_truncated = (st["finish"] == "length")
+    client.last_truncated = truncated
     client.last_finish = st["finish"]
 
     content = "".join(st["content_parts"])
