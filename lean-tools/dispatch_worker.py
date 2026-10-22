@@ -1477,6 +1477,50 @@ def _worker_add_note(pid, text):
             f"reasoning step (not an interrupt). Confirm with action='status'.")
 
 
+def _recheck_grant(lines):
+    """Re-cap a saved grant (resume) against the driver's LIVE authority, as dispatch does:
+    leash <= current /leash, max_iterations <= current ceiling, tools only those the driver
+    still has at a leash that allows them. Returns (lines, notes) or (error_str, None)."""
+    out, notes, leash, tools_i = [], [], None, None
+    for l in lines:
+        k, _, v = l.partition(":")
+        k, v = k.strip().lower(), v.strip()
+        if k == "leash":
+            leash, down = _capped_leash(v)
+            if down:
+                notes.append(f"leash {v} -> {leash}")
+            l = f"leash: {leash}"
+        elif k == "max_iterations":
+            try:
+                n, ceil = int(v), _ceiling("max_iterations")
+                if ceil and n > ceil:
+                    notes.append(f"iterations {n} -> {ceil}")
+                    l = f"max_iterations: {ceil}"
+            except ValueError:
+                _dbg_swallow()
+        elif k == "tools":
+            tools_i = len(out)
+        out.append(l)
+    if tools_i is not None:
+        want = [t.strip() for t in out[tools_i].partition(":")[2].split(",") if t.strip()]
+        have = _H.get("active_tool_names", lambda: set())()
+        if not have:
+            return ("error: can't verify your own tools right now, so this worker's tool "
+                    "grant can't be re-checked. Retry, or dispatch a fresh worker."), None
+        levels, need = _H["LEASH_LEVELS"], _H.get("tool_min_leash")
+        lv = leash or "r"
+        keep = [t for t in want if t in have and not (
+            need and need(t) and levels.index(need(t)) > levels.index(lv))]
+        if keep != want:
+            notes.append("tools dropped: " + ", ".join(t for t in want if t not in keep))
+        if not keep:
+            return ("error: none of this worker's granted tools are still allowed at your "
+                    "current leash/tool set, so it can't be resumed. Dispatch a fresh "
+                    "worker instead."), None
+        out[tools_i] = "tools: " + ",".join(keep)
+    return out, notes
+
+
 def _worker_resume(pid, text, cwd, iterations=None):
     """RELAUNCH a worker that DIED without finishing (max_iterations / lease-kill / crash /
     stopped incomplete), reloading its transcript checkpoint so it continues from where it
@@ -1544,6 +1588,11 @@ def _worker_resume(pid, text, cwd, iterations=None):
                    and not l.strip().lower().startswith(drop)]
     if new_iter is not None:
         grant_lines.append(f"max_iterations: {new_iter}")
+    # RE-CHECK the grant against the driver's authority NOW (not at dispatch time): the
+    # operator may have lowered /leash, the iteration ceiling, or the tool set since.
+    grant_lines, notes = _recheck_grant(grant_lines)
+    if isinstance(grant_lines, str):
+        return grant_lines
     grant_lines.append("checkpoint: 1")
     new_brief_text = "\n".join([
         f"{B}\n{steer}\n{B}",
@@ -1588,7 +1637,9 @@ def _worker_resume(pid, text, cwd, iterations=None):
                         "launch_cwd": launch_cwd,
                         "idle_timeout": meta.get("idle_timeout"),
                         "hb_timeout": meta.get("hb_timeout"),
-                        "leash": meta.get("leash", "r"), "resumed_from": pid,
+                        "leash": next((l.split(":", 1)[1].strip() for l in grant_lines
+                                       if l.lower().startswith("leash:")),
+                                      meta.get("leash", "r")), "resumed_from": pid,
                         "taskboard": meta.get("taskboard", "")}
     # The old worker is retired - suppress any lingering failure notice for it.
     meta["announced"] = True
@@ -1599,7 +1650,9 @@ def _worker_resume(pid, text, cwd, iterations=None):
     return (f"resumed worker {pid} as NEW pid {new_pid} (a resume is a fresh process; the "
             f"old pid is dead). It reloaded the saved transcript and continues from where "
             f"it stopped, with your steer on top. Its result reaches you automatically when "
-            f"it finishes - don't poll.")
+            f"it finishes - don't poll."
+            + (f" Grant re-checked against your current limits: {'; '.join(notes)}."
+               if notes else ""))
 
 
 def _board_session_owner():
