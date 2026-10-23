@@ -4,7 +4,7 @@
 
 **A small terminal coding agent. Stdlib-only Python core, minimal context overhead.**
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
 ![Core dependencies: none](https://img.shields.io/badge/core%20dependencies-none%20(stdlib%20only)-brightgreen.svg)
 
@@ -286,4 +286,4 @@ See [CONTRIBUTING.md](CONTRIBUTING.md), [LEAN_TOOLS.md](LEAN_TOOLS.md), and
 
 ## License
 
-[MIT](LICENSE).
+[Apache-2.0](LICENSE). Releases up to and including 0.10.103 were published under MIT.
