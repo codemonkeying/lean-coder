@@ -657,7 +657,7 @@ class OllamaClient:
                                          _cold_retried=_cold_retried, _stall_retried=True)
             # Map to ConnectionError so core's graceful next-model failover handles it
             # instead of the bare TimeoutError killing the REPL. Confirmed recurring
-            # from the leangym harness side (pre-headers prefill stall @ ollama.py:472).
+            # from an external harness (pre-headers prefill stall @ ollama.py:472).
             raise ConnectionError(
                 f"Ollama at {self.cfg.host} accepted the connection but stalled "
                 f"before responding within gen_ttft_timeout ({e}). Host may be wedged, "

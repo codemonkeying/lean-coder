@@ -5761,7 +5761,7 @@ class Config:
                                      # (reasoning + tool calls + full pre-stub/pre-compact
                                      # results) to a LOCAL JSONL sidecar - for YOUR OWN use
                                      # (debugging what the agent did, or building an RL/SFT
-                                     # dataset e.g. with leangym). OFF by default. It stays on
+                                     # dataset). OFF by default. It stays on
                                      # this machine and is NEVER uploaded or phoned home
                                      # anywhere - lean-coder has no telemetry. No redaction on
                                      # write; never captured for workers or incognito.
@@ -12507,7 +12507,7 @@ class TrainingCapture:
             # _cap_new_run_turn (called from run_turn) queues this; consumed once here so
             # subsequent turns of the same request don't repeat it. Text is captured RAW,
             # exactly like reasoning/tool_result below (core does no redaction on write -
-            # personal-machine capture; the leangym consumer re-redacts on ingest).
+            # personal-machine capture; the consumer re-redacts on ingest).
             pend = self._cap_pending_user
             if pend is not None:
                 self._cap_pending_user = None
@@ -12610,7 +12610,7 @@ class TrainingCapture:
 
     # --- per-exchange OUTCOME signal (STaR accept/reject; see docs CORE_OUTCOME_SIGNAL) ---
     # Coarse + grounded ONLY: exit-code roll-ups + a cheap next-turn keyword heuristic. No
-    # LLM judge here - the leangym loop owns any smarter scoring on top of these primitives.
+    # LLM judge here - an external loop owns any smarter scoring on top of these primitives.
     _CAP_CORRECTION_RE = re.compile(
         r"\b(no+|nope|wrong|incorrect|that'?s not|not what|didn'?t work|doesn'?t work|"
         r"broke|broken|still (?:fail|error|broken)|revert|undo|redo|fix (?:it|that|this)|"
@@ -12624,7 +12624,7 @@ class TrainingCapture:
     def _cap_classify_followup(self, next_user_text: str) -> str:
         """Classify the NEXT operator turn as the prior exchange's outcome signal:
         correction | satisfied | continuation. Correction wins over satisfied (a mixed
-        'thanks but this is wrong' is a correction). Pure heuristic; leangym can refine."""
+        'thanks but this is wrong' is a correction). Pure heuristic; callers can refine."""
         t = (next_user_text or "").strip()
         if not t:
             return "continuation"
