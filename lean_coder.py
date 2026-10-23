@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L1869   Lean-tools (plugin tools: discovery, manager)
-  L2256   MCP client (connection, manager, OAuth, discovery)
-  L2710   Providers (backend plugin registry)
-  L2987   Interactive pickers + menus (raw-mode UI engine)
-  L3362   Terminal styling (colors, formatting helpers)
-  L3656   Streaming + markdown render (model output)
-  L4425   Composer (pinned input line, editor, stdin)
-  L5392   Token accounting (calibrated context meter)
-  L5645   Config (dataclass, field registry, load/save)
-  L9627   Tool execution + text tool-call parsing
-  L10100  Remote workspace (executor client, /connect)
-  L12291  Context meter
-  L12386  Agent (turn loop, context mgmt, tool dispatch)
-  L20114  Slash-command handlers + dispatch table
-  L20256  REPL (interactive loop, session resume)
-  L20728  Worker agent (headless --agent-run)
-  L21416  Entry (CLI arg parsing, main)
+  L1876   Lean-tools (plugin tools: discovery, manager)
+  L2263   MCP client (connection, manager, OAuth, discovery)
+  L2717   Providers (backend plugin registry)
+  L2994   Interactive pickers + menus (raw-mode UI engine)
+  L3369   Terminal styling (colors, formatting helpers)
+  L3663   Streaming + markdown render (model output)
+  L4432   Composer (pinned input line, editor, stdin)
+  L5399   Token accounting (calibrated context meter)
+  L5652   Config (dataclass, field registry, load/save)
+  L9637   Tool execution + text tool-call parsing
+  L10110  Remote workspace (executor client, /connect)
+  L12441  Context meter
+  L12536  Agent (turn loop, context mgmt, tool dispatch)
+  L20273  Slash-command handlers + dispatch table
+  L20415  REPL (interactive loop, session resume)
+  L20887  Worker agent (headless --agent-run)
+  L21575  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -154,7 +154,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.10.102"
+__version__ = "0.10.103"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -162,6 +162,13 @@ __version__ = "0.10.102"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.10.103": [
+        "ask_user_to_run: clearer description; results say what happened (ran, edited and",
+        "  ran, cleared, cancelled, interrupted, timed out). No keypress within ask_timeout",
+        "  (default 300s, /set ask_timeout, 0 = never) moves the request to /pending.",
+        "/pending: list, run [n] or drop [n|all] timed-out requests.",
+        "/set: removed duplicate rows.",
+    ],
     "0.10.102": [
         "/prompt delete <name>: deletes a custom prompt after a y/N. System prompts can't be",
         "  deleted - an edited one is reset to default, an untouched one is left as is (both",
@@ -1627,7 +1634,7 @@ def _norm_leash(s):
 # operator can edit it, runs it in a real terminal, and the result returns here.
 ASK_USER_TOOL = {"type": "function", "function": {
     "name": "ask_user_to_run",
-    "description": "Hand a command to the operator to run in their own terminal; the exact command and its exit code come back to you (never any password). Use when run_command can't: sudo/root, an interactive prompt, or a typed secret. They may edit it before running.",
+    "description": "Hand a command to the operator to run in their own terminal; they may edit it or decline. Use it when a step needs the operator: sudo/root, a passphrase or login prompt (e.g. git push or commit needing a GPG/SSH key, 2FA), or another interactive prompt. Try non-interactive options first where available.",
     "parameters": {"type": "object",
         "properties": {"cmd": {"type": "string", "description": "The command to hand over."},
                        "reason": {"type": "string", "description": "Brief why this needs the operator (e.g. 'needs sudo')."}},
@@ -5873,6 +5880,8 @@ class Config:
                                      # separately hard-capped (400 lines) so a recall can't flood
                                      # context. /set notes_spool <n>.
     ask_user_to_run: bool = True     # expose the ask_user_to_run handoff tool
+    ask_timeout: int = 300           # ask_user_to_run: secs with NO keypress before the
+                                     # request times out to /pending (0 = wait forever)
     composer: bool = True            # pinned bottom input line (type while it works)
     scrub_invisible: bool = True     # strip invisible/zero-width/format-control unicode
                                      # from model-supplied text before it's written to
@@ -6353,6 +6362,7 @@ _SCALAR_FIELDS = (
     ("min_p",                     None,                False),
     ("presence_penalty",          None,                False),
     ("ask_user_to_run",           True,                True),
+    ("ask_timeout",               300,                 True),
     ("autosave",                  True,                True),
     ("command_timeout",           300,                 True),
     ("tool_timeout",              60,                  False),
@@ -12035,6 +12045,19 @@ def confirm_remote_tool(cfg, host, name, args, safe=False, fetch=None):
     return ask_action(cfg, f"run {name} on {host}?")
 
 
+def requested_note(cmd: str, exit_code, proposed: str = None, output: str = None) -> str:
+    """Result of an ask_user_to_run the operator ran: 'operator ran' or 'operator
+    edited and ran', the command, exit code and captured output (never a password -
+    echo-off entry isn't in the pty stream). Pure function for testability."""
+    edited = proposed is not None and proposed.strip() != cmd.strip()
+    note = (f"[operator {'edited and ran' if edited else 'ran'}]\n$ {cmd}\n"
+            f"exit {exit_code}")
+    if output is not None:
+        out = output.strip()
+        note += ("\noutput:\n" + _clip_output(out) if out else "\noutput: (none)")
+    return note
+
+
 def operator_note(cmd: str, exit_code, proposed: str = None, output: str = None) -> str:
     """The note fed back to the model after the operator runs something, so it
     stays in sync. Shows the actual command (and any edit) and, when captured, the
@@ -12126,8 +12149,9 @@ def _tee_capture(argv, cwd=None) -> tuple:
     return code, _clean_captured(raw)
 
 
-def _edit_prompt(prompt: str, prefill: str) -> str:
-    """Editable input pre-filled with `prefill` (via readline). Empty = cancel."""
+def _edit_prompt(prompt: str, prefill: str, cancel_marker: bool = False):
+    """Editable input pre-filled with `prefill` (via readline). Empty = cancel.
+    cancel_marker: ^C/EOF return None (so the caller can say it was ^C), not ''."""
     if readline is not None:
         # insert_text alone: the startup hook fires inside readline's initial
         # display, so a manual redisplay() here draws the prefilled line twice.
@@ -12136,14 +12160,60 @@ def _edit_prompt(prompt: str, prefill: str) -> str:
         return input(prompt).strip()
     except (EOFError, KeyboardInterrupt):
         print()
-        return ""
+        return None if cancel_marker else ""
     finally:
         if readline is not None:
             readline.set_startup_hook()
 
 
+_ASK_TIMED_OUT = "\x00ask-timed-out"     # sentinel from _await_first_key
+
+
+def _await_first_key(timeout: int):
+    """Wait up to `timeout` secs for the operator's FIRST keypress, without echo
+    (cbreak; ^C still raises KeyboardInterrupt). Returns the bytes read (an escape
+    sequence is read whole), or None on timeout. Only the wait for acknowledgement is
+    timed - once a key lands, editing and the run itself are never timed out. No tty
+    or timeout<=0 -> '' (proceed straight to the prompt, no wait)."""
+    if timeout <= 0 or not sys.stdin.isatty():
+        return ""
+    try:
+        import termios, tty
+    except ImportError:                       # Windows: no timed wait, prompt directly
+        return ""
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setcbreak(fd)
+        r, _, _ = select.select([fd], [], [], timeout)
+        if not r:
+            return None
+        data = os.read(fd, 64)
+        while select.select([fd], [], [], 0.02)[0]:   # rest of an escape sequence / paste
+            more = os.read(fd, 64)
+            if not more:
+                break
+            data += more
+        return data.decode("utf-8", "ignore")
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+
+def _prefill_after_key(cmd: str, key: str):
+    """(prefill, run_now) for the editable line given the operator's first key:
+    Enter runs as-is; backspace starts editing with the last char gone; printable
+    text is appended; anything else (arrows, other escapes) just opens the editor."""
+    if key in ("\r", "\n"):
+        return cmd, True
+    if key in ("\x7f", "\x08"):
+        return cmd[:-1], False
+    if key and key.isprintable() and not key.startswith("\x1b"):
+        return cmd + key, False
+    return cmd, False
+
+
 def run_direct_command(cfg, cmd: str, reason: str = None, remote=None,
-                       editable=True) -> str:
+                       editable=True, requested=False, timed=True) -> str:
     """Run a command in a real terminal (local, or on `remote` over the ssh
     master so sudo prompts live); return an operator_note for the model.
     `editable` (default) shows an editable, location-labelled line for the
@@ -12156,12 +12226,38 @@ def run_direct_command(cfg, cmd: str, reason: str = None, remote=None,
         _active_spinner.stop()
     if editable:
         print(dim("  Enter to run (edit first if you like); empty line or ^C to decline."))
-        final = _edit_prompt(_direct_prompt(cfg, remote), cmd)
+        prompt = _direct_prompt(cfg, remote)
+        timeout = int(getattr(cfg, "ask_timeout", 300) or 0) if requested and timed else 0
+        if timeout > 0 and sys.stdin.isatty():
+            sys.stdout.write(prompt + cmd)
+            sys.stdout.flush()
+            try:
+                key = _await_first_key(timeout)
+            except KeyboardInterrupt:
+                print()
+                return "[operator cancelled the request (^C)]"
+            sys.stdout.write("\r\033[K")
+            sys.stdout.flush()
+            if key is None:
+                mins = f"{timeout // 60} min" if timeout % 60 == 0 else f"{timeout}s"
+                print(dim(f"  no response in {mins} - request moved to /pending."))
+                return _ASK_TIMED_OUT + mins
+            prefill, run_now = _prefill_after_key(cmd, key)
+            if run_now:
+                print(prompt + cmd)
+                final = cmd
+            else:
+                final = _edit_prompt(prompt, prefill, cancel_marker=True)
+        else:
+            final = _edit_prompt(prompt, cmd, cancel_marker=requested)
     else:
         print(_direct_prompt(cfg, remote) + cmd)   # show where it runs, then run
         final = cmd
+    if final is None:
+        return "[operator cancelled the request (^C)]"
     if not final:
-        return "[operator declined to run the command]"
+        return ("[operator cleared the command and did not run it]" if requested
+                else "[operator declined to run the command]")
     # Run under a pty so the operator sees output LIVE and any prompt (sudo) works,
     # while we CAPTURE the output for the model to act on. The password isn't captured
     # (typed echo-off, not in the pty stream). Remote: the ssh -tt argv carries its own
@@ -12184,10 +12280,64 @@ def run_direct_command(cfg, cmd: str, reason: str = None, remote=None,
         code, output = _tee_capture(argv)
     except KeyboardInterrupt:
         print()
+        if requested:
+            return f"[operator interrupted the command (^C)]\n$ {final}"
         return operator_note(final, None, proposed=cmd) + "\n(interrupted)"
     except Exception as e:
         return f"[operator command error] {e}"
+    if requested:
+        return requested_note(final, code, proposed=cmd, output=output)
     return operator_note(final, code, proposed=cmd, output=output)
+
+
+def handle_pending_command(agent, cfg, arg: str):
+    """/pending: ask_user_to_run requests that timed out with no response.
+      /pending              list them
+      /pending run [n]      run #n (default 1) now; the result goes to the model next turn
+      /pending drop [n|all] discard #n (default 1) or all"""
+    q = agent._pending_asks
+    parts = arg.split()
+    verb = parts[0] if parts else ""
+    if not q:
+        print(dim("nothing pending."))
+        return
+    if not verb:
+        for i, p in enumerate(q, 1):
+            ago = int((time.time() - p["at"]) // 60)
+            where = p["remote"].host if p["remote"] is not None else "local"
+            why = f"  ({p['reason']})" if p.get("reason") else ""
+            print(f"  {i}. {p['cmd']}" + dim(f"{why} · {where} · {ago}m ago"))
+        print(dim("  /pending run [n] to run one, /pending drop [n|all] to discard."))
+        return
+    if verb not in ("run", "drop"):
+        print(yellow("usage: /pending [run [n] | drop [n|all]]"))
+        return
+    if verb == "drop" and parts[1:] == ["all"]:
+        q.clear()
+        print(dim("dropped all pending requests."))
+        return
+    try:
+        n = int(parts[1]) if len(parts) > 1 else 1
+        item = q[n - 1]
+        if n < 1:
+            raise IndexError
+    except (ValueError, IndexError):
+        print(yellow(f"no pending request #{parts[1] if len(parts) > 1 else 1}."))
+        return
+    if verb == "drop":
+        q.remove(item)
+        print(dim(f"dropped: {item['cmd']}"))
+        return
+    if item["remote"] is not agent.remote:
+        where = item["remote"].host if item["remote"] is not None else "local"
+        print(yellow(f"that request was for {where}; switch there first (or drop it)."))
+        return
+    q.remove(item)
+    note = run_direct_command(cfg, item["cmd"], item.get("reason"),
+                              remote=agent.remote, requested=True, timed=False)
+    agent._queued_turns.append("[the earlier timed-out ask_user_to_run request, from "
+                               "/pending]\n" + note)
+    print(dim("-> result goes to the model as your next turn."))
 
 
 def run_sh_command(agent, cfg, arg: str):
@@ -12935,6 +13085,7 @@ class Agent:
         self._elected_compact = False   # set by request_compact -> _maybe_compact runs it
         self._last_compact_ts = 0.0      # time of last auto-compaction (loop guard)
         self._autostart_pending = None   # self-prompt queued to run as the next turn
+        self._pending_asks = []          # ask_user_to_run requests that timed out (/pending)
         self._queued_turns = []          # user turns queued by a command (e.g. /prompt use);
                                          # the REPL drains these as full turns before prompting
         self._activity = []              # system-activity log: automatic behaviours
@@ -15132,7 +15283,14 @@ class Agent:
             with composer_suspended():
                 result = run_direct_command(
                     self.cfg, args.get("cmd", ""), args.get("reason"),
-                    remote=self.remote)
+                    remote=self.remote, requested=True)
+            if result.startswith(_ASK_TIMED_OUT):
+                mins = result[len(_ASK_TIMED_OUT):]
+                self._pending_asks.append({"cmd": args.get("cmd", ""),
+                                           "reason": args.get("reason"),
+                                           "remote": self.remote, "at": time.time()})
+                result = (f"[request timed out after {mins} with no response; the "
+                          "operator may be away. It stays queued for them (/pending).]")
         elif (self.remote is None and _tool_may_hit_pinentry(name, args)
                 and _gpg_ssh_locked()):
             # gpg-agent is about to pop pinentry-curses (an ssh key with a cold cache).
@@ -15929,7 +16087,7 @@ def _render_tool_call(entry: dict, cap: int = EXPAND_MAX_CHARS) -> str:
 # ----------------------------------------------------------------------------
 
 SLASH_COMMANDS = ["/clear", "/new", "/rewind", "/trim", "/compact", "/compact_at", "/compactat", "/session", "/save", "/load",
-                  "/prompt", "/sh", "/connect", "/machines", "/local", "/disconnect", "/tools", "/push", "/pull", "/reload",
+                  "/prompt", "/sh", "/pending", "/connect", "/machines", "/local", "/disconnect", "/tools", "/push", "/pull", "/reload",
                   "/model", "/models", "/provider", "/providers", "/think", "/effort",
                   "/set", "/usage", "/approve", "/leash", "/autosave", "/incognito",
                   "/askread", "/bg", "/background", "/note", "/plan", "/board", "/mcp", "/info", "/activity", "/expand",
@@ -16146,6 +16304,7 @@ HELP_COMMANDS = [
     ("/session", "list | delete <name>"),
     ("/prompt [name]", "send a saved prompt as your next turn (no arg = picker; new/edit/reset/delete <name> to manage)"),
     ("/sh [cmd]", "run a command in a terminal (no arg: drop into your $SHELL)"),
+    ("/pending", "ask_user_to_run requests that timed out: list, run [n], drop [n|all]"),
     ("/connect [host]", "run tools on a remote over SSH"),
     ("/machines", "list saved remote hosts; remove <name> (add via the config [machines] table)"),
     ("/local [host]", "detach the active remote"),
@@ -16387,12 +16546,11 @@ _SETTINGS_FIELDS = [
     ("auto_update", "on launch, self-update to the latest published build (needs the 'update' lean-tool)", "bool"),
     ("command_timeout", "run_command timeout (s)", "int"),
     ("tool_timeout", "wedge tripwire (s) for an in-process tool; long-by-design tools opt out", "int"),
-    ("command_timeout", "run_command timeout (s)", "int"),
+    ("ask_timeout", "ask_user_to_run: secs with no keypress before it times out to /pending (0 = never)", "int"),
     ("max_iterations", "max tool-call rounds per turn (0 = unlimited)", "int"),
     ("bg_max_concurrent", "max background tasks (0 = unlimited)", "int"),
     ("worker_max_concurrent", "max worker agents at once (0 = unlimited)", "int"),
     ("worker_idle_timeout", "worker lease timeout (s); unattended self-kill", "int"),
-    ("worker_max_iterations", "max tool-call rounds per worker", "int"),
     ("ask_user_to_run", "ask_user_to_run tool", "bool"),
     ("leash", "capability ceiling", tuple(LEASH_LEVELS)),
     ("confirm_reads", "ask-on-read (confirm read tools too)", "bool"),
@@ -16428,10 +16586,8 @@ _SETTINGS_FIELDS = [
     ("capture_training", "capture RAW per-turn trajectories to a LOCAL JSONL sidecar for your own debugging/RL - stays on-box, never uploaded (off)", "bool"),
     ("ingest_cap_floor", "opaque tool result: min truncation size (chars)", "int"),
     ("ingest_cap_ceil", "opaque tool result: hard char ceiling", "int"),
-    ("capture_training", "capture RAW per-turn training trajectories to a JSONL sidecar (off; personal machine)", "bool"),
     ("capture_training_dir", "training-capture output dir (blank = CONFIG_DIR/training/)", "str"),
     ("keep_alive", "ollama: model keep-alive (e.g. 10m, -1, 0)", "str"),
-    ("auto_num_ctx", "ollama: detect num_ctx at startup", "bool"),
 ]
 _SETTINGS_BY_KEY = {k: (label, kind) for k, label, kind in _SETTINGS_FIELDS}
 # Settings that change the LIVE agent (its tool surface / system prompt), not just a
@@ -17362,6 +17518,8 @@ def _arg_completions(agent, cfg, cmd):
         return ["msg"]
     if cmd == "/connect":
         return ["remove"] + sorted(set(list(cfg.connect_hosts) + list(getattr(agent, "remotes", {}))))
+    if cmd == "/pending":
+        return ["run", "drop"]
     if cmd == "/connect remove":
         return sorted(cfg.connect_hosts)
     if cmd == "/machines":
@@ -20042,6 +20200,7 @@ _BUILTIN_COMMANDS_TABLE = {
     "/new": handle_new_command,
     "/prompt": handle_prompt_command,
     "/sh": run_sh_command,
+    "/pending": handle_pending_command,
     "/connect": handle_connect_command,
     "/machines": handle_machines_command,
     "/tools": handle_tools_command,
