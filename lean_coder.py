@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L1864   Lean-tools (plugin tools: discovery, manager)
-  L2251   MCP client (connection, manager, OAuth, discovery)
-  L2705   Providers (backend plugin registry)
-  L2982   Interactive pickers + menus (raw-mode UI engine)
-  L3357   Terminal styling (colors, formatting helpers)
-  L3651   Streaming + markdown render (model output)
-  L4420   Composer (pinned input line, editor, stdin)
-  L5387   Token accounting (calibrated context meter)
-  L5640   Config (dataclass, field registry, load/save)
-  L9622   Tool execution + text tool-call parsing
-  L10095  Remote workspace (executor client, /connect)
-  L12286  Context meter
-  L12381  Agent (turn loop, context mgmt, tool dispatch)
-  L20074  Slash-command handlers + dispatch table
-  L20216  REPL (interactive loop, session resume)
-  L20688  Worker agent (headless --agent-run)
-  L21376  Entry (CLI arg parsing, main)
+  L1869   Lean-tools (plugin tools: discovery, manager)
+  L2256   MCP client (connection, manager, OAuth, discovery)
+  L2710   Providers (backend plugin registry)
+  L2987   Interactive pickers + menus (raw-mode UI engine)
+  L3362   Terminal styling (colors, formatting helpers)
+  L3656   Streaming + markdown render (model output)
+  L4425   Composer (pinned input line, editor, stdin)
+  L5392   Token accounting (calibrated context meter)
+  L5645   Config (dataclass, field registry, load/save)
+  L9627   Tool execution + text tool-call parsing
+  L10100  Remote workspace (executor client, /connect)
+  L12291  Context meter
+  L12386  Agent (turn loop, context mgmt, tool dispatch)
+  L20114  Slash-command handlers + dispatch table
+  L20256  REPL (interactive loop, session resume)
+  L20728  Worker agent (headless --agent-run)
+  L21416  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -154,7 +154,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.10.101"
+__version__ = "0.10.102"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -162,6 +162,11 @@ __version__ = "0.10.101"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.10.102": [
+        "/prompt delete <name>: deletes a custom prompt after a y/N. System prompts can't be",
+        "  deleted - an edited one is reset to default, an untouched one is left as is (both",
+        "  say so). Tab-completes the verb and the prompt names.",
+    ],
     "0.10.101": [
         "One-line rows share one fit rule (_fit_tail): tool call lines, result previews,",
         "  worker/bg/board notices, approval prompts and the autostart preview fill to the",
@@ -16139,7 +16144,7 @@ HELP_COMMANDS = [
     ("/save [name]", "name the current session"),
     ("/load [name]", "resume a session (no arg = picker)"),
     ("/session", "list | delete <name>"),
-    ("/prompt [name]", "send a saved prompt as your next turn (no arg = picker; new/edit/reset <name> to manage)"),
+    ("/prompt [name]", "send a saved prompt as your next turn (no arg = picker; new/edit/reset/delete <name> to manage)"),
     ("/sh [cmd]", "run a command in a terminal (no arg: drop into your $SHELL)"),
     ("/connect [host]", "run tools on a remote over SSH"),
     ("/machines", "list saved remote hosts; remove <name> (add via the config [machines] table)"),
@@ -16261,6 +16266,33 @@ def _use_prompt(agent, name):
     print(dim(f"sending prompt '{name}' ({len(text.split())} words) as your next turn."))
 
 
+def _delete_prompt(agent, name):
+    """/prompt delete <name>. A custom prompt's file is removed after a y/N (it can't
+    be recovered). System prompts can't be deleted: an edited one is reset to its
+    default, an untouched one is left alone - both say so."""
+    if name in BUILTIN_PROMPTS:
+        if restore_prompt(name):
+            _refresh_system_prompt(agent, name)
+            print(yellow(f"system prompts can't be deleted - '{name}' has been reset "
+                         "to its default."))
+        else:
+            print(yellow(f"system prompts can't be deleted - no changes made, '{name}' "
+                         "is already default."))
+        return
+    f = prompt_file(name)
+    if not f.is_file():
+        print(yellow(f"no prompt '{name}' to delete."))
+        return
+    if not _ask(f"delete prompt '{name}' ({f})? it can't be recovered"):
+        print(dim("kept."))
+        return
+    try:
+        f.unlink()
+        print(dim(f"deleted prompt '{name}'."))
+    except OSError as e:
+        print(red(f"couldn't delete '{name}': {e}"))
+
+
 def handle_prompt_command(agent, cfg, arg):
     """/prompt: fire a saved prompt as a one-shot turn, or manage prompt files.
       /prompt                 picker: choose a saved prompt to USE (fires next turn)
@@ -16268,8 +16300,10 @@ def handle_prompt_command(agent, cfg, arg):
       /prompt new <name>      create a new custom prompt and open it in the editor
       /prompt edit <name>     view/edit an existing prompt file
       /prompt reset <name>    restore a built-in to its baked default
+      /prompt delete <name>   delete a custom prompt (asks first); on a system prompt
+                              it resets to default instead (they can't be deleted)
 
-    The verbs new/edit/use/reset are reserved: `/prompt use foo` always means the USE
+    The verbs new/edit/use/reset/delete are reserved: `/prompt use foo` always means the USE
     verb, even if you have a prompt literally named 'use' (pick it from the no-arg
     picker instead). Bare `/prompt <name>` USES it - the common case - so a saved
     instruction fires without retyping."""
@@ -16282,6 +16316,12 @@ def handle_prompt_command(agent, cfg, arg):
             _refresh_system_prompt(agent, name)
         else:
             print(dim(f"'{name}' has no override to restore (already default)."))
+        return
+    if arg == "delete":
+        print(yellow("usage: /prompt delete <name>"))
+        return
+    if arg.startswith("delete "):
+        _delete_prompt(agent, arg.split(maxsplit=1)[1].strip())
         return
     if arg == "use":
         arg = ""                                  # bare 'use' -> fall through to the picker
@@ -17332,8 +17372,8 @@ def _arg_completions(agent, cfg, cmd):
         return list(getattr(agent, "remotes", {}))
     if cmd == "/prompt":
         b, c = list_prompts(all_builtins=True)   # bare /prompt <name> = USE; verbs first
-        return ["new", "edit", "use", "reset"] + b + c
-    if cmd in ("/prompt use", "/prompt edit"):   # name-complete after the verb (existing prompts)
+        return ["new", "edit", "use", "reset", "delete"] + b + c
+    if cmd in ("/prompt use", "/prompt edit", "/prompt delete"):   # name-complete after the verb (existing prompts)
         b, c = list_prompts(all_builtins=True)
         return b + c
     # /prompt new takes a NEW name (nothing to complete), so no name list here.
