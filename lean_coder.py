@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L1879   Lean-tools (plugin tools: discovery, manager)
-  L2266   MCP client (connection, manager, OAuth, discovery)
-  L2720   Providers (backend plugin registry)
-  L2997   Interactive pickers + menus (raw-mode UI engine)
-  L3372   Terminal styling (colors, formatting helpers)
-  L3666   Streaming + markdown render (model output)
-  L4435   Composer (pinned input line, editor, stdin)
-  L5402   Token accounting (calibrated context meter)
-  L5655   Config (dataclass, field registry, load/save)
-  L9640   Tool execution + text tool-call parsing
-  L10113  Remote workspace (executor client, /connect)
-  L12444  Context meter
-  L12539  Agent (turn loop, context mgmt, tool dispatch)
-  L20276  Slash-command handlers + dispatch table
-  L20418  REPL (interactive loop, session resume)
-  L20890  Worker agent (headless --agent-run)
-  L21578  Entry (CLI arg parsing, main)
+  L1883   Lean-tools (plugin tools: discovery, manager)
+  L2270   MCP client (connection, manager, OAuth, discovery)
+  L2724   Providers (backend plugin registry)
+  L3001   Interactive pickers + menus (raw-mode UI engine)
+  L3376   Terminal styling (colors, formatting helpers)
+  L3670   Streaming + markdown render (model output)
+  L4439   Composer (pinned input line, editor, stdin)
+  L5406   Token accounting (calibrated context meter)
+  L5659   Config (dataclass, field registry, load/save)
+  L9644   Tool execution + text tool-call parsing
+  L10117  Remote workspace (executor client, /connect)
+  L12448  Context meter
+  L12543  Agent (turn loop, context mgmt, tool dispatch)
+  L20285  Slash-command handlers + dispatch table
+  L20427  REPL (interactive loop, session resume)
+  L20899  Worker agent (headless --agent-run)
+  L21603  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -154,7 +154,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.10.104"
+__version__ = "0.10.105"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -162,6 +162,10 @@ __version__ = "0.10.104"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.10.105": [
+        "Headless worker usage file now records prompt-cache read/write tokens and is "
+        "written on every exit, including incomplete and failed runs.",
+    ],
     "0.10.104": [
         "Licence changed from MIT to Apache-2.0. Releases up to 0.10.103 remain MIT.",
     ],
@@ -13073,6 +13077,8 @@ class Agent:
         self.last_prompt_tokens = None
         self.session_in = 0              # tokens sent/received this session (any backend);
         self.session_out = 0            # accumulated per chat() call, zeroed on /clear
+        self.session_cache_read = 0      # prompt-cache read/write tokens (providers that
+        self.session_cache_write = 0     # report them apart from session_in, e.g. Anthropic)
         # Generation telemetry for honest DECODE throughput (tok/s). Only providers that
         # expose per-call gen timing (ollama's eval_count/eval_duration) contribute; the
         # rest never set the client attrs so these stay 0 (Agent reads with a getattr
@@ -13859,6 +13865,7 @@ class Agent:
         self.finish_reasons = []         # parallel to this session's assistant turns
         self.last_prompt_tokens = None
         self.session_in = self.session_out = 0
+        self.session_cache_read = self.session_cache_write = 0
         self.session_eval_tokens = self.session_eval_ns = 0
         self.tools.changed_files.clear()
         self.dirty = False
@@ -15153,6 +15160,8 @@ class Agent:
                 calibrate_tokens(raw, prompt_eval + cr + cw)
                 self.last_prompt_tokens = prompt_eval
                 self.session_in += prompt_eval
+                self.session_cache_read += cr
+                self.session_cache_write += cw
             # Output tokens are reported by the client (Ollama eval_count / API
             # output_tokens) on an optional attribute, so any backend contributes
             # to the session count without a chat() signature change.
@@ -20891,6 +20900,15 @@ def _brief_result_path(brief_file, result_file):
 # ==========================================================================
 
 def run_agent_brief(args) -> int:
+    """`--agent-run` entry: run the brief, then write the usage sidecar on EVERY exit
+    path (ok, INCOMPLETE, failure) once an Agent was built."""
+    try:
+        return _run_agent_brief(args)
+    finally:
+        _write_brief_usage(args.brief_file, _active_agent)
+
+
+def _run_agent_brief(args) -> int:
     """Headless WORKER role (`--agent-run`): read a brief file, run ONE brief to
     completion, write the model's final answer (its ===RESULT=== block, or the whole
     final message) to the result file, exit. No composer, no readline, no banner, no
@@ -21561,17 +21579,24 @@ def run_agent_brief(args) -> int:
         Path(resultf).write_text(f"{RESULT_MARK}\n{block}\n{RESULT_MARK}\n")
     except OSError as e:
         return _fail(f"cannot write result file: {e}")
-    # Report this worker's token spend (observability): the parent sums finished workers'
-    # spend for /worker status (see dispatch_worker _worker_tokens_spent). A tiny
-    # '<brief>.usage' sidecar with in/out totals; best-effort, never fatal.
-    try:
-        Path(str(brief_file) + ".usage").write_text(
-            f"in={int(getattr(agent, 'session_in', 0) or 0)} "
-            f"out={int(getattr(agent, 'session_out', 0) or 0)}\n")
-    except OSError:
-        _dbg_swallow()
     print(dim(f"agent-run: done -> {resultf}"))
     return 0
+
+
+def _write_brief_usage(brief_file, agent):
+    """'<brief>.usage' sidecar: this worker's token spend (observability; the parent sums
+    in/out for /worker status, see dispatch_worker _read_usage). in/out as the provider
+    reports them; cache_read/cache_write are prompt-cache tokens NOT included in `in`
+    (0 for providers whose `in` already counts them). Best-effort, never fatal."""
+    if not brief_file or agent is None:
+        return
+    g = lambda k: int(getattr(agent, k, 0) or 0)
+    try:
+        Path(str(brief_file) + ".usage").write_text(
+            f"in={g('session_in')} out={g('session_out')} "
+            f"cache_read={g('session_cache_read')} cache_write={g('session_cache_write')}\n")
+    except OSError:
+        _dbg_swallow()
 
 
 # ==========================================================================
