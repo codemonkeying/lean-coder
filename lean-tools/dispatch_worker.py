@@ -79,8 +79,7 @@ TOOL = {
         "context); returns a pid. It runs in the BACKGROUND and you're NOTIFIED "
         "AUTOMATICALLY when it finishes (a notice on a later turn) - don't poll it, just "
         "carry on or end your turn. For scoped errands whose output would bloat this "
-        "session, e.g. 'scout this module, report where X is handled'. Default READ-ONLY; "
-        "leash='rw'/'rwe' to let it edit/run, never above YOUR capability. Manage/steer a "
+        "session, e.g. 'scout this module, report where X is handled'. Manage/steer a "
         "worker (and list models, resume a dead one) via `action`."),
     "parameters": {
         "type": "object",
@@ -125,13 +124,11 @@ TOOL = {
                                      "(see action='models'); its provider is inferred. Default: "
                                      "inherit your current model."},
             "provider": {"type": "string",
-                         "description": "Optional backend for the worker's brain (must be enabled). "
-                                        "Only needed to disambiguate when the same model name is on "
-                                        "more than one provider; else inferred from `model`."},
+                         "description": "Optional provider for `model`; only needed when a model "
+                                        "name exists on several providers."},
             "brain_host": {"type": "string",
                            "description": "Optional ollama endpoint (URL or /machines alias) to run "
-                                          "the worker's BRAIN on - distinct from `host` (its TOOLS). "
-                                          "Runs the model on a different box (ollama only)."},
+                                          "the worker's BRAIN on - distinct from `host` (its TOOLS)."},
             "host": {"type": "string",
                      "description": "Optional box to run the worker's TOOLS on ([user@]host or a "
                                     "/connect name); defaults to this session's target. A password "
@@ -139,19 +136,15 @@ TOOL = {
             "cwd": {"type": "string",
                     "description": "Optional working directory (defaults to current)."},
             "from_session": {"type": "string",
-                             "description": "Optional: seed this worker from a saved SESSION (name "
-                                            "under CONFIG_DIR/sessions, or a path). Its transcript "
-                                            "becomes the worker's history and `task` runs as a steer "
-                                            "turn on top; checkpointing is forced on so it can be "
-                                            "promoted back to a session later."},
+                             "description": "Optional: seed the worker from a saved session (name "
+                                            "or path); its transcript becomes its history and `task` "
+                                            "runs as a steer on top."},
             "name": {"type": "string",
                      "description": "For 'promote'/'pause' (pid=): the session name to save the "
                                     "worker under (pause defaults to worker-<pid>)."},
             "taskboard": {"type": "string",
-                          "description": "Optional: assign this worker to a named task-board (see "
-                                         "the `board` tool). The worker auto-gets the board tool and "
-                                         "is told to report its task done there. Usually add+assign "
-                                         "the task first, then dispatch with taskboard=<name>."},
+                          "description": "Optional: named task-board (see `board`) the worker "
+                                         "reports its task done on. Usually add+assign the task first."},
             "iterations": {"type": "integer",
                            "description": "Optional tool-call budget, capped at the operator ceiling "
                                           "(default 30; omit = ceiling). On 'dispatch' sets the worker's "
@@ -161,11 +154,9 @@ TOOL = {
                       "description": "Worker capability: r=read-only (default), rw=edit, rwe=edit+run. "
                                      "Capped at your own leash."},
             "tools": {"type": "array", "items": {"type": "string"},
-                      "description": "Optional ALLOWLIST of tool names the worker may use (e.g. "
-                                     "[\"read_file\",\"web_fetch\"] for a scout). Omit = your full "
-                                     "leash-permitted set. A worker never gets a tool you lack, and "
-                                     "the grant is still leash-capped; its plan/note meta tools are "
-                                     "always kept."},
+                      "description": "Optional ALLOWLIST of tool names the worker may use. Omit = "
+                                     "your full leash-permitted set. Never exceeds your tools/leash; "
+                                     "plan/note always kept."},
             "context": {"type": "string",
                         "description": "Optional CURATED background the worker needs but that isn't "
                                        "the task itself (e.g. 'auth was just refactored; tokens now "
@@ -179,8 +170,7 @@ TOOL = {
                                      "(tagged as from you). Also the payload for 'add_note'."},
             "page": {"type": "integer",
                      "description": "For 'result'/'transcript' (pid=): which page to show "
-                                    "(1-based, default 1). The reply tells you the page count "
-                                    "and whether more remain."},
+                                    "(1-based, default 1)."},
         },
         "required": [],
     },
@@ -1977,3 +1967,4 @@ def setup(lc, cfg):
                            "/worker status [pid], /worker cancel <pid>, "
                            "/worker inject <pid> <message>",
                            _worker_completer)
+    lc["register_command"]("/wkr", _worker_cmd, "", _worker_completer)   # status-row alias

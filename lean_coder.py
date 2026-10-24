@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L1883   Lean-tools (plugin tools: discovery, manager)
-  L2270   MCP client (connection, manager, OAuth, discovery)
-  L2724   Providers (backend plugin registry)
-  L3001   Interactive pickers + menus (raw-mode UI engine)
-  L3376   Terminal styling (colors, formatting helpers)
-  L3670   Streaming + markdown render (model output)
-  L4439   Composer (pinned input line, editor, stdin)
-  L5406   Token accounting (calibrated context meter)
-  L5659   Config (dataclass, field registry, load/save)
-  L9644   Tool execution + text tool-call parsing
-  L10117  Remote workspace (executor client, /connect)
-  L12448  Context meter
-  L12543  Agent (turn loop, context mgmt, tool dispatch)
-  L20285  Slash-command handlers + dispatch table
-  L20427  REPL (interactive loop, session resume)
-  L20899  Worker agent (headless --agent-run)
-  L21603  Entry (CLI arg parsing, main)
+  L1900   Lean-tools (plugin tools: discovery, manager)
+  L2287   MCP client (connection, manager, OAuth, discovery)
+  L2741   Providers (backend plugin registry)
+  L3018   Interactive pickers + menus (raw-mode UI engine)
+  L3393   Terminal styling (colors, formatting helpers)
+  L3691   Streaming + markdown render (model output)
+  L4460   Composer (pinned input line, editor, stdin)
+  L5450   Token accounting (calibrated context meter)
+  L5703   Config (dataclass, field registry, load/save)
+  L9720   Tool execution + text tool-call parsing
+  L10193  Remote workspace (executor client, /connect)
+  L12534  Context meter
+  L12629  Agent (turn loop, context mgmt, tool dispatch)
+  L20507  Slash-command handlers + dispatch table
+  L20649  REPL (interactive loop, session resume)
+  L21121  Worker agent (headless --agent-run)
+  L21825  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -154,7 +154,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.10.105"
+__version__ = "0.10.106"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -162,6 +162,24 @@ __version__ = "0.10.105"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.10.106": [
+        "ask_user_to_run: a request that times out becomes the single waiting command",
+        "  (a newer one replaces it; kept with the session). /user_to_run (aliases",
+        "  /usertorun, /pending, /usr) shows it with a y/n/c/f/exit picker: y asks the",
+        "  model to re-issue it (new pending=run|skip arg), f runs it now, c clears it.",
+        "Status line: session name without 'session:'; counts for a waiting command (!),",
+        "  workers, background jobs and assigned board tasks. Aliases /wkr /bgd /brd.",
+        "Background icon is now a clock everywhere; starting a background job shows the",
+        "  same cyan bar as its finish. All icons and fallbacks live in one table.",
+        "/board: boards this session is on are listed last and marked; newest last.",
+        "request_compact is always listed; outside the compaction window it reports the",
+        "  current compact settings instead.",
+        "ssh tool: a locked key is handed to the operator instead of prompting; terminal",
+        "  settings are restored after ssh calls.",
+        "/bg: one line per task, like /worker, and no longer lists workers; /bg <pid> shows",
+        "  the log path and tail.",
+        "Tool descriptions trimmed (about 450 tokens smaller).",
+    ],
     "0.10.105": [
         "Headless worker usage file now records prompt-cache read/write tokens and is "
         "written on every exit, including incomplete and failed runs.",
@@ -1644,7 +1662,8 @@ ASK_USER_TOOL = {"type": "function", "function": {
     "description": "Hand a command to the operator to run in their own terminal; they may edit it or decline. Use it when a step needs the operator: sudo/root, a passphrase or login prompt (e.g. git push or commit needing a GPG/SSH key, 2FA), or another interactive prompt. Try non-interactive options first where available.",
     "parameters": {"type": "object",
         "properties": {"cmd": {"type": "string", "description": "The command to hand over."},
-                       "reason": {"type": "string", "description": "Brief why this needs the operator (e.g. 'needs sudo')."}},
+                       "reason": {"type": "string", "description": "Brief why this needs the operator (e.g. 'needs sudo')."},
+                       "pending": {"type": "string", "enum": ["run", "skip"], "description": "Only after operator approval: run or skip the waiting command."}},
         "required": ["cmd"]}}}
 
 # Surfaced ONLY during /compact (added to the tool surface for that window, removed
@@ -1670,15 +1689,11 @@ UPDATE_PLAN_TOOL = {"type": "function", "function": {
 # user's threshold), only pick the tidiest MOMENT inside the window the user opened.
 REQUEST_COMPACT_TOOL = {"type": "function", "function": {
     "name": "request_compact",
-    "description": ("Electively compact NOW, at a clean stopping point. Only call this "
-                    "when the CURRENT task/step is genuinely complete (work committed, "
-                    "nothing half-done) and the next thing is a fresh, unrelated task that "
-                    "won't need this history - a natural boundary to summarize + reset at. "
-                    "It runs the same compaction the automatic one does: you summarize the "
-                    "older context and write your next-step self-prompt, then history is "
-                    "replaced by that summary. Do NOT call it mid-task, and do NOT call it "
-                    "just because context is large - the automatic compaction covers pure "
-                    "size. Prefer finishing cleanly first. Takes no arguments."),
+    "description": ("Compact NOW at a clean break: only when the current task/step is "
+                    "fully done and the next is unrelated. You write the summary + next-step "
+                    "prompt; history is replaced by it. Never mid-task, never just for size "
+                    "(auto-compaction covers that). Below the compaction threshold it does "
+                    "nothing and returns the current compact settings."),
     "parameters": {"type": "object", "properties": {}, "required": []}}}
 
 
@@ -1731,9 +1746,11 @@ def active_tools(cfg, remote=False, lean_tool_schemas=(), model_tools=True,
     _META = ("update_plan", "note", "request_compact")
     def _named(nm):
         return allow is None or nm in _META or nm in allow
-    tools = [UPDATE_PLAN_TOOL, NOTE_TOOL]  # plan upkeep + session notebook: no fs/exec, every non-chat tier
-    if offer_compact:               # soft zone: let the model elect a compaction at a break
-        tools.append(REQUEST_COMPACT_TOOL)
+    # plan upkeep + notebook + elective compaction: no fs/exec, every non-chat tier.
+    # request_compact is ALWAYS listed (a stable surface keeps the prompt cache warm);
+    # outside the soft zone it just reports the compact settings. `offer_compact` is
+    # kept for call-site compatibility.
+    tools = [UPDATE_PLAN_TOOL, NOTE_TOOL, REQUEST_COMPACT_TOOL]
     for t in TOOLS:
         nm = t["function"]["name"]
         if not _named(nm):
@@ -3486,7 +3503,11 @@ GLYPH = {
     "prompt_remote": glyph("»", ">>"),  # prompt glyph when tools run on a REMOTE (like root's $ vs #)
     "bullet":   glyph("●", "*"),       # assistant message
     "tool":     glyph("⚙", "*"),       # a tool call (uncategorised / fallback)
-    "bg":       glyph("⚡", "&"),       # a backgrounded (detached) run_command
+    "bg":       glyph("◷", "bgd"),     # background: detached run_command / status count
+    "user_wait": glyph("!", "usr"),    # status count: a command waiting on the operator
+    "worker":   glyph("⚒", "wkr"),     # status count: running workers
+    "board":    glyph("⊡", "brd"),     # status count: board tasks assigned to this session
+    "enrolled": glyph("▸", "*"),       # /board: a board this session is enrolled on
     "warn":     glyph("⚠", "!"),
     "edit":     glyph("✎", "*"),       # files changed
     # Per-CATEGORY call-line icons (derived from tool tiering, not per-tool): the eye
@@ -5341,6 +5362,29 @@ def _tool_may_hit_pinentry(name: str, args: dict) -> bool:
 
 
 @contextmanager
+def _tty_guard():
+    """Save the terminal settings (termios) and restore them on exit - including on
+    timeout, kill or exception - so a credential prompt that dies mid-draw can't leave
+    the terminal raw. No-op off a tty or without termios (Windows)."""
+    saved = fd = None
+    try:
+        import termios
+        if sys.stdin.isatty():
+            fd = sys.stdin.fileno()
+            saved = termios.tcgetattr(fd)
+    except Exception:
+        saved = None
+    try:
+        yield
+    finally:
+        if saved is not None:
+            try:
+                termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+            except Exception:
+                pass
+
+
+@contextmanager
 def _unlock_handoff():
     """Give a pending gpg-agent pinentry a clean terminal: say so, release the
     composer, register this tty with gpg-agent, run the body, then restore."""
@@ -5888,7 +5932,7 @@ class Config:
                                      # context. /set notes_spool <n>.
     ask_user_to_run: bool = True     # expose the ask_user_to_run handoff tool
     ask_timeout: int = 300           # ask_user_to_run: secs with NO keypress before the
-                                     # request times out to /pending (0 = wait forever)
+                                     # request becomes the waiting command (0 = wait forever)
     composer: bool = True            # pinned bottom input line (type while it works)
     scrub_invisible: bool = True     # strip invisible/zero-width/format-control unicode
                                      # from model-supplied text before it's written to
@@ -7011,7 +7055,37 @@ def load_envelope(data):
     return body, meta
 
 
-def save_session(messages, cfg, name: str, remote=None, pinned_plan="", notes=None, origin=None):
+class _HostRef:
+    """Stand-in for a remote a restored waiting command was meant for (only .host)."""
+    def __init__(self, host): self.host = host
+
+
+def _pending_ask_dump(item):
+    """JSON form of the waiting command: the remote object becomes its host name."""
+    if not item:
+        return None
+    r = item.get("remote")
+    return {"cmd": item.get("cmd", ""), "reason": item.get("reason"),
+            "host": r.host if r is not None else None, "at": item.get("at", 0)}
+
+
+def _pending_ask_load(d, remote):
+    """Inverse of _pending_ask_dump: rebind to the live remote when the host matches,
+    else a _HostRef (so /user_to_run says 'switch there first')."""
+    if not isinstance(d, dict) or not d.get("cmd"):
+        return None
+    host = d.get("host")
+    if host is None:
+        r = None
+    elif remote is not None and getattr(remote, "host", None) == host:
+        r = remote
+    else:
+        r = _HostRef(host)
+    return {"cmd": d["cmd"], "reason": d.get("reason"), "remote": r, "at": d.get("at", 0)}
+
+
+def save_session(messages, cfg, name: str, remote=None, pinned_plan="", notes=None, origin=None,
+                 pending_ask=None):
     """Write the conversation to ~/.config/leancoder/sessions/<name>.json with a
     metadata header. Returns (path, meta). Raises ValueError on a bad name.
 
@@ -7041,6 +7115,7 @@ def save_session(messages, cfg, name: str, remote=None, pinned_plan="", notes=No
         "turns": len(body),
         "pinned_plan": pinned_plan or "",
         "notes": list(notes or []),          # session-scoped episodic memory (note tool)
+        "pending_ask": _pending_ask_dump(pending_ask),   # the waiting command (/user_to_run)
         "session_overrides": dict(getattr(cfg, "session_overrides", {}) or {}),
         "tok_factor": _tok_factor(),         # learned estimate->actual factor (calibrated meter)
         "origin": origin,                    # None for a normal save; else where it came from,
@@ -7330,7 +7405,8 @@ def autosave_session(agent, cfg):
         rhost = agent.remote.host if getattr(agent, "remote", None) else None
         save_session(agent.messages, cfg, name, remote=rhost,
                      pinned_plan=getattr(agent, "pinned_plan", ""),
-                     notes=getattr(agent, "notes", None))
+                     notes=getattr(agent, "notes", None),
+                     pending_ask=getattr(agent, "_pending_ask", None))
         _write_lock(name)
         _prune_autosaves()
     except (ValueError, OSError):
@@ -12247,7 +12323,8 @@ def run_direct_command(cfg, cmd: str, reason: str = None, remote=None,
             sys.stdout.flush()
             if key is None:
                 mins = f"{timeout // 60} min" if timeout % 60 == 0 else f"{timeout}s"
-                print(dim(f"  no response in {mins} - request moved to /pending."))
+                print(dim(f"  no response in {mins} - held as the waiting command "
+                          "(/user_to_run)."))
                 return _ASK_TIMED_OUT + mins
             prefill, run_now = _prefill_after_key(cmd, key)
             if run_now:
@@ -12297,54 +12374,63 @@ def run_direct_command(cfg, cmd: str, reason: str = None, remote=None,
     return operator_note(final, code, proposed=cmd, output=output)
 
 
+def _ask_where(item) -> str:
+    return item["remote"].host if item.get("remote") is not None else "local"
+
+
 def handle_pending_command(agent, cfg, arg: str):
-    """/pending: ask_user_to_run requests that timed out with no response.
-      /pending              list them
-      /pending run [n]      run #n (default 1) now; the result goes to the model next turn
-      /pending drop [n|all] discard #n (default 1) or all"""
-    q = agent._pending_asks
-    parts = arg.split()
-    verb = parts[0] if parts else ""
-    if not q:
-        print(dim("nothing pending."))
+    """/user_to_run (aliases /usertorun, /pending, /usr): the ONE waiting command - an
+    ask_user_to_run request that timed out with no response (a newer one overwrites it).
+    Shows it in full, then a picker:
+      y  ask the model to re-issue it (ask_user_to_run pending=run|skip)
+      n  keep it waiting       c  clear it       f  fire it now       exit  keep it"""
+    item = agent._pending_ask
+    if item is None:
+        print(dim("nothing waiting."))
         return
-    if not verb:
-        for i, p in enumerate(q, 1):
-            ago = int((time.time() - p["at"]) // 60)
-            where = p["remote"].host if p["remote"] is not None else "local"
-            why = f"  ({p['reason']})" if p.get("reason") else ""
-            print(f"  {i}. {p['cmd']}" + dim(f"{why} · {where} · {ago}m ago"))
-        print(dim("  /pending run [n] to run one, /pending drop [n|all] to discard."))
-        return
-    if verb not in ("run", "drop"):
-        print(yellow("usage: /pending [run [n] | drop [n|all]]"))
-        return
-    if verb == "drop" and parts[1:] == ["all"]:
-        q.clear()
-        print(dim("dropped all pending requests."))
-        return
-    try:
-        n = int(parts[1]) if len(parts) > 1 else 1
-        item = q[n - 1]
-        if n < 1:
-            raise IndexError
-    except (ValueError, IndexError):
-        print(yellow(f"no pending request #{parts[1] if len(parts) > 1 else 1}."))
-        return
-    if verb == "drop":
-        q.remove(item)
-        print(dim(f"dropped: {item['cmd']}"))
-        return
-    if item["remote"] is not agent.remote:
-        where = item["remote"].host if item["remote"] is not None else "local"
-        print(yellow(f"that request was for {where}; switch there first (or drop it)."))
-        return
-    q.remove(item)
-    note = run_direct_command(cfg, item["cmd"], item.get("reason"),
-                              remote=agent.remote, requested=True, timed=False)
-    agent._queued_turns.append("[the earlier timed-out ask_user_to_run request, from "
-                               "/pending]\n" + note)
-    print(dim("-> result goes to the model as your next turn."))
+    ago = int((time.time() - item["at"]) // 60)
+    print(bold("  waiting command") + dim(f"  · {_ask_where(item)} · {ago}m ago"))
+    for line in (item["cmd"] or "").splitlines() or [""]:
+        print(f"    {line}")
+    if item.get("reason"):
+        print(dim(f"  reason: {item['reason']}"))
+    choice = (arg.strip().lower() if arg.strip() else None)
+    if choice is None:
+        try:
+            with composer_suspended():
+                choice = input("  [y]es ask model / [n]o keep / [c]lear / [f]orce run / exit: ")
+        except (EOFError, KeyboardInterrupt):
+            print()
+            choice = "n"
+        choice = choice.strip().lower()
+    if choice in ("y", "yes"):
+        agent._pending_ask = None
+        agent._pending_offer = item
+        agent._queued_turns.append(
+            "[operator, via /user_to_run: the waiting command below is approved. Call "
+            "ask_user_to_run with pending=\"run\" to hand it over again, or "
+            "pending=\"skip\" to drop it if it's no longer needed.]\n$ " + item["cmd"])
+        print(dim("-> the model is asked to re-issue it next turn."))
+    elif choice in ("c", "clear"):
+        agent._pending_ask = None
+        print(dim("cleared."))
+    elif choice in ("f", "force"):
+        if item["remote"] is not agent.remote:
+            print(yellow(f"that command was for {_ask_where(item)}; switch there first "
+                         "(or clear it)."))
+            return
+        agent._pending_ask = None
+        with composer_suspended():
+            note = run_direct_command(cfg, item["cmd"], item.get("reason"),
+                                      remote=agent.remote, requested=True)
+        note = agent._ask_result(item["cmd"], item.get("reason"), note)
+        agent._queued_turns.append("[the waiting ask_user_to_run command, fired from "
+                                   "/user_to_run]\n" + note)
+        print(dim("-> result goes to the model as your next turn."))
+    elif choice in ("n", "no", "exit", ""):
+        print(dim("kept waiting."))
+    else:
+        print(yellow("pick y, n, c, f or exit."))
 
 
 def run_sh_command(agent, cfg, arg: str):
@@ -13094,7 +13180,9 @@ class Agent:
         self._elected_compact = False   # set by request_compact -> _maybe_compact runs it
         self._last_compact_ts = 0.0      # time of last auto-compaction (loop guard)
         self._autostart_pending = None   # self-prompt queued to run as the next turn
-        self._pending_asks = []          # ask_user_to_run requests that timed out (/pending)
+        self._pending_ask = None         # THE waiting command: last timed-out ask_user_to_run
+                                         # (single slot, newest overwrites; /user_to_run)
+        self._pending_offer = None       # one the operator approved (y) for the model to re-fire
         self._queued_turns = []          # user turns queued by a command (e.g. /prompt use);
                                          # the REPL drains these as full turns before prompting
         self._activity = []              # system-activity log: automatic behaviours
@@ -14378,12 +14466,16 @@ class Agent:
         soft zone, but a stale/replayed/hallucinated call could arrive below it - refuse
         those so an elected compaction can never happen before the user's threshold (the
         model never gets to spend on a compaction the user hasn't opened the window for)."""
-        if not self.cfg.compact_for()["auto"]:
-            return "compaction is off (auto_compact disabled) - not compacting."
+        c = self.cfg.compact_for()
+        used, window, zone, pct = self._ctx_summary(self.cfg)
+        settings = (f"current settings: auto_compact {'on' if c['auto'] else 'off'}, "
+                    f"compact_soft {c['soft'] * 100:.0f}%, compact_at {c['hard'] * 100:.0f}%; "
+                    f"context now {pct:.0f}% ({zone}).")
+        if not c["auto"]:
+            return "not compacting: auto-compaction is off. " + settings
         if self._ctx_zone()[0] == "ok":
-            return ("not yet: context is still light (below the compaction threshold), so a "
-                    "compaction would just discard fidelity for no gain. Keep going - the "
-                    "option reappears once context is heavier.")
+            return ("not compacting: context is below the soft threshold, where a "
+                    "compaction would discard fidelity for no gain. " + settings)
         self._elected_compact = True
         return ("compaction queued - finish this turn cleanly (no half-done work); the "
                 "compaction runs right after, and you'll write the summary + next-step then.")
@@ -15273,6 +15365,48 @@ class Agent:
                 print(red(f"\n{e2}"))
                 return None
 
+    def _ask_result(self, cmd, reason, result):
+        """Post-process an ask_user_to_run outcome: a timeout fills the single waiting
+        slot (overwriting any earlier one) and becomes an honest note for the model."""
+        if not result.startswith(_ASK_TIMED_OUT):
+            return result
+        mins = result[len(_ASK_TIMED_OUT):]
+        replaced = self._pending_ask is not None
+        self._pending_ask = {"cmd": cmd, "reason": reason,
+                             "remote": self.remote, "at": time.time()}
+        return (f"[request timed out after {mins} with no response; the operator may be "
+                "away. It is held as the waiting command (/user_to_run)"
+                + (", replacing the one waiting before" if replaced else "")
+                + ". Only one command waits at a time.]")
+
+    def _ask_user_to_run(self, args):
+        """The ask_user_to_run tool. pending='run' re-fires the command the operator
+        approved via /user_to_run (y); pending='skip' drops it. With nothing approved,
+        pending='run' is just a normal ask of `cmd`."""
+        pending = (args.get("pending") or "").strip().lower()
+        offer, self._pending_offer = self._pending_offer, None
+        if pending == "skip":
+            if offer is None:
+                return "[nothing was waiting to skip.]"
+            return f"[skipped the waiting command: {offer['cmd']}]"
+        if pending == "run" and offer is not None:
+            if offer["remote"] is not self.remote:
+                self._pending_ask = offer
+                return (f"[the waiting command was for {_ask_where(offer)}, but this "
+                        "session now points elsewhere; it stays waiting (/user_to_run).]")
+            cmd, reason = offer["cmd"], offer.get("reason")
+        else:
+            if offer is not None:            # approved but model didn't re-fire: keep it
+                self._pending_ask = offer
+            cmd, reason = args.get("cmd", ""), args.get("reason")
+        # Interactive handoff: no spinner, operator runs it directly (on the remote
+        # box when connected). Suspend the composer so the editable prompt owns
+        # stdin/echo (no reader-thread race).
+        with composer_suspended():
+            result = run_direct_command(self.cfg, cmd, reason,
+                                        remote=self.remote, requested=True)
+        return self._ask_result(cmd, reason, result)
+
     def _run_one_call(self, call):
         """Execute a single tool call: parse args, record + print the call, run it
         (with the tool spinner, or the interactive handoff for ask_user_to_run),
@@ -15289,20 +15423,7 @@ class Agent:
         print(_tool_call_line(name, args, cid))
         self._maybe_auto_expand(name, cid)
         if name == "ask_user_to_run":
-            # Interactive handoff: no spinner, operator runs it directly
-            # (on the remote box when connected). Suspend the composer so
-            # the editable prompt owns stdin/echo (no reader-thread race).
-            with composer_suspended():
-                result = run_direct_command(
-                    self.cfg, args.get("cmd", ""), args.get("reason"),
-                    remote=self.remote, requested=True)
-            if result.startswith(_ASK_TIMED_OUT):
-                mins = result[len(_ASK_TIMED_OUT):]
-                self._pending_asks.append({"cmd": args.get("cmd", ""),
-                                           "reason": args.get("reason"),
-                                           "remote": self.remote, "at": time.time()})
-                result = (f"[request timed out after {mins} with no response; the "
-                          "operator may be away. It stays queued for them (/pending).]")
+            result = self._ask_user_to_run(args)
         elif (self.remote is None and _tool_may_hit_pinentry(name, args)
                 and _gpg_ssh_locked()):
             # gpg-agent is about to pop pinentry-curses (an ssh key with a cold cache).
@@ -15312,13 +15433,16 @@ class Agent:
             # like the shell `export GPG_TTY` ritual) and hand it over clean for this
             # one call. No real tty here (worker/headless): don't run it at all - the
             # prompt would land on someone else's terminal.
-            if not sys.stdin.isatty():
-                result = ("error: the ssh key (gpg-agent) is locked and this session has "
-                          "no terminal to show the passphrase prompt on. Ask the operator "
-                          "to run this same ssh command once via ask_user_to_run (that "
-                          "unlocks it), then retry.")
+            if name == "ssh" or not sys.stdin.isatty():
+                # The ssh tool never pops the unlock prompt itself: a prompt that
+                # outlives the tool's timeout is killed mid-draw and leaves the
+                # terminal raw (staircase output). Hand the unlock to the operator.
+                result = ("error: the ssh key (gpg-agent) is locked, so this call was not "
+                          "run. Ask the operator to unlock it via ask_user_to_run (e.g. "
+                          "`export GPG_TTY=$(tty); gpg-connect-agent updatestartuptty /bye "
+                          ">/dev/null; ssh <host> true`), then retry.")
             else:
-                with _unlock_handoff():
+                with _unlock_handoff(), _tty_guard():
                     result = self._run_tool(name, args)
         elif (name == "run_command" and self.remote is None
                 and _may_prompt_on_tty(args.get("cmd", ""))):
@@ -15327,8 +15451,17 @@ class Agent:
             # -> raw-mode corruption (`stty sane`). Hand pinentry a clean terminal by
             # suspending the composer for just this run, like /connect and ask_user_to_run.
             # No spinner (it'd fight the suspend); warm-cache runs just don't prompt.
-            with composer_suspended():
+            with composer_suspended(), _tty_guard():
                 result = self._run_tool(name, args)
+        elif name == "ssh" and self.remote is None:
+            # Unlocked-key ssh: run as normal, but put the terminal settings back
+            # afterwards even on timeout/kill (safety net against a stray prompt).
+            spin = Spinner(name, TOOL_FRAMES, cyan, interval=0.12).start()
+            try:
+                with _tty_guard():
+                    result = self._run_tool(name, args)
+            finally:
+                spin.stop()
         else:
             # Tool-running indicator (distinct from the model spinner),
             # labelled with the tool so you always see WHAT is running.
@@ -15343,6 +15476,9 @@ class Agent:
         self._cap_add_result(name, call.get("id", ""), result)  # training-capture
         if _TTY:
             print(_tool_result_preview(name, result, cid))
+            bar = _bg_start_lines(name, args, result)
+            if bar:
+                print(bar)
         self.messages.append(_tool_result_msg(name, result,
                                               tool_call_id=call.get("id", "")))
 
@@ -15885,8 +16021,26 @@ def _wake_label(body: str) -> str:
     if head.startswith("worker"):
         return "worker"
     if head.startswith("bg ") or head.startswith("background") or "task" in head[:40]:
-        return "bg"
+        return f"{GLYPH['bg']} background"
     return "auto"
+
+
+_BG_STARTED_RE = re.compile(r"started in background: pid (\d+)")
+
+
+def _bg_start_lines(name: str, args: dict, result: str) -> str:
+    """A cyan accent bar when a background job STARTS (run_command background=true or
+    the background tool's run) - the same bar its finish/wake shows, so both ends of a
+    job read alike. '' when this call didn't start one."""
+    if name not in ("run_command", "background"):
+        return ""
+    m = _BG_STARTED_RE.search(result or "")
+    if not m:
+        return ""
+    cmd = " ".join(str(args.get("cmd", "")).split())
+    bar = cyan(GLYPH["userbar"])
+    head = f"{bar} {cyan(bold(GLYPH['bg'] + ' background'))}{dim('  pid ' + m.group(1))}"
+    return f"{head}\n{bar} {dim(_headline_fit(cmd, None, 'cmd'))}"
 
 
 def _wake_turn_lines(text: str, agent=None) -> str:
@@ -16099,10 +16253,10 @@ def _render_tool_call(entry: dict, cap: int = EXPAND_MAX_CHARS) -> str:
 # ----------------------------------------------------------------------------
 
 SLASH_COMMANDS = ["/clear", "/new", "/rewind", "/trim", "/compact", "/compact_at", "/compactat", "/session", "/save", "/load",
-                  "/prompt", "/sh", "/pending", "/connect", "/machines", "/local", "/disconnect", "/tools", "/push", "/pull", "/reload",
+                  "/prompt", "/sh", "/user_to_run", "/usertorun", "/pending", "/usr", "/connect", "/machines", "/local", "/disconnect", "/tools", "/push", "/pull", "/reload",
                   "/model", "/models", "/provider", "/providers", "/think", "/effort",
                   "/set", "/usage", "/approve", "/leash", "/autosave", "/incognito",
-                  "/askread", "/bg", "/background", "/note", "/plan", "/board", "/mcp", "/info", "/activity", "/expand",
+                  "/askread", "/bg", "/background", "/bgd", "/note", "/plan", "/board", "/brd", "/mcp", "/info", "/activity", "/expand",
                   "/help", "/h", "/?", "/quit", "/exit", "/q"]
 
 # Built-in command names are the shadow-protection set: lean-tool commands can't claim
@@ -16316,7 +16470,7 @@ HELP_COMMANDS = [
     ("/session", "list | delete <name>"),
     ("/prompt [name]", "send a saved prompt as your next turn (no arg = picker; new/edit/reset/delete <name> to manage)"),
     ("/sh [cmd]", "run a command in a terminal (no arg: drop into your $SHELL)"),
-    ("/pending", "ask_user_to_run requests that timed out: list, run [n], drop [n|all]"),
+    ("/user_to_run", "the waiting command (a timed-out ask_user_to_run): view, then y/n/c/f/exit (aliases /usertorun /pending /usr)"),
     ("/connect [host]", "run tools on a remote over SSH"),
     ("/machines", "list saved remote hosts; remove <name> (add via the config [machines] table)"),
     ("/local [host]", "detach the active remote"),
@@ -16336,7 +16490,7 @@ HELP_COMMANDS = [
     ("/autosave [on|off]", "autosave + auto-load last on start"),
     ("/incognito [on|off]", "don't save the session locally"),
     ("/askread [on|off]", "confirm read tools too"),
-    ("/bg [kill <pid>]", "list/kill background tasks"),
+    ("/bg [<pid> | kill <pid|all>]", "list background tasks (one line each); <pid> = log + tail; kill (aliases /background /bgd)"),
     ("/note [grep|range|add|clear]", "the session notebook (episodic memory); no arg = recent"),
     ("/plan [set|goal|add|done|clear]", "view/steer the pinned GOAL+TODO; no arg = show"),
     ("/board [name|delete <name>]", "inspect task boards read-only (no tool schema, no model turn)"),
@@ -16558,7 +16712,7 @@ _SETTINGS_FIELDS = [
     ("auto_update", "on launch, self-update to the latest published build (needs the 'update' lean-tool)", "bool"),
     ("command_timeout", "run_command timeout (s)", "int"),
     ("tool_timeout", "wedge tripwire (s) for an in-process tool; long-by-design tools opt out", "int"),
-    ("ask_timeout", "ask_user_to_run: secs with no keypress before it times out to /pending (0 = never)", "int"),
+    ("ask_timeout", "ask_user_to_run: secs with no keypress before it becomes the waiting command (/user_to_run; 0 = never)", "int"),
     ("max_iterations", "max tool-call rounds per turn (0 = unlimited)", "int"),
     ("bg_max_concurrent", "max background tasks (0 = unlimited)", "int"),
     ("worker_max_concurrent", "max worker agents at once (0 = unlimited)", "int"),
@@ -16871,6 +17025,26 @@ def handle_bg_command(agent, cfg, arg):
     session reads its own registry directly."""
     remote = getattr(agent, "remote", None)
     parts = arg.split()
+    if parts and parts[0].isdigit() and remote is None:      # /bg <pid>: log + tail
+        pid = int(parts[0])
+        r = next((x for x in _bg_load() if x.get("pid") == pid), None)
+        if r is None:
+            print(dim(f"no background task {pid}."))
+            return
+        state = "running" if _proc_alive(pid) else f"exit {_bg_exit_code(r)}"
+        print(bold(f"{GLYPH['bg']} {pid}") + dim(f"  {state}  {r.get('started', '?')}"))
+        print(f"  {r.get('cmd', '?')}")
+        log = r.get("log", "")
+        print(dim(f"  log: {log or '?'}"))
+        try:
+            tail = Path(log).read_text(errors="replace").splitlines()[-15:] if log else []
+        except OSError:
+            tail = []
+        for ln in tail:
+            print(dim("  | ") + ln)
+        if state == "running":
+            print(dim(f"  /bg kill {pid} to stop it."))
+        return
     if parts and parts[0].lower() == "kill":
         tgt = parts[1] if len(parts) > 1 else ""
         if remote is not None:
@@ -16918,11 +17092,10 @@ def handle_bg_command(agent, cfg, arg):
             print(_fit_line(f"  {bold(cyan(str(r.get('pid'))))}  {label}  "
                             f"(ran {r.get('runtime', '?')})  {_one_line(r.get('cmd', '?'))}",
                             ellipsis=True))
-            if st == "running":
-                print(dim(f"      /bg kill {r.get('pid')}"))
+        print(dim("  /bg kill <pid|all> to stop."))
         return
     me = os.getpid()
-    recs = _bg_load()
+    recs = [r for r in _bg_load() if r.get("kind", "task") == "task"]   # workers: /worker
     running = [r for r in recs if _proc_alive(r.get("pid"))]
     # finished = registered, not alive, but wrote an exit sidecar (so we can report
     # pass/fail). Entries with no sidecar have simply gone and aren't worth listing.
@@ -16931,7 +17104,7 @@ def handle_bg_command(agent, cfg, arg):
     if not running and not finished:
         print(dim("no background tasks running.  (start one with the `background` tool)"))
         return
-    print(bold("background tasks:"))
+    print(bold("background tasks:") + dim("  /bg <pid> = log + tail · kill <pid|all>"))
     # One chronological list, oldest first, so the NEWEST task sits at the bottom next
     # to the prompt (same reading order as /worker). 'started' is %Y-%m-%d %H:%M:%S, so
     # it sorts as a string.
@@ -16942,15 +17115,12 @@ def handle_bg_command(agent, cfg, arg):
             print(_fit_line(f"  {bold(cyan(str(r.get('pid'))))}  {green('running')}  "
                             f"{dim(r.get('started', '?'))}{tag}  {_one_line(r.get('cmd', '?'))}",
                             ellipsis=True))
-            print(_fit_line(dim(f"      /bg kill {r.get('pid')}   ·   log: {r.get('log', '?')}"),
-                            ellipsis=True))
         else:
             code = _bg_exit_code(r)
             stat = green("exit 0") if code == "0" else red(f"exit {code}")
             print(_fit_line(f"  {dim(str(r.get('pid')))}  {stat}  "
                             f"{dim(r.get('started', '?'))}  {_one_line(r.get('cmd', '?'))}",
                             ellipsis=True))
-            print(_fit_line(dim(f"      log: {r.get('log', '?')}"), ellipsis=True))
 
 
 def handle_note_command(agent, cfg, arg):
@@ -17109,14 +17279,27 @@ def handle_board_command(agent, cfg, arg):
             print(dim("no task boards. The model creates one with the `board` tool "
                       "(or a worker assigned to a named board)."))
             return
+        # Boards this session is enrolled on go at the BOTTOM (marked), next to the
+        # prompt; within each group the most recently updated is last.
+        me = _my_session_name()
+
+        def _enrolled(name):
+            if not me:
+                return False
+            bd = _taskboard_load(name) or {}
+            return any(isinstance(p, dict) and p.get("name") == me
+                       for p in (bd.get("participants") or []))
+        rows = sorted(reversed(rows), key=lambda r: _enrolled(r[0]))   # stable sort
         print(bold("task boards") + dim(f"  ({len(rows)})"))
         for name, meta in rows:
             counts = meta.get("counts", {})
             csum = ", ".join(f"{k}:{v}" for k, v in counts.items() if v) or "empty"
             when = meta.get("updated_at", "")
             when = dim(f"  {when}") if when else ""
-            print(_fit_line(f"  {cyan(name)}  " + dim(f"({csum})") + when, ellipsis=True))
-        print(dim("`/board <name>` to view one."))
+            mark = GLYPH["enrolled"] if _enrolled(name) else " "
+            print(_fit_line(f"{mark} {cyan(name)}  " + dim(f"({csum})") + when, ellipsis=True))
+        print(dim(f"`/board <name>` to view one. {GLYPH['enrolled']} = this session is on it."))
+        return
         return
 
     parts = arg.split(maxsplit=1)
@@ -17256,6 +17439,39 @@ def _think_line(cfg):
     return f"thinking: {think}{dim(' ' + GLYPH['dot'] + ' ')}effort: {effort}"
 
 
+def _my_board_tasks() -> int:
+    """Open board tasks assigned to this session (status 'assigned'), across boards."""
+    me = _my_session_name()
+    if not me:
+        return 0
+    n = 0
+    for bname, _meta in _taskboards_list():
+        bd = _taskboard_load(bname) or {}
+        n += sum(1 for t in (bd.get("tasks") or [])
+                 if isinstance(t, dict) and t.get("assignee") == me
+                 and t.get("status") == "assigned")
+    return n
+
+
+def _activity_counts(agent) -> list:
+    """Status-row counters, in order user-wait, workers, background, board; each shown
+    only when > 0, as '<glyph> N' (ASCII fallback 'usr N' etc.). Never raises."""
+    out = []
+    try:
+        me = os.getpid()
+        for key, n in (
+                ("user_wait", 1 if getattr(agent, "_pending_ask", None) else 0),
+                ("worker", len(_bg_running(owner=me, kind="worker"))),
+                ("bg", len(_bg_running(owner=me, kind="task"))),
+                ("board", _my_board_tasks())):
+            if n:
+                out.append(yellow(f"{GLYPH[key]} {n}") if key == "user_wait"
+                           else f"{GLYPH[key]} {n}")
+    except Exception:
+        pass
+    return out
+
+
 def _status_rows(agent, cfg):
     """The status rows printed above each prompt so the live state is never invisible:
       1. session (name + autosave / incognito / amnesic) + condensed model @ provider, + pinned plan
@@ -17277,10 +17493,11 @@ def _status_rows(agent, cfg):
     if cfg.incognito:
         s = [magenta(f"{GLYPH['ghost']} incognito")]
     elif cfg.autosave:
-        s = [f"session: {agent.autosave_name}"]
+        s = [agent.autosave_name]
     else:
         s = ["amnesic"]
     s.append(model_at)                        # turn count lives in /info (context line)
+    s += _activity_counts(agent)              # ! usr  ⚒ wkr  ◷ bgd  ⊡ brd (only when > 0)
     rows.append("  " + d.join(s))
 
     # 2) perms + context management
@@ -17488,7 +17705,7 @@ def _arg_completions(agent, cfg, cmd):
         return ["on", "off"]
     if cmd == "/leash":
         return list(LEASH_LEVELS)
-    if cmd in ("/bg", "/background"):
+    if cmd in ("/bg", "/background", "/bgd"):
         return ["kill"]
     if cmd == "/rewind":
         # Offer the turn counts that actually exist, so Tab shows the depth available
@@ -17502,7 +17719,7 @@ def _arg_completions(agent, cfg, cmd):
         return ["recent", "grep", "range", "add", "clear"]
     if cmd == "/plan":
         return ["set", "goal", "add", "done", "clear"]
-    if cmd == "/board":
+    if cmd in ("/board", "/brd"):
         return ["delete"] + [n for n, _ in _taskboards_list()]
     if cmd == "/board delete":
         return [n for n, _ in _taskboards_list()]
@@ -17530,8 +17747,8 @@ def _arg_completions(agent, cfg, cmd):
         return ["msg"]
     if cmd == "/connect":
         return ["remove"] + sorted(set(list(cfg.connect_hosts) + list(getattr(agent, "remotes", {}))))
-    if cmd == "/pending":
-        return ["run", "drop"]
+    if cmd in ("/user_to_run", "/usertorun", "/pending", "/usr"):
+        return ["y", "n", "c", "f", "exit"]
     if cmd == "/connect remove":
         return sorted(cfg.connect_hosts)
     if cmd == "/machines":
@@ -17714,7 +17931,8 @@ def handle_save_command(agent, cfg, arg):
         rhost = agent.remote.host if getattr(agent, "remote", None) else None
         path, meta = save_session(agent.messages, cfg, name, remote=rhost,
                                   pinned_plan=getattr(agent, "pinned_plan", ""),
-                                  notes=getattr(agent, "notes", None))
+                                  notes=getattr(agent, "notes", None),
+                                  pending_ask=getattr(agent, "_pending_ask", None))
     except ValueError:
         print(red(f"invalid session name: {name!r}"))
         return
@@ -17855,6 +18073,9 @@ def _restore_session_state(agent, cfg, meta):
 
     # Restore session-scoped episodic notes (the note tool). Absent in older sessions
     # -> keep whatever's live (don't clobber). Coerced to a clean list of {dtg,text}.
+    if "pending_ask" in meta:                              # the waiting command
+        agent._pending_ask = _pending_ask_load(meta.get("pending_ask"),
+                                               getattr(agent, "remote", None))
     notes = meta.get("notes")
     if isinstance(notes, list):
         agent.notes = [n for n in notes if isinstance(n, dict) and n.get("text")]
@@ -20212,7 +20433,8 @@ _BUILTIN_COMMANDS_TABLE = {
     "/new": handle_new_command,
     "/prompt": handle_prompt_command,
     "/sh": run_sh_command,
-    "/pending": handle_pending_command,
+    "/user_to_run": handle_pending_command, "/usertorun": handle_pending_command,
+    "/pending": handle_pending_command, "/usr": handle_pending_command,
     "/connect": handle_connect_command,
     "/machines": handle_machines_command,
     "/tools": handle_tools_command,
@@ -20228,10 +20450,10 @@ _BUILTIN_COMMANDS_TABLE = {
     "/session": handle_session_command,
     "/save": handle_save_command,
     "/load": handle_load_command,
-    "/bg": handle_bg_command, "/background": handle_bg_command,
+    "/bg": handle_bg_command, "/background": handle_bg_command, "/bgd": handle_bg_command,
     "/note": handle_note_command,
     "/plan": handle_plan_command,
-    "/board": handle_board_command,
+    "/board": handle_board_command, "/brd": handle_board_command,
     "/autosave": handle_autosave_command,
     "/incognito": handle_incognito_command,
     "/leash": handle_leash_command,

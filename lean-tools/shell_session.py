@@ -67,8 +67,7 @@ TOOL = {
     "parameters": {
         "type": "object",
         "properties": {
-            "action": {"type": "string", "enum": ["start", "send", "read", "close", "list"],
-                       "description": "start | send | read | close | list"},
+            "action": {"type": "string", "enum": ["start", "send", "read", "close", "list"]},
             "id": {"type": "string",
                    "description": "Session id (from start). Required for send/read/close."},
             "command": {"type": "string",

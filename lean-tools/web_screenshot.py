@@ -59,10 +59,8 @@ def _dbg_swallow():
 TOOL = {
     "name": "web_screenshot",
     "description": (
-        "Capture a screenshot of a URL using a headless browser (Playwright; chromium/firefox/webkit). "
-        "Saves a PNG to ~/screenshots/ and returns the file path + visible text snapshot. "
-        "Works with localhost, LAN addresses, and public URLs. "
-        "Use for checking WordPress themes, layouts, and frontend rendering."
+        "Screenshot a URL in a headless browser; saves a PNG to ~/screenshots/ and returns "
+        "its path + visible text. Use to check layouts/frontend rendering."
     ),
     "parameters": {
         "type": "object",
@@ -74,17 +72,17 @@ TOOL = {
             "full_page": {
                 "type": "boolean",
                 "default": False,
-                "description": "Capture the full scrollable page (default false = viewport only).",
+                "description": "Capture the full scrollable page.",
             },
             "width": {
                 "type": "integer",
                 "default": 1280,
-                "description": "Viewport width in pixels (default 1280).",
+                "description": "Viewport width in pixels.",
             },
             "height": {
                 "type": "integer",
                 "default": 800,
-                "description": "Viewport height in pixels (default 800).",
+                "description": "Viewport height in pixels.",
             },
             "mobile": {
                 "type": "boolean",
@@ -93,12 +91,12 @@ TOOL = {
             },
             "device": {
                 "type": "string",
-                "description": "Playwright device name for full emulation (e.g. 'iPhone 14', 'Pixel 7', 'iPad Mini'). Sets viewport, UA, scale, touch. See playwright.dev/python/docs/emulation#devices.",
+                "description": "Playwright device name for full emulation (e.g. 'iPhone 14', 'Pixel 7', 'iPad Mini'). Sets viewport, UA, scale, touch.",
             },
             "dark": {
                 "type": "boolean",
                 "default": False,
-                "description": "Emulate prefers-color-scheme: dark (default false = light).",
+                "description": "Emulate prefers-color-scheme: dark.",
             },
             "breakpoints": {
                 "type": "array",
@@ -112,7 +110,7 @@ TOOL = {
             "dom": {
                 "type": "boolean",
                 "default": False,
-                "description": "Include a full accessibility-tree text dump alongside the screenshot (default false).",
+                "description": "Include a full accessibility-tree text dump.",
             },
             "browser": {
                 "type": "string",

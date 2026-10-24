@@ -33,9 +33,8 @@ TOOL = {
         "A named task board: a dependency DAG of tasks you (the driver) schedule workers "
         "over. Lay out tasks with deps, assign each ready one to a worker, mark finishes, and "
         "the board recomputes what's ready next; 'reconcile' collects the results in "
-        "dependency order at the end. A task is READY only once its deps are all done. Push "
-        "model: the driver schedules; workers report their own task + read the board, but "
-        "never self-select. Lifecycle: open -> assigned -> done|failed."),
+        "dependency order at the end. A task is READY only once its deps are all done. "
+        "Lifecycle: open -> assigned -> done|failed."),
     "parameters": {
         "type": "object",
         "properties": {
@@ -45,15 +44,13 @@ TOOL = {
                        "description": "create=new board; add=append a task (deps=[...]); "
                                       "assign=put a worker/participant on a READY task; done/fail="
                                       "record an outcome; cancel=void a task that should not have "
-                                      "existed / is no longer wanted (NOT a failure, NOT a done - "
-                                      "excluded from reconcile, pings the current assignee to stop); "
+                                      "existed / is no longer wanted (not a failure; excluded from "
+                                      "reconcile; stops the assignee); "
                                       "list=tasks (status= or query= filters); "
                                       "reconcile=done results in dependency order; participant="
                                       "register a peer agent (pre-declare an expected role), OR - with "
                                       "no worker= - LIST every registered peer with its LIVE/dormant "
-                                      "state (a read-only liveness check: call this BEFORE assign to see "
-                                      "whether a peer is live-here/live-elsewhere/dormant/missing, "
-                                      "instead of learning it as a side effect of assigning). Driver-only: "
+                                      "state (read-only; check it BEFORE assign). Driver-only: "
                                       "create/add/assign/cancel/participant-register. Workers: done/fail "
                                       "their task + list/reconcile/participant-list. myboards=boards this "
                                       "session is a participant on (no board= needed)."},
@@ -72,10 +69,7 @@ TOOL = {
                                       "a board note. A bare label with no participant just records "
                                       "the assignee."},
             "role": {"type": "string",
-                     "description": "participant: the peer's role label (defaults to its name). "
-                                    "assign uses 'worker' as the participant name; this is only "
-                                    "for action='participant' registration. (Omit worker= AND role= on "
-                                    "action='participant' to just LIST peers + their live/dormant state.)"},
+                     "description": "participant: the peer's role label (defaults to its name)."},
             "note": {"type": "string",
                      "description": "Optional free text: driver->worker context on assign, or "
                                     "worker->driver why on fail."},

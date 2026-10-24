@@ -999,7 +999,7 @@ BUILTIN_TOOLS = [
      "description": "Run a non-interactive shell command (builds, tests, git, file ops); returns exit code + stdout/stderr (truncated - if clipped, pipe to a file or grep/head/tail it). Fresh shell each call - cd/env don't persist, chain with '&&'. Runs in the FOREGROUND and is killed at {command_timeout}s: for anything slower, or any server/daemon/watcher, pass background=true instead (returns a pid immediately; check/stop it with the background tool). For sudo/interactive use ask_user_to_run; for a persistent shell (REPL, ssh) use shell_session.",
      "parameters": {"type": "object",
         "properties": {"cmd": {"type": "string", "description": "The shell command to run."},
-                       "background": {"type": "boolean", "description": "Run detached and return a pid immediately instead of waiting for it to finish - for dev servers, watchers, daemons, or any command that won't stop on its own. Check output (its log path) / stop it with the background tool."}},
+                       "background": {"type": "boolean", "description": "Run detached, return a pid at once (servers, watchers, anything slow); manage via the background tool."}},
         "required": ["cmd"]}},
     {"name": "background", "tier": "exec",
      "description": "Run/manage long-lived tasks (dev servers, watchers, builds) that would blow run_command's foreground timeout. action: run (default when cmd given) starts a detached task, returns pid + log; status (default, no cmd) lists this session's tasks, or one with pid; kill needs pid. Detached tasks die on exit; use nohup/systemd to outlive that.",

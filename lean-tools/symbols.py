@@ -22,12 +22,10 @@ from pathlib import Path
 
 TOOL = {
     "name": "symbols",
-    "description": ("Navigate PYTHON code without grepping: mode='outline' lists every "
-                    "class/def (line + signature) in a file or dir; mode='def' finds where "
-                    "a named class/function/method is defined. Zero-dep (stdlib ast); Python "
-                    "only. Faster + more exact than search_files for 'where is X / what's in "
-                    "this file'. Just pass a path - the defaults do the sensible thing; on a "
-                    "big file outline auto-summarizes to top-level classes/functions."),
+    "description": ("Navigate PYTHON code: mode='outline' lists every class/def (line + "
+                    "signature) in a file or dir; mode='def' finds where a name is defined. "
+                    "Faster + more exact than search_files for 'where is X / what's in this "
+                    "file'."),
     "parameters": {
         "type": "object",
         "properties": {
