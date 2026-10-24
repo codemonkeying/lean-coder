@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L1963   Lean-tools (plugin tools: discovery, manager)
-  L2350   MCP client (connection, manager, OAuth, discovery)
-  L2804   Providers (backend plugin registry)
-  L3081   Interactive pickers + menus (raw-mode UI engine)
-  L3456   Terminal styling (colors, formatting helpers)
-  L3754   Streaming + markdown render (model output)
-  L4523   Composer (pinned input line, editor, stdin)
-  L5513   Token accounting (calibrated context meter)
-  L5766   Config (dataclass, field registry, load/save)
-  L9845   Tool execution + text tool-call parsing
-  L10318  Remote workspace (executor client, /connect)
-  L12659  Context meter
-  L12754  Agent (turn loop, context mgmt, tool dispatch)
-  L20653  Slash-command handlers + dispatch table
-  L20795  REPL (interactive loop, session resume)
-  L21269  Worker agent (headless --agent-run)
-  L22019  Entry (CLI arg parsing, main)
+  L1966   Lean-tools (plugin tools: discovery, manager)
+  L2353   MCP client (connection, manager, OAuth, discovery)
+  L2807   Providers (backend plugin registry)
+  L3084   Interactive pickers + menus (raw-mode UI engine)
+  L3459   Terminal styling (colors, formatting helpers)
+  L3757   Streaming + markdown render (model output)
+  L4526   Composer (pinned input line, editor, stdin)
+  L5516   Token accounting (calibrated context meter)
+  L5769   Config (dataclass, field registry, load/save)
+  L9848   Tool execution + text tool-call parsing
+  L10321  Remote workspace (executor client, /connect)
+  L12662  Context meter
+  L12757  Agent (turn loop, context mgmt, tool dispatch)
+  L20656  Slash-command handlers + dispatch table
+  L20798  REPL (interactive loop, session resume)
+  L21272  Worker agent (headless --agent-run)
+  L22022  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -154,7 +154,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.10.110"
+__version__ = "0.10.111"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -162,6 +162,9 @@ __version__ = "0.10.110"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.10.111": [
+        "/board: the usage hint moved to the title line, matching /bg.",
+    ],
     "0.10.110": [
         "Workers: a headless worker gets its own short system prompt and a worker-only",
         "  `finish` tool. Calling finish or simply stopping runs the same wrap-up step;",
@@ -17432,7 +17435,8 @@ def handle_board_command(agent, cfg, arg):
             return any(isinstance(p, dict) and p.get("name") == me
                        for p in (bd.get("participants") or []))
         rows = sorted(reversed(rows), key=lambda r: _enrolled(r[0]))   # stable sort
-        print(bold("task boards") + dim(f"  ({len(rows)})"))
+        print(bold("task boards") + dim(f"  ({len(rows)})  /board <name> = view one · "
+                                        f"{GLYPH['enrolled']} = this session is on it"))
         for name, meta in rows:
             counts = meta.get("counts", {})
             csum = ", ".join(f"{k}:{v}" for k, v in counts.items() if v) or "empty"
@@ -17440,7 +17444,6 @@ def handle_board_command(agent, cfg, arg):
             when = dim(f"  {when}") if when else ""
             mark = GLYPH["enrolled"] if _enrolled(name) else " "
             print(_fit_line(f"{mark} {cyan(name)}  " + dim(f"({csum})") + when, ellipsis=True))
-        print(dim(f"`/board <name>` to view one. {GLYPH['enrolled']} = this session is on it."))
         return
         return
 
