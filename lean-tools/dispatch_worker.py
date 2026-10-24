@@ -274,7 +274,7 @@ def _workers_dir():
 
 def _compose_brief(task, model, cwd, max_iter, leash="r", provider="", brain_host="",
                    tools="", context="", plan="", notes="", depth=0, child_budget=0,
-                   checkpoint=False, resume="", board=0, taskboard=""):
+                   checkpoint=False, resume="", board=0, taskboard="", session=""):
     """Build the brief file text: the task wrapped in BRIEF markers + a GRANT header.
     `leash` is the already-capped grant (see _capped_leash). `provider` (optional) is
     the backend the worker must activate for `model`; absent = inherit the driver's.
@@ -315,6 +315,8 @@ def _compose_brief(task, model, cwd, max_iter, leash="r", provider="", brain_hos
         grant.append(f"board: {board}")
     if taskboard:
         grant.append(f"taskboard: {taskboard}")
+    if session:                               # seeded from a saved session: report goes back there
+        grant.append(f"session: {_one(session)}")
     out = [f"{B}\n{task.strip()}\n{B}", f"{G}\n" + "\n".join(grant) + f"\n{G}"]
     for text, mark_key in ((context, "SEED_CONTEXT_MARK"), (plan, "SEED_PLAN_MARK"),
                            (notes, "SEED_NOTES_MARK")):
@@ -642,7 +644,8 @@ def run(args, cwd):
                                              plan=seed_plan, notes=seed_notes,
                                              depth=my_depth + 1, child_budget=child_budget,
                                              checkpoint=do_checkpoint, board=board_session,
-                                             taskboard=taskboard, resume=seed_resume))
+                                             taskboard=taskboard, resume=seed_resume,
+                                             session=seed_session_name))
     except OSError as e:
         return f"error: cannot write brief file: {e}"
 
@@ -1924,7 +1927,7 @@ def setup(lc, cfg):
     # Returns the dispatch status line (which carries the new worker pid).
     _reg_spawn = lc.get("register_peer_spawn")
     if _reg_spawn:
-        def _board_spawn(session_name, task):
+        def _board_spawn(session_name, task, board=""):
             # A woken peer inherits the DRIVER's own leash (capped there, like any dispatch).
             # Waking a peer to DO a task usually means editing/running, so the read-only
             # dispatch default would block real work. A read-only driver still wakes only a
@@ -1932,6 +1935,7 @@ def setup(lc, cfg):
             return run({"action": "dispatch",
                         "task": task or "Continue this session's work.",
                         "from_session": session_name,
+                        "taskboard": board or "",
                         "leash": _H["_norm_leash"](getattr(cfg, "leash", "r")) or "r"},
                        str(getattr(cfg, "cwd", ".")))
         _reg_spawn(_board_spawn)

@@ -51,8 +51,8 @@ TOOL = {
                                       "register a peer agent (pre-declare an expected role), OR - with "
                                       "no worker= - LIST every registered peer with its LIVE/dormant "
                                       "state (read-only; check it BEFORE assign). Driver-only: "
-                                      "create/add/assign/cancel/participant-register. Workers: done/fail "
-                                      "their task + list/reconcile/participant-list. myboards=boards this "
+                                      "create/add/assign/cancel/participant-register. Workers: list/"
+                                      "reconcile/participant-list (finish reports their task). myboards=boards this "
                                       "session is a participant on (no board= needed)."},
             "board": {"type": "string",
                       "description": "Board name (like a session name). Required by every action except myboards."},
@@ -186,7 +186,7 @@ def _notify_assigner(board_name, tid, action, note, assigned_by, task_name, resu
         return (f" (assigner '{handle}' already driven by pid {wpid}"
                 + ("; pinged" if pushed else "; push failed") + ", not re-spawned)")
     spawn = _H.get("spawn_peer")
-    out = spawn(handle, ping) if spawn else ""
+    out = spawn(handle, ping, board_name) if spawn else ""
     return (f" (assigner '{handle}' dormant; spawned)"
             if out and "error" not in out.lower()
             else f" (assigner '{handle}' dormant; spawn failed: {out or 'dispatch_worker not enabled'})")
@@ -500,6 +500,10 @@ def run(args, cwd):
         ping = (f"[board '{name}'] You are assigned {tid}: {tname}."
                 + (f" Note: {note}" if note else "")
                 + " Do this task, then mark it done on the board (action='done').")
+        # A spawned headless worker reports through finish (which posts here), so its
+        # wake text must not tell it to mark the board itself.
+        ping_spawn = ping.replace(" Do this task, then mark it done on the board (action='done').",
+                                  " Do this task.")
         # If 'worker' names a registered PARTICIPANT (a peer session), resolve its live
         # address and act on the peer's lifecycle. A NON-NUMERIC handle that isn't yet a
         # registered participant is still treated as a peer session name: we resolve it,
@@ -566,7 +570,7 @@ def run(args, cwd):
                             + ("; pinged" if pushed else "; push failed") + ", not re-spawned)")
                 else:
                     spawn = _H.get("spawn_peer")
-                    out = spawn(handle, ping) if spawn else ""
+                    out = spawn(handle, ping_spawn, name) if spawn else ""
                     tail = (f" (peer '{handle}' dormant; spawned)"
                             if out and "error" not in out.lower()
                             else f" (peer '{handle}' dormant; spawn failed: {out or 'dispatch_worker not enabled'})")
@@ -580,7 +584,10 @@ def run(args, cwd):
         tid = (args.get("task") or "").strip()
         if not tid:
             return f"error: action='{action}' needs a 'task' id."
-        # done/fail: a worker may call for the task it was assigned (or the driver, for any).
+        # done/fail: a headless worker reports through finish (which posts here itself,
+        # via _via_finish); a direct call from one gets a one-line redirect.
+        if not _is_driver() and not args.get("_via_finish"):
+            return "Use finish instead: it posts your report to this task."
         note = (args.get("note") or "").strip()
         result_ref = (args.get("result_ref") or "").strip() or None
 

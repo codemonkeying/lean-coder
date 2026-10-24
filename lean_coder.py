@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L1914   Lean-tools (plugin tools: discovery, manager)
-  L2301   MCP client (connection, manager, OAuth, discovery)
-  L2755   Providers (backend plugin registry)
-  L3032   Interactive pickers + menus (raw-mode UI engine)
-  L3407   Terminal styling (colors, formatting helpers)
-  L3705   Streaming + markdown render (model output)
-  L4474   Composer (pinned input line, editor, stdin)
-  L5464   Token accounting (calibrated context meter)
-  L5717   Config (dataclass, field registry, load/save)
-  L9787   Tool execution + text tool-call parsing
-  L10260  Remote workspace (executor client, /connect)
-  L12601  Context meter
-  L12696  Agent (turn loop, context mgmt, tool dispatch)
-  L20580  Slash-command handlers + dispatch table
-  L20722  REPL (interactive loop, session resume)
-  L21196  Worker agent (headless --agent-run)
-  L21900  Entry (CLI arg parsing, main)
+  L1963   Lean-tools (plugin tools: discovery, manager)
+  L2350   MCP client (connection, manager, OAuth, discovery)
+  L2804   Providers (backend plugin registry)
+  L3081   Interactive pickers + menus (raw-mode UI engine)
+  L3456   Terminal styling (colors, formatting helpers)
+  L3754   Streaming + markdown render (model output)
+  L4523   Composer (pinned input line, editor, stdin)
+  L5513   Token accounting (calibrated context meter)
+  L5766   Config (dataclass, field registry, load/save)
+  L9845   Tool execution + text tool-call parsing
+  L10318  Remote workspace (executor client, /connect)
+  L12659  Context meter
+  L12754  Agent (turn loop, context mgmt, tool dispatch)
+  L20653  Slash-command handlers + dispatch table
+  L20795  REPL (interactive loop, session resume)
+  L21269  Worker agent (headless --agent-run)
+  L22019  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -154,7 +154,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.10.109"
+__version__ = "0.10.110"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -162,6 +162,13 @@ __version__ = "0.10.109"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.10.110": [
+        "Workers: a headless worker gets its own short system prompt and a worker-only",
+        "  `finish` tool. Calling finish or simply stopping runs the same wrap-up step;",
+        "  the reply is the report (still written fenced to the result file).",
+        "Board: a worker's report is posted to its board task by finish; a worker woken",
+        "  from a saved session appends the request + report to that session on DONE.",
+    ],
     "0.10.109": [
         "Prompt cache: mid tool-loop the newest tool result is now cached, so the next",
         "  step re-reads it cheaply instead of paying for it twice (~18% lower input",
@@ -1221,6 +1228,31 @@ SYSTEM_PROMPT = (
     "</batch_reads>"
 )
 
+# Headless worker system prompt (--agent-run). No one watches a worker: the operator-
+# facing parts of SYSTEM_PROMPT (ask_user_to_run, confirm intent, surface to the
+# operator, decision format) would contradict its situation, so it gets this instead.
+# Fixed for the whole run (cache-safe). The task itself rides the first user turn.
+WORKER_SYSTEM_PROMPT = (
+    "You are a headless worker agent. No one is watching; another agent dispatched you "
+    "and reads only your final report. Be concise. "
+    "<on_failure>"
+    "If an action fails, read the error and check your assumptions before switching "
+    "tactics. Don't blindly retry the same thing, but don't abandon a viable approach "
+    "after one failure. If you're genuinely stuck, stop and say so in your report."
+    "</on_failure> "
+    "Do only what the task asks. "
+    "<batch_reads>"
+    "Issue independent read-only lookups together in one turn: they run concurrently."
+    "</batch_reads>"
+)
+
+# Asked once the worker has finished (finish called OR it simply stopped). Same text
+# either way. Tools stay allowed for a last check; the reply with no tool call is the report.
+FINISH_INSTR = (
+    "Wrap up. If anything still needs checking or saving, do it now with your tools. "
+    "Then write your final report as plain text: what you did, what you found, where "
+    "things are, and anything left undone or blocking. Start it with DONE or FAILED.")
+
 # Chat-only system prompt (leash=chat OR a model that can't tool-call): NO tools are
 # attached, so the agentic scaffolding above - <decision_format>, <ask_operator>,
 # <batch_reads>, <reversibility>, the "tool result" framing - is all dangling
@@ -1547,6 +1579,8 @@ SYSTEM_PROMPTS_DIR = PROMPTS_DIR / "system"
 BUILTIN_PROMPTS = {
     "system":         SYSTEM_PROMPT,
     "chat_system":    CHAT_SYSTEM_PROMPT,  # lean prompt used when NO tools are attached (leash=chat)
+    "worker_system":  WORKER_SYSTEM_PROMPT,  # headless --agent-run worker
+    "worker_finish":  FINISH_INSTR,      # the one worker finish-step prompt (soft + hard)
     "compact":        COMPACT_INSTR,     # the ONE compaction prompt (manual + auto + elected)
     "compact_nudge": COMPACT_NUDGE,    # the gentle soft-zone "wrap up at a break" nudge
 }
@@ -1696,12 +1730,10 @@ UPDATE_PLAN_TOOL = {"type": "function", "function": {
         "required": ["plan"]}}}
 
 
-# Surfaced ONLY in the soft context zone (the user has, via compact_soft, opened the
-# spend window). Lets the model ELECT a compaction at a clean semantic boundary - a
-# finished task, before switching to an unrelated one - instead of being nagged with
-# no lever, or force-wiped mid-thought when context later hits the hard threshold.
-# Cost is NOT the model's call: it can never compact before the soft zone (the
-# user's threshold), only pick the tidiest MOMENT inside the window the user opened.
+# Always listed (a stable tool list keeps the prompt cache warm). Lets the model ELECT
+# a compaction at a clean semantic boundary instead of being force-wiped mid-thought at
+# the hard threshold. Cost is NOT the model's call: below the soft zone (the user's
+# threshold) it does nothing and just reports the settings.
 REQUEST_COMPACT_TOOL = {"type": "function", "function": {
     "name": "request_compact",
     "description": ("Compact NOW at a clean break: only when the current task/step is "
@@ -1710,6 +1742,21 @@ REQUEST_COMPACT_TOOL = {"type": "function", "function": {
                     "(auto-compaction covers that). Below the compaction threshold it does "
                     "nothing and returns the current compact settings."),
     "parameters": {"type": "object", "properties": {}, "required": []}}}
+
+
+# Worker-only (headless --agent-run). The soft trigger of the worker finish step, the
+# twin of request_compact: it only sets a flag and ends the loop; the finish step then
+# asks for the report. A worker that just stops (no tool call) gets the SAME finish step
+# (the hard trigger), so one prompt serves both. Never offered to an interactive session.
+FINISH_TOOL_DESC = "Call when your task is done; you'll then be asked for your final report."
+def _finish_tool(cfg):
+    d = FINISH_TOOL_DESC
+    tb = getattr(cfg, "worker_taskboard", "") or ""
+    if tb:
+        d += f" The report is posted to board '{tb}'."
+    return {"type": "function", "function": {
+        "name": "finish", "description": d,
+        "parameters": {"type": "object", "properties": {}, "required": []}}}
 
 
 # Session-scoped episodic memory. A core agent tool (handled in _run_tool like
@@ -1757,7 +1804,7 @@ def active_tools(cfg, remote=False, lean_tool_schemas=(), model_tools=True,
     # surface). The agent-internal meta tools are never removed (a worker must always
     # keep its plan/notebook/compaction), so allow() waves them through.
     allow = getattr(cfg, "tool_allowlist", None)
-    _META = ("update_plan", "note", "request_compact")
+    _META = ("update_plan", "note", "request_compact", "finish")
     def _named(nm):
         return allow is None or nm in _META or nm in allow
     # plan upkeep + notebook + elective compaction: no fs/exec, every non-chat tier.
@@ -1765,6 +1812,8 @@ def active_tools(cfg, remote=False, lean_tool_schemas=(), model_tools=True,
     # outside the soft zone it just reports the compact settings. `offer_compact` is
     # kept for call-site compatibility.
     tools = [UPDATE_PLAN_TOOL, NOTE_TOOL, REQUEST_COMPACT_TOOL]
+    if getattr(cfg, "worker_run", False):        # headless worker only
+        tools.append(_finish_tool(cfg))
     for t in TOOLS:
         nm = t["function"]["name"]
         if not _named(nm):
@@ -1834,7 +1883,7 @@ def _leash_allows_tool(leash, name, lean_safe=None):
     loaded message, a tool wrongly leaked onto the surface - it is refused here unless
     `leash` truly permits it. Mirrors active_tools()'s tiering exactly. update_plan /
     request_compact is agent-internal (no fs/exec) and allowed at any tier."""
-    if name in ("update_plan", "request_compact", "note"):
+    if name in ("update_plan", "request_compact", "note", "finish"):
         return True
     if leash == "chat":
         return False                         # no tools at all
@@ -6015,6 +6064,10 @@ class Config:
                                      # set, run_agent_brief auto-loads the `board` lean-tool so the
                                      # worker can report done/list. Distinct from worker_board_session
                                      # (the int file-claim mutex). "" = no task board. Not a knob.
+    worker_run: bool = False         # INTERNAL: this process is a headless --agent-run worker
+                                     # (worker system prompt + the finish tool). Not a knob.
+    worker_session: str = ""         # INTERNAL: the session NAME this worker was seeded from
+                                     # (grant 'session:'); its report is written back there.
     tool_allowlist: tuple = None     # None = no restriction (all leash-permitted tools).
                                      # Else a set/tuple of tool NAMES the surface is
                                      # narrowed to (still leash-capped). Runtime-only,
@@ -6485,6 +6538,7 @@ _EPHEMERAL_KEYS = frozenset((
     "tool_allowlist",     # runtime-only per-worker tool grant; never persisted (a fresh
                           # launch must default to the full surface, like leash)
     "worker_depth", "worker_child_budget", "worker_board_session", "worker_taskboard",
+    "worker_run", "worker_session",
                           # runtime-only tree position + granted child budget + shared-board
                           # session id + assigned task-board name, set from the grant per
                           # worker; never a saved knob
@@ -7958,14 +8012,18 @@ def register_peer_spawn(fn):
     return fn
 
 
-def spawn_peer(session_name, task):
-    """Board -> spawn a worker from a dormant peer's session file. Returns a status line, or
-    "" if no dispatcher is registered / the spawn failed. Never raises."""
+def spawn_peer(session_name, task, board=""):
+    """Board -> spawn a worker from a dormant peer's session file. `board` names the task
+    board the wake came from (its finish report is posted there). Returns a status line,
+    or "" if no dispatcher is registered / the spawn failed. Never raises."""
     fn = _PEER_SPAWN_HOOK[0]
     if fn is None:
         return ""
     try:
-        return fn(session_name, task) or ""
+        try:
+            return fn(session_name, task, board) or ""
+        except TypeError:                      # an older 2-arg hook
+            return fn(session_name, task) or ""
     except Exception:
         return ""
 
@@ -8423,7 +8481,7 @@ def tool_min_leash(name):
     MCP), or None when unknown. dispatch_worker checks a named per-worker allowlist
     against the worker's leash with this, so a tool the leash would silently filter out
     is refused at dispatch instead of reported as granted."""
-    if name in ("update_plan", "note", "request_compact"):
+    if name in ("update_plan", "note", "request_compact", "finish"):
         return "r"
     ag = _active_agent
     plug = ag.lean_tools.get(name) if ag is not None else None
@@ -13488,7 +13546,7 @@ class Agent:
         # dispatched with a narrowed grant must not RUN a tool outside it, however the
         # call arrived. None = no restriction; the meta tools are always permitted.
         allow = getattr(self.cfg, "tool_allowlist", None)
-        if allow is not None and name not in ("update_plan", "note", "request_compact") \
+        if allow is not None and name not in ("update_plan", "note", "request_compact", "finish") \
                 and name not in allow:
             print(red(f"\n{GLYPH['warn']} blocked {name}: not in this worker's tool grant "
                       f"(not run)"))
@@ -13550,6 +13608,11 @@ class Agent:
         """Route a tool call: to the remote executor when connected (with a
         local confirmation first, since the executor can't prompt), else local.
         The model is unaware of any of this - identical surface either way."""
+        if name == "finish":                # worker finish step trigger (agent-internal)
+            if getattr(self, "_in_finish_step", False):
+                return "Already finishing: write your report as plain text."
+            self._finish_called = True
+            return "ok"
         if name == "request_compact":       # elective soft-zone compaction (agent-internal)
             return self._request_compact()
         if name == "update_plan":            # pinned-plan upkeep (local agent state, never remote)
@@ -13698,6 +13761,8 @@ class Agent:
                 addendum = spec["system_addendum"](self, self.cfg) or ""
             except Exception:
                 addendum = ""
+        if getattr(self.cfg, "worker_run", False):
+            return (read_prompt("worker_system") or WORKER_SYSTEM_PROMPT) + addendum
         return (read_prompt("system") or SYSTEM_PROMPT) + addendum
 
     # XML-tag wrapper (providers converge on tags to delimit machine context so the model
@@ -15267,6 +15332,12 @@ class Agent:
                 _dbg_swallow()
         return self._offer_login_on_auth_error(err)
 
+    def _finish_stop(self):
+        """A worker called finish this batch (and isn't already in the finish step):
+        end the loop so run_agent_brief runs the finish step."""
+        return bool(getattr(self, "_finish_called", False)
+                    and not getattr(self, "_in_finish_step", False))
+
     def _loop(self):
         # max_iterations <= 0 means unlimited (count up forever).
         cap = self.cfg.max_iterations
@@ -15393,7 +15464,7 @@ class Agent:
                         and isinstance(self.messages[-1].get("content"), str):
                     self.messages[-1]["content"] += "\n\n" + TRUNC_NOTE
                 self._cap_end_turn()
-                if self._abort:
+                if self._abort or self._finish_stop():
                     return
                 continue
             for call in calls:
@@ -15407,6 +15478,8 @@ class Agent:
                 if last.get("role") == "tool" and isinstance(last.get("content"), str):
                     last["content"] += "\n\n" + TRUNC_NOTE
             self._cap_end_turn()   # training-capture: flush the turn record (no-op if off)
+            if self._finish_stop():
+                return
         self._hit_iteration_cap = True    # stopped on the budget, not a natural finish
         print(yellow(f"\n{GLYPH['warn']} hit {cap}-iteration cap; stopping this turn. "
                      f"Refine your request or continue, or raise the limit: "
@@ -21252,6 +21325,7 @@ def _run_agent_brief(args) -> int:
     cfg.composer = False
     cfg.autosave = False                  # a worker doesn't autosave/auto-load sessions
     cfg.auto_compact = False             # one brief, no self-compaction compaction
+    cfg.worker_run = True                # worker system prompt + the finish tool
     # Mark this process a headless worker: no human is watching, so a provider that
     # would fast-fail an interactive turn on a transient throttle should instead wait
     # it out (a provider can check this env and back off 429 in worker mode).
@@ -21297,6 +21371,7 @@ def _run_agent_brief(args) -> int:
     # board JSON under the config dir, never the user tree), so this never widens the leash;
     # and it's scoped - a worker with no taskboard grant gets nothing extra. If the grant
     # ALSO carries a tools= allowlist, keep 'board' in it (the worker still needs it).
+    cfg.worker_session = (grant.get("session") or "").strip()
     tb_name = (grant.get("taskboard") or "").strip()
     if tb_name:
         cfg.worker_taskboard = tb_name
@@ -21406,48 +21481,18 @@ def _run_agent_brief(args) -> int:
 
     # Preamble: tell the worker it's headless + how to return its answer.
     preamble = (
-        "You are a headless worker agent. You have ONE task (below). Do it using your "
-        "tools, then STOP. When finished, write your final answer as your last message, "
-        f"wrapped between two {RESULT_MARK} markers, e.g.\n{RESULT_MARK}\n<your result>\n"
-        f"{RESULT_MARK}\nNothing after the closing marker. There is no user to ask - if "
-        "you get stuck, put what you found + what blocked you inside the result block. "
-        "Your leash is fixed; do not ask to raise it.\n"
-        "IMPORTANT: do NOT put a tool call and your " + RESULT_MARK + " block in the same "
-        "message - a message that also calls a tool is NOT your final answer, and the "
-        f"{RESULT_MARK} would make the tool call be ignored (your action would not run). "
-        "Finish every tool call FIRST, wait for its result, confirm the change (re-read if "
-        f"you edited), and only THEN write the {RESULT_MARK} block on its own.\n"
-        "HOW YOUR RUN ENDS: a message from you that calls NO tool ENDS your run immediately. "
-        "So never send a bare transition like 'now I'll compile the findings' or 'let me write "
-        "that up' on its own - that message has no tool call, so your run stops right there and "
-        f"whatever you meant to write next is lost. Every message must either (a) call a tool to "
-        f"keep working, or (b) BE your final answer in the {RESULT_MARK} block. There is no "
-        "in-between 'thinking out loud' message.\n"
-        "MID-TASK MESSAGES: the operator or the agent that dispatched you may send you a "
-        "message while you work (it arrives as a new turn prefixed [operator inject] or "
-        "[parent-agent inject]). Treat it as a correction/steer that OUTRANKS your original "
-        "task where they conflict (e.g. a changed constraint, a stop-and-redirect). When one "
-        "arrives, briefly acknowledge it - aim for about one sentence confirming you got it "
-        "and what you'll change - then carry on. (Keep the ack short, but do not truncate a "
-        "thought to hit a length.)\n"
-        "FIRST, before your first tool call, state your understanding of the task in about one "
-        "sentence (what you're going to do). This stated intent lets whoever dispatched you "
-        "catch a misread early and stop or redirect you. Keep it short, but don't truncate a "
-        "thought to hit a length.\n"
+        "Start with one sentence on what you're going to do, then do the task with your "
+        "tools. Call finish when it's done.\n"
+        "Messages marked [operator inject] or [parent-agent inject] can arrive while you "
+        "work; they override the task where they conflict. Acknowledge in a sentence and "
+        "carry on.\n"
         # Seed context the parent curated (bounded at dispatch) - "here's what you need to
         # know", distinct from the task itself. Only when present.
         + (f"\nCONTEXT FROM THE AGENT THAT DISPATCHED YOU (background you need; not the task "
            f"itself):\n{seed_context.strip()}\n" if seed_context.strip() else "")
-        # Task-board contract (Phase 2b): when the driver assigned this worker to a named
-        # board, tell it - once, structurally - to report its own task done there. The
-        # `board` tool was auto-loaded above; the worker marks its task done (and may read
-        # the board with list/find), but cannot assign/create - that's the driver's job.
-        + (f"\nTASK BOARD: you are working task board '{cfg.worker_taskboard}'. Use the "
-           f"`board` tool: when your task is complete, call action='done' board="
-           f"'{cfg.worker_taskboard}' task=<your task id> result_ref=<path to your work "
-           f"product>, so the driver knows to schedule what your task unblocks. You may "
-           f"also action='list'/'find' to see the board, but you cannot create/add/assign "
-           f"(that is the driver's role). Your task id is stated in the task below.\n"
+        # Task board: finish posts the report there, so the worker never marks it itself.
+        + (f"\nThis task is on board '{cfg.worker_taskboard}'; your report is posted there "
+           f"when you finish. You can read the board with the board tool.\n"
            if getattr(cfg, "worker_taskboard", "") else "")
         + "\nTASK:\n"
         + brief)
@@ -21679,15 +21724,18 @@ def _run_agent_brief(args) -> int:
                     agent.notes = _ckpt_meta["notes"]
                 # On a resume the transcript already carries the original task + all prior
                 # work, so the first turn is just the parent's steer (not the full preamble).
-                first_turn = (
-                    "[resume] You are being RESUMED: your prior transcript above is your own "
-                    "earlier work on this task (it ended before you wrote your "
-                    f"{RESULT_MARK} block - you hit a limit, were stopped, or crashed). "
-                    "Continue from where you left off. The same rules apply: keep working via "
-                    f"tool calls, and when finished write your final answer between two "
-                    f"{RESULT_MARK} markers as a message with no tool call.\n\n"
-                    "STEER FROM THE AGENT THAT RESUMED YOU (outranks your prior plan where "
-                    f"they conflict):\n{brief}")
+                # Seeded from a SESSION (e.g. a board wake): the history is that session's
+                # own conversation, not an unfinished worker run, so the steer is the new task.
+                if cfg.worker_session:
+                    first_turn = (f"{brief}\n\n(You're running headless from this session; "
+                                  "call finish when it's done.)")
+                else:
+                    first_turn = (
+                        "[resume] Your prior transcript above is your own earlier work on this "
+                        "task; it ended before you finished (a limit, a stop, or a crash). "
+                        "Continue from where you left off, and call finish when it's done.\n\n"
+                        "STEER FROM THE AGENT THAT RESUMED YOU (outranks your prior plan where "
+                        f"they conflict):\n{brief}")
                 print(dim(f"agent-run: resumed from checkpoint ({len(body)} prior messages)"))
             else:
                 print(yellow("agent-run: resume checkpoint had no usable messages; "
@@ -21770,11 +21818,8 @@ def _run_agent_brief(args) -> int:
         print(dim(f"agent-run: incomplete (iteration cap) -> {resultf}"))
         return 2
 
-    # Missing-RESULT rescue: the loop ends the moment the model emits an assistant
-    # message with no tool call - but a worker sometimes stops on a bare "let me compile
-    # the findings" preamble WITHOUT ever writing the RESULT block, so the harvest below
-    # would capture that stub as the whole answer. If the final text carries no marker,
-    # nudge it to actually produce the RESULT (at most 2 turns), then re-harvest.
+    # An empty reply the provider already re-sent silently: asking again just re-presents
+    # the same request (and a real decline gets worse the more it's pushed).
     def _empty_exhausted():
         # The LAST reply was empty AND the provider already spent its silent re-sends on
         # it: nudging would just re-present the same request (and a real decline gets
@@ -21784,17 +21829,6 @@ def _run_agent_brief(args) -> int:
                 and not last.get("tool_calls")
                 and (getattr(agent.client, "last_empty_retries", 0) or 0) > 0)
 
-    for _ in range(2):
-        if RESULT_MARK in _final_asst_content() or _empty_exhausted():
-            break
-        try:
-            agent.run_turn(
-                f"You stopped without writing your {RESULT_MARK} block, so no answer was "
-                f"captured. Write your COMPLETE final answer now, wrapped between two "
-                f"{RESULT_MARK} markers, as your entire message (no tool call in it). Do not "
-                f"summarize that you will - write the actual content.")
-        except Exception as e:
-            return _fail(f"worker result-rescue turn failed: {e}")
 
     # pending-bg PARK: the worker reasoned to a natural stop, but it still has its own
     # live background job(s). It must NOT exit yet - on a remote executor, this process
@@ -21847,22 +21881,30 @@ def _run_agent_brief(args) -> int:
                 note = ""
             steer = ((note + "\n\n") if note else "") + (
                 "Your background job(s) have finished (see above). Incorporate the outcome, "
-                f"then write your final answer between two {RESULT_MARK} markers as your "
-                "entire message (no tool call).")
+                "then call finish.")
             try:
                 agent.run_turn(steer)
             except Exception as e:
                 print(dim(f"agent-run: post-bg finalise turn failed ({e}); harvesting as-is."))
     except Exception as e:
         print(dim(f"agent-run: bg-park skipped ({e}); harvesting as-is."))
-    # Harvest: the last assistant text -> its RESULT block, or the whole message.
-    final = ""
-    for m in reversed(agent.messages):
-        if m.get("role") == "assistant" and isinstance(m.get("content"), str) and m["content"].strip():
-            final = m["content"]
-            break
+    # FINISH STEP. Soft trigger: the worker called finish. Hard trigger: it just stopped.
+    # Either way the same single prompt runs (the compaction shape), so there is nothing
+    # for the model to remember and no nudge ladder. Skipped only when a legacy worker
+    # already wrote a fenced RESULT, or the provider returned nothing after its retries.
+    if RESULT_MARK not in _final_asst_content() and not _empty_exhausted():
+        agent._finish_called = False
+        agent._in_finish_step = True
+        try:
+            agent.run_turn(read_prompt("worker_finish") or FINISH_INSTR)
+        except Exception as e:
+            return _fail(f"worker finish step failed: {e}")
+        finally:
+            agent._in_finish_step = False
+    final = _final_asst_content()
     block = _extract_marked(final, RESULT_MARK) or final.strip()
-    if not block:
+    no_reply = not block
+    if no_reply:
         # Report the facts to the DRIVER (never to the worker's model), no verdict:
         # an empty reply is as often congestion or a network blip as a real decline.
         _n = getattr(agent.client, "last_empty_retries", 0) or 0
@@ -21872,12 +21914,89 @@ def _run_agent_brief(args) -> int:
                  + (f" (last stop_reason: {_sr})" if _sr else "")
                  + ". Possible causes: an API/network issue, a refusal, or a transient "
                    "glitch; no work was done." if (_n or _sr) else "(worker produced no output)")
+    status, stated = _report_status(block)
+    if no_reply:
+        status = "failed"
     try:
         Path(resultf).write_text(f"{RESULT_MARK}\n{block}\n{RESULT_MARK}\n")
     except OSError as e:
         return _fail(f"cannot write result file: {e}")
-    print(dim(f"agent-run: done -> {resultf}"))
+    posted = _worker_post_board(agent, cfg, status, block)
+    if status == "done" and cfg.worker_session:
+        lines = [f"[board '{b}' {t} -> done" + ("" if stated else ", no DONE/FAILED given")
+                 + "]" for b, t in posted]
+        _worker_session_writeback(cfg.worker_session, brief,
+                                  block + ("\n\n" + "\n".join(lines) if lines else ""))
+    print(dim(f"agent-run: {status} -> {resultf}"))
     return 0
+
+
+def _report_status(report):
+    """('done'|'failed', stated): the worker's report starts with DONE or FAILED (the
+    finish prompt asks for it). Missing -> done, stated=False (noted on the board line)."""
+    head = re.sub(r"^[\s*_#>`\[]+", "", report or "")[:12].upper()
+    if head.startswith("FAILED"):
+        return "failed", True
+    if head.startswith("DONE"):
+        return "done", True
+    return "done", False
+
+
+def _worker_board_tasks(cfg):
+    """(board, task id) pairs this worker run is answering: tasks still 'assigned' on its
+    board to this process (a dispatched worker, by pid) or to the session it was woken
+    from (a board-woken peer, by name)."""
+    tb = getattr(cfg, "worker_taskboard", "") or ""
+    if not tb:
+        return []
+    me = {str(os.getpid())} | ({cfg.worker_session} if getattr(cfg, "worker_session", "") else set())
+    try:
+        board = _taskboard_load(tb)
+    except Exception:
+        return []
+    return [(tb, t.get("id")) for t in board.get("tasks", [])
+            if t.get("status") == "assigned" and str(t.get("assignee") or "") in me]
+
+
+def _worker_post_board(agent, cfg, status, report):
+    """Post the finish report to the worker's board task(s) through the board tool (so the
+    assigner is notified exactly as for any done/fail). Returns the (board, id) posted."""
+    pairs = _worker_board_tasks(cfg)
+    plug = agent.lean_tools.get("board") if pairs else None
+    if not plug or not callable(plug.get("run")):
+        return []
+    done = []
+    for b, tid in pairs:
+        try:
+            out = plug["run"]({"action": "done" if status == "done" else "fail",
+                               "board": b, "task": tid, "note": report,
+                               "_via_finish": True}, str(getattr(cfg, "cwd", ".")))
+            if not str(out).startswith("error"):
+                done.append((b, tid))
+        except Exception:
+            _dbg_swallow()
+    return done
+
+
+def _worker_session_writeback(name, wake, reply):
+    """A worker woken from a saved session finished its task: record the exchange in that
+    session as two plain messages (what came in, what it reported), so whoever opens the
+    session later has the context. The worker's intermediate steps are NOT copied. If a
+    live REPL owns the session right now, hand it over as a peer message instead (that
+    REPL saves it itself; never two writers). Else re-read the file and append - never
+    overwrite with the worker's stale snapshot. Best-effort, never raises."""
+    try:
+        if _participant_resolve(name).get("state") == "live-here":
+            peer_inject(name, f"{wake.strip()}\n\n{reply.strip()}")
+            return
+        p = _session_path(name)
+        data = json.loads(p.read_text())
+        data.setdefault("messages", []).extend([
+            {"role": "user", "content": wake.strip()},
+            {"role": "assistant", "content": reply.strip()}])
+        _atomic_write_text(p, json.dumps(data, indent=2))
+    except Exception:
+        _dbg_swallow()
 
 
 def _write_brief_usage(brief_file, agent):
