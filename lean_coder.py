@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L1905   Lean-tools (plugin tools: discovery, manager)
-  L2292   MCP client (connection, manager, OAuth, discovery)
-  L2746   Providers (backend plugin registry)
-  L3023   Interactive pickers + menus (raw-mode UI engine)
-  L3398   Terminal styling (colors, formatting helpers)
-  L3696   Streaming + markdown render (model output)
-  L4465   Composer (pinned input line, editor, stdin)
-  L5455   Token accounting (calibrated context meter)
-  L5708   Config (dataclass, field registry, load/save)
-  L9774   Tool execution + text tool-call parsing
-  L10247  Remote workspace (executor client, /connect)
-  L12588  Context meter
-  L12683  Agent (turn loop, context mgmt, tool dispatch)
-  L20569  Slash-command handlers + dispatch table
-  L20711  REPL (interactive loop, session resume)
-  L21185  Worker agent (headless --agent-run)
-  L21889  Entry (CLI arg parsing, main)
+  L1910   Lean-tools (plugin tools: discovery, manager)
+  L2297   MCP client (connection, manager, OAuth, discovery)
+  L2751   Providers (backend plugin registry)
+  L3028   Interactive pickers + menus (raw-mode UI engine)
+  L3403   Terminal styling (colors, formatting helpers)
+  L3701   Streaming + markdown render (model output)
+  L4470   Composer (pinned input line, editor, stdin)
+  L5460   Token accounting (calibrated context meter)
+  L5713   Config (dataclass, field registry, load/save)
+  L9783   Tool execution + text tool-call parsing
+  L10256  Remote workspace (executor client, /connect)
+  L12597  Context meter
+  L12692  Agent (turn loop, context mgmt, tool dispatch)
+  L20578  Slash-command handlers + dispatch table
+  L20720  REPL (interactive loop, session resume)
+  L21194  Worker agent (headless --agent-run)
+  L21898  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -154,7 +154,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.10.107"
+__version__ = "0.10.108"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -162,6 +162,11 @@ __version__ = "0.10.107"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.10.108": [
+        "Status line: activity counts sit right after the session name, all in amber.",
+        "board: assigning a task to your own session just records it (it no longer",
+        "  starts a second copy of the session).",
+    ],
     "0.10.107": [
         "Restart report: a clean exit (^C, /exit, closing the window) records the",
         "  background jobs and workers it stops. On reopen the operator sees them and",
@@ -9087,7 +9092,11 @@ def _participant_resolve(name):
         pid, host = info.get("pid"), info.get("host")
         if host == _HOSTNAME:
             # Same box: pid is authoritative (mirrors _lock_is_live).
-            if isinstance(pid, int) and _pid_alive(pid) and pid != os.getpid():
+            if pid == os.getpid():
+                # This very session holds the lock: never 'dormant' (that would spawn
+                # a second copy of ourselves from our own session file).
+                return {"state": "self", "pid": pid}
+            if isinstance(pid, int) and _pid_alive(pid):
                 return {"state": "live-here", "pid": pid}
         else:
             # Cross-host: can't probe the pid; trust heartbeat freshness ('ts' per autosave).
@@ -17523,8 +17532,7 @@ def _activity_counts(agent) -> list:
                 ("bg", len(_bg_running(owner=me, kind="task"))),
                 ("board", _my_board_tasks())):
             if n:
-                out.append(yellow(f"{GLYPH[key]} {n}") if key == "user_wait"
-                           else f"{GLYPH[key]} {n}")
+                out.append(yellow(f"{GLYPH[key]} {n}"))   # same amber as a soft-zone ctx
     except Exception:
         pass
     return out
@@ -17554,8 +17562,9 @@ def _status_rows(agent, cfg):
         s = [agent.autosave_name]
     else:
         s = ["amnesic"]
+    s += _activity_counts(agent)              # ! usr  ⚒ wkr  ◷ bgd  ⊡ brd (only when > 0),
+                                              # right after the session name: a fixed spot
     s.append(model_at)                        # turn count lives in /info (context line)
-    s += _activity_counts(agent)              # ! usr  ⚒ wkr  ◷ bgd  ⊡ brd (only when > 0)
     rows.append("  " + d.join(s))
 
     # 2) perms + context management

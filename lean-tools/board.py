@@ -165,6 +165,8 @@ def _notify_assigner(board_name, tid, action, note, assigned_by, task_name, resu
     resolve = _H.get("_participant_resolve")
     res = resolve(handle) if resolve else {"state": "missing"}
     state = res.get("state")
+    if state == "self":                # we assigned it to ourselves: nobody to wake
+        return ""
     if state == "live-here":
         pinj = _H.get("peer_inject")
         ok = bool(pinj and pinj(handle, ping)) or _push(res.get("pid"), ping)
@@ -512,7 +514,7 @@ def run(args, cwd):
             # A bare label, not a registered participant: try to resolve it as a peer
             # session by name. If it backs a real session, adopt it as a participant.
             res0 = _H["_participant_resolve"](worker)
-            if res0.get("state") in ("live-here", "live-elsewhere", "dormant"):
+            if res0.get("state") in ("self", "live-here", "live-elsewhere", "dormant"):
                 up = _H.get("_taskboard_participant_upsert")
                 if up:
                     def _do_reg(bd):
@@ -531,7 +533,9 @@ def run(args, cwd):
             handle = prec.get("name")
             res = _H["_participant_resolve"](handle)
             state = res.get("state")
-            if state == "live-here":
+            if state == "self":
+                tail = " (assigned to this session; no ping needed)"
+            elif state == "live-here":
                 # A live-here participant is an independent PEER session, not a worker we
                 # dispatched - so reach it via its inbox (peer_inject -> its wake hook),
                 # NOT worker_inject (which only knows THIS session's workers). Fall back to
@@ -678,6 +682,8 @@ def run(args, cwd):
                            f" (assignee '{who}' live; push failed)"
                 elif state == "live-elsewhere":
                     msg += f" (assignee '{who}' live on {res.get('host')}; not woken, sees it on next list)"
+                elif state == "self":
+                    pass                       # cancelled our own task: nothing to tell
                 else:
                     # dormant/missing: don't SPAWN a session just to tell it to stop - pointless.
                     msg += f" (assignee '{who}' not live; not told to stop)"
