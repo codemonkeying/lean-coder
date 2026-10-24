@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L1900   Lean-tools (plugin tools: discovery, manager)
-  L2287   MCP client (connection, manager, OAuth, discovery)
-  L2741   Providers (backend plugin registry)
-  L3018   Interactive pickers + menus (raw-mode UI engine)
-  L3393   Terminal styling (colors, formatting helpers)
-  L3691   Streaming + markdown render (model output)
-  L4460   Composer (pinned input line, editor, stdin)
-  L5450   Token accounting (calibrated context meter)
-  L5703   Config (dataclass, field registry, load/save)
-  L9720   Tool execution + text tool-call parsing
-  L10193  Remote workspace (executor client, /connect)
-  L12534  Context meter
-  L12629  Agent (turn loop, context mgmt, tool dispatch)
-  L20507  Slash-command handlers + dispatch table
-  L20649  REPL (interactive loop, session resume)
-  L21121  Worker agent (headless --agent-run)
-  L21825  Entry (CLI arg parsing, main)
+  L1905   Lean-tools (plugin tools: discovery, manager)
+  L2292   MCP client (connection, manager, OAuth, discovery)
+  L2746   Providers (backend plugin registry)
+  L3023   Interactive pickers + menus (raw-mode UI engine)
+  L3398   Terminal styling (colors, formatting helpers)
+  L3696   Streaming + markdown render (model output)
+  L4465   Composer (pinned input line, editor, stdin)
+  L5455   Token accounting (calibrated context meter)
+  L5708   Config (dataclass, field registry, load/save)
+  L9774   Tool execution + text tool-call parsing
+  L10247  Remote workspace (executor client, /connect)
+  L12588  Context meter
+  L12683  Agent (turn loop, context mgmt, tool dispatch)
+  L20569  Slash-command handlers + dispatch table
+  L20711  REPL (interactive loop, session resume)
+  L21185  Worker agent (headless --agent-run)
+  L21889  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -154,7 +154,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.10.106"
+__version__ = "0.10.107"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -162,6 +162,11 @@ __version__ = "0.10.106"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.10.107": [
+        "Restart report: a clean exit (^C, /exit, closing the window) records the",
+        "  background jobs and workers it stops. On reopen the operator sees them and",
+        "  the model is told once, with each job's last log lines.",
+    ],
     "0.10.106": [
         "ask_user_to_run: a request that times out becomes the single waiting command",
         "  (a newer one replaces it; kept with the session). /user_to_run (aliases",
@@ -7055,6 +7060,53 @@ def load_envelope(data):
     return body, meta
 
 
+def _stopped_on_exit_snapshot(tail_lines: int = 5) -> list:
+    """At a clean exit, BEFORE _bg_kill_session runs: this session's still-running
+    background jobs and workers, each with the last few lines of its log, so the next
+    open can say what the exit stopped. Local registry only. Never raises."""
+    out = []
+    try:
+        for r in _bg_running(owner=os.getpid(), kind=None):
+            tail = []
+            log = r.get("log") or ""
+            try:
+                tail = Path(log).read_text(errors="replace").splitlines()[-tail_lines:] if log else []
+            except OSError:
+                pass
+            out.append({"pid": r.get("pid"), "kind": r.get("kind", "task"),
+                        "cmd": str(r.get("cmd", ""))[:300], "started": r.get("started", ""),
+                        "log": log, "tail": [t[:200] for t in tail]})
+    except Exception:
+        _dbg_swallow()
+    return out
+
+
+def _stopped_report(stopped) -> tuple:
+    """(operator lines, model note) for jobs a previous exit stopped; ('', '') if none."""
+    if not isinstance(stopped, list) or not stopped:
+        return "", ""
+    bar = cyan(GLYPH["userbar"])
+    lines = [f"{bar} {cyan(bold('session restarted'))}"
+             + dim(f"  {len(stopped)} job(s) were stopped when it last exited")]
+    note = ["[session restarted: the previous run exited cleanly, which stopped these "
+            "jobs. They are NOT running now and no finish notice will come; restart any "
+            "that are still needed.]"]
+    for j in stopped:
+        if not isinstance(j, dict):
+            continue
+        what = "worker" if j.get("kind") == "worker" else "background"
+        icon = GLYPH["worker"] if what == "worker" else GLYPH["bg"]
+        cmd = " ".join(str(j.get("cmd", "")).split())
+        lines.append(f"{bar} {icon} {j.get('pid')}  " + dim(f"{j.get('started', '')}  ")
+                     + _headline_fit(cmd, None, "cmd", lead=len(str(j.get('pid'))) + 6))
+        note.append(f"- {what} pid {j.get('pid')} (started {j.get('started', '?')}): {cmd}")
+        if j.get("log"):
+            note.append(f"  log: {j['log']}")
+        for t in j.get("tail") or []:
+            note.append(f"  | {t}")
+    return "\n".join(lines), "\n".join(note)
+
+
 class _HostRef:
     """Stand-in for a remote a restored waiting command was meant for (only .host)."""
     def __init__(self, host): self.host = host
@@ -7085,7 +7137,7 @@ def _pending_ask_load(d, remote):
 
 
 def save_session(messages, cfg, name: str, remote=None, pinned_plan="", notes=None, origin=None,
-                 pending_ask=None):
+                 pending_ask=None, stopped_on_exit=None):
     """Write the conversation to ~/.config/leancoder/sessions/<name>.json with a
     metadata header. Returns (path, meta). Raises ValueError on a bad name.
 
@@ -7116,6 +7168,7 @@ def save_session(messages, cfg, name: str, remote=None, pinned_plan="", notes=No
         "pinned_plan": pinned_plan or "",
         "notes": list(notes or []),          # session-scoped episodic memory (note tool)
         "pending_ask": _pending_ask_dump(pending_ask),   # the waiting command (/user_to_run)
+        "stopped_on_exit": list(stopped_on_exit or []),  # jobs a clean exit stopped (restart report)
         "session_overrides": dict(getattr(cfg, "session_overrides", {}) or {}),
         "tok_factor": _tok_factor(),         # learned estimate->actual factor (calibrated meter)
         "origin": origin,                    # None for a normal save; else where it came from,
@@ -7387,7 +7440,7 @@ def _detach_if_stolen(agent, cfg) -> bool:
     return True
 
 
-def autosave_session(agent, cfg):
+def autosave_session(agent, cfg, at_exit=False):
     """Write the live conversation to its rolling autosave session. No-op when
     autosave is off or the conversation is empty. Must never raise into the turn
     loop - a failed autosave should not kill a working session."""
@@ -7406,7 +7459,8 @@ def autosave_session(agent, cfg):
         save_session(agent.messages, cfg, name, remote=rhost,
                      pinned_plan=getattr(agent, "pinned_plan", ""),
                      notes=getattr(agent, "notes", None),
-                     pending_ask=getattr(agent, "_pending_ask", None))
+                     pending_ask=getattr(agent, "_pending_ask", None),
+                     stopped_on_exit=_stopped_on_exit_snapshot() if at_exit else None)
         _write_lock(name)
         _prune_autosaves()
     except (ValueError, OSError):
@@ -13183,6 +13237,7 @@ class Agent:
         self._pending_ask = None         # THE waiting command: last timed-out ask_user_to_run
                                          # (single slot, newest overwrites; /user_to_run)
         self._pending_offer = None       # one the operator approved (y) for the model to re-fire
+        self._restart_note = None        # jobs the last clean exit stopped (told once)
         self._queued_turns = []          # user turns queued by a command (e.g. /prompt use);
                                          # the REPL drains these as full turns before prompting
         self._activity = []              # system-activity log: automatic behaviours
@@ -14794,6 +14849,9 @@ class Agent:
         if self._pending_ai_note:        # leash/permissions note (on change/startup)
             notes.append(self._pending_ai_note)
             self._pending_ai_note = None
+        if getattr(self, "_restart_note", None):   # restart report: once, then gone
+            notes.append(self._restart_note)
+            self._restart_note = None
         nudge = self._soft_nudge()       # throttled soft-zone context nudge
         if nudge:
             notes.append(nudge)
@@ -18073,6 +18131,10 @@ def _restore_session_state(agent, cfg, meta):
 
     # Restore session-scoped episodic notes (the note tool). Absent in older sessions
     # -> keep whatever's live (don't clobber). Coerced to a clean list of {dtg,text}.
+    _ops, _note = _stopped_report(meta.get("stopped_on_exit"))
+    if _ops:                                               # restart report (once)
+        print(_ops)
+        agent._restart_note = _note      # rides the operator's next turn (no auto-turn)
     if "pending_ask" in meta:                              # the waiting command
         agent._pending_ask = _pending_ask_load(meta.get("pending_ask"),
                                                getattr(agent, "remote", None))
@@ -20695,7 +20757,9 @@ def repl(cfg: Config, resume=None):
     # this is safe to fire unconditionally. Registered LAST so it runs FIRST (atexit is
     # LIFO): before _release_lock (lock still ours) and before close_all_remotes (so the
     # remote host is still readable for the saved meta).
-    atexit.register(lambda: autosave_session(agent, cfg))
+    # at_exit: also records still-running jobs/workers (it runs BEFORE _bg_kill_session,
+    # which main() registered earlier) so the next open can report what the exit stopped.
+    atexit.register(lambda: autosave_session(agent, cfg, at_exit=True))
     # Closing the terminal window sends SIGHUP, whose default action kills the process
     # WITHOUT running atexit - so the save above never happened. Turn it into a normal
     # exit so the atexit chain (save, release lock, close remotes) runs.
