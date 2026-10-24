@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L1910   Lean-tools (plugin tools: discovery, manager)
-  L2297   MCP client (connection, manager, OAuth, discovery)
-  L2751   Providers (backend plugin registry)
-  L3028   Interactive pickers + menus (raw-mode UI engine)
-  L3403   Terminal styling (colors, formatting helpers)
-  L3701   Streaming + markdown render (model output)
-  L4470   Composer (pinned input line, editor, stdin)
-  L5460   Token accounting (calibrated context meter)
-  L5713   Config (dataclass, field registry, load/save)
-  L9783   Tool execution + text tool-call parsing
-  L10256  Remote workspace (executor client, /connect)
-  L12597  Context meter
-  L12692  Agent (turn loop, context mgmt, tool dispatch)
-  L20578  Slash-command handlers + dispatch table
-  L20720  REPL (interactive loop, session resume)
-  L21194  Worker agent (headless --agent-run)
-  L21898  Entry (CLI arg parsing, main)
+  L1914   Lean-tools (plugin tools: discovery, manager)
+  L2301   MCP client (connection, manager, OAuth, discovery)
+  L2755   Providers (backend plugin registry)
+  L3032   Interactive pickers + menus (raw-mode UI engine)
+  L3407   Terminal styling (colors, formatting helpers)
+  L3705   Streaming + markdown render (model output)
+  L4474   Composer (pinned input line, editor, stdin)
+  L5464   Token accounting (calibrated context meter)
+  L5717   Config (dataclass, field registry, load/save)
+  L9787   Tool execution + text tool-call parsing
+  L10260  Remote workspace (executor client, /connect)
+  L12601  Context meter
+  L12696  Agent (turn loop, context mgmt, tool dispatch)
+  L20580  Slash-command handlers + dispatch table
+  L20722  REPL (interactive loop, session resume)
+  L21196  Worker agent (headless --agent-run)
+  L21900  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -154,7 +154,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.10.108"
+__version__ = "0.10.109"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -162,6 +162,11 @@ __version__ = "0.10.108"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.10.109": [
+        "Prompt cache: mid tool-loop the newest tool result is now cached, so the next",
+        "  step re-reads it cheaply instead of paying for it twice (~18% lower input",
+        "  cost on a short tool loop in our measurement; more on longer loops).",
+    ],
     "0.10.108": [
         "Status line: activity counts sit right after the session name, all in amber.",
         "board: assigning a task to your own session just records it (it no longer",
@@ -1739,9 +1744,8 @@ def active_tools(cfg, remote=False, lean_tool_schemas=(), model_tools=True,
     `lean_tool_schemas` is an iterable of (schema, is_safe). `model_tools` is whether the
     ACTIVE MODEL can tool-call at all (a provider may report a chat-only model via its
     tool_support() hook); False drops the whole tool block regardless of leash - a model
-    with no tools can't be granted any by raising the ceiling. `offer_compact` adds the
-    elective request_compact tool (surfaced only in the soft context zone - the caller
-    decides). (`remote` is kept for call-site symmetry; the core tools are identical
+    with no tools can't be granted any by raising the ceiling. request_compact is
+    always listed (stable tool list = warm cache); `offer_compact` is accepted but ignored. (`remote` is kept for call-site symmetry; the core tools are identical
     local or remote.)"""
     leash = getattr(cfg, "leash", "rwe")
     if leash == "chat" or not model_tools:
@@ -13426,11 +13430,10 @@ class Agent:
             return tools
 
     def _offer_compact(self) -> bool:
-        """Whether to surface the elective request_compact tool this turn: only in the
-        soft context zone (auto-compaction on), i.e. once context has crossed the user's
-        compact_soft threshold - the point at which the user has decided spending on a
-        compaction is acceptable. The model then picks the tidy MOMENT within that window;
-        it can never elect one BELOW soft, so it never decides how much the user pays."""
+        """Whether an elected request_compact would actually compact now: only in the
+        soft context zone (auto-compaction on). The tool itself is ALWAYS listed (a stable
+        tool list keeps the prompt cache warm); below soft it just reports the settings,
+        so the model never decides how much the user pays."""
         if not self.cfg.compact_for()["auto"]:
             return False
         return self._ctx_zone()[0] == "soft"
@@ -14850,9 +14853,8 @@ class Agent:
         # through _loop directly, NOT run_turn, so they never open a spurious boundary.)
         self._cap_new_run_turn(user_input, is_model_generated)
         self._turn_count += 1
-        # Rebuild the surface so the elective request_compact tool appears/disappears
-        # as context crosses the soft threshold (offer_compact tracks the zone). Cheap;
-        # keeps the offered tools honest to the current zone without a separate trigger.
+        # Rebuild the tool surface (picks up leash / model / lean-tool changes). Cheap.
+        # request_compact is always in it, so crossing soft does NOT change the list.
         self.refresh_tools()
         notes = []
         if self._pending_ai_note:        # leash/permissions note (on change/startup)
@@ -15144,7 +15146,7 @@ class Agent:
                 msgs = repair_tool_pairs(
                     self._window_messages(self.messages, self.cfg.window_messages))
                 # Stitch the pinned plan onto the SENT slice only (a copy) - never into
-                # stored history, and after the last cache breakpoint (messages[-2]) so it
+                # stored history, and after the rolling cache breakpoint (never on it) so it
                 # stays uncached and a plan edit busts nothing. See _plan_reminder.
                 msgs = self._with_plan_reminder(msgs)
                 return self.client.chat(

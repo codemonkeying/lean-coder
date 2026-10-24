@@ -461,6 +461,13 @@ def _cvt_messages(messages):
     return system, out
 
 
+def _is_tool_result_msg(msg):
+    """True for a user message made only of tool_result blocks (a mid-loop tool reply)."""
+    c = msg.get("content")
+    return (msg.get("role") == "user" and isinstance(c, list) and bool(c)
+            and all(isinstance(b, dict) and b.get("type") == "tool_result" for b in c))
+
+
 def _mark_cache(msg):
     """Add cache_control breakpoint (1h TTL, session-scoped) to last content block."""
     cc = {"type": "ephemeral", "ttl": "1h"}
@@ -783,8 +790,15 @@ class _ApiKeyClient:
         else:
             cached_tools = api_tools
         cached_msgs = list(api_msgs)
-        if len(cached_msgs) >= 2:
-            cached_msgs[-2] = _mark_cache(cached_msgs[-2])   # rolling recent breakpoint
+        # Rolling breakpoint. Mid tool-loop the last message is a pure tool-result
+        # message (nothing stitched onto it), so mark IT: the next request re-reads it at
+        # 0.1x instead of paying 1x now + a 2x cache write next time. When the last
+        # message is a user turn it carries send-time notes (env/plan) that are NOT in
+        # the next request's copy, so mark the one before it and keep the notes uncached.
+        _rb = len(cached_msgs) - 1 if (cached_msgs and _is_tool_result_msg(cached_msgs[-1])) \
+            else len(cached_msgs) - 2
+        if _rb >= 0:
+            cached_msgs[_rb] = _mark_cache(cached_msgs[_rb])   # rolling recent breakpoint
         # 4th breakpoint: core tags the frozen post-compaction summary message with
         # cache_boundary=True. The [system][summary] prefix is stable until the next
         # compaction, so anchoring here caches the biggest static block at ~0.1x re-read.
@@ -793,7 +807,7 @@ class _ApiKeyClient:
         # part of the API schema).
         _bnd = max((k for k, mm in enumerate(cached_msgs) if mm.get("cache_boundary")),
                    default=None)
-        if _bnd is not None and _bnd != len(cached_msgs) - 2:
+        if _bnd is not None and _bnd != _rb:
             cached_msgs[_bnd] = _mark_cache(cached_msgs[_bnd])
         cached_msgs = [{k: v for k, v in mm.items() if k != "cache_boundary"}
                        for mm in cached_msgs]

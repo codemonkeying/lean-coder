@@ -9063,5 +9063,14 @@ check("composer: Enter clears the Tab candidate list (no stale /compact hints ne
 
 check("_visible_wait works with the Composer as stdout", _vw_ok is True)
 
+# Rolling cache breakpoint: mid tool-loop the LAST message (pure tool results, nothing
+# stitched) is marked; on a fresh user turn (send-time notes on it) the one BEFORE it is.
+import importlib.util as _ilu
+_aspec = _ilu.spec_from_file_location("_lc_aapi", str(lc.Path(lc.__file__).parent / "providers" / "anthropic_api.py"))
+_aapi = _ilu.module_from_spec(_aspec); _aspec.loader.exec_module(_aapi)
+_trm = {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "x", "content": "r"}]}
+check("cache: a pure tool-result message is the rolling breakpoint target",
+      _aapi._is_tool_result_msg(_trm) and not _aapi._is_tool_result_msg({"role": "user", "content": "hi"}))
+
 print("\n" + ("ALL PASS" if ok else "SOME FAILED"))
 sys.exit(0 if ok else 1)
