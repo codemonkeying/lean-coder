@@ -1,0 +1,2145 @@
+"""dispatch_worker - let the model hand a scoped sub-task to a headless WORKER
+agent that runs in the background, then collect its result later.
+
+WHY: some work is a self-contained errand - "read this large module and tell me
+where X is handled", "run the test suite and summarise the failures". Doing it
+inline burns the main session's context on raw output. A worker does it in its
+OWN session (own context, own model choice) and hands back only the answer.
+
+HOW (piggybacks the background-task machinery, adds no new transport):
+  - the model calls dispatch_worker(task=..., [model=...], [cwd=...]);
+  - we write a BRIEF file (the task + a GRANT header: leash, model, cwd, limits);
+  - we bg_launch `lean_coder --agent-run --brief-file B --result-file R` as a
+    detached task tagged kind="worker", with a lease (self-terminates if this
+    session dies / stops attending - caps runaway quota);
+  - the worker runs one brief on THIS box (the driver's provider + auth - no
+    per-box install/oauth), writes its answer between ===RESULT=== markers to R,
+    exits. Its file/command tools ride the same executor path this session uses.
+  - the finished worker is surfaced via /worker (workers are deliberately hidden
+    from /bg + the bg_status tool, so a session without this tool never sees them).
+
+LEASH: the worker's grant is set by the driver (the main AI) via the `leash` arg
+and capped at the driver's OWN live leash - MIN(requested, parent), the leash
+principle: a grant is never above the grantor's authority (see _capped_leash).
+So read/write/exec workers are ALL supported; the default is 'r' (a scout), and a
+write/exec worker inherits approval=auto headless (nobody's there to confirm), so
+grant rw/rwe deliberately. This is a driver_only tool: it spawns the worker process
+on the driver, so it is never pushed to / run on a remote executor.
+
+WORKER CEILINGS (the cost lever) - each resolves in priority order:
+  1. the env var (operator LOCKDOWN - still wins, a running session can't move it);
+  2. else the live cfg value (editable in /settings, saved to config, usable at once);
+  3. else the built-in default (shown below).
+  cfg field              /settings + config      env var                          default
+  worker_max_concurrent  most workers at once     LEANCODER_WORKER_MAX_CONCURRENT   10
+  worker_idle_timeout    lease secs; self-kill    LEANCODER_WORKER_IDLE_TIMEOUT     1800
+  worker_max_iterations  highest budget/worker   LEANCODER_WORKER_MAX_ITER         200
+  worker_default_iterations budget if none given LEANCODER_WORKER_DEFAULT_ITER     50
+
+RESUME: with cfg.worker_checkpoint on, a worker dumps its transcript to a
+'<brief>.checkpoint' sidecar each iteration; action='resume' (pid=, text=) relaunches a
+DEAD/timed-out/incomplete worker from that checkpoint (a NEW pid - resume is a fresh OS
+process; lineage kept in meta['resumed_from']). Off by default = no checkpoint file.
+"""
+import json
+import re
+import os
+import shlex
+import sys
+import time
+from pathlib import Path
+
+
+def _dbg_swallow():
+    """Debug bucket shim: hands a swallowed exception to lean-coder's _dbg_swallow
+    (a no-op unless LEANCODER_DEBUG=1). Never raises."""
+    for _m in ("__main__", "lean_coder"):
+        _f = getattr(sys.modules.get(_m), "_dbg_swallow", None)
+        if _f and _f is not _dbg_swallow:
+            try:
+                _f(2)
+            except Exception:
+                pass
+            return
+
+
+# Built-in ceiling defaults (last resort: env var > live cfg > this - see docstring).
+_DEFAULTS = {"max_concurrent": 10, "idle_timeout": 1800, "max_iterations": 200,
+             "default_iterations": 50,
+             "max_depth": 2, "max_children": 2}
+_ENV = {"max_concurrent": "LEANCODER_WORKER_MAX_CONCURRENT",
+        "idle_timeout": "LEANCODER_WORKER_IDLE_TIMEOUT",
+        "max_iterations": "LEANCODER_WORKER_MAX_ITER",
+        "default_iterations": "LEANCODER_WORKER_DEFAULT_ITER",
+        "max_depth": "LEANCODER_WORKER_MAX_DEPTH",
+        "max_children": "LEANCODER_WORKER_MAX_CHILDREN"}
+
+TOOL = {
+    "name": "dispatch_worker",
+    "glyph": "\u2691",
+    "description": (
+        "Run a self-contained sub-task in a background worker agent with its own context; "
+        "returns a pid. You get a done notice on a later turn, so don't poll: carry on or "
+        "end your turn. Good for errands whose output would bloat this session."),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "action": {"type": "string",
+                       "enum": ["dispatch", "models", "status", "result", "transcript",
+                                "cancel", "pause", "resume", "inject"],
+                       "default": "dispatch",
+                       "description": "dispatch: start a worker from task. models: list usable "
+                                      "models. status: all workers, or one with pid. result/"
+                                      "transcript: a worker's full result or its own tool trail, "
+                                      "paged (transcript needs worker_checkpoint). cancel: kill "
+                                      "and discard. pause: save as a session and stop. resume: "
+                                      "restart a paused, dead or capped worker. inject: send text "
+                                      "to a running worker."},
+            "task": {"type": "string",
+                     "description": "For dispatch: what to do and what to report back. The "
+                                    "worker sees nothing else."},
+            "prompt": {"type": "string",
+                       "description": "Optional role prompt put before the task."},
+            "context": {"type": "string",
+                        "description": "Background state the worker needs beyond the task."},
+            "pid": {"type": "integer", "description": "Worker to act on."},
+            "text": {"type": "string",
+                     "description": "inject: a correction read on its next step. resume: a new steer."},
+            "model": {"type": "string",
+                      "description": "Worker model (see models); default your own. Use "
+                                     "provider::model if the name is on several providers."},
+            "host": {"type": "string",
+                     "description": "Machine for the worker's tools ([user@]host or /connect "
+                                    "name); default this session's target."},
+            "cwd": {"type": "string", "description": "Working directory; default current."},
+            "from_session": {"type": "string",
+                             "description": "Saved session to seed the worker's history; task "
+                                            "becomes a steer on top."},
+            "taskboard": {"type": "string",
+                          "description": "Board the worker marks its task done on."},
+            "iterations": {"type": "integer",
+                           "description": "Tool-call budget (default 50, max 200; both set "
+                                          "in settings). On resume, a fresh budget."},
+            "leash": {"type": "string", "enum": ["r", "rw", "rwe"], "default": "r",
+                      "description": "r=read-only, rw=edit, rwe=edit+run; capped at yours."},
+            "page": {"type": "integer", "description": "Page for result/transcript (from 1)."},
+        },
+        "required": [],
+    },
+    "driver_only": True,   # spawns the worker process on the driver; never pushed remotely
+    "no_timeout": True,    # launches/awaits a background worker agent; long-by-design
+    # NOT safe: dispatching a worker spends quota + runs commands, so it confirms
+    # unless approval is auto/armed (same policy as any non-read tool).
+}
+
+# Captured from core in setup(). A tool's run() doesn't get lc, so we stash the
+# hooks + helpers here at startup (setup runs driver-only, which is where a worker
+# is launched - so these are always present when run() fires).
+_H = {}
+
+
+def _ceiling(key):
+    """An integer worker ceiling, resolved in priority order:
+      1. the env var (LEANCODER_WORKER_*) if set + valid - an operator LOCKDOWN that
+         a running session can't move;
+      2. else the live cfg value (worker_<key>), editable in /settings + persisted to
+         config - the user's own knob, usable straight away;
+      3. else the built-in default.
+    So users get simple, persistent control via /settings, while an env var still wins
+    as a hard ceiling when the operator wants one."""
+    env = os.environ.get(_ENV.get(key, ""), "")
+    if env.strip():
+        try:
+            return int(env)
+        except ValueError:
+            _dbg_swallow()
+    cfg = _H.get("cfg")
+    val = getattr(cfg, f"worker_{key}", None) if cfg else None
+    if isinstance(val, int):
+        return val
+    return _DEFAULTS[key]
+
+
+def _governor_check(my_depth):
+    """Safe-recursion gate for the process trying to spawn a worker. `my_depth` is this
+    process's depth in the worker tree (driver = 0, its workers = 1, ...). Returns
+    (ok, error_str, granted_child_budget):
+      - the DRIVER (depth 0) may always spawn (only max_concurrent bounds it); the child
+        it makes is depth 1 and gets a child budget of worker_max_children.
+      - a WORKER (depth >= 1) may spawn ONLY IF depth < worker_max_depth AND it still has
+        child budget left (granted by its parent, decremented per spawn). The child it
+        makes is depth my_depth+1 and inherits a SHRINKING budget (its own remaining
+        minus the one it's spending), so a subtree is bounded by depth x count, never a
+        fork-bomb. Both gates REFUSE loudly rather than silently succeed."""
+    cfg = _H.get("cfg")
+    max_depth = _ceiling("max_depth")
+    if my_depth <= 0:
+        # The driver: ungated here (max_concurrent is its bound). Its children are depth 1
+        # and get the operator's per-worker child allowance.
+        return True, "", _ceiling("max_children")
+    if my_depth >= max_depth:
+        return (False, (f"error: recursion depth limit reached (this worker is at depth "
+                        f"{my_depth}, worker_max_depth is {max_depth}). A worker at the max "
+                        f"depth cannot spawn its own workers. Raise worker_max_depth / "
+                        f"LEANCODER_WORKER_MAX_DEPTH to allow deeper recursion."), 0)
+    remaining = int(getattr(cfg, "worker_child_budget", 0) or 0)
+    if remaining <= 0:
+        return (False, ("error: this worker was granted no child budget (worker_max_children "
+                        "is 0, or its budget is spent), so it cannot spawn workers. "
+                        "Raise worker_max_children / "
+                        "LEANCODER_WORKER_MAX_CHILDREN to grant one."), 0)
+    # Spend one from this worker's budget; the child inherits what's left after this spawn.
+    cfg.worker_child_budget = remaining - 1
+    return True, "", remaining - 1
+
+
+def _capped_leash(requested):
+    """The worker's granted leash = MIN(requested, the parent's LIVE leash). A worker
+    can NEVER exceed its parent's authority (the leash principle: a grant is <= the
+    grantor's own). requested defaults to 'r' (read-only). Junk -> 'r'. Reads the
+    parent's leash off the live cfg captured in setup(), so a runtime /leash change is
+    respected. Returns (granted_leash, was_downgraded)."""
+    levels = _H["LEASH_LEVELS"]                       # ("chat","r","rw","rwe")
+    req = _H["_norm_leash"](requested) or "r"
+    if req == "chat":                                 # a worker with no tools is pointless
+        req = "r"
+    parent = getattr(_H.get("cfg"), "leash", "rwe") or "rwe"
+    granted = req if levels.index(req) <= levels.index(parent) else parent
+    return granted, (granted != req)
+
+
+def _workers_dir():
+    """Where this driver's worker files (brief/result/progress/checkpoint...) live: its
+    OWN per-process runtime dir, beside its bg task records - so they share one
+    lifecycle (removed on clean exit, reaped by pid-liveness after a crash; never by
+    age). Falls back to CONFIG_DIR/workers only on a core that predates run dirs."""
+    rpd = _H.get("_run_pid_dir")
+    return Path(rpd()) if rpd else Path(_H["CONFIG_DIR"]) / "workers"
+
+
+def _live_provider_settings():
+    """The driver's live provider-held settings (capture_settings hook, e.g. the account
+    label after a session-only switch) as {"provider": name, "settings": {...}}, so the
+    worker runs on the same account as its driver instead of config.toml's default."""
+    try:
+        cfg, gp = _H.get("cfg"), _H.get("get_provider")
+        prov = getattr(cfg, "provider", "") if cfg else ""
+        spec = gp(prov) if (gp and prov) else None
+        if spec and spec.get("capture_settings"):
+            got = spec["capture_settings"](None, cfg) or {}
+            filt = _H.get("_inheritable_settings")
+            got = filt(prov, got) if filt else {
+                k: v for k, v in got.items()
+                if k in tuple(spec.get("worker_inherit") or ("account",))
+                and not _SECRETISH_KEY.search(k)}
+            if got:
+                return {"provider": prov, "settings": got}
+    except Exception:
+        pass
+    return None
+
+
+def _grant_settings(worker_provider):
+    """The driver's live provider settings, but ONLY when the worker runs on the
+    driver's own provider (an account label means nothing to another provider)."""
+    ps = _live_provider_settings()
+    if not ps:
+        return None
+    if worker_provider and worker_provider != ps.get("provider"):
+        return None
+    return ps
+
+
+def _compose_brief(task, model, cwd, max_iter, leash="r", provider="", brain_host="",
+                   tools="", context="", plan="", notes="", depth=0, child_budget=0,
+                   checkpoint=False, resume="", taskboard="", session="",
+                   provider_settings=None):
+    """Build the brief file text: the task wrapped in BRIEF markers + a GRANT header.
+    `leash` is the already-capped grant (see _capped_leash). `provider` (optional) is
+    the backend the worker must activate for `model`; absent = inherit the driver's.
+    `brain_host` (optional) is an ollama inference endpoint for the worker's BRAIN,
+    distinct from where its tools run; absent = the driver's own host. `tools`
+    (optional) is a comma-separated allowlist of tool names; absent = full toolset.
+    `context`/`plan`/`notes` (optional) seed the worker with curated STATE - a
+    background blob, a starting plan, notebook entries - each emitted as its own marker
+    block the worker parses in run_agent_brief. Not truncated: the parent decides how
+    much state the job needs. `depth` is this worker's depth in the tree (driver->worker
+    = 1); `child_budget` is how many children it may itself spawn (0 = none) - both drive
+    the safe-recursion governor."""
+    B, G = _H["BRIEF_MARK"], _H["GRANT_MARK"]
+    # Model-written fields must never forge a grant: a GRANT marker inside the task or
+    # seed text (parsed LAST-pair-wins) or a newline inside a grant value (a second
+    # 'leash:' line) would otherwise override the capped leash/cwd.
+    _defang = lambda t: (t or "").replace(G, "=== GRANT ===")
+    _one = lambda v: _defang(str(v).replace("\r", " ").replace("\n", " ")) if v else v
+    task, context, plan, notes = _defang(task), _defang(context), _defang(plan), _defang(notes)
+    model, provider, brain_host, tools, cwd = map(_one, (model, provider, brain_host, tools, cwd))
+    taskboard, leash, resume = _one(taskboard), _one(leash), _one(resume)
+    grant = [f"leash: {leash}", f"cwd: {cwd}", f"max_iterations: {max_iter}"]
+    if model:
+        grant.append(f"model: {model}")
+    if provider:
+        grant.append(f"provider: {provider}")
+    if brain_host:
+        grant.append(f"brain_host: {brain_host}")
+    if tools:
+        grant.append(f"tools: {tools}")
+    if depth:
+        grant.append(f"depth: {depth}")
+    if child_budget:
+        grant.append(f"child_budget: {child_budget}")
+    if checkpoint:
+        grant.append("checkpoint: 1")
+    if taskboard:
+        grant.append(f"taskboard: {taskboard}")
+    if session:                               # seeded from a saved session: report goes back there
+        grant.append(f"session: {_one(session)}")
+    if provider_settings:                     # driver's LIVE provider-held settings (e.g. account)
+        import json as _json
+        grant.append("provider_settings: " + _one(_json.dumps(provider_settings, sort_keys=True)))
+    out = [f"{B}\n{task.strip()}\n{B}", f"{G}\n" + "\n".join(grant) + f"\n{G}"]
+    for text, mark_key in ((context, "SEED_CONTEXT_MARK"), (plan, "SEED_PLAN_MARK"),
+                           (notes, "SEED_NOTES_MARK")):
+        if text and text.strip():
+            m = _H[mark_key]
+            out.append(f"{m}\n{text.strip()}\n{m}")
+    # A resumed worker: point it at the dead worker's transcript checkpoint. run_agent_brief
+    # reloads that transcript, then runs `task` as a fresh steer turn on top of it.
+    if resume:
+        rm = _H["RESUME_MARK"]
+        out.append(f"{rm}\n{resume.strip()}\n{rm}")
+    return "\n".join(out) + "\n"
+
+
+def _self_argv():
+    """The command that launches THIS lean-coder as a headless worker. Uses the same
+    interpreter + the CORE module file (captured as lc["__file__"] in setup()), so the
+    worker is the exact build the parent runs (no PATH lookup, no version drift)."""
+    core = Path(_H["__file__"]).resolve()
+    return f"{shlex.quote(sys.executable)} {shlex.quote(str(core))}"
+
+
+def _tb_arg(args):
+    """The optional taskboard scope for a team action (pause_all/stop_all/resume_all):
+    args['taskboard'] stripped, or None = all workers this session (unscoped)."""
+    tb = (args.get("taskboard") or "").strip()
+    return tb or None
+
+
+def run(args, cwd):
+    if "bg_launch" not in _H:
+        return ("error: dispatch_worker is not initialised (its setup() did not run; "
+                "it must be enabled as a driver lean-tool).")
+    action = (args.get("action") or "dispatch").strip().lower()
+    if action == "status":
+        return _worker_status(args.get("pid"))
+    if action == "models":
+        return _worker_models()
+    if action == "result":
+        return _worker_result(args.get("pid"), args.get("page"))
+    if action == "cancel":
+        return _worker_cancel(args.get("pid"))
+    if action == "pause":
+        return _worker_pause(args.get("pid"), args.get("name"))
+    if action == "pause_all":
+        return _worker_pause_all(_tb_arg(args))
+    if action == "stop_all":
+        return _worker_stop_all(_tb_arg(args))
+    if action == "resume_all":
+        return _worker_resume_all(cwd, _tb_arg(args))
+    if action == "inject":
+        return _worker_inject(args.get("pid"), args.get("text"), source="parent-agent")
+    if action == "set_plan":
+        return _worker_set_plan(args.get("pid"), args.get("plan") or args.get("text"))
+    if action == "add_note":
+        return _worker_add_note(args.get("pid"), args.get("notes") or args.get("text"))
+    if action == "resume":
+        return _worker_resume(args.get("pid"), args.get("text") or args.get("task"), cwd,
+                              iterations=args.get("iterations"))
+    if action == "transcript":
+        return _worker_transcript(args.get("pid"), args.get("page"))
+    if action == "promote":
+        return _worker_promote(args.get("pid"), args.get("name") or args.get("text"))
+    if action != "dispatch":
+        return ("error: unknown action %r (use dispatch | models | status | result | "
+                "transcript | cancel | pause | resume | inject)." % action)
+    task = (args.get("task") or "").strip()
+    prompt_note = ""
+    if task and args.get("prompt"):
+        task, prompt_note = (_H.get("with_worker_prompt") or (lambda n, t: (t, "")))(
+            args.get("prompt"), task)
+    if not task:
+        return "error: dispatch_worker action='dispatch' needs a non-empty task."
+    # Optional: SEED this fresh worker from a saved SESSION (or any checkpoint-shaped
+    # file) - the unified {meta,messages} envelope means a session file is a valid
+    # worker checkpoint. Given a bare name, resolve it under CONFIG_DIR/sessions.
+    # run_agent_brief reloads that transcript, then runs `task` as a steer turn on top.
+    seed_session = (args.get("from_session") or "").strip()
+    seed_resume = ""
+    seed_session_name = ""     # the session-file STEM, if seeded from one under sessions/
+    if seed_session:
+        p = Path(seed_session)
+        if not p.is_file():
+            cand = Path(_H["CONFIG_DIR"]) / "sessions" / (seed_session + ".json")
+            if cand.is_file():
+                p = cand
+        if not p.is_file():
+            return (f"error: from_session {seed_session!r} not found "
+                    f"(looked for a file and under CONFIG_DIR/sessions/).")
+        seed_resume = str(p.resolve())
+        # If it's a real session file (under sessions/, .json), remember its NAME so the
+        # bg record carries from_session=<name> - lets a REPL that opens the same session
+        # detect it's being driven by this live worker and offer a take-over (no .lock is
+        # held: a worker runs headless with autosave off).
+        try:
+            sess_dir = (Path(_H["CONFIG_DIR"]) / "sessions").resolve()
+            if p.resolve().parent == sess_dir and p.suffix == ".json":
+                seed_session_name = p.stem
+        except Exception:
+            seed_session_name = ""
+    # SAFE-RECURSION governor: is THIS process allowed to spawn a worker at all, and if
+    # so how many? The driver (worker_depth 0) is governed only by max_concurrent. A
+    # WORKER (depth >= 1) must pass two gates before it can spawn a child:
+    #   (a) DEPTH: my depth < worker_max_depth (default 1 -> a depth-1 worker is blocked;
+    #       recursion is opt-IN by raising the ceiling).
+    #   (b) CHILD BUDGET: I was granted a child budget by my parent, and I have some left
+    #       (each spawn decrements it). Grandchildren get a SHRINKING budget so a subtree
+    #       is bounded by depth x a decrementing count, not a flat number.
+    # Both refuse rather than silently succeed - a misfire can't fork-bomb the API.
+    _cfg = _H.get("cfg")
+    my_depth = int(getattr(_cfg, "worker_depth", 0) or 0)
+    ok, why, child_budget = _governor_check(my_depth)
+    if not ok:
+        return why
+
+    # Operator ceiling: concurrency.
+    bg_list = _H["bg_list"]
+    max_conc = _ceiling("max_concurrent")
+    live = bg_list(kind="worker")
+    if max_conc and len(live) >= max_conc:
+        return (f"error: at the worker limit ({max_conc} running). Wait for one to "
+                f"finish (its result reaches you automatically) or raise "
+                f"LEANCODER_WORKER_MAX_CONCURRENT.")
+
+    # Model + provider. Default: inherit the driver's current model+provider (both
+    # blank -> the worker keeps whatever it activates). A `model` may be ANY model on
+    # ANY enabled provider; we infer its provider from the enabled-provider->models
+    # map. An explicit `provider` disambiguates (same model name on two backends) or
+    # forces a backend. Validated against real availability so
+    # a bad name fails HERE (loud) rather than silently falling back inside the worker.
+    model = (args.get("model") or "").strip()
+    provider = (args.get("provider") or "").strip()   # still honoured from /worker and old callers
+    if "::" in model:     # provider::model picks a provider ('/' and ':' occur in model names)
+        p, _, m = model.partition("::")
+        p, m = p.strip(), m.strip()
+        if not p or not m:
+            return "error: model must be 'name' or 'provider::name'."
+        provider, model = p, m
+    brain_host = (args.get("brain_host") or "").strip()
+    inherited = not model and not provider and not brain_host
+    if inherited:
+        # Default: the driver's LIVE provider+model (a /model switch this session is not
+        # in the config file the worker process loads, so pass it explicitly).
+        _dcfg = _H.get("cfg")
+        try:
+            provider = (getattr(_dcfg, "provider", "") or "").strip()
+            model = (_dcfg.active_model() or "").strip() if _dcfg else ""
+        except Exception:
+            provider = model = ""
+    # brain_host relocates INFERENCE to a different ollama endpoint. The model then
+    # lives on THAT box, not the driver's, so we can't validate it against the driver's
+    # enabled-provider models - it's implicitly the ollama provider on the remote
+    # endpoint. Resolve the alias and default provider to ollama.
+    if brain_host:
+        resolve = _H.get("resolve_host") or (lambda h, m=None: h)
+        machines = getattr(_H.get("cfg"), "machines", {}) or {}
+        brain_host = _H.get("_norm_host", lambda h: h)(resolve(brain_host, machines))
+        if not provider:
+            provider = "ollama"
+        if provider != "ollama":
+            return "error: brain_host is ollama-only (inference endpoints are ollama URLs)."
+    if (model or provider) and not brain_host and not inherited:   # the driver's own pair needs no check
+        pmodels = _H.get("enabled_provider_models", lambda: {})()
+        if provider and provider not in pmodels:
+            return (f"error: provider '{provider}' is not enabled. Enabled: "
+                    f"{', '.join(pmodels) or '(none)'}.")
+        if model:
+            # Which enabled provider(s) offer this model?
+            hosts = [p for p, ms in pmodels.items() if model in (ms or [])]
+            if provider:
+                if model not in (pmodels.get(provider) or []):
+                    avail = ', '.join(pmodels.get(provider) or []) or '(unknown)'
+                    return (f"error: model '{model}' is not available on provider "
+                            f"'{provider}'. available there: {avail}")
+            elif len(hosts) == 1:
+                provider = hosts[0]                      # unambiguous -> infer it
+            elif len(hosts) > 1:
+                return (f"error: model '{model}' exists on multiple enabled providers "
+                        f"({', '.join(hosts)}); pass model='<provider>::{model}' to pick one.")
+            else:
+                allm = ', '.join(sorted({m for ms in pmodels.values() for m in ms})) or '(unknown)'
+                return (f"error: model '{model}' is not available on any enabled "
+                        f"provider. available: {allm}")
+
+    # Where the worker's TOOLS run. Precedence:
+    #   1. an explicit `host` arg -> run the worker's tools on THAT machine. We ensure a
+    #      live ssh master to it HERE, in the foreground (the one place a password can be
+    #      entered - a detached worker can't answer a prompt). Key auth is silent.
+    #   2. else the PARENT's live remote -> ride the same executor path the parent uses.
+    #   3. else local on the driver.
+    want_host = (args.get("host") or "").strip()
+    if want_host:
+        ensure = _H.get("ensure_worker_master")
+        if ensure is None:
+            return "error: this build can't target a host for a worker (update lean-coder)."
+        remote = ensure(want_host)
+        if "error" in remote:
+            return (f"error: {remote['error']}. Worker not dispatched; retry once "
+                    f"'{want_host}' is reachable.")
+        wcwd = (args.get("cwd") or "").strip() or remote["cwd"]
+    else:
+        remote = _H.get("active_remote", lambda: None)()
+        if remote:
+            # A detached worker can't answer an auth prompt, so the master MUST be live NOW
+            # (we're in the foreground dispatch call - the one place a password could be
+            # entered). Verify it; if it's down, tell the operator to reconnect.
+            alive = _H.get("_ssh_master_alive", lambda *a: False)(remote["host"], remote["ctl"])
+            if not alive:
+                return (f"error: connected to {remote['host']} but its ssh master isn't live "
+                        f"- a worker can't authenticate on its own. Run a remote command (or "
+                        f"/connect {remote['host']}) to re-establish it, then retry.")
+            # cwd is on the REMOTE: default to the parent's remote cwd, don't stat locally.
+            wcwd = (args.get("cwd") or "").strip() or remote["cwd"]
+        else:
+            wcwd = (args.get("cwd") or "").strip() or cwd
+            if not Path(wcwd).is_dir():
+                return f"error: cwd is not a directory: {wcwd}"
+
+    # Leash: cap the requested grant at the parent's live authority (never exceed it).
+    leash, downgraded = _capped_leash(args.get("leash") or "r")
+    cap_note = ""
+    if downgraded:
+        cap_note = (f" (capped to '{leash}' - a worker can't exceed your current "
+                    f"'{getattr(_H.get('cfg'), 'leash', '?')}' leash)")
+
+    # Optional per-worker tool allowlist. Accept a list or a comma string; validate every
+    # name against what the PARENT actually exposes so a typo fails loud HERE, not silently
+    # inside the worker. Meta tools (plan/note/compaction) are always kept, so a caller
+    # need not list them. Empty after filtering -> treat as no restriction.
+    tools_arg = args.get("tools")
+    tools_csv = ""
+    if tools_arg:
+        if isinstance(tools_arg, str):
+            want_tools = [t.strip() for t in tools_arg.split(",") if t.strip()]
+        else:
+            want_tools = [str(t).strip() for t in tools_arg if str(t).strip()]
+        want_tools = _H.get("_tool_alias_names", list)(want_tools)   # web_screenshot -> view
+        _META = {"update_plan", "note", "request_compact"}
+        want_tools = [t for t in want_tools if t not in _META]
+        if want_tools:
+            parent_tools = _H.get("active_tool_names", lambda: set())()
+            # Fail CLOSED: with no readable parent surface we can't prove the driver has
+            # these tools, and the worker force-enables granted lean-tools - so refuse
+            # rather than wave unchecked names through.
+            if not parent_tools:
+                return ("error: can't verify your own tools right now, so tools=[...] can't "
+                        "be granted. Dispatch without tools= (full leash surface) or retry.")
+            bad = [t for t in want_tools if t not in parent_tools]
+            if bad:
+                return (f"error: you don't have these tools to grant: {', '.join(bad)}. "
+                        f"Available: {', '.join(sorted(parent_tools))}.")
+            # A named tool the worker's LEASH would filter out must fail here, not be
+            # reported as granted and then vanish from the worker's surface.
+            _need = _H.get("tool_min_leash")
+            if _need:
+                _lv = _H["LEASH_LEVELS"]
+                short = [(t, _need(t)) for t in want_tools]
+                short = [(t, n) for t, n in short if n and _lv.index(n) > _lv.index(leash)]
+                if short:
+                    return (f"error: at leash '{leash}' the worker can't use "
+                            + ", ".join(f"{t} (needs '{n}')" for t, n in short)
+                            + ". Dispatch with a higher leash; tools=[...] still limits it to "
+                              "exactly the tools you list.")
+            tools_csv = ",".join(want_tools)
+
+    # Optional named task-board (Phase 2b): assign this worker to a task DAG board by NAME.
+    # The worker's run_agent_brief auto-loads the `board` lean-tool when this is set (so it
+    # can report done/list) and injects the report-done contract into its brief. The driver has usually already added+assigned
+    # the task on the board; this just tells the worker WHICH board to report to.
+    taskboard = (args.get("taskboard") or "").strip()
+
+    # Optional seed STATE the parent curated: a background blob, a starting plan, and
+    # notebook lines. NOT size-capped - "share state, not context" is a discipline for
+    # the parent to exercise, not something to enforce by clipping the payload to a
+    # useless state (an emergency brief may legitimately need a lot of context; a hard
+    # cap could silently truncate the one step that matters). Passed through whole.
+    seed_context = (args.get("context") or "").strip()
+    seed_plan = (args.get("plan") or "").strip()
+    seed_notes = (args.get("notes") or "").strip()
+    # Per-worker iteration budget: the driver MAY request a cap at dispatch (e.g. a tight
+    # leash for a scout, a longer one for a refactor), but it is capped at the operator
+    # ceiling (env > cfg > default) - a grant is never above the grantor's authority, and
+    # an env lockdown stays a hard limit. Junk/non-positive -> silently fall back to the
+    # ceiling (never crash on a bad arg).
+    _ceil_iter = _ceiling("max_iterations")
+    _req_iter = args.get("iterations")
+    # 0 means unlimited, for the ceiling and the default alike.
+    _dflt = _ceiling("default_iterations")
+    if _ceil_iter > 0:
+        max_iter = min(_dflt, _ceil_iter) if _dflt > 0 else _ceil_iter
+    else:
+        max_iter = max(_dflt, 0)
+    if _req_iter is not None:
+        try:
+            _ri = int(_req_iter)
+            if _ri > 0:
+                max_iter = min(_ri, _ceil_iter) if _ceil_iter > 0 else _ri
+                if _ceil_iter > 0 and _ri > _ceil_iter:   # tell the driver its request was clamped (silent before)
+                    cap_note += (f" (iterations {_ri} capped to the {_ceil_iter} ceiling - "
+                                 f"raise via /set worker_max_iterations)")
+        except (TypeError, ValueError):
+            _dbg_swallow()
+    idle_timeout = _ceiling("idle_timeout")
+    # Progress-staleness watchdog: bark (alert the parent), never bite. The worker bumps
+    # its .progress file every iteration, so if that mtime goes stale the worker is stuck
+    # (model looping / hung tool) rather than just quiet - distinct from idle_timeout,
+    # which fires on the PARENT dying. Default = half the idle timeout, floored at 300s;
+    # silence != dead, so it only alerts and the operator decides (cancel/inject).
+    hb_timeout = max(300, idle_timeout // 2) if idle_timeout else 0
+
+    # Write the brief + result-file targets in this driver's run dir.
+    wdir = _workers_dir()
+    try:
+        wdir.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        return f"error: cannot create workers dir: {e}"
+    # Unique per worker: two workers dispatched in the SAME second must not share a
+    # brief/result path (os.getpid() is the parent's - identical for all of them), or
+    # the second's ===RESULT=== overwrites the first's. A per-session monotonic counter
+    # guarantees uniqueness even within one second.
+    _H["_seq"] = _H.get("_seq", 0) + 1
+    stamp = f"{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}-{_H['_seq']}"
+    brief_file = wdir / f"{stamp}.brief"
+    result_file = wdir / f"{stamp}.result"
+    # Checkpoint the transcript (opt-in) so a dead/timed-out worker can be action='resume'd.
+    # A session-seeded worker turns it ON regardless (so it can be promoted back later).
+    do_checkpoint = bool(getattr(_cfg, "worker_checkpoint", False)) or bool(seed_resume)
+    try:
+        brief_file.write_text(_compose_brief(task, model, wcwd, max_iter, leash=leash,
+                                             provider=provider, brain_host=brain_host,
+                                             tools=tools_csv, context=seed_context,
+                                             plan=seed_plan, notes=seed_notes,
+                                             depth=my_depth + 1, child_budget=child_budget,
+                                             checkpoint=do_checkpoint,
+                                             taskboard=taskboard, resume=seed_resume,
+                                             session=seed_session_name,
+                                             provider_settings=_grant_settings(provider)))
+    except OSError as e:
+        return f"error: cannot write brief file: {e}"
+
+    # The worker PROCESS always runs on the driver; when attached to a remote its
+    # driver-local cwd is irrelevant (tools run remotely), so launch it from the parent's
+    # cwd there. --cwd is the worker's LOCAL cfg.cwd (driver); when remote, run_agent_brief
+    # leaves cfg.cwd at the driver default and the remote workspace carries wcwd instead.
+    launch_cwd = cwd if remote else wcwd
+    cmd = (f"{_self_argv()} --agent-run "
+           f"--brief-file {shlex.quote(str(brief_file))} "
+           f"--result-file {shlex.quote(str(result_file))} "
+           f"--cwd {shlex.quote(launch_cwd)}")
+    if remote:
+        cmd += (f" --remote-host {shlex.quote(remote['host'])} "
+                f"--remote-ctl {shlex.quote(remote['ctl'])}")
+    if brain_host:
+        # Point the worker's INFERENCE at a different ollama endpoint than the driver.
+        # (Distinct from --remote-host, which relocates the worker's TOOLS.)
+        cmd += f" --host {shlex.quote(brain_host)}"
+    launched = _H["bg_launch"](cmd, cwd=launch_cwd, kind="worker", idle_timeout=idle_timeout,
+                               heartbeat_timeout=hb_timeout,
+                               heartbeat_file=str(brief_file) + ".progress",
+                               meta=({"from_session": seed_session_name}
+                                     if seed_session_name else None))
+    if "error" in launched:
+        return f"error: could not launch worker: {launched['error']}"
+
+    # Remember the result-file per pid so /worker can harvest it.
+    where = remote["host"] if remote else "local"
+    _H["workers"][launched["pid"]] = {"result": str(result_file), "task": task,
+                                      "started": time.time(), "model": model or "(default)",
+                                      "where": where, "log": launched.get("log"),
+                                      "brief": str(brief_file),
+                                      "checkpoint": do_checkpoint, "cmd": cmd,
+                                      "launch_cwd": launch_cwd, "idle_timeout": idle_timeout,
+                                      "hb_timeout": hb_timeout, "taskboard": taskboard}
+    mstr = model or "current model"
+    lstr = {"r": "read-only", "rw": "read+write", "rwe": "read+write+exec"}.get(leash, leash)
+    _H["workers"][launched["pid"]]["leash"] = leash
+    _publish_subs()
+    wnote = f"on {remote['host']}" if remote else "local (driver)"
+    tnote = f", tools limited to [{tools_csv}]" if tools_csv else ""
+    seeds = [n for n, v in (("context", seed_context), ("plan", seed_plan),
+                            ("notes", seed_notes)) if v]
+    snote = f", seeded {'+'.join(seeds)}" if seeds else ""
+    return (f"dispatched worker pid {launched['pid']} ({mstr}, {lstr}, tools {wnote}"
+            f"{tnote}{snote}, cwd {wcwd}){cap_note}.\n"
+            + (f"Note: {prompt_note}.\n" if prompt_note else "") +
+            f"It runs in the background and its result arrives as a notice on a later turn, "
+            f"so there's no need to poll. Carry on, or end your turn if there's nothing else.")
+
+
+def _read_result(path):
+    """The worker's ===RESULT=== block from its result file, or None if not written
+    yet / unreadable."""
+    try:
+        text = Path(path).read_text()
+    except OSError:
+        return None
+    # The writer frames the file as marker line / block / marker line, so take exactly
+    # that frame: whatever the block quotes, its head survives.
+    mark = _H["RESULT_MARK"]
+    lines = text.strip().split("\n")
+    if len(lines) >= 2 and lines[0].strip() == mark and lines[-1].strip() == mark:
+        res = "\n".join(lines[1:-1]).strip()
+    else:
+        ext = _H.get("_extract_fenced") or _H["_extract_marked"]
+        res = ext(text, mark)
+    return _with_reason(res, path)
+
+
+def _with_subs(res, path):
+    """Append the '(this worker spawned ...)' harness line to a result SHOWN to the
+    driver/operator (finish notice, action=result). Not part of _read_result: board
+    result_ref and resume must get the bare result."""
+    if res is None:
+        return None
+    sub = _subs_summary(path)
+    return f"{res.rstrip()}\n{sub}" if sub else res
+
+
+_NO_OUTPUT = "(worker produced no output"
+_ERR_LINE = re.compile(r"error|fail|expired|denied|not authenticated|unauthori[sz]ed|"
+                       r"forbidden|refused|timed? ?out|HTTP \d{3}|traceback|exception", re.I)
+_SECRETISH_KEY = re.compile(r"key|token|secret|passw|auth|url|cookie|cred", re.I)
+
+# Only HARNESS-written log lines may supply a failure reason - never arbitrary tool
+# output (a tool printing "0 errors" or a test's traceback must not become the worker's
+# "reason"). Every failure/auth line the worker harness emits carries this prefix.
+_HARNESS_LINE = re.compile(r"^agent-run:")
+
+# Fallback copy of core's _redact (tools don't import core; setup() swaps in core's own
+# so both sides stay identical). Keep in sync with lean_coder._REDACT.
+_REDACT = [
+    (re.compile(r"(Bearer\s+)\S+", re.I), r"\1***"),
+    (re.compile(r"((?:api[_-]?key|token|secret|password|authorization)[\"']?\s*[:=]\s*)"
+                r"(?:\"[^\"]*\"|'[^']*'|\S+)", re.I), r"\1***"),
+    (re.compile(r"([?&](?:[\w-]*(?:token|key|secret|sig|signature|auth)[\w-]*)=)[^&\s]+", re.I),
+     r"\1***"),
+    (re.compile(r"\bsk-[^\s\"',;)]+"), "sk-***"),
+    # long opaque runs: >=32 chars, at least one digit, no '/', not lower snake_case,
+    # not pure hex (32-64: SHAs/hashes) and not UUID-shaped (request IDs)
+    # (paths and identifiers are kept)
+    (re.compile(r"(?<![\w+/=-])(?![0-9a-fA-F]{32,64}(?![\w+/=-]))(?![0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}(?![\w+/=-]))(?=[A-Za-z0-9+_=-]*\d)(?![a-z0-9_]*_[a-z0-9_]*(?![\w+/=-]))[A-Za-z0-9+_-]{32,}={0,2}(?![\w+/=-])"), "***"),
+]
+
+
+def _redact(text):
+    """Mask secret-looking spans (bearer tokens, key=/token: values incl. quoted JSON,
+    sk- keys, long opaque digit-bearing runs, token/key URL params)."""
+    core = _H.get("_redact")
+    if core is not None and core is not _redact:
+        return core(text)
+    text = str(text or "")
+    for rx, rep in _REDACT:
+        text = rx.sub(rep, text)
+    return text
+
+
+def _sidecar_reason(result_path):
+    """The worker's self-written failure cause (<result>.reason), redacted; "" if none."""
+    try:
+        return _redact(" ".join(Path(str(result_path) + ".reason").read_text(
+            errors="replace").split()))[:200]
+    except OSError:
+        return ""
+
+
+def _log_reason(result_path):
+    """Short one-line failure cause: the worker's own <result>.reason sidecar first;
+    else the last harness-written error lines of its bg log (the generic 'agent-run:
+    failed/done ->' trailer skipped, tool output ignored). Always redacted. "" if none."""
+    own = _sidecar_reason(result_path) if result_path else ""
+    if own:
+        return own
+    meta = next((m for m in (_H.get("workers") or {}).values()
+                 if m.get("result") == str(result_path)), None) or {}
+    log = meta.get("log")
+    if not log:
+        return ""
+    try:
+        raw = Path(log).read_text(errors="replace").splitlines()[-200:]
+    except OSError:
+        return ""
+    hits = []
+    for ln in raw:
+        ln = re.sub(r"\x1b\[[0-9;]*m", "", ln).strip()
+        if not ln or re.match(r"agent-run: (failed|done|incomplete)\b", ln):
+            continue
+        if not _HARNESS_LINE.search(ln):
+            continue
+        if ln.startswith("agent-run:") and not _ERR_LINE.search(ln):
+            continue
+        ln = _redact(ln)
+        if ln not in hits:
+            hits.append(ln)
+    return " / ".join(hits[-2:])[:200]
+
+
+def _with_reason(res, path):
+    """An empty/no-output result always carries a reason: a bare/unknown one is filled
+    from the worker's log, else 'unknown'."""
+    if res is None:
+        return None
+    r = res.strip()
+    if r and not r.startswith(_NO_OUTPUT):
+        return res   # a successful report is the worker's own text: return it unchanged
+    if r.startswith(_NO_OUTPUT + ";") and not r.endswith("reason: unknown)"):
+        return _redact(res)
+    why = _log_reason(path) or "unknown"
+    return f"{_NO_OUTPUT}; reason: {why})"
+
+
+def _read_usage(result_path):
+    """A finished worker's token spend from its '<brief>.usage' sidecar (written on exit
+    by run_agent_brief). Returns (in_tokens, out_tokens); (0, 0) if absent/unreadable.
+    Observability: summed for /worker status, nothing gates on it."""
+    try:
+        txt = Path(_brief_from_result(result_path) + ".usage").read_text()
+    except OSError:
+        return 0, 0
+    vin = vout = 0
+    for tok in txt.split():
+        k, _, v = tok.partition("=")
+        try:
+            if k == "in":
+                vin = int(v)
+            elif k == "out":
+                vout = int(v)
+        except ValueError:
+            _dbg_swallow()
+    return vin, vout
+
+
+def _accrue_usage(meta):
+    """Add a finished worker's token spend to the session's shared totals, ONCE. Guarded
+    by meta['usage_counted'] so a re-scan can't double-count. Best-effort - a worker with
+    no .usage sidecar (crashed before writing) simply contributes 0."""
+    if meta.get("usage_counted"):
+        return
+    meta["usage_counted"] = True
+    vin, vout = _read_usage(meta["result"])
+    meta["tokens_in"], meta["tokens_out"] = vin, vout
+    _H["tokens_in"] = _H.get("tokens_in", 0) + vin
+    _H["tokens_out"] = _H.get("tokens_out", 0) + vout
+
+
+def _worker_tokens_spent():
+    """Cumulative tokens (in+out) spent by all FINISHED workers this session (their .usage
+    sidecars, accrued once each in _accrue_usage). Still-running workers count 0 until they
+    exit. Pure observability - surfaced in /worker status; nothing gates on it."""
+    return _H.get("tokens_in", 0) + _H.get("tokens_out", 0)
+
+def _worker_stderr_tail(result_path, n=15):
+    """Last few lines of a FAILED worker's combined stdout+stderr log (bg_launch runs it
+    with stderr merged into the log), so a crash/early death leaves a visible trace in the
+    failure notice instead of vanishing. "" if we have no log path or it's unreadable."""
+    meta = None
+    for m in _H["workers"].values():
+        if m.get("result") == result_path:
+            meta = m
+            break
+    log = (meta or {}).get("log")
+    tail = _H.get("_bg_log_tail")
+    if not (log and tail):
+        return ""
+    try:
+        return tail(log, n)
+    except Exception:
+        return ""
+
+
+def _read_progress(result_path):
+    """The worker's deterministic progress heartbeat (iter/elapsed/last-tool/intent),
+    written each iteration to <brief>.progress by run_agent_brief. Returns the text
+    (stripped) or "" if none yet. Facts only - no tokens, no model cooperation."""
+    try:
+        return Path(_brief_from_result(result_path) + ".progress").read_text().strip()
+    except OSError:
+        return ""
+
+
+# Nested-worker visibility: each worker publishes "<running> <direct> <total>" to
+# <its brief>.subs (running = live descendants, direct = children it spawned, total =
+# all descendants ever spawned). A parent sums its live children's sidecars, so the
+# count recurses across processes and the driver sees the whole tree.
+def _read_subs(result_path):
+    """(running, direct, total) from a child's .subs sidecar; zeros if absent."""
+    try:
+        v = [int(x) for x in Path(_brief_from_result(result_path) + ".subs").read_text().split()[:3]]
+        return tuple(v + [0] * (3 - len(v)))
+    except (OSError, ValueError):
+        return (0, 0, 0)
+
+
+def _subtree_counts():
+    """(running, direct, total) for THIS process's worker tree."""
+    workers = _H.get("workers") or {}
+    if not workers:
+        return (0, 0, 0)
+    try:
+        rows = _worker_rows()
+    except Exception:
+        rows = {}
+    running = total = 0
+    for wp, meta in list(workers.items()):
+        r, _d, t = _read_subs(meta["result"])
+        total += 1 + t                   # spawned totals kept even for a dead child
+        if _child_running(wp, meta, rows):
+            running += 1 + r             # a dead child's stale .subs running count ignored
+    return (running, len(workers), total)
+
+
+def _child_running(wp, meta, rows):
+    """True only for a child whose bg row state is 'running' and whose result file
+    doesn't exist yet (existence test only - no parsing, no log reads)."""
+    row = rows.get(wp)
+    if not row or row.get("state") != "running":
+        return False
+    try:
+        return not Path(meta["result"]).exists()
+    except (OSError, KeyError, TypeError):
+        return False
+
+
+_NESTED_CACHE = [0.0, 0]
+
+
+def _nested_running():
+    """Running workers BELOW my running children (status bar adds this to its own
+    count). Cheap: alive-only rows, result-file existence, cached ~1s."""
+    now = time.monotonic()
+    if now - _NESTED_CACHE[0] < 1.0:
+        return _NESTED_CACHE[1]
+    try:
+        workers = _H.get("workers") or {}
+        if not workers:
+            n = 0
+        else:
+            rows = _worker_rows()
+            n = sum(_read_subs(m["result"])[0] for wp, m in list(workers.items())
+                    if _child_running(wp, m, rows))
+    except Exception:
+        n = 0
+    _NESTED_CACHE[0], _NESTED_CACHE[1] = now, n
+    return n
+
+
+def _publish_subs():
+    """Rewrite my own .subs sidecar (only inside a worker: LEAN_WORKER_BRIEF set by
+    run_agent_brief). Called on spawn, child finish, and each worker iteration."""
+    me = os.environ.get("LEAN_WORKER_BRIEF")
+    if not me:
+        return
+    try:
+        tmp = f"{me}.subs.{os.getpid()}.tmp"
+        Path(tmp).write_text(" ".join(map(str, _subtree_counts())) + "\n")
+        os.replace(tmp, me + ".subs")    # atomic: a reader never sees a half-written file
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except (OSError, UnboundLocalError):
+            pass
+
+
+def _subs_summary(result_path):
+    """The one harness line appended to a finished worker's result, or '' if it
+    spawned none."""
+    _r, d, t = _read_subs(result_path)
+    if not d:
+        return ""
+    w = "worker" if d == 1 else "workers"
+    return (f"(this worker spawned {d} {w}" + (f", {t} incl. their sub-workers)" if t > d else ")"))
+
+
+def _list_header():
+    """'/worker' list header: '<worker glyph> N workers:' (N = running incl. nested;
+    omitted when 0)."""
+    g = (_H.get("GLYPH") or {}).get("worker", "wkr")
+    n = _subtree_counts()[0]
+    return f"{g} {n} workers:" if n else f"{g} workers:"
+
+
+def _read_planview(result_path):
+    """The worker's CURRENT pinned plan, mirrored to <brief>.planview each iteration by
+    run_agent_brief. Lets a parent read the live plan (with the worker's own checkbox
+    progress) so action='set_plan' can send back an EDITED copy instead of a blind
+    overwrite. Returns the plan text (stripped) or "" if the worker has no pinned plan."""
+    try:
+        return Path(_brief_from_result(result_path) + ".planview").read_text().strip()
+    except OSError:
+        return ""
+
+def _inject_count(result_path):
+    """How many injects this worker has CONSUMED (lines in <brief>.injects.log), and the
+    last one's teaser - the delivery ack for action='inject'. (0, "") if none."""
+    try:
+        lines = [l for l in Path(_brief_from_result(result_path) + ".injects.log")
+                 .read_text().splitlines() if l.strip()]
+    except OSError:
+        return 0, ""
+    if not lines:
+        return 0, ""
+    last = lines[-1].split("consumed:", 1)[-1].strip()
+    return len(lines), last
+
+
+def _finished_notice():
+    """Scan tracked workers for ones that FINISHED since we last looked, and build the
+    notice to inject into the model's next turn. A worker finishes one of two ways:
+      - SUCCESS: its result file got a ===RESULT=== block -> report the (capped) result;
+      - FAILED:  the process is GONE but no result was ever written (crash / early death /
+        lease-kill before writing) -> report the failure + any stderr tail, so the model
+        is never left waiting on a worker that will never report. Without this second
+        branch a dead-without-result worker sits in silent limbo forever (the bug this
+        fixes).
+    Reports each newly-finished worker once (dedup via meta['announced']); when that clears
+    the LAST outstanding worker, appends an 'all N finished' line. Fires a desktop ping per
+    finish if the notify lean-tool's _ping is present. "" when nothing new finished."""
+    workers = _H["workers"]
+    if not workers:
+        return ""
+    ping = _H.get("ping")
+    rows = _worker_rows()               # {pid: bg_status row}; absent row => proc gone
+    lines = []
+    just_finished = []
+    for pid, meta in workers.items():
+        if meta.get("announced"):
+            continue
+        res = _with_subs(_read_result(meta["result"]), meta["result"])
+        if res is not None:
+            meta["announced"] = True
+            just_finished.append(pid)
+            _accrue_usage(meta)          # meter this worker's token spend into the session
+            tail = res.strip()
+            if len(tail) > 1500:         # keep a long result from flooding the turn
+                tail = tail[:1500] + " ...[truncated; /worker %d for the full result]" % pid
+                _sub = _subs_summary(meta["result"])
+                if _sub:
+                    tail += "\n" + _sub      # the harness line must survive the cap
+            lines.append(f"worker {pid} finished ({meta.get('leash','r')}, {meta['model']}) - "
+                         f"task: {meta['task'][:100]}\nresult:\n{tail}")
+            if res.lstrip().startswith("INCOMPLETE: tool budget"):
+                lines.append(f"worker {pid} ran out of budget; its summary is above "
+                             f"(action='result' pid={pid} for all of it). To continue: "
+                             f"action='resume' pid={pid} iterations=<more> [text=<steer>].")
+            if ping:
+                try:
+                    ping("lean-coder worker", f"worker {pid} finished")
+                except Exception:
+                    _dbg_swallow()
+            continue
+        # No result. Only a FAILURE if the process is actually gone (a running worker
+        # just hasn't written yet - leave it). A missing bg_status row => proc gone.
+        if rows.get(pid) is not None:
+            continue                     # still running; wait
+        meta["announced"] = True
+        just_finished.append(pid)
+        errtail = _worker_stderr_tail(meta.get("result"))
+        msg = (f"worker {pid} FAILED ({meta.get('leash','r')}, {meta['model']}) - "
+               f"it exited without writing a result "
+               f"(crash / early death / lease-kill).\ntask: {meta['task'][:100]}")
+        msg += f"\nreason: {_log_reason(meta.get('result')) or 'unknown'}"
+        if errtail:
+            msg += f"\nstderr tail:\n{errtail}"
+        lines.append(msg)
+        if ping:
+            try:
+                ping("lean-coder worker", f"worker {pid} FAILED (no result)")
+            except Exception:
+                _dbg_swallow()
+    if not just_finished:
+        return ""
+    _publish_subs()                      # a child finished: my running count dropped
+    total = len(workers)
+    outstanding = sum(1 for m in workers.values() if not m.get("announced"))
+    if outstanding == 0 and total > 1:
+        lines.append(f"all {total} dispatched workers have finished - collect any "
+                     f"you haven't used with /worker.")
+        if ping:
+            try:
+                ping("lean-coder workers", f"all {total} workers finished")
+            except Exception:
+                _dbg_swallow()
+    return "[" + "\n\n".join(lines) + "]"
+
+
+def _worker_rows():
+    """{pid: bg_status row} for this session's workers, keyed by pid. Empty if none."""
+    return {r["pid"]: r for r in _H["bg_status"](os.getpid(), kind="worker")}
+
+
+def _worker_status(pid=None):
+    """MODEL-facing status of dispatched workers (the tool's action='status'). One
+    line per worker: state, runtime, result-ready flag, task teaser. `pid` narrows to
+    one. Note: finished results reach the model automatically - this is for the rare
+    case it needs to check a slow/suspect one."""
+    workers = _H["workers"]
+    if not workers:
+        return "no workers dispatched this session."
+    rows = _worker_rows()
+    if pid is not None:
+        try:
+            pid = int(pid)
+        except (TypeError, ValueError):
+            return f"error: bad pid {pid!r}."
+        meta = workers.get(pid)
+        if not meta:
+            return f"no worker with pid {pid} this session."
+        workers = {pid: meta}
+    out = []
+    for wp, meta in workers.items():
+        row = rows.get(wp)
+        state = row["state"] if row else "gone"
+        runtime = row["runtime"] if row else "?"
+        ready = _read_result(meta["result"]) is not None
+        if ready and not meta.get("usage_counted"):
+            _accrue_usage(meta)          # keep the shared spend current when status is read
+        line = (f"pid {wp}  {state}  (ran {runtime})  "
+                f"result {'ready' if ready else 'pending'}  {meta['model']}  "
+                f"task: {meta['task'][:80]}")
+        _ns = 0 if ready else _read_subs(meta["result"])[0]
+        if _ns:
+            line += f"  (+{_ns} sub-workers running)"
+        if ready and meta.get("tokens_in") is not None:
+            _t = meta.get("tokens_in", 0) + meta.get("tokens_out", 0)
+            if _t:
+                line += f"  ({_t:,} tok)"
+        prog = _read_progress(meta["result"])
+        if prog and not ready:
+            line += "\n  progress: " + " | ".join(prog.splitlines())
+        if not ready and pid is not None:
+            # Only when narrowed to one worker (the plan can be many lines) - show its live
+            # pinned plan so the parent can steer/edit it via set_plan.
+            plan = _read_planview(meta["result"])
+            if plan:
+                line += "\n  plan:\n    " + "\n    ".join(plan.splitlines())
+        n_inj, last_inj = _inject_count(meta["result"])
+        if n_inj:
+            line += f"\n  injects delivered: {n_inj} (last: {last_inj[:80]})"
+        out.append(line)
+    spent = _worker_tokens_spent()
+    if spent:
+        out.append(f"total worker spend: {spent:,} tokens (finished workers)")
+    return "\n".join(out)
+
+
+def _worker_models():
+    """List the models available to dispatch a worker on, grouped by enabled provider,
+    so the driver can pick a cheap leaf model without guessing an exact id. Read-only."""
+    pmodels = _H.get("enabled_provider_models", lambda: {})()
+    if not pmodels:
+        return "no enabled providers report models."
+    cur = getattr(_H.get("cfg"), "model", "") or ""
+    lines = [_H["bold"]("models you can dispatch a worker on:")]
+    for prov, models in pmodels.items():
+        models = list(models or [])
+        head = _H["cyan"](prov)
+        if not models:
+            lines.append(f"  {head}: (none available)")
+            continue
+        lines.append(f"  {head}:")
+        for m in models:
+            tag = _H["dim"]("  (current default)") if m == cur else ""
+            lines.append(f"    {m}{tag}")
+    lines.append(_H["dim"]("dispatch with model=<id>, or model=<provider>::<id> if the id "
+                           "is on more than one. Omit model to use your current default."))
+    return "\n".join(lines)
+
+
+
+def _worker_result(pid, page=None):
+    """MODEL-facing full result (the tool's action='result'): return a worker's
+    COMPLETE ===RESULT=== block, paged like 'transcript' (page=) so the core ingestion
+    cap never silently drops the middle of a long one. The turn-rider finish notice caps
+    the result at 1500 chars; this is how the model pulls the rest without a human
+    running /worker. `pid` is required (which worker); with no pid, if exactly one
+    worker exists, use it, else ask which."""
+    workers = _H["workers"]
+    if not workers:
+        return "no workers dispatched this session."
+    if pid is None:
+        if len(workers) == 1:
+            pid = next(iter(workers))
+        else:
+            return ("error: action='result' needs a pid (which worker). "
+                    "Use action='status' to list them.")
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return f"error: bad pid {pid!r}."
+    meta = workers.get(pid)
+    if not meta:
+        return f"no worker with pid {pid} this session."
+    res = _with_subs(_read_result(meta["result"]), meta["result"])
+    if res is None:
+        return (f"worker {pid} has no result yet (still running or terminated before "
+                f"writing one). Use action='status' to check its state.")
+    # Collecting the result here counts as harvesting it: mark announced + accrue usage so
+    # a later _finished_notice() scan can't re-report this same worker as FAILED once its
+    # process exits and its result sidecar is reaped (the false 'exited without writing a
+    # result' notice - we already HAVE the result in hand right now).
+    if not meta.get("announced"):
+        meta["announced"] = True
+        _accrue_usage(meta)
+    head = f"worker {pid} result (task: {meta['task'][:100]})"
+    pages = _paginate_lines(res.strip(), _RESULT_PAGE)
+    if len(pages) <= 1:
+        return f"{head}:\n{res.strip()}"
+    try:
+        p = min(max(1, int(page or 1)), len(pages))
+    except (TypeError, ValueError):
+        p = 1
+    footer = ("" if p >= len(pages)
+              else f"\n\n[more: {len(pages) - p} page(s) left - action='result' page={p + 1}]")
+    return f"{head} - page {p}/{len(pages)}:\n{pages[p - 1]}{footer}"
+
+
+def _paginate_lines(text, size):
+    """Split text into pages of <= size chars, breaking at line boundaries (a single
+    over-long line is hard-split so no page can exceed size)."""
+    pages, cur = [], ""
+    for ln in text.split("\n"):
+        while len(ln) > size:
+            if cur:
+                pages.append(cur)
+                cur = ""
+            pages.append(ln[:size])
+            ln = ln[size:]
+        if cur and len(cur) + 1 + len(ln) > size:
+            pages.append(cur)
+            cur = ln
+        else:
+            cur = (cur + "\n" + ln) if cur else ln
+    if cur:
+        pages.append(cur)
+    return pages
+
+
+_RESULT_PAGE = 5500       # result page: leaves header/footer room under the 6k ingest cap
+_TRANSCRIPT_PAGE = 6000   # chars of rendered trail per page (keeps one read digestible)
+
+
+def _render_transcript_turn(m):
+    """One transcript message -> readable lines. Assistant reasoning, its tool calls
+    (name + compact args), and tool results are each shown with a role tag; the raw
+    provider shapes (list content, tool_calls arrays) are flattened to text."""
+    role = m.get("role", "?")
+    content = m.get("content")
+    if isinstance(content, list):   # provider block form -> join text parts
+        parts = []
+        for b in content:
+            if isinstance(b, dict):
+                parts.append(b.get("text") or b.get("content") or "")
+            else:
+                parts.append(str(b))
+        content = "\n".join(p for p in parts if p)
+    content = "" if content is None else str(content).strip()
+    tag = {"user": "STEER", "assistant": "worker", "tool": "tool"}.get(role, role)
+    # The first STEER turn is the fixed worker preamble (~2KB of boilerplate the driver
+    # already knows) followed by 'TASK:\n<the task>'. Collapse it to just the task so the
+    # transcript shows the worker's ACTUAL work, not the rubric.
+    if role == "user" and "\nTASK:\n" in content:
+        content = "TASK: " + content.split("\nTASK:\n", 1)[1].strip()
+    out = []
+    if content:
+        out.append(f"[{tag}] {content}")
+    for tc in m.get("tool_calls", []) or []:
+        fn = tc.get("function") or tc
+        name = fn.get("name", "?")
+        args = fn.get("arguments")
+        if isinstance(args, (dict, list)):
+            args = json.dumps(args)
+        args = (args or "").strip()
+        if len(args) > 300:
+            args = args[:300] + "..."
+        out.append(f"[worker>tool] {name}({args})")
+    if role == "tool" and not content:
+        out.append(f"[tool] {m.get('tool_name', '')}: (no output)")
+    return "\n".join(out)
+
+
+def _worker_transcript(pid, page):
+    """MODEL-facing transcript (the tool's action='transcript'): render a worker's OWN
+    full reasoning + tool trail from its checkpoint, paged, so the driver can inspect HOW
+    a worker reached its result (or where a dead one got stuck) without resuming it. Needs
+    the worker to have been dispatched with worker_checkpoint on (the same sidecar resume
+    uses). `page` is 1-based (default 1); the reply reports the page count and whether more
+    remain. Read-only - never mutates the worker or its checkpoint."""
+    workers = _H["workers"]
+    if not workers:
+        return "no workers dispatched this session."
+    if pid is None:
+        if len(workers) == 1:
+            pid = next(iter(workers))
+        else:
+            return ("error: action='transcript' needs a pid (which worker). "
+                    "Use action='status' to list them.")
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return f"error: bad pid {pid!r}."
+    meta = workers.get(pid)
+    if not meta:
+        return f"no worker with pid {pid} this session."
+    ckpt = _brief_from_result(meta["result"]) + ".checkpoint"
+    if not Path(ckpt).exists():
+        return (f"worker {pid} has no transcript checkpoint (dispatched with checkpointing "
+                f"off, so nothing was recorded). Turn on worker_checkpoint (/set or config) "
+                f"before dispatching workers whose trail you may want to read.")
+    try:
+        data = json.loads(Path(ckpt).read_text())
+    except Exception as e:
+        return f"worker {pid} checkpoint is unreadable ({e})."
+    body = [m for m in data.get("messages", []) if m.get("role") != "system"]
+    if not body:
+        return f"worker {pid} checkpoint has no recorded turns yet."
+    blocks = [b for b in (_render_transcript_turn(m) for m in body) if b]
+    full = "\n\n".join(blocks)
+    # Paginate on rendered chars, breaking only at turn boundaries so no turn is split.
+    pages, cur = [], ""
+    for b in blocks:
+        if cur and len(cur) + len(b) + 2 > _TRANSCRIPT_PAGE:
+            pages.append(cur)
+            cur = b
+        else:
+            cur = (cur + "\n\n" + b) if cur else b
+    if cur:
+        pages.append(cur)
+    npages = len(pages) or 1
+    try:
+        p = max(1, int(page or 1))
+    except (TypeError, ValueError):
+        p = 1
+    if p > npages:
+        p = npages
+    head = (f"worker {pid} transcript (task: {meta['task'][:80]}) - "
+            f"page {p}/{npages}, {len(body)} turns:")
+    footer = ("" if p >= npages
+              else f"\n\n[more: {npages - p} page(s) left - action='transcript' page={p + 1}]")
+    return f"{head}\n\n{pages[p - 1]}{footer}"
+
+
+def _worker_promote(pid, name):
+    """PROMOTE a worker's transcript into a saved SESSION you can /load. Reads the
+    worker's checkpoint (the unified {meta,messages} envelope) and writes it under
+    CONFIG_DIR/sessions/<name>.json via the core save_session. Needs worker_checkpoint
+    (the sidecar must exist). Works for a running, finished, or paused worker - it's a
+    snapshot of the trail so far."""
+    if pid is None:
+        return "error: action='promote' needs a pid (which worker to save)."
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return f"error: bad pid {pid!r}."
+    name = (name or "").strip()
+    if not name:
+        return "error: action='promote' needs name=<session name> to save under."
+    meta = _H["workers"].get(pid)
+    if not meta:
+        return f"no worker with pid {pid} this session."
+    ckpt = _brief_from_result(meta["result"]) + ".checkpoint"
+    if not Path(ckpt).exists():
+        return (f"worker {pid} has no checkpoint to promote (dispatched with checkpointing "
+                f"off). Dispatch with worker_checkpoint on (session-seeded workers force it).")
+    save_session = _H.get("save_session")
+    load_envelope = _H.get("load_envelope")
+    if not save_session or not load_envelope:
+        return "error: core save_session/load_envelope not available (old core?)."
+    try:
+        data = json.loads(Path(ckpt).read_text())
+    except Exception as e:
+        return f"worker {pid} checkpoint is unreadable ({e})."
+    body, cmeta = load_envelope(data)
+    if not body:
+        return f"worker {pid} checkpoint has no recorded turns yet - nothing to promote."
+    # Rebuild a full message list (system + body) as save_session expects, and carry the
+    # worker's pinned_plan + notes across from the checkpoint meta. Stamp origin so the
+    # promoted session is identifiable as an ex-worker (the worker's brief stamp).
+    messages = [{"role": "system", "content": ""}] + body
+    stamp = Path(_brief_from_result(meta["result"])).stem
+    try:
+        path, _ = save_session(messages, _H["cfg"], name,
+                               pinned_plan=cmeta.get("pinned_plan", ""),
+                               notes=cmeta.get("notes", []),
+                               origin=f"worker:{stamp}")
+    except ValueError:
+        return f"error: invalid session name {name!r}."
+    except Exception as e:
+        return f"error: could not save session: {e}"
+    return (f"promoted worker {pid} -> session '{name}' ({len(body)} turns). "
+            f"/load {name} to resume it here.")
+
+
+def _worker_cancel(pid):
+    """MODEL-facing cancel (the tool's action='cancel'): kill a still-running worker
+    by pid. An already-finished worker is a no-op (its result stands - use it). Reuses
+    the same process-group kill the human /bg kill uses."""
+    workers = _H["workers"]
+    if pid is None:
+        return "error: action='cancel' needs a pid (the worker to kill)."
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return f"error: bad pid {pid!r}."
+    meta = workers.get(pid)
+    if not meta:
+        return f"no worker with pid {pid} this session (nothing to cancel)."
+    if _read_result(meta["result"]) is not None:
+        return (f"worker {pid} already finished; nothing to cancel. Its result is in the "
+                f"done notice or action='result'.")
+    rows = _worker_rows()
+    row = rows.get(pid)
+    if row and row["state"] != "running":
+        return f"worker {pid} is not running ({row['state']}); nothing to cancel."
+    # Kill the worker AND every descendant it spawned. A worker-spawned grandchild is
+    # setsid'd into its own process group, so a single killpg would orphan it; _bg_kill_tree
+    # walks the registry's owner graph to reach every level. Fall back to the flat kill if
+    # core predates the tree helper.
+    kill = _H.get("_bg_kill_tree") or _H.get("_bg_kill")
+    if not kill:
+        return "error: no kill hook available (core too old)."
+    kill(pid)
+    meta["announced"] = True    # suppress a finish notice for a worker we deliberately killed
+    return (f"cancelled worker {pid} (SIGTERM to it and any workers it spawned). "
+            f"task: {meta['task'][:80]}")
+
+
+def _live_worker_pids(taskboard=None):
+    """pids of THIS session's workers that are still running (a bg row in 'running' state)
+    and have not delivered a result. Optionally narrowed to one taskboard (the team
+    gesture: 'pause the mining team'). Order: dispatch order (dict insertion)."""
+    workers = _H["workers"]
+    rows = _worker_rows()
+    out = []
+    for pid, meta in workers.items():
+        if taskboard is not None and meta.get("taskboard", "") != taskboard:
+            continue
+        if _read_result(meta["result"]) is not None:
+            continue
+        row = rows.get(pid)
+        if row is not None and row.get("state") != "running":
+            continue
+        out.append(pid)
+    return out
+
+
+def _pause_one(pid, name=None):
+    """PAUSE a running worker: SAVE its transcript as a normal session file (the same
+    path as action='promote'), then kill it. The saved session is the durable handle -
+    nothing else is parked on disk, and the worker's scratch files go with the driver's
+    run dir as usual. Continue it later from this session (action='resume' pid=, which
+    reuses the original grant) or from ANY session (dispatch from_session=<name>).
+    Needs worker_checkpoint on and at least one written checkpoint. Returns (ok, msg)."""
+    workers = _H["workers"]
+    meta = workers.get(pid)
+    if not meta:
+        return False, f"no worker with pid {pid} this session."
+    if _read_result(meta["result"]) is not None:
+        return False, f"worker {pid} already finished - nothing to pause (its result stands)."
+    if not meta.get("checkpoint"):
+        return False, (f"worker {pid} has checkpointing off, so it can't be paused (nothing to "
+                       f"save). Dispatch with worker_checkpoint on, or action='cancel' it.")
+    name = (name or "").strip() or f"worker-{pid}"
+    saved = _worker_promote(pid, name)
+    if not saved.startswith("promoted "):
+        return False, f"worker {pid} NOT paused (could not save it): {saved}"
+    kill = _H.get("_bg_kill_tree") or _H.get("_bg_kill")
+    if not kill:
+        return False, "error: no kill hook available (core too old)."
+    kill(pid)
+    meta["announced"] = True          # a deliberate pause is not a failure - no finish notice
+    meta["paused"] = True
+    meta["saved_as"] = name
+    return True, f"paused worker {pid}: saved as session '{name}'"
+
+
+def _worker_pause(pid, name=None):
+    """MODEL-facing pause (the tool's action='pause'): save a running worker as a session
+    (name=, default 'worker-<pid>') and stop it. The return names both ways back."""
+    if pid is None:
+        return "error: action='pause' needs a pid (which worker to pause)."
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return f"error: bad pid {pid!r}."
+    ok, msg = _pause_one(pid, name)
+    if ok:
+        n = _H["workers"][pid]["saved_as"]
+        msg += (f". Continue it: action='resume' pid={pid} [text=<steer>] [iterations=N] "
+                f"(this session), or dispatch from_session='{n}' task=<steer> (any session, "
+                f"even after a restart).")
+    return msg
+
+
+def _worker_pause_all(taskboard=None):
+    """MODEL-facing pause-all (the tool's action='pause_all'): pause EVERY running worker
+    this session (optionally only those on taskboard=<name>), each saved as its own
+    'worker-<pid>' session. The 'freeze the whole team' gesture."""
+    pids = _live_worker_pids(taskboard)
+    scope = f" on board '{taskboard}'" if taskboard else ""
+    if not pids:
+        return f"no running workers{scope} to pause."
+    done, failed = [], []
+    for pid in pids:
+        ok, msg = _pause_one(pid)
+        (done if ok else failed).append((pid, msg))
+    lines = [f"paused {len(done)} worker(s){scope}, each saved as a session:"]
+    for pid, _ in done:
+        lines.append(f"  pid {pid} -> session '{_H['workers'][pid]['saved_as']}'")
+    for pid, msg in failed:
+        lines.append(f"  pid {pid} NOT paused: {msg}")
+    if done:
+        lines.append("Continue: action='resume_all' (this session), or dispatch "
+                     "from_session=<name> task=<steer> per worker (any session).")
+    return "\n".join(lines)
+
+
+def _worker_stop_all(taskboard=None):
+    """MODEL-facing stop-all (the tool's action='stop_all'): kill EVERY running worker
+    this session (optionally only taskboard=<name>) and DISCARD it (the reaper wipes its
+    sidecars - not resumable). The hard 'shut the whole team down' gesture; use pause_all to
+    keep them resumable."""
+    pids = _live_worker_pids(taskboard)
+    scope = f" on board '{taskboard}'" if taskboard else ""
+    if not pids:
+        return f"no running workers{scope} to stop."
+    stopped = []
+    for pid in pids:
+        out = _worker_cancel(pid)
+        stopped.append((pid, out))
+    return (f"stopped {len(stopped)} worker(s){scope} (killed + discarded, not resumable; "
+            f"use pause_all to keep them resumable):\n"
+            + "\n".join(f"  pid {pid}" for pid, _ in stopped))
+
+
+def _worker_resume_all(cwd, taskboard=None):
+    """MODEL-facing resume-all (the tool's action='resume_all'): relaunch EVERY paused
+    worker this session (optionally only taskboard=<name>), each from its parked
+    checkpoint. The counterpart to pause_all - 'unfreeze the team'. Each resume is a new
+    pid; skips workers that aren't paused."""
+    paused = [(pid, meta) for pid, meta in _H["workers"].items()
+              if meta.get("paused")
+              and (taskboard is None or meta.get("taskboard", "") == taskboard)]
+    scope = f" on board '{taskboard}'" if taskboard else ""
+    if not paused:
+        return f"no paused workers{scope} to resume."
+    lines = [f"resuming {len(paused)} paused worker(s){scope}:"]
+    for pid, _ in paused:
+        out = _worker_resume(pid, "", cwd)
+        first = out.splitlines()[0] if out else out
+        lines.append(f"  {first}")
+    return "\n".join(lines)
+
+def _brief_from_result(result_path):
+    """The worker's brief-file path from its result path (they share a stamp: the tool
+    writes <stamp>.brief + <stamp>.result). The inject sidecar lives beside the brief
+    (<stamp>.brief.inject), driver-side even for a remote worker."""
+    r = str(result_path)
+    return r[:-len(".result")] + ".brief" if r.endswith(".result") else r + ".brief"
+
+
+def _worker_inject(pid, text, source="operator"):
+    """Deliver a mid-task message to a RUNNING worker. Writes (append-safe, NUL-
+    separated so two quick injects can't clobber) to the worker's <brief>.inject
+    sidecar; the worker drains it at its next between-iteration boundary and appends it
+    as a user turn (see run_agent_brief's _drain_injects). `source` prefixes the message
+    ([operator inject] / [parent-agent inject]) so the worker can weight it. Does NOT
+    interrupt a running tool call - it lands on the next reasoning step; use cancel to
+    stop hard. A finished/gone worker can't receive one."""
+    workers = _H["workers"]
+    if pid is None:
+        return "error: action='inject' needs a pid (which worker) and text."
+    msg = (text or "").strip()
+    if not msg:
+        return "error: action='inject' needs non-empty text (the message to send)."
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return f"error: bad pid {pid!r}."
+    meta = workers.get(pid)
+    if not meta:
+        return f"no worker with pid {pid} this session (nothing to inject into)."
+    if _read_result(meta["result"]) is not None:
+        return (f"worker {pid} already finished, too late to inject. Use its result or "
+                f"dispatch a new worker.")
+    rows = _worker_rows()
+    row = rows.get(pid)
+    if row and row["state"] != "running":
+        return f"worker {pid} is not running ({row['state']}); can't inject."
+    inject_path = Path(_brief_from_result(meta["result"]) + ".inject")
+    labelled = f"[{source} inject] {msg}"
+    try:
+        with inject_path.open("a") as f:
+            f.write(labelled + "\0")
+    except OSError as e:
+        return f"error: could not write inject for worker {pid}: {e}"
+    return (f"injected into worker {pid} as [{source} inject]. It arrives at the worker's next "
+            f"step, after any running command finishes. Check with action='status'.")
+
+
+def _running_worker_sidecar(pid, action, suffix):
+    """Shared guard for the live-steer actions (inject/set_plan/add_note): validate that
+    `pid` names a RUNNING worker and return (sidecar_path, None), else (None, error_str).
+    `suffix` is the sidecar to target ('.inject'/'.plan'/'.note')."""
+    workers = _H["workers"]
+    if pid is None:
+        return None, f"error: action='{action}' needs a pid (which worker)."
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return None, f"error: bad pid {pid!r}."
+    meta = workers.get(pid)
+    if not meta:
+        return None, f"no worker with pid {pid} this session (nothing to steer)."
+    if _read_result(meta["result"]) is not None:
+        return None, (f"worker {pid} already finished, too late to {action}. Use its result "
+                      f"or dispatch a new worker.")
+    row = _worker_rows().get(pid)
+    if row and row["state"] != "running":
+        return None, f"worker {pid} is not running ({row['state']}); can't {action}."
+    return Path(_brief_from_result(meta["result"]) + suffix), None
+
+
+def _worker_set_plan(pid, text):
+    """Live-steer a RUNNING worker's PINNED PLAN (the tool's action='set_plan'). Writes
+    the full plan (GOAL + '- [ ]' TODO) to the worker's <brief>.plan sidecar; the worker
+    drains it at its next between-iteration boundary and REPLACES its pinned plan via
+    agent._update_plan (see run_agent_brief's _drain_plan), and gets an inline inject so
+    it can't miss the change. A full replacement, not an append - the last set_plan wins.
+
+    Call with NO plan text to READ the worker's current plan (with its own checkbox
+    progress) - do that first, edit the returned plan, and send it back, so you EDIT the
+    plan rather than blindly clobbering the worker's progress. Does not interrupt a
+    running tool call. A finished/gone worker can't receive one."""
+    path, err = _running_worker_sidecar(pid, "set_plan", ".plan")
+    if err:
+        return err
+    plan = (text or "").strip()
+    if not plan:
+        # No plan supplied -> READ affordance: hand back the live plan for editing.
+        meta = _H["workers"].get(int(pid))
+        cur = _read_planview(meta["result"]) if meta else ""
+        if not cur:
+            return (f"worker {pid} has no pinned plan yet (nothing to edit). Send a full plan "
+                    f"as `plan` to set one.")
+        return (f"worker {pid} current plan (edit this and send it back as `plan` to update "
+                f"it - tick/add boxes rather than overwrite its progress):\n{cur}")
+    try:
+        with path.open("a") as f:
+            f.write(plan + "\0")
+    except OSError as e:
+        return f"error: could not write plan for worker {pid}: {e}"
+    return (f"queued a plan update for worker {pid}; it replaces the pinned plan at the "
+            f"worker's next step. Check with action='status'.")
+
+
+def _worker_add_note(pid, text):
+    """Live-steer a RUNNING worker's NOTEBOOK (the tool's action='add_note'). Appends the
+    note (NUL-separated so two quick notes can't clobber) to the worker's <brief>.note
+    sidecar; the worker drains it at its next between-iteration boundary and appends it to
+    agent.notes, tagged 'parent:' so it reads as handed down (see _drain_notes). Does not
+    interrupt a running tool call. A finished/gone worker can't receive one."""
+    msg = (text or "").strip()
+    if not msg:
+        return "error: action='add_note' needs non-empty text (the note to add)."
+    path, err = _running_worker_sidecar(pid, "add_note", ".note")
+    if err:
+        return err
+    try:
+        with path.open("a") as f:
+            f.write(msg + "\0")
+    except OSError as e:
+        return f"error: could not write note for worker {pid}: {e}"
+    return (f"queued a note for worker {pid}; it arrives at the worker's next step. "
+            f"Check with action='status'.")
+
+
+def _recheck_grant(lines):
+    """Re-cap a saved grant (resume) against the driver's LIVE authority, as dispatch does:
+    leash <= current /leash, max_iterations <= current ceiling, tools only those the driver
+    still has at a leash that allows them. Returns (lines, notes) or (error_str, None)."""
+    out, notes, leash, tools_i = [], [], None, None
+    for l in lines:
+        k, _, v = l.partition(":")
+        k, v = k.strip().lower(), v.strip()
+        if k == "leash":
+            leash, down = _capped_leash(v)
+            if down:
+                notes.append(f"leash {v} -> {leash}")
+            l = f"leash: {leash}"
+        elif k == "max_iterations":
+            try:
+                n, ceil = int(v), _ceiling("max_iterations")
+                if ceil and n > ceil:
+                    notes.append(f"iterations {n} -> {ceil}")
+                    l = f"max_iterations: {ceil}"
+            except ValueError:
+                _dbg_swallow()
+        elif k == "tools":
+            tools_i = len(out)
+        out.append(l)
+    if tools_i is not None:
+        want = [t.strip() for t in out[tools_i].partition(":")[2].split(",") if t.strip()]
+        want = _H.get("_tool_alias_names", list)(want)   # renamed tools (web_screenshot -> view)
+        have = _H.get("active_tool_names", lambda: set())()
+        if not have:
+            return ("error: can't verify your own tools right now, so this worker's tool "
+                    "grant can't be re-checked. Retry, or dispatch a fresh worker."), None
+        levels, need = _H["LEASH_LEVELS"], _H.get("tool_min_leash")
+        lv = leash or "r"
+        keep = [t for t in want if t in have and not (
+            need and need(t) and levels.index(need(t)) > levels.index(lv))]
+        if keep != want:
+            notes.append("tools dropped: " + ", ".join(t for t in want if t not in keep))
+        if not keep:
+            return ("error: none of this worker's granted tools are still allowed at your "
+                    "current leash/tool set, so it can't be resumed. Dispatch a fresh "
+                    "worker instead."), None
+        out[tools_i] = "tools: " + ",".join(keep)
+    return out, notes
+
+
+def _worker_resume(pid, text, cwd, iterations=None):
+    """RELAUNCH a worker that DIED without finishing (max_iterations / lease-kill / crash /
+    stopped incomplete), reloading its transcript checkpoint so it continues from where it
+    left off instead of cold. `text` is a fresh steer (what to fix/do next). `iterations`
+    (optional) grants the resumed worker a FRESH max_iterations budget - important when the
+    worker died BY hitting its cap, or it would just hit the same cap again; absent = reuse
+    the original grant's budget. Returns a NEW pid (the old process is dead - resume is a
+    new OS process; lineage is tracked via meta['resumed_from']). Requirements: the worker
+    was dispatched with worker_checkpoint on (so a '<brief>.checkpoint' exists), it is NOT
+    still running (use inject for that), and it has not already delivered a result (that
+    stands - dispatch fresh instead)."""
+    workers = _H["workers"]
+    if pid is None:
+        return "error: action='resume' needs a pid (which dead worker to relaunch)."
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return f"error: bad pid {pid!r}."
+    meta = workers.get(pid)
+    if not meta:
+        return f"no worker with pid {pid} this session (nothing to resume)."
+    if meta.get("resumed_as"):
+        return (f"worker {pid} was already resumed as pid {meta['resumed_as']}; resume "
+                f"that one instead.")
+    _prev = _read_result(meta["result"])
+    if _prev is not None and not _prev.lstrip().startswith("INCOMPLETE"):
+        return (f"worker {pid} already finished with a result - nothing to resume (its "
+                f"result stands; read it, or dispatch a fresh worker for new work).")
+    row = _worker_rows().get(pid)
+    if row is not None and row.get("state") == "running":
+        return (f"worker {pid} is still running. Use action='inject' to steer it or "
+                f"action='cancel' to stop it.")
+    ckpt = _brief_from_result(meta["result"]) + ".checkpoint"
+    if not Path(ckpt).exists():
+        return (f"worker {pid} has no transcript checkpoint, so it can't be resumed - it "
+                f"was dispatched with checkpointing off. Turn on worker_checkpoint (/set "
+                f"or config) before dispatching workers you may want to resume.")
+    steer = (text or "").strip() or ("Continue your task from where you left off and "
+                                     "finish it.")
+    # Concurrency ceiling still applies (a resume is a new running worker).
+    max_conc = _ceiling("max_concurrent")
+    if max_conc and len(_H["bg_list"](kind="worker")) >= max_conc:
+        return (f"error: at the worker limit ({max_conc} running); can't resume now. Wait "
+                f"for one to finish or raise LEANCODER_WORKER_MAX_CONCURRENT.")
+
+    # Build a FRESH brief that reuses the dead worker's GRANT verbatim (same leash/model/
+    # tools/cwd), plus a RESUME marker pointing at its checkpoint and checkpoint:1 so the
+    # resumed worker is itself resumable. New stamp -> new brief/result files (the old
+    # ones are swept normally); the steer becomes the brief's task (its first turn on top
+    # of the reloaded transcript).
+    try:
+        orig = Path(meta["brief"]).read_text()
+    except OSError as e:
+        return f"error: cannot read worker {pid}'s brief to resume it: {e}"
+    grant = _H["_extract_marked"](orig, _H["GRANT_MARK"]) or ""
+    B, G, RM = _H["BRIEF_MARK"], _H["GRANT_MARK"], _H["RESUME_MARK"]
+    # Optionally bump the iteration budget (a worker that died ON its cap needs a bigger
+    # one, or it dies on it again). Strip the old max_iterations line and re-add it.
+    new_iter = None
+    if iterations is not None:
+        try:
+            new_iter = int(iterations)
+        except (TypeError, ValueError):
+            return f"error: bad iterations {iterations!r} (want an integer)."
+        if new_iter <= 0:
+            return "error: iterations must be a positive integer."
+    drop = ("checkpoint:", "resumed_from:") + (("max_iterations:",) if new_iter is not None else ())
+    _lineage = [x for l in grant.splitlines() if l.strip().lower().startswith("resumed_from:")
+                for x in l.split(":", 1)[1].split()]
+    grant_lines = [l for l in grant.splitlines() if l.strip()
+                   and not l.strip().lower().startswith(drop)]
+    # Lineage: the resumed worker answers board tasks assigned to any earlier pid of it.
+    grant_lines.append("resumed_from: " + " ".join(_lineage + [str(pid)]))
+    if new_iter is not None:
+        grant_lines.append(f"max_iterations: {new_iter}")
+    # RE-CHECK the grant against the driver's authority NOW (not at dispatch time): the
+    # operator may have lowered /leash, the iteration ceiling, or the tool set since.
+    grant_lines, notes = _recheck_grant(grant_lines)
+    if isinstance(grant_lines, str):
+        return grant_lines
+    grant_lines.append("checkpoint: 1")
+    new_brief_text = "\n".join([
+        f"{B}\n{steer}\n{B}",
+        f"{G}\n" + "\n".join(grant_lines) + f"\n{G}",
+        f"{RM}\n{ckpt}\n{RM}"]) + "\n"
+
+    wdir = _workers_dir()
+    try:
+        wdir.mkdir(parents=True, exist_ok=True)   # may have been swept since dispatch
+    except OSError as e:
+        return f"error: cannot create workers dir: {e}"
+    _H["_seq"] = _H.get("_seq", 0) + 1
+    stamp = f"{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}-{_H['_seq']}"
+    brief_file = wdir / f"{stamp}.brief"
+    result_file = wdir / f"{stamp}.result"
+    try:
+        brief_file.write_text(new_brief_text)
+    except OSError as e:
+        return f"error: cannot write resume brief: {e}"
+
+    # Relaunch: reuse the dead worker's launch command verbatim but swap in the new brief/
+    # result paths (this preserves its --cwd / --remote-host / --remote-ctl / --host wiring,
+    # so a remote/remote-brain worker resumes on the same target).
+    old_cmd = meta.get("cmd", "")
+    cmd = old_cmd.replace(shlex.quote(str(meta["brief"])), shlex.quote(str(brief_file)))
+    cmd = cmd.replace(shlex.quote(meta["result"]), shlex.quote(str(result_file)))
+    if str(brief_file) not in cmd or str(result_file) not in cmd:
+        return ("error: could not reconstruct the resume launch command (the worker's "
+                "original launch is unavailable). Dispatch a fresh worker instead.")
+    launch_cwd = meta.get("launch_cwd") or cwd
+    launched = _H["bg_launch"](cmd, cwd=launch_cwd, kind="worker",
+                               idle_timeout=meta.get("idle_timeout") or _ceiling("idle_timeout"),
+                               heartbeat_timeout=meta.get("hb_timeout") or 0,
+                               heartbeat_file=str(brief_file) + ".progress")
+    if "error" in launched:
+        return f"error: could not relaunch worker: {launched['error']}"
+    new_pid = launched["pid"]
+    workers[new_pid] = {"result": str(result_file), "task": meta["task"],
+                        "started": time.time(), "model": meta.get("model", "(default)"),
+                        "where": meta.get("where", "local"), "log": launched.get("log"),
+                        "brief": str(brief_file), "checkpoint": True, "cmd": cmd,
+                        "launch_cwd": launch_cwd,
+                        "idle_timeout": meta.get("idle_timeout"),
+                        "hb_timeout": meta.get("hb_timeout"),
+                        "leash": next((l.split(":", 1)[1].strip() for l in grant_lines
+                                       if l.lower().startswith("leash:")),
+                                      meta.get("leash", "r")), "resumed_from": pid,
+                        "taskboard": meta.get("taskboard", "")}
+    # The old worker is retired - suppress any lingering failure notice for it.
+    meta["announced"] = True
+    meta["resumed_as"] = new_pid
+    # If this worker was deliberately PAUSED, clear its sentinel now that we've read the
+    # checkpoint + relaunched: the old sidecars are no longer parked and reap normally.
+    if meta.get("paused"):
+        meta["paused"] = False      # its saved session stays - the operator's to keep/delete
+    return (f"resumed worker {pid} as pid {new_pid}, continuing from its saved transcript "
+            f"with your steer. Its result arrives as a notice when it finishes."
+            + (f" Grant re-checked against your current limits: {'; '.join(notes)}."
+               if notes else ""))
+
+
+def _worker_cmd(agent, cfg, arg):
+    """/worker - human command, at PARITY with the model's dispatch_worker actions:
+      /worker                    list dispatched workers (state + result-ready)
+      /worker <pid>              print that worker's full result
+      /worker transcript <pid> [page]  read a worker's own reasoning/tool trail (paged)
+      /worker status [pid]       the model-facing status view (state/runtime/ready)
+      /worker cancel <pid>       kill + discard a still-running worker
+      /worker pause <pid> [name] save it as a session (default worker-<pid>), then stop it
+      /worker pause_all [board]   pause every worker (or one board's team), each saved
+      /worker stop_all [board]    kill + discard every worker (or one board's team)
+      /worker resume_all [board]  relaunch every paused worker (or one board's team)
+      /worker inject <pid> <msg> mid-task message to a running worker
+      /worker set_plan <pid> <plan>  replace a running worker's pinned plan
+      /worker add_note <pid> <note>  add a note to a running worker's notebook
+      /worker resume <pid> <steer>   relaunch a DEAD worker from its saved transcript
+      /worker models                 list the models you can dispatch a worker on
+    Subcommands reuse the same helpers the tool uses, so the human and the model see
+    identical behaviour."""
+    workers = _H["workers"]
+    if not workers:
+        print(_H["dim"]("no workers dispatched this session."))
+        return
+    bg_status = _H["bg_status"]
+    rows = {r["pid"]: r for r in bg_status(os.getpid(), kind="worker")}
+    arg = (arg or "").strip()
+    parts = arg.split()
+
+    # Subcommands (parity with the model tool). A bare pid stays the result shortcut.
+    if parts and parts[0].lower() == "models":
+        print(_worker_models())
+        return
+    # Fleet lifecycle (optional taskboard scope): /worker pause_all [board]
+    if parts and parts[0].lower() in ("pause_all", "stop_all", "resume_all"):
+        tb = parts[1] if len(parts) > 1 else None
+        if parts[0].lower() == "pause_all":
+            print(_worker_pause_all(tb))
+        elif parts[0].lower() == "stop_all":
+            print(_worker_stop_all(tb))
+        else:
+            print(_worker_resume_all(str(getattr(cfg, "cwd", ".")), tb))
+        return
+    if parts and parts[0].lower() in ("status", "cancel", "pause", "result", "transcript",
+                                      "inject", "set_plan", "add_note", "resume"):
+        sub = parts[0].lower()
+        pid = parts[1] if len(parts) > 1 else None
+        if sub == "status":
+            print(_worker_status(pid))
+        elif sub == "result":
+            print(_worker_result(pid))
+        elif sub == "transcript":
+            # /worker transcript <pid> [page]
+            page = parts[2] if len(parts) > 2 else None
+            print(_worker_transcript(pid, page))
+        elif sub == "inject":
+            # /worker inject <pid> <message...> - the rest of the line is the message.
+            text = arg.split(None, 2)[2] if len(parts) > 2 else ""
+            print(_worker_inject(pid, text, source="operator"))
+        elif sub == "set_plan":
+            # /worker set_plan <pid> <plan...> - the rest of the line is the plan.
+            text = arg.split(None, 2)[2] if len(parts) > 2 else ""
+            print(_worker_set_plan(pid, text))
+        elif sub == "add_note":
+            # /worker add_note <pid> <note...> - the rest of the line is the note.
+            text = arg.split(None, 2)[2] if len(parts) > 2 else ""
+            print(_worker_add_note(pid, text))
+        elif sub == "resume":
+            # /worker resume <pid> <steer...> - the rest of the line is the steer.
+            text = arg.split(None, 2)[2] if len(parts) > 2 else ""
+            print(_worker_resume(pid, text, str(getattr(cfg, "cwd", "."))))
+        elif sub == "pause":
+            print(_worker_pause(pid, parts[2] if len(parts) > 2 else None))
+        else:  # cancel
+            print(_worker_cancel(pid))
+        return
+
+    if arg.isdigit():
+        pid = int(arg)
+        meta = workers.get(pid)
+        if not meta:
+            print(_H["dim"](f"no worker with pid {pid} this session."))
+            return
+        res = _with_subs(_read_result(meta["result"]), meta["result"])
+        _fit = _H.get("_fit_line") or (lambda x, **k: x)
+        print(_fit(_H["bold"](f"worker {pid}") + _H["dim"]("  " + " ".join(meta['task'].split())),
+                   ellipsis=True))
+        if res:
+            print(res)
+        else:
+            print(_H["dim"]("  (running - no result yet)"))
+            prog = _read_progress(meta["result"])
+            if prog:
+                for pl in prog.splitlines():
+                    if pl.lower().startswith("intent:"):
+                        # Intent is prose; print label dim, value normal so it reads.
+                        print(_H["dim"]("  intent:  ") + pl.split(":", 1)[1].strip())
+                    else:
+                        print(_H["dim"]("  " + pl))
+        n_inj, last_inj = _inject_count(meta["result"])
+        if n_inj:
+            print(_H["dim"](f"  injects: {n_inj} delivered (last: {last_inj[:80]})"))
+        return
+    # Usage hint goes UNDER the header, not at the bottom: as the last line it read like
+    # one more running task. The newest worker stays the last row, next to the prompt.
+    print(_H["bold"](_list_header()) + _H["dim"](
+        "  /worker <pid> = full result + progress/intent · status [pid] · "
+        "cancel <pid> · inject/set_plan/add_note <pid> <text> · resume <pid> <steer>"))
+    for pid, meta in workers.items():
+        row = rows.get(pid)
+        state = row["state"] if row else "gone"
+        runtime = row["runtime"] if row else "?"
+        done = _read_result(meta["result"]) is not None
+        # In flight = marker + bold cyan pid + green state; finished = plain (same as /bg).
+        _mk = (_H.get("GLYPH") or {}).get("enrolled", "*")
+        if done:
+            mark, pidc, tag = " ", _H["dim"](str(pid)), "result ready"
+        else:
+            mark, pidc, tag = _mk, _H["bold"](_H["cyan"](str(pid))), _H["green"](state)
+        _fit = _H.get("_fit_line") or (lambda x, **k: x)
+        _1l = _H.get("_one_line") or (lambda x: " ".join(str(x).split()))
+        _ns = 0 if done else _read_subs(meta["result"])[0]
+        _nst = f"(+{_ns} sub)  " if _ns else ""
+        print(_fit(f"{mark} {pidc}  {tag}  (ran {runtime})  {_nst}"
+                   f"{meta['model']}  {_H['dim'](_1l(meta['task']))}", ellipsis=True))
+        if not done:
+            # Compact heartbeat only (iter + last tool); full progress + intent via
+            # /worker <pid>. Keep it to one short line so the list stays scannable.
+            prog = _read_progress(meta["result"])
+            if prog:
+                pl = {k.strip().lower(): v.strip()
+                      for k, v in (x.split(":", 1) for x in prog.splitlines() if ":" in x)}
+                bits = []
+                first = prog.splitlines()[0] if prog.splitlines() else ""
+                if first.startswith("iter "):
+                    bits.append(first)
+                if pl.get("last"):
+                    bits.append("last " + pl["last"])
+                n_inj, _last = _inject_count(meta["result"])
+                if n_inj:
+                    bits.append(f"{n_inj} inject" + ("s" if n_inj > 1 else ""))
+                if bits:
+                    print(_fit(_H["dim"]("        " + "  ".join(bits)), ellipsis=True))
+
+
+def _worker_completer(agent, cfg):
+    """Tab-completion for /worker's first argument: the subcommand verbs plus every
+    live worker pid (so `cancel <Tab>` / a bare `<Tab>` offers real pids). Matches the
+    menu contract of other multi-verb commands (e.g. /mcp)."""
+    opts = ["status", "result", "transcript", "cancel", "pause", "pause_all", "stop_all",
+            "resume", "resume_all", "inject", "set_plan", "add_note", "board", "models"]
+    opts += [str(pid) for pid in _H.get("workers", {})]
+    return opts
+
+
+def _prompt_names_into(tool):
+    """Put the worker prompt names (read at launch) into the `prompt` param text."""
+    names = (_H.get("worker_prompt_names") or (lambda: []))()
+    prop = tool["parameters"]["properties"].get("prompt")
+    if prop is not None:
+        prop["description"] = ("Optional role prompt put before the task"
+                               + (f": {', '.join(names)}." if names else "."))
+
+
+def setup(lc, cfg):
+    # Capture the core hooks + helpers run()/the command need (a tool's run() gets
+    # no lc). setup() is driver-only = exactly where a worker is launched, so these
+    # are always present when run() fires.
+    for k in ("bg_launch", "bg_list", "bg_status", "_bg_kill", "_bg_kill_tree", "_bg_log_tail", "_extract_marked", "_extract_fenced", "CONFIG_DIR", "_run_pid_dir",
+              "BRIEF_MARK", "GRANT_MARK", "RESULT_MARK", "RESUME_MARK", "LEASH_LEVELS", "_norm_leash", "_redact",
+              "SEED_CONTEXT_MARK", "SEED_PLAN_MARK", "SEED_NOTES_MARK",
+              "active_remote", "_ssh_master_alive", "ensure_worker_master",
+              "active_tool_names", "tool_min_leash", "_tool_alias_names", "resolve_host", "_norm_host",
+              "with_worker_prompt", "worker_prompt_names",
+              "save_session", "load_envelope", "get_provider", "_inheritable_settings",
+              "dim", "bold", "green", "cyan", "_fit_line", "_one_line", "GLYPH"):
+        if k in lc:
+            _H[k] = lc[k]
+    _H["__file__"] = lc.get("__file__")     # the CORE module file, for the worker argv
+    _prompt_names_into(TOOL)
+    _H["cfg"] = cfg
+    _H["workers"] = {}                       # pid -> {result, task, started, model, announced}
+    _H.setdefault("tokens_in", 0)            # observability: cumulative finished-worker spend
+    _H.setdefault("tokens_out", 0)           # (accrued as each worker finishes; see _accrue_usage)
+
+    # Desktop ping on a worker finish, IF the notify lean-tool is also enabled (its
+    # _ping is exposed on lc when it runs). Optional - absent => notices are text-only.
+    _H["ping"] = lc.get("_ping")
+    lc["_dw_publish_subs"] = _publish_subs     # worker loop republishes each iteration
+    lc["_dw_nested_running"] = _nested_running   # status bar: + workers below my children
+
+    # Surface a worker's finished result to the model: wrap run_turn so each turn, any
+    # tracked worker that finished since last turn injects a finish notice (per-worker
+    # + an 'all done' line when the last one clears). Workers are hidden from the core
+    # bg finished-notify (kind filter), so this is their notification path.
+    Agent = lc["Agent"]
+    _orig_run_turn = Agent.run_turn
+
+    def run_turn(self, user_input, *args, **kwargs):
+        try:
+            notice = _finished_notice()
+        except Exception:
+            notice = ""
+        if notice:
+            user_input = user_input + "\n\n" + notice
+        return _orig_run_turn(self, user_input, *args, **kwargs)
+    Agent.run_turn = run_turn
+
+    # AUTONOMY: also feed worker finishes into the event-driven WAKE path so a finished
+    # worker wakes the agent with no operator input (when cfg.wake_on_bg_finish is on).
+    # Workers are hidden from the core bg wake (kind filter), so this hook is their only
+    # wake route. _finished_notice owns its dedup (meta['announced']), so a worker
+    # surfaced by wake won't re-report via the run_turn wrapper above. Best-effort: if
+    # the core is older and lacks the registry, wake simply stays task-only.
+    _reg = lc.get("register_wake_hook")
+    if _reg:
+        _reg(lambda: _finished_notice() or "")
+
+    # BOARD -> WORKER ping. Expose a pid-targeted inject to the board tool (assign/done
+    # push a "you're on t3" / "t2 done, you're unblocked" nudge to the live worker so it
+    # need not poll the board). Board.py can't see our _H["workers"], so bridge via core.
+    # A board 'worker' label may be a pid (int) or a free label; only an int pid maps to a
+    # live worker here - anything else returns False (board falls back to no push).
+    _reg_inject = lc.get("register_worker_inject")
+    if _reg_inject:
+        def _board_push(worker, text):
+            try:
+                pid = int(str(worker).strip())
+            except (TypeError, ValueError):
+                return False
+            if pid not in _H["workers"]:
+                return False
+            out = _worker_inject(pid, text, source="board")
+            return isinstance(out, str) and out.startswith("injected")
+        _reg_inject(_board_push)
+
+    # BOARD -> DORMANT-PEER spawn. When the board assigns to a participant with no live
+    # process, wake it by dispatching a worker FROM its session file (from_session=), seeded
+    # with the task. Reuses the normal dispatch path (governor/concurrency/leash all apply).
+    # Returns the dispatch status line (which carries the new worker pid).
+    _reg_spawn = lc.get("register_peer_spawn")
+    if _reg_spawn:
+        def _board_spawn(session_name, task, board=""):
+            # A woken peer inherits the DRIVER's own leash (capped there, like any dispatch).
+            # Waking a peer to DO a task usually means editing/running, so the read-only
+            # dispatch default would block real work. A read-only driver still wakes only a
+            # read-only peer; the leash never widens beyond the driver's own.
+            return run({"action": "dispatch",
+                        "task": task or "Continue this session's work.",
+                        "from_session": session_name,
+                        "taskboard": board or "",
+                        "leash": _H["_norm_leash"](getattr(cfg, "leash", "r")) or "r"},
+                       str(getattr(cfg, "cwd", ".")))
+        _reg_spawn(_board_spawn)
+
+    # A small helper to list models available on this box (for validation), resolved
+    # lazily so it reflects the live provider.
+    def _available_models():
+        try:
+            get_provider = lc["get_provider"]
+            spec = get_provider(cfg.provider) if cfg.provider else None
+            return list(spec["list_models"]() or []) if spec else []
+        except Exception:
+            return []
+    _H["available_models"] = _available_models
+
+    # Map every ENABLED provider -> its available models, so a worker `model` can be
+    # ANY model on any enabled backend (its provider inferred). Resolved lazily so it
+    # reflects the live registry. Returns an ordered dict {provider_name: [models]}.
+    def _enabled_provider_models():
+        get_provider = lc["get_provider"]
+        out = {}
+        for name in (cfg.providers_enabled or []):
+            try:
+                spec = get_provider(name)
+                out[name] = list(spec["list_models"]() or []) if spec else []
+            except Exception:
+                out[name] = []
+        return out
+    _H["enabled_provider_models"] = _enabled_provider_models
+
+    lc["register_command"]("/worker", _worker_cmd,
+                           "list workers (+ results); /worker <pid> = full result, "
+                           "/worker status [pid], /worker cancel <pid>, "
+                           "/worker inject <pid> <message>",
+                           _worker_completer)
+    lc["register_command"]("/wkr", _worker_cmd, "", _worker_completer)   # status-row alias

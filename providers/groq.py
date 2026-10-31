@@ -1,0 +1,698 @@
+import getpass
+import json
+import os
+import re
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+
+def _dbg_swallow():
+    """Debug bucket shim: hands a swallowed exception to lean-coder's _dbg_swallow
+    (a no-op unless LEANCODER_DEBUG=1). Never raises."""
+    for _m in ("__main__", "lean_coder"):
+        _f = getattr(sys.modules.get(_m), "_dbg_swallow", None)
+        if _f and _f is not _dbg_swallow:
+            try:
+                _f(2)
+            except Exception:
+                pass
+            return
+
+
+# Groq - an OpenAI-compatible inference API (very fast; free tier is generous but
+# rate-limited). docs: https://console.groq.com/docs/openai  # sweep-ok
+# Auth is a Bearer key (gsk_...). Wire format is OpenAI-compatible, so conversion
+# from lean-coder's internal format is nearly an identity.
+_API_BASE    = "https://api.groq.com/openai/v1"  # sweep-ok
+_MAX_TOKENS  = 32768       # fallback when /models doesn't report a model's output limit
+_CTX_DEFAULT = 131_072
+_PROVIDER    = "groq"  # sweep-ok
+
+_CONFIG_DIR = None
+_MODEL_DATA = {}
+_lc         = {}
+
+# Groq's edge (Cloudflare) 403s the default Python-urllib User-Agent (error 1010);
+# any real UA passes.  # sweep-ok
+_UA = "lean-coder"  # sweep-ok
+
+# Free-tier caps (console.groq.com/docs/rate-limits): 30 req/min on chat models;
+# per-model req/day and tokens/min. Every response's x-ratelimit-* headers carry
+# the account's REAL per-model values (limit-requests = per DAY, limit-tokens =
+# per MINUTE) and override these. Unknown models fall back to "*".
+# Measured Oct 2026 from headers: every chat model on this free key (gpt-oss-120b,
+# gpt-oss-20b, qwen3.8-27b) = 1000 req/day, 8000 tokens/min. Llama models are
+# no longer served to it.
+_RATE_DEFAULTS = {
+    "*": {"rpm": 30, "rpd": 1000, "tpm": 8000},
+}
+_LEDGER = None
+
+
+def _ledger():
+    global _LEDGER
+    if _LEDGER is None and _lc.get("RateLedger"):
+        # Groq's daily request window is rolling (tokens/requests replenish
+        # continuously), so count the last 24h rather than since midnight.
+        _LEDGER = _lc["RateLedger"](_PROVIDER, _RATE_DEFAULTS, day_reset="rolling")
+    return _LEDGER
+
+
+def _learn_rl(model, headers):
+    """x-ratelimit-limit-requests is per DAY, -tokens per MINUTE on Groq."""
+    led = _ledger()
+    if not (led and headers):
+        return
+    def _i(k):
+        try:
+            return int(headers.get(k))
+        except (TypeError, ValueError):
+            return None
+    led.learn(model, rpd=_i("x-ratelimit-limit-requests"), tpm=_i("x-ratelimit-limit-tokens"))
+
+# Privacy posture shown at the point of use (on connect + in /usage).
+_PRIVACY    = "prompts are not used for training (API traffic under a separate DPA)"
+_PRIVACY_HI = False   # low risk -> dim, not a warning
+# Show the on-activate identity + privacy banner? Off by default (the core
+# 'provider: <name>  model: <model>' line already announces the backend).
+_SHOW_BANNER = False
+
+# Non-chat models the /models endpoint returns (speech, TTS, safety classifiers).
+# They can't drive a coding agent, so they're kept out of the picker.  # sweep-ok
+_SKIP_KEYS = ("whisper", "orpheus", "guard")  # sweep-ok
+
+# Models that generate text but reject custom tool definitions (Groq's "compound"
+# agentic systems run their own built-in tools). Kept in the list but flagged.  # sweep-ok
+_NO_TOOLS_KEYS = ("compound",)  # sweep-ok
+
+
+# ----------------------------------------------------------------------------
+# Credentials: ~/.config/leancoder/groq.json   {"key": "gsk_...", "active": false}
+# Key resolution order: GROQ_API_KEY > keyfile  # sweep-ok
+# ----------------------------------------------------------------------------
+
+def _cred_path():
+    return (_CONFIG_DIR or Path.home() / ".config" / "leancoder") / "groq.json"  # sweep-ok
+
+def _models_cache_path():
+    return (_CONFIG_DIR or Path.home() / ".config" / "leancoder") / "model-cache-groq.json"
+
+def _api_key():
+    v = os.environ.get("GROQ_API_KEY", "")  # sweep-ok
+    if v:
+        return v
+    try:
+        return json.loads(_cred_path().read_text()).get("key", "")
+    except Exception:
+        return ""
+
+def _cred_data():
+    try:
+        return json.loads(_cred_path().read_text())
+    except Exception:
+        return {}
+
+def _save_cred(data):
+    _cred_path().parent.mkdir(parents=True, exist_ok=True)
+    _cred_path().write_text(json.dumps(data, indent=2))
+    try:
+        _cred_path().chmod(0o600)
+    except OSError:
+        _dbg_swallow()
+
+def _clear_cred():
+    if _cred_path().is_file():
+        _cred_path().unlink()
+
+
+# ----------------------------------------------------------------------------
+# Transient-error retry (same shape as the other providers)
+# ----------------------------------------------------------------------------
+
+_MAX_RETRIES = 3
+_MAX_WAIT    = 75
+_RETRY_CODES = (429, 502, 503, 504)   # 429 retried only with a delay hint; 5xx via backoff
+
+
+def _retry_after_secs(headers, body):
+    ra = headers.get("Retry-After") or headers.get("retry-after")
+    if ra:
+        try:
+            return float(ra)
+        except (TypeError, ValueError):
+            _dbg_swallow()
+    try:                                   # Groq embeds "try again in 7.66s" in the message
+        msg = json.loads(body).get("error", {}).get("message", "")
+        m = re.search(r"in ([\d.]+)s", msg)  # sweep-ok
+        if m:
+            return float(m.group(1))
+    except Exception:
+        _dbg_swallow()
+    return None
+
+
+def _backoff(attempt):
+    return min(2.0 * (2 ** attempt), _MAX_WAIT)
+
+
+def _interruptible_sleep(secs, should_abort, why="waiting"):
+    vw = _lc.get("visible_wait")
+    if vw:      # live countdown, so a wait is never a silent blank screen
+        return vw(secs, why, should_abort)
+    return _plain_sleep(secs, should_abort)
+
+
+def _plain_sleep(secs, should_abort):
+    waited = 0.0
+    while waited < secs:
+        if should_abort and should_abort():
+            return False
+        chunk = min(0.5, secs - waited)
+        time.sleep(chunk)
+        waited += chunk
+    return True
+
+
+# ----------------------------------------------------------------------------
+# Model cache
+# ----------------------------------------------------------------------------
+
+def _load_models_cache():
+    try:
+        return json.loads(_models_cache_path().read_text()).get("models", [])
+    except Exception:
+        return []
+
+
+def _fetch_models(key):
+    """GET /models (OpenAI-shaped). Keeps active text->text chat models; drops
+    speech/TTS/classifier models that can't drive a coding agent."""
+    try:
+        req = urllib.request.Request(
+            f"{_API_BASE}/models",
+            headers={"Authorization": f"Bearer {key}", "User-Agent": _UA},  # sweep-ok
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read())
+        out = []
+        for m in data.get("data", []):
+            mid = m.get("id", "")
+            if not mid or not m.get("active", True):
+                continue
+            low = mid.lower()  # sweep-ok
+            if any(k in low for k in _SKIP_KEYS):
+                continue
+            imod = m.get("input_modalities")  or ["text"]
+            omod = m.get("output_modalities") or ["text"]
+            if "text" not in imod or "text" not in omod:
+                continue
+            out.append({
+                "id":               mid,
+                "max_input_tokens": m.get("context_window") or m.get("context_length") or _CTX_DEFAULT,
+                "max_tokens":       m.get("max_completion_tokens") or m.get("max_output_length") or _MAX_TOKENS,
+                # Only gpt-oss takes reasoning_effort low/med/high. qwen3 et al accept
+                # only none/default (a different scale) and 400 on low/med/high, so we
+                # don't expose the effort knob for them - they just reason by default.
+                "reason":           "gpt-oss" in low,  # sweep-ok
+            })
+        if out:
+            try:
+                _models_cache_path().parent.mkdir(parents=True, exist_ok=True)
+                _models_cache_path().write_text(json.dumps({"models": out}))
+            except Exception:
+                _dbg_swallow()
+            return out
+    except Exception:
+        _dbg_swallow()
+    return _load_models_cache()
+
+
+def _ensure_models(force=False):
+    global _MODEL_DATA
+    if _MODEL_DATA and not force:
+        return _MODEL_DATA
+    key    = _api_key()
+    models = _fetch_models(key) if key else _load_models_cache()
+    _MODEL_DATA = {m["id"]: m for m in models}
+    return _MODEL_DATA
+
+
+def _list_models():
+    return list(_ensure_models())
+
+
+def _context_window(model):
+    return _ensure_models().get(model, {}).get("max_input_tokens", _CTX_DEFAULT)
+
+
+def _capabilities(model):
+    caps = {}
+    if _ensure_models().get(model, {}).get("reason"):
+        caps["effort"] = ["low", "med", "high"]
+    return caps
+
+
+def _is_no_tools(model):
+    m = model.lower()  # sweep-ok
+    return any(k in m for k in _NO_TOOLS_KEYS)
+
+
+def _model_status(model):
+    # Shown dimmed next to the model in /model. Flags models that generate text but
+    # reject custom tool definitions, so the picker says so up front.
+    return "chat-only (no tool calling)" if _is_no_tools(model) else None
+
+
+# ----------------------------------------------------------------------------
+# Display helpers
+# ----------------------------------------------------------------------------
+
+def _sn(n):
+    try:
+        n = int(n)
+        if n >= 1_000_000: return f"{n/1_000_000:.1f}M"
+        if n >= 1_000:     return f"{n/1_000:.0f}k"
+        return str(n)
+    except Exception:
+        return str(n)
+
+
+def _privacy_note():
+    if _PRIVACY_HI:
+        paint = _lc.get("yellow") or _lc.get("dim") or (lambda s: s)
+    else:
+        paint = _lc.get("dim") or (lambda s: s)
+    return paint("  privacy: " + _PRIVACY)
+
+
+# ----------------------------------------------------------------------------
+# Message / tool conversion (lean-coder internal -> OpenAI/Groq; near identity)
+# ----------------------------------------------------------------------------
+
+def _cvt_tools(tools):
+    out = []
+    for t in tools:
+        fn = t.get("function", {})
+        out.append({
+            "type": "function",
+            "function": {
+                "name":        fn["name"],
+                "description": fn.get("description", ""),
+                "parameters":  fn.get("parameters", {"type": "object", "properties": {}}),
+            },
+        })
+    return out
+
+
+def _cvt_messages(messages):
+    out = []
+    i   = 0
+    while i < len(messages):
+        m    = messages[i]
+        role = m.get("role")
+        if role in ("system", "user"):
+            out.append({"role": role, "content": m.get("content", "")})
+            i += 1
+        elif role == "assistant":
+            msg = {"role": "assistant", "content": m.get("content", "") or ""}
+            tcs = []
+            for tc in (m.get("tool_calls") or []):
+                fn   = tc.get("function", {})
+                args = fn.get("arguments", {})
+                if not isinstance(args, str):
+                    args = json.dumps(args)
+                tcs.append({
+                    "id":       tc.get("id", ""),
+                    "type":     "function",
+                    "function": {"name": fn.get("name", ""), "arguments": args},
+                })
+            if tcs:
+                msg["tool_calls"] = tcs
+                if not msg["content"]:
+                    msg["content"] = None
+            out.append(msg)
+            i += 1
+        elif role == "tool":
+            # lean-coder tool results carry `tool_name`, not `tool_call_id`; OpenAI
+            # needs the id, so correlate positionally to the preceding assistant's
+            # tool_calls (their ids round-tripped from our streamed response).
+            prev_calls = []
+            for prev in reversed(out):
+                if prev.get("role") == "assistant":
+                    prev_calls = prev.get("tool_calls") or []
+                    break
+            ci = 0
+            while i < len(messages) and messages[i].get("role") == "tool":
+                r    = messages[i]
+                tcid = r.get("tool_call_id", "")
+                if not tcid and ci < len(prev_calls):
+                    tcid = prev_calls[ci].get("id", "")
+                _c = r.get("content", "")
+                if not isinstance(_c, str):    # a loaded/synthesised history may carry
+                    _c = "" if _c is None else str(_c)   # a non-string; the API wants text
+                out.append({
+                    "role":         "tool",
+                    "tool_call_id": tcid,
+                    "content":      _c,
+                })
+                ci += 1
+                i  += 1
+        else:
+            i += 1
+    return out
+
+
+# ----------------------------------------------------------------------------
+# Client
+# ----------------------------------------------------------------------------
+
+def _user_cap(cfg):
+    """The operator's reply cap (provider setting max_out): a positive int, else None."""
+    try:
+        v = int(cfg.setting("max_out") or 0) if cfg is not None else 0
+    except (TypeError, ValueError, AttributeError):
+        v = 0
+    return v if v > 0 else None
+
+
+class _GroqClient:
+    uncapped_ctx = True
+
+    def __init__(self, cfg):
+        self.cfg               = cfg
+        self.last_out_tokens   = None
+        self.last_cache_read   = 0
+        self.last_cache_write  = 0
+        self._sess_cache_read  = 0
+        self._sess_cache_write = 0
+
+    def _model(self):
+        return self.cfg.active_model()
+
+    def list_models(self):
+        return _list_models()
+
+    def running_models(self):
+        return []
+
+    def detect_num_ctx(self):
+        return _context_window(self._model())
+
+    def _consume(self, resp, should_abort):
+        out = self._consume_stream(resp, should_abort)
+        cap = getattr(self, "_sent_cap", None)
+        if cap and not out[2] and self.last_finish == "length":
+            print(_lc["yellow"](f"[!] reply hit max_out ({cap:,} tokens) and was cut off - "
+                                f"/provider set max_out <higher> or 0 for no cap"))
+        return out
+
+    def _consume_stream(self, resp, should_abort):
+        """Read the streamed reply with core's shared OpenAI-style reader. Provider
+        extras: a delta.refusal marks the turn a refusal; prompt-cache hits
+        (prompt_tokens_details.cached_tokens) are split out of the prompt count; usage may arrive under x_groq.usage.
+        Native tool calls only (no text-encoded fallback on a hosted API)."""
+        extra = {"cached": 0, "refusal": False}
+
+        def on_obj(obj, st):
+            for ch in obj.get("choices") or []:
+                if (ch.get("delta") or {}).get("refusal"):
+                    extra["refusal"] = True
+            um = obj.get("usage") or (obj.get("x_groq") or {}).get("usage")
+            if um and not obj.get("usage"):
+                st["prompt_total"] = um.get("prompt_tokens", st["prompt_total"])
+                st["out_tokens"] = um.get("completion_tokens", st["out_tokens"])
+            if um:
+                det = um.get("prompt_tokens_details") or {}
+                extra["cached"] = det.get("cached_tokens", extra["cached"]) or 0
+
+        def on_done(st):
+            if extra["refusal"]:
+                st["finish"] = "refusal"
+            self._last_in_total = st["prompt_total"] or 0
+            # prompt_tokens includes any cache hit; core sums prompt_eval + cache, so
+            # return only the uncached part.
+            if st["prompt_total"] is not None:
+                st["prompt_total"] = max(st["prompt_total"] - extra["cached"], 0)
+
+        self.last_cache_read, self.last_cache_write = 0, 0
+        out = _lc["consume_openai_stream"](self, resp, should_abort, None,
+                                           on_obj=on_obj, on_done=on_done,
+                                           text_fallback=False)
+        self.last_cache_read = extra["cached"]
+        return out
+
+    def _send(self, key, payload, should_abort):
+        data    = json.dumps(payload).encode()
+        model   = payload.get("model", "")
+        attempt = 0
+        led     = _ledger()
+        if led:
+            warn = led.preflight(model, self.cfg)
+            if warn:
+                print(_lc["yellow"](f"[!] {model}: {warn}"))
+        while True:
+            self._last_in_total = 0
+            self.last_out_tokens = None
+            req = urllib.request.Request(
+                f"{_API_BASE}/chat/completions",
+                data=data, method="POST",
+                headers={"Content-Type": "application/json",
+                         "Authorization": f"Bearer {key}",
+                         "User-Agent": _UA},  # sweep-ok
+            )
+            try:
+                with urllib.request.urlopen(
+                        req,
+                        timeout=(getattr(self.cfg, "gen_connect_timeout", None) or 600)) as resp:
+                    _learn_rl(model, resp.headers)
+                    result = self._consume(resp, should_abort)
+                    if led:
+                        led.record(model, self._last_in_total, self.last_out_tokens or 0, 200)
+                    return result
+            except urllib.error.HTTPError as e:
+                _learn_rl(model, e.headers)
+                if led:
+                    led.record(model, 0, 0, e.code)
+                body = e.read().decode(errors="replace")
+                if e.code in _RETRY_CODES and attempt < _MAX_RETRIES:
+                    hint = _retry_after_secs(e.headers or {}, body)
+                    if e.code == 429:
+                        wait = (hint + 1) if hint is not None else None
+                    else:
+                        wait = (hint + 1) if hint is not None else _backoff(attempt)
+                    if wait is not None and wait <= _MAX_WAIT:
+                        attempt += 1
+                        reason = "rate limited" if e.code == 429 else f"unavailable ({e.code})"
+                        print(_lc["red"](f"[!] {model} {reason} - retry {attempt}/{_MAX_RETRIES} "
+                                         f"in {wait:.0f}s"))
+                        if not _interruptible_sleep(wait, should_abort, f"{model} retry {attempt}/{_MAX_RETRIES}"):
+                            raise RuntimeError("aborted during retry wait") from None
+                        continue
+                raise RuntimeError(f"API {e.code}: {body[:400]}") from None
+            except (urllib.error.URLError, ConnectionError, OSError) as e:
+                # Transport failure (dropped connection, TLS reset, DNS blip) - no
+                # HTTP status. Retry with backoff; a bad message never surfaces empty.
+                if attempt < _MAX_RETRIES:
+                    wait = _backoff(attempt)
+                    attempt += 1
+                    detail = str(getattr(e, "reason", None) or e) or type(e).__name__
+                    print(_lc["red"](f"[!] {model} connection error ({detail[:80]}) - "
+                                     f"retry {attempt}/{_MAX_RETRIES} in {wait:.0f}s"))
+                    if not _interruptible_sleep(wait, should_abort, f"{model} retry {attempt}/{_MAX_RETRIES}"):
+                        raise RuntimeError("aborted during retry wait") from None
+                    continue
+                raise RuntimeError(
+                    f"request failed: {str(getattr(e, 'reason', None) or e) or type(e).__name__}"
+                ) from None
+
+    def chat(self, messages, tools, should_abort=None):
+        key = _api_key()
+        if not key:
+            raise RuntimeError("no API key - use /provider login")
+
+        cur_model = self._model()
+        minfo     = _ensure_models().get(cur_model, {})
+        # No artificial cap: ask for the model's full output limit. The ONLY clamp
+        # is Groq's tokens/minute rule below (it rejects a request whose input +
+        # requested output exceeds TPM), which is a hard server rule, not a choice.
+        max_out   = minfo.get("max_tokens") or _MAX_TOKENS
+        max_in    = minfo.get("max_input_tokens", _CTX_DEFAULT)
+        _mt       = _lc.get("messages_tokens")
+        _est_toks = _mt(messages, tools) if _mt else len(json.dumps(messages)) // 4
+        if _mt is None and tools:
+            _est_toks += len(json.dumps(tools)) // 4
+        # Groq counts the REQUESTED max_completion_tokens against tokens/minute, so
+        # an output budget above (TPM - input) 429s every time (measured: 8000 TPM
+        # on gpt-oss-120b, 16384 requested = instant reject). Clamp it to fit.
+        led = _ledger()
+        tpm = led.caps(cur_model, self.cfg).get("tpm") if led else None
+        if tpm:
+            room = tpm - _est_toks - 256
+            if room < 512:
+                raise RuntimeError(
+                    f"~{_est_toks:,} input tokens leaves no room under {cur_model}'s "
+                    f"{tpm:,} tokens/min free cap - /compact, or switch provider "
+                    f"(gemini / openrouter take far larger contexts)")
+            max_out = min(max_out, room)
+        max_out = min(max_out, max_in - _est_toks)
+        if max_out < 512:
+            raise RuntimeError(
+                f"context too large for {cur_model} "
+                f"(~{_est_toks:,} of {max_in:,} tokens used, no room to reply) - run /compact first"
+            )
+
+        # Optional user reply cap (same knob as llamacpp/mlx; unset/0 = no cap). Applied
+        # after the room checks, so a small cap never trips the "no room" errors.
+        cap = _user_cap(self.cfg)
+        if cap:
+            max_out = min(max_out, cap)
+        self._sent_cap = cap
+
+        payload = {
+            "model":          cur_model,
+            "messages":       _cvt_messages(messages),
+            "max_completion_tokens": max_out,
+            "stream":         True,
+            "stream_options": {"include_usage": True},
+        }
+        # compound-style models reject custom tools; send none so they 200 as
+        # chat-only instead of 400ing. The /model picker flags them via model_status.
+        if tools and not _is_no_tools(cur_model):
+            payload["tools"] = _cvt_tools(tools)
+
+        if minfo.get("reason"):
+            eff = self.cfg.setting("effort")
+            if eff:
+                payload["reasoning_effort"] = "medium" if eff == "med" else eff
+
+        result = self._send(key, payload, should_abort)
+        self._sess_cache_read  += self.last_cache_read
+        self._sess_cache_write += self.last_cache_write
+        return result
+
+
+def _make_client(cfg):
+    return _GroqClient(cfg)
+
+
+# ----------------------------------------------------------------------------
+# Provider hooks
+# ----------------------------------------------------------------------------
+
+def _available():
+    return bool(_api_key())
+
+
+def _autostart():
+    return bool(_api_key()) and _cred_data().get("active", False)
+
+
+def _on_activate(agent, cfg):
+    _ensure_models(force=True)
+    if cfg.setting("effort") is None and _ensure_models().get(cfg.active_model(), {}).get("reason"):
+        cfg.set_setting("effort", "med")
+    if _SHOW_BANNER:
+        key    = _api_key()
+        masked = f"{key[:8]}...{key[-4:]}" if key and len(key) > 12 else "(env)"
+        print(_lc["dim"](f"  Groq API key  {masked}"))
+        print(_privacy_note())
+    d = _cred_data()
+    d["active"] = True
+    if d.get("key") or _cred_path().is_file():
+        _save_cred(d)
+
+
+def _on_deactivate(agent, cfg):
+    d = _cred_data()
+    d["active"] = False
+    if d.get("key"):
+        _save_cred(d)
+
+
+def _login(agent, cfg):
+    key = _api_key()
+    if not key:
+        print(_lc["dim"]("Paste your Groq API key (gsk_...) and press Enter:"))
+        try:
+            raw = getpass.getpass(prompt="").strip()
+        except (EOFError, KeyboardInterrupt):
+            return False
+        m   = re.search(r"gsk_\S+", raw)  # sweep-ok - extract key from surrounding noise
+        key = m.group(0) if m else raw
+        if not key.startswith("gsk_"):  # sweep-ok
+            print(_lc["red"]("[!] does not look like a Groq key"))
+            return False
+        _save_cred({"key": key, "active": True})
+        print(_lc["dim"](f"  saved to {_cred_path()}"))
+    else:
+        d = _cred_data()
+        d["active"] = True
+        if d.get("key"):
+            _save_cred(d)
+    return True
+
+
+def _clear(agent, cfg):
+    _clear_cred()
+
+
+def _usage(agent, cfg):
+    led = _ledger()
+    return led.meters(cfg.active_model(), cfg) if led else None
+
+
+def _detail(agent, cfg, arg=""):
+    bold = _lc["bold"]
+    dim  = _lc["dim"]
+
+    cur_model = cfg.active_model()
+    can_eff   = _ensure_models().get(cur_model, {}).get("reason")
+    cur_eff   = cfg.setting("effort") or ("med" if can_eff else "na")
+    lines = [bold(cur_model) + dim(f"   effort: {cur_eff}")]
+
+    si = getattr(agent, "session_in",  0) or 0
+    so = getattr(agent, "session_out", 0) or 0
+    cr = getattr(agent.client, "_sess_cache_read",  0) or 0
+    cw = getattr(agent.client, "_sess_cache_write", 0) or 0
+    cache_s = f"   cache r {_sn(cr)} w {_sn(cw)}" if (cr or cw) else ""
+    lines.append(dim(f"\n  session   in {si:,}   out {so:,}   total {si + so:,}{cache_s}"))
+    lines.append("\n" + _privacy_note())
+    led = _ledger()
+    if led:
+        lines.append(dim("\n" + "\n".join(led.detail_lines(cur_model, cfg))))
+    lines.append(dim("  (Groq - see console.groq.com for limits)"))  # sweep-ok
+    return "\n".join(lines)
+
+
+# ----------------------------------------------------------------------------
+# Registration
+# ----------------------------------------------------------------------------
+
+PROVIDER = {
+    "name":           _PROVIDER,
+    "description":    "Groq (fast OpenAI-compatible inference; API key)",  # sweep-ok
+    "make_client":    _make_client,
+    "list_models":    _list_models,
+    "context_window": _context_window,
+    "capabilities":   _capabilities,
+    "model_status":   _model_status,
+    "tool_support":   lambda m: not _is_no_tools(m),   # core forces chat-only for these
+    "available":      _available,
+    "autostart":      _autostart,
+    "on_activate":    _on_activate,
+    "on_deactivate":  _on_deactivate,
+    "usage":          _usage,
+    "login":          _login,
+    "clear":          _clear,
+    "detail":         _detail,
+    "tag":            "groq",
+}
+
+
+def setup(lc, cfg):
+    global _CONFIG_DIR
+    _lc.update(lc)
+    _CONFIG_DIR = lc.get("CONFIG_DIR")

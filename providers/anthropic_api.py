@@ -1,0 +1,1034 @@
+import datetime
+import getpass
+import json
+import os
+import re
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+
+def _dbg_swallow():
+    """Debug bucket shim: hands a swallowed exception to lean-coder's _dbg_swallow
+    (a no-op unless LEANCODER_DEBUG=1). Never raises."""
+    for _m in ("__main__", "lean_coder"):
+        _f = getattr(sys.modules.get(_m), "_dbg_swallow", None)
+        if _f and _f is not _dbg_swallow:
+            try:
+                _f(2)
+            except Exception:
+                pass
+            return
+
+
+_API_BASE       = "https://api.anthropic.com"  # sweep-ok
+_MAX_TOKENS     = 16384
+_CTX_DEFAULT    = 200_000
+_SONNET_CTX_CAP = 200_000   # sonnet 1M draws credits on Max; cap it
+_PROVIDER       = "anthropic_api"  # sweep-ok
+
+_CONFIG_DIR = None   # set in setup() from lc["CONFIG_DIR"]
+_MODEL_DATA = {}     # model_id -> {max_input_tokens, max_tokens, can_think, ...}
+_lc         = {}     # display helpers injected by setup()
+
+# Transient-error retry. 429 is handled separately (Haiku fallback in chat()); here
+# we only back off on Anthropic's 529 "Overloaded" + gateway/5xx errors, which the
+# provider previously surfaced straight to the user.
+_MAX_RETRIES = 3
+_MAX_WAIT    = 75   # seconds; cap a single wait so the REPL never hangs
+_RETRY_CODES = (500, 502, 503, 504, 529)   # 529 = Anthropic "Overloaded"
+# Max gap between stream events before the socket is treated as dead and we bail to
+# the retry path. A real overload is an explicit SSE error/HTTP 529 (handled above),
+# not a silent hang, and ping/thinking deltas arrive well inside this - so 90s of
+# TOTAL silence = a stalled connection. Matches the anthropic SDK streaming
+# idleTimeout default (90s; sdk-typescript issue #867). stream_tiered raises
+# StreamStall (a ConnectionError) on trip, caught by _send's transport-retry branch.
+_STREAM_IDLE_TIMEOUT = 90   # seconds
+
+# Privacy posture shown at the point of use (on connect + in /usage).
+_PRIVACY    = "commercial API - inputs & outputs are not used to train Anthropic's models"
+_PRIVACY_HI = False   # low risk -> dim
+# Show the on-activate identity + privacy banner? Off by default (the core
+# 'provider: <name>  model: <model>' line already announces the backend).
+_SHOW_BANNER = False
+
+
+def _retry_after_secs(headers):
+    ra = headers.get("retry-after") or headers.get("Retry-After")
+    if ra:
+        try:
+            return float(ra)
+        except (TypeError, ValueError):
+            _dbg_swallow()
+    return None
+
+
+def _backoff(attempt):
+    """Exponential backoff (2s, 4s, 8s, ...), capped at _MAX_WAIT."""
+    return min(2.0 * (2 ** attempt), _MAX_WAIT)
+
+
+# SSE error-event types that are transient overloads/5xx. Anthropic can signal an
+# overload MID-STREAM as an {"type":"error","error":{"type":...}} frame (HTTP 200,
+# then this) instead of an HTTP 529 - those must retry like a 529, not die raw.
+_TRANSIENT_SSE_ERR_TYPES = ("overloaded_error", "overloaded", "api_error")
+
+
+class _TransientStreamError(RuntimeError):
+    """A mid-stream SSE error frame that is a transient overload/5xx worth retrying.
+    Distinct type so _send's retry loop can catch it (the stream is consumed inside
+    the urlopen `with`, so this escapes past the HTTPError handler otherwise)."""
+
+
+def _raise_sse_error(err):
+    """Raise an SSE error frame's error dict. A transient overload/5xx raises
+    _TransientStreamError (retried); anything else raises a plain RuntimeError."""
+    etype = str((err or {}).get("type", "")).lower()
+    msg = (err or {}).get("message") or "API error"
+    if etype in _TRANSIENT_SSE_ERR_TYPES:
+        raise _TransientStreamError(f"{msg} (sse:{etype})")
+    raise RuntimeError(msg)
+
+
+def _note_empty_response(content, tool_calls, stop_reason, retries=0):
+    """Tell the OPERATOR an empty assistant turn happened, once the silent retries are
+    spent. Anthropic answers a decline (and some congested/glitched sends) with a NORMAL
+    200 stream: no error frame, zero text, maybe stop_reason 'refusal' - so content is ""
+    with no exception. Never claims a cause: the stop_reason is a fact, not a verdict.
+    Operator-only: the model is never told (a model shown its own 'refusal' tends to
+    keep refusing for the rest of the session, even when the empty reply was a blip)."""
+    if content or tool_calls:
+        return
+    yellow = _lc.get("yellow") or _lc.get("dim") or (lambda s: s)
+    dim    = _lc.get("dim") or (lambda s: s)
+    warn   = (_lc.get("GLYPH") or {}).get("warn", "!")
+    sr = f"stop_reason: {stop_reason}" if stop_reason else "no stop_reason"
+    after = f" after {retries} retries" if retries else ""
+    print(yellow(f"  {warn} the model returned no reply{after} ({sr}) - possibly a refusal, "
+                 f"API congestion, or a network glitch.")
+          + dim("  retry, /rewind, or /model to switch backend."))
+
+
+def _interruptible_sleep(secs, should_abort):
+    """Sleep in slices so should_abort()/Ctrl-C breaks the wait. False if aborted."""
+    waited = 0.0
+    while waited < secs:
+        if should_abort and should_abort():
+            return False
+        chunk = min(0.5, secs - waited)
+        time.sleep(chunk)
+        waited += chunk
+    return True
+
+
+# ----------------------------------------------------------------------------
+# Credentials: ~/.config/leancoder/anthropic_api.json  # sweep-ok
+# {"key": "sk-ant-api03-...", "active": false}
+# Key resolution order: LEANCODER_ANTHROPIC_API_KEY > ANTHROPIC_API_KEY > keyfile  # sweep-ok
+# ----------------------------------------------------------------------------
+
+def _cred_path():
+    return (_CONFIG_DIR or Path.home() / ".config" / "leancoder") / "anthropic_api.json"  # sweep-ok
+
+def _models_cache_path():
+    return (_CONFIG_DIR or Path.home() / ".config" / "leancoder") / "model-cache-api.json"
+
+def _api_key():
+    for ev in ("LEANCODER_ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY"):  # sweep-ok
+        v = os.environ.get(ev, "")
+        if v:
+            return v
+    try:
+        return json.loads(_cred_path().read_text()).get("key", "")
+    except Exception:
+        return ""
+
+def _cred_data():
+    try:
+        return json.loads(_cred_path().read_text())
+    except Exception:
+        return {}
+
+def _save_cred(data):
+    _cred_path().parent.mkdir(parents=True, exist_ok=True)
+    _cred_path().write_text(json.dumps(data, indent=2))
+    try:
+        _cred_path().chmod(0o600)
+    except OSError:
+        _dbg_swallow()
+
+def _clear_cred():
+    if _cred_path().is_file():
+        _cred_path().unlink()
+
+
+# ----------------------------------------------------------------------------
+# Model cache
+# ----------------------------------------------------------------------------
+
+def _load_models_cache():
+    try:
+        return json.loads(_models_cache_path().read_text()).get("models", [])
+    except Exception:
+        return []
+
+
+def _fetch_models(key):
+    """GET /v1/models with API key auth. Writes disk cache on success."""
+    try:
+        req = urllib.request.Request(
+            f"{_API_BASE}/v1/models",
+            headers={
+                "x-api-key":         key,  # sweep-ok
+                "anthropic-version": "2023-06-01",  # sweep-ok
+            },
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read())
+        out = []
+        for m in data.get("data", []):
+            mid = m.get("id", "")
+            if not mid:
+                continue
+            caps  = m.get("capabilities", {})
+            think = caps.get("thinking", {})
+            out.append({
+                "id":               mid,
+                "max_input_tokens": m.get("max_input_tokens", _CTX_DEFAULT),
+                "max_tokens":       m.get("max_tokens", _MAX_TOKENS),
+                "can_think":    think.get("types", {}).get("adaptive", {}).get("supported", False),
+                "can_effort":   caps.get("effort", {}).get("supported", False),
+                "can_ctx_mgmt": caps.get("context_management", {}).get(
+                    "clear_thinking_20251015", {}).get("supported", False),
+            })
+        if out:
+            try:
+                _models_cache_path().parent.mkdir(parents=True, exist_ok=True)
+                _models_cache_path().write_text(json.dumps({"models": out}))
+            except Exception:
+                _dbg_swallow()
+            return out
+    except Exception:
+        _dbg_swallow()
+    return _load_models_cache()
+
+
+def _ensure_models(force=False):
+    global _MODEL_DATA
+    if _MODEL_DATA and not force:
+        return _MODEL_DATA
+    key    = _api_key()
+    models = _fetch_models(key) if key else _load_models_cache()
+    _MODEL_DATA = {m["id"]: m for m in models}
+    return _MODEL_DATA
+
+
+def _list_models():
+    return list(_ensure_models())
+
+
+def _context_window(model):
+    limit = _ensure_models().get(model, {}).get("max_input_tokens", _CTX_DEFAULT)
+    if "sonnet" in model:  # sweep-ok
+        limit = min(limit, _SONNET_CTX_CAP)
+    return limit
+
+
+def _capabilities(model):
+    info = _ensure_models().get(model, {})
+    caps = {}
+    if info.get("can_think"):
+        caps["thinking"] = ["off", "adaptive", "max"]
+    if info.get("can_effort"):
+        effort = ["low", "med", "high"]
+        if _has_xhigh(model):
+            effort += ["xhigh", "max"]
+        elif _has_max(model):
+            effort += ["max"]
+        caps["effort"] = effort
+    return caps
+
+
+def _opus_minor(m):
+    try:
+        return int(m.split("opus-4-")[1].split("-")[0]) if "opus-4-" in m else 0  # sweep-ok
+    except (ValueError, IndexError):
+        return 0
+
+
+def _has_xhigh(model):
+    """xhigh effort: Opus 4.7+, Fable 5."""
+    m = (model or "").lower()
+    return "fable" in m or _opus_minor(m) >= 7  # sweep-ok
+
+
+def _has_max(model):
+    """max effort (and adaptive thinking for thinking=max): Opus 4.6+, Sonnet 4.6, Fable 5."""
+    m = (model or "").lower()
+    return _has_xhigh(model) or "sonnet-4-6" in m or _opus_minor(m) >= 6  # sweep-ok
+
+
+def _api_effort(val):
+    """Map the UI spelling to the API value ('med' -> 'medium')."""
+    val = val or "low"
+    return "medium" if val == "med" else val
+
+
+def _rl_only(headers):
+    """Keep only rate-limit headers (anthropic-ratelimit-*, retry-after)."""
+    return {k.lower(): v for k, v in (headers or {}).items()
+            if "ratelimit" in k.lower() or k.lower() == "retry-after"}
+
+
+_TOOL_ID_OK = re.compile(r"^[a-zA-Z0-9_-]+$")
+
+
+def _safe_tool_id(raw, msg_idx, pos):
+    """Anthropic requires tool ids matching ^[a-zA-Z0-9_-]+$. Fall back to a
+    deterministic id from (message index, call position) so a tool_use and its
+    paired tool_result regenerate the SAME string."""
+    if isinstance(raw, str) and _TOOL_ID_OK.match(raw):
+        return raw
+    return f"call_{msg_idx}_{pos}"
+
+
+def _thinking_replay(m):
+    """Signed thinking blocks captured from the stream, for replay first in the
+    assistant content. Unsigned blocks are dropped (the API would reject them)."""
+    out = []
+    for b in (m.get("thinking_blocks") or []):
+        if isinstance(b, dict) and b.get("signature"):
+            out.append({"type": "thinking", "thinking": b.get("thinking", ""),
+                        "signature": b["signature"]})
+    return out
+
+
+# ----------------------------------------------------------------------------
+# Display helpers
+# ----------------------------------------------------------------------------
+
+def _fmt_reset(iso):
+    try:
+        dt  = datetime.datetime.fromisoformat(iso.replace("Z", "+00:00")).astimezone()
+        now = datetime.datetime.now(datetime.timezone.utc).astimezone()
+        if dt.date() == now.date():
+            return dt.strftime("%H:%M")
+        return dt.strftime("%-d%b")
+    except Exception:
+        return iso[:16] if iso else ""
+
+
+def _bar(pct, width=10):
+    filled = min(int(pct / 100 * width), width)
+    return "[" + "#" * filled + "-" * (width - filled) + "]"
+
+
+def _sn(n):
+    try:
+        n = int(n)
+        if n >= 1_000_000: return f"{n/1_000_000:.1f}M"
+        if n >= 1_000:     return f"{n/1_000:.0f}k"
+        return str(n)
+    except Exception:
+        return str(n)
+
+
+def _privacy_note():
+    if _PRIVACY_HI:
+        paint = _lc.get("yellow") or _lc.get("dim") or (lambda s: s)
+    else:
+        paint = _lc.get("dim") or (lambda s: s)
+    return paint("  privacy: " + _PRIVACY)
+
+
+
+# ----------------------------------------------------------------------------
+# Message / tool format conversion (API format matches the OAuth provider)
+# ----------------------------------------------------------------------------
+
+def _cvt_tools(tools):
+    out = []
+    for t in tools:
+        fn = t.get("function", {})
+        out.append({
+            "name":         fn["name"],
+            "description":  fn.get("description", ""),
+            "input_schema": fn.get("parameters", {"type": "object", "properties": {}}),
+        })
+    return out
+
+
+def _tool_result_content(r):
+    """tool_result.content for one role:tool message. Plain string when there is
+    no image (legacy path, unchanged). When the message carries image_path AND
+    the core image encoder is available, return an ARRAY of blocks - text first,
+    then an image block - per the Anthropic vision spec (content MUST be a list,
+    never a stringified list). Any encode failure falls back to the text string,
+    so a broken/missing image never breaks the turn."""
+    text = r.get("content", "")
+    # The API requires tool_result content to be a string (or a block list). A
+    # loaded/synthesised history could carry a non-string (None, a number) - coerce
+    # it so one odd message can't 400 the whole request.
+    if not isinstance(text, str):
+        text = "" if text is None else str(text)
+    ip   = r.get("image_path")
+    if not ip:
+        return text
+    enc = _lc.get("encode_image_block")
+    got = enc(ip) if enc else None
+    if not got:
+        return text
+    media, data = got
+    blocks = []
+    if text:
+        blocks.append({"type": "text", "text": text})
+    blocks.append({
+        "type": "image",
+        "source": {"type": "base64", "media_type": media, "data": data},
+    })
+    return blocks
+
+
+def _cvt_messages(messages):
+    system = ""
+    out    = []
+    i      = 0
+    while i < len(messages):
+        m    = messages[i]
+        role = m.get("role")
+
+        if role == "system":
+            system = m.get("content", "")
+            i += 1
+
+        elif role == "user":
+            um = {"role": "user", "content": m["content"]}
+            if m.get("cache_boundary"):
+                um["cache_boundary"] = True     # core's stable-prefix signal (see chat())
+            out.append(um)
+            i += 1
+
+        elif role == "assistant":
+            content = _thinking_replay(m)
+            if m.get("content"):
+                content.append({"type": "text", "text": m["content"]})
+            for k, tc in enumerate(m.get("tool_calls") or []):
+                fn   = tc.get("function", {})
+                args = fn.get("arguments", {})
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except Exception:
+                        args = {}
+                content.append({
+                    "type":  "tool_use",
+                    "id":    _safe_tool_id(tc.get("id"), i, k),
+                    "name":  fn.get("name", ""),
+                    "input": args,
+                })
+            out.append({"role": "assistant", "content": content or ""})
+            i += 1
+
+        elif role == "tool":
+            j = i - 1
+            while j >= 0 and messages[j].get("role") == "tool":
+                j -= 1
+            prev_calls = []
+            if j >= 0 and messages[j].get("role") == "assistant":
+                prev_calls = messages[j].get("tool_calls") or []
+            blocks = []
+            ci     = 0
+            while i < len(messages) and messages[i].get("role") == "tool":
+                r    = messages[i]
+                tcid = r.get("tool_call_id", "")
+                if not tcid and ci < len(prev_calls):
+                    tcid = prev_calls[ci].get("id", "")
+                tcid = _safe_tool_id(tcid, j, ci)
+                blocks.append({
+                    "type":        "tool_result",
+                    "tool_use_id": tcid,
+                    "content":     _tool_result_content(r),
+                })
+                ci += 1
+                i  += 1
+            out.append({"role": "user", "content": blocks})
+
+        else:
+            i += 1
+
+    return system, out
+
+
+def _is_tool_result_msg(msg):
+    """True for a user message made only of tool_result blocks (a mid-loop tool reply)."""
+    c = msg.get("content")
+    return (msg.get("role") == "user" and isinstance(c, list) and bool(c)
+            and all(isinstance(b, dict) and b.get("type") == "tool_result" for b in c))
+
+
+def _mark_cache(msg):
+    """Add cache_control breakpoint (1h TTL, session-scoped) to last content block."""
+    cc = {"type": "ephemeral", "ttl": "1h"}
+    content = msg.get("content")
+    if isinstance(content, list) and content:
+        last = dict(content[-1])
+        last["cache_control"] = cc
+        return dict(msg, content=[*content[:-1], last])
+    if isinstance(content, str) and content:
+        return dict(msg, content=[{"type": "text", "text": content, "cache_control": cc}])
+    return msg
+
+
+# ----------------------------------------------------------------------------
+# Client
+# ----------------------------------------------------------------------------
+
+_API_BETAS = (  # sweep-ok - oauth-2025-04-20 deliberately absent (API key path)
+    "claude-code-20250219,"  # sweep-ok
+    "interleaved-thinking-2025-05-14,"
+    "thinking-token-count-2026-05-13,"
+    "context-management-2025-06-27,"
+    "prompt-caching-scope-2026-01-05,"
+    "advisor-tool-2026-03-01,"
+    "effort-2025-11-24,"
+    "cache-diagnosis-2026-04-07,"
+    "extended-cache-ttl-2025-04-11"
+)
+
+
+class _ApiKeyClient:
+    uncapped_ctx = True
+
+    def __init__(self, cfg):
+        self.cfg              = cfg
+        self.last_out_tokens  = None
+        self.last_stop_reason = None   # stop_reason of the last reply (never sent to the model)
+        self.last_empty_retries = 0    # silent re-sends spent on an empty reply this call
+        self._last_rl         = {}   # anthropic-ratelimit-* response headers  # sweep-ok
+        self.last_cache_read  = 0    # cache_read_input_tokens from last turn
+        self.last_cache_write = 0    # cache_creation_input_tokens from last turn
+        self.last_cache_write_1h = 0 # ephemeral_1h_input_tokens from last turn
+        self.last_input_tokens = 0   # raw input_tokens (uncached fresh) from last turn
+        self._sess_cache_read  = 0   # session totals
+        self._sess_cache_write = 0
+        self._sess_cache_write_1h = 0
+
+    def _model(self):
+        return self.cfg.active_model()
+
+    def list_models(self):
+        return _list_models()
+
+    def running_models(self):
+        return []
+
+    def detect_num_ctx(self):
+        return _context_window(self._model())
+
+    def _consume_urllib(self, resp, should_abort):
+        content_parts = []
+        thinking_blocks = []
+        cur_think     = None
+        tool_calls    = []
+        cur_tool      = None
+        cur_json      = []
+        prompt_eval   = None
+        output_eval   = None
+        stop_reason   = None
+        printed       = False
+        aborted       = False
+        md            = _lc["MarkdownStream"](sys.stdout.write)
+
+        spin = _lc["Spinner"]("thinking", _lc["THINK_FRAMES"]).start()
+        try:
+            for raw in _lc["stream_tiered"](resp, self.cfg, where="anthropic",
+                                            idle=_STREAM_IDLE_TIMEOUT):
+                if should_abort and should_abort():
+                    aborted = True
+                    break
+                line = raw.decode(errors="replace").strip()
+                if not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if data == "[DONE]":
+                    break
+                try:
+                    obj = json.loads(data)
+                except Exception:
+                    continue
+
+                etype = obj.get("type")
+
+                if etype == "content_block_start":
+                    blk = obj.get("content_block", {})
+                    if blk.get("type") == "tool_use":
+                        cur_tool = {"id": blk.get("id", ""), "name": blk.get("name", "")}
+                        cur_json = []
+                    elif blk.get("type") == "thinking":
+                        cur_think = {"type": "thinking",
+                                     "thinking": blk.get("thinking", "") or "",
+                                     "signature": blk.get("signature", "") or ""}
+                        thinking_blocks.append(cur_think)
+
+                elif etype == "content_block_delta":
+                    delta = obj.get("delta", {})
+                    if delta.get("type") == "thinking_delta" and cur_think is not None:
+                        cur_think["thinking"] += delta.get("thinking", "") or ""
+                    elif delta.get("type") == "signature_delta" and cur_think is not None:
+                        cur_think["signature"] += delta.get("signature", "") or ""
+                    elif delta.get("type") == "text_delta":
+                        chunk = delta.get("text", "")
+                        if chunk:
+                            if not printed:
+                                spin.stop()
+                                sys.stdout.write(_lc["blue"]((_lc.get("GLYPH") or {}).get("bullet", "*") + " "))
+                                printed = True
+                            md.feed(chunk)
+                            content_parts.append(chunk)
+                    elif delta.get("type") == "input_json_delta":
+                        cur_json.append(delta.get("partial_json", ""))
+
+                elif etype == "content_block_stop":
+                    cur_think = None
+                    if cur_tool:
+                        try:
+                            args = json.loads("".join(cur_json)) if cur_json else {}
+                        except Exception:
+                            args = {}
+                        tool_calls.append({
+                            "id": cur_tool["id"],
+                            "function": {"name": cur_tool["name"], "arguments": args},
+                        })
+                        cur_tool = None
+                        cur_json = []
+
+                elif etype == "message_start":
+                    _u = obj.get("message", {}).get("usage", {})
+                    prompt_eval = _u.get("input_tokens")
+                    self.last_input_tokens = prompt_eval or 0
+                    self.last_cache_read  = _u.get("cache_read_input_tokens",  0) or 0
+                    self.last_cache_write = _u.get("cache_creation_input_tokens", 0) or 0
+                    self.last_cache_write_1h = (_u.get("cache_creation") or {}).get(
+                        "ephemeral_1h_input_tokens", 0) or 0
+
+                elif etype == "message_delta":
+                    output_eval = obj.get("usage", {}).get("output_tokens")
+                    _sr = obj.get("delta", {}).get("stop_reason")
+                    if _sr:
+                        stop_reason = _sr
+
+                elif etype == "error":
+                    _raise_sse_error(obj.get("error", {}))
+
+        finally:
+            spin.stop()
+
+        if printed:
+            md.flush()
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+
+        if output_eval:
+            self.last_out_tokens = output_eval
+        content   = "".join(content_parts)
+        self.last_stop_reason = stop_reason   # read by the empty-reply retry (never sent to the model)
+        assistant = {"role": "assistant", "content": content}
+        if tool_calls:
+            assistant["tool_calls"] = tool_calls
+        _tb = [b for b in thinking_blocks if b.get("signature")]
+        if _tb and not aborted:
+            assistant["thinking_blocks"] = _tb
+        return assistant, prompt_eval, aborted
+
+    def _send(self, key, payload, should_abort):
+        hdrs = {
+            "Content-Type":      "application/json",
+            "x-api-key":         key,  # sweep-ok
+            "anthropic-version": "2023-06-01",  # sweep-ok
+            "anthropic-beta":    _API_BETAS,  # sweep-ok
+        }
+        data    = json.dumps(payload).encode()
+        attempt = 0
+        while True:
+            req = urllib.request.Request(
+                f"{_API_BASE}/v1/messages",
+                data=data,
+                method="POST",
+                headers=hdrs,
+            )
+            try:
+                with urllib.request.urlopen(
+                        req,
+                        timeout=(getattr(self.cfg, "gen_connect_timeout", None) or 600)) as resp:
+                    self._last_rl = _rl_only(resp.headers)
+                    return self._consume_urllib(resp, should_abort)
+            except _TransientStreamError as e:
+                # A mid-stream overload/5xx SSE frame - retry like a 529 (it escaped the
+                # urlopen with-block, so the HTTPError handler below never saw it).
+                if attempt < _MAX_RETRIES:
+                    wait = _backoff(attempt)
+                    attempt += 1
+                    print(_lc["red"](f"[!] {payload.get('model', '')} overloaded (stream) - "
+                                     f"retry {attempt}/{_MAX_RETRIES} in {wait:.0f}s"))
+                    if not _interruptible_sleep(wait, should_abort):
+                        raise RuntimeError("aborted during retry wait") from None
+                    continue
+                raise RuntimeError(f"API 529: {e}") from None
+            except urllib.error.HTTPError as e:
+                self._last_rl = _rl_only(e.headers)
+                body = e.read().decode(errors="replace")
+                # 429 -> chat()'s Haiku fallback; here only transient overloads.
+                if e.code in _RETRY_CODES and attempt < _MAX_RETRIES:
+                    hint = _retry_after_secs(e.headers or {})
+                    wait = (hint + 1) if hint is not None else _backoff(attempt)
+                    if wait <= _MAX_WAIT:
+                        attempt += 1
+                        print(_lc["red"](f"[!] {payload.get('model', '')} overloaded ({e.code}) - "
+                                         f"retry {attempt}/{_MAX_RETRIES} in {wait:.0f}s"))
+                        if not _interruptible_sleep(wait, should_abort):
+                            raise RuntimeError("aborted during retry wait") from None
+                        continue
+                _err = RuntimeError(f"API {e.code}: {body[:400]}")
+                _err.status = e.code
+                raise _err from None
+            except (urllib.error.URLError, ConnectionError, OSError) as e:
+                # Transport failure (dropped connection, TLS reset, DNS blip) - no
+                # HTTP status. Retry with backoff like a 5xx; a bad message never
+                # surfaces empty.
+                if attempt < _MAX_RETRIES:
+                    wait = _backoff(attempt)
+                    attempt += 1
+                    detail = str(getattr(e, "reason", None) or e) or type(e).__name__
+                    print(_lc["red"](f"[!] {payload.get('model', '')} connection error "
+                                     f"({detail[:80]}) - retry {attempt}/{_MAX_RETRIES} in {wait:.0f}s"))
+                    if not _interruptible_sleep(wait, should_abort):
+                        raise RuntimeError("aborted during retry wait") from None
+                    continue
+                raise RuntimeError(
+                    f"request failed: {str(getattr(e, 'reason', None) or e) or type(e).__name__}"
+                ) from None
+
+    def _send_retrying_empty(self, key, payload, should_abort):
+        """_send, plus: an EMPTY reply (no text, no tool call, not aborted) is a normal
+        200 with no exception, yet as likely a transient glitch as a real decline - so
+        re-send the same request with the same backoff + budget as a transient error.
+        History is untouched; the model never learns of it. The operator is told only
+        once the retries are spent (see _note_empty_response)."""
+        attempt = 0
+        self.last_empty_retries = 0
+        while True:
+            out = self._send(key, payload, should_abort)
+            _a, _pe, _ab = out
+            if (not _ab and not (_a or {}).get("content") and not (_a or {}).get("tool_calls")
+                    and attempt < _MAX_RETRIES):
+                wait = _backoff(attempt)
+                attempt += 1
+                self.last_empty_retries = attempt
+                print((_lc.get("red") or str)(f"[!] {payload.get('model', '')} returned no reply - "
+                                 f"retry {attempt}/{_MAX_RETRIES} in {wait:.0f}s"))
+                if not _interruptible_sleep(wait, should_abort):
+                    raise RuntimeError("aborted during retry wait") from None
+                continue
+            if not _ab:
+                _note_empty_response((_a or {}).get("content"), (_a or {}).get("tool_calls"),
+                                     getattr(self, "last_stop_reason", None), attempt)
+            return out
+
+    def _on_error(self, key, payload, should_abort):
+        """429 handler: report the rate limit + retry-after and raise. We do NOT
+        downgrade to Haiku - a silent model swap mid-conversation is confusing, and
+        Haiku's max_tokens ceiling (64k) is below what an Opus/Sonnet turn requests, so
+        the retry 400'd anyway. The turn stops cleanly; wait out the retry-after or
+        check your API key's rate limits."""
+        orig    = payload["model"]
+        retry_s = self._last_rl.get("retry-after", "")  # sweep-ok
+        retry_note = f" (retry after {retry_s}s)" if retry_s else ""
+        print(_lc["red"](f"[!] {orig} rate limited{retry_note} - wait or check your API key limits"))  # sweep-ok
+        raise RuntimeError("rate limited") from None
+
+    def chat(self, messages, tools, should_abort=None):
+        key = _api_key()
+        if not key:
+            raise RuntimeError("no API key - use /provider login")
+
+        # Zero per-turn cache counters so a failed request does not re-add stale ones.
+        self.last_cache_read = self.last_cache_write = self.last_cache_write_1h = 0
+        system, api_msgs = _cvt_messages(messages)
+        api_tools        = sorted(_cvt_tools(tools), key=lambda t: t.get("name", "")) if tools else []
+
+        cur_model  = self._model()
+        minfo      = _ensure_models().get(cur_model, {})
+        max_out    = minfo.get("max_tokens", _MAX_TOKENS)
+        max_in     = minfo.get("max_input_tokens", _CTX_DEFAULT)
+        # Use core's CALIBRATED estimator (chars/4 * learned factor + per-message framing,
+        # self-tuned from real input_tokens) instead of a raw json.dumps//4 - the latter
+        # both over-counts (JSON punctuation/escaping) and under-counts (no per-msg
+        # overhead), unpredictably. Falls back to the crude form if core isn't wired yet.
+        _mt = _lc.get("messages_tokens")
+        _est_toks  = _mt(messages, api_tools) if _mt else len(json.dumps(messages)) // 4
+        if _est_toks > max_in:
+            raise RuntimeError(
+                f"context too large for {cur_model} "
+                f"(~{_est_toks:,} tokens vs {max_in:,} limit) - run /compact first"
+            )
+
+        # Prompt caching: stable breakpoints so repeat input re-reads at ~0.1x cost.
+        # All session-scoped + 1h TTL. scope:"global" was removed - with tools present
+        # the render order (tools -> system -> messages) means a global breakpoint on
+        # system is not a true global prefix, and the API 400s. Session scope still
+        # caches the re-read within a session (the main win). See the OAuth client.
+        _cc_stable = {"type": "ephemeral", "ttl": "1h"}
+        if system:
+            sys_blocks = [{"type": "text", "text": system, "cache_control": _cc_stable}]
+        else:
+            sys_blocks = None
+        if api_tools:
+            cached_tools = list(api_tools)
+            cached_tools[-1] = dict(cached_tools[-1], cache_control=_cc_stable)
+        else:
+            cached_tools = api_tools
+        cached_msgs = list(api_msgs)
+        # Rolling breakpoint. Mid tool-loop the last message is a pure tool-result
+        # message (nothing stitched onto it), so mark IT: the next request re-reads it at
+        # 0.1x instead of paying 1x now + a 2x cache write next time. When the last
+        # message is a user turn it carries send-time notes (env/plan) that are NOT in
+        # the next request's copy, so mark the one before it and keep the notes uncached.
+        _rb = len(cached_msgs) - 1 if (cached_msgs and _is_tool_result_msg(cached_msgs[-1])) \
+            else len(cached_msgs) - 2
+        if _rb >= 0:
+            cached_msgs[_rb] = _mark_cache(cached_msgs[_rb])   # rolling recent breakpoint
+        # 4th breakpoint: core tags the frozen post-compaction summary message with
+        # cache_boundary=True. The [system][summary] prefix is stable until the next
+        # compaction, so anchoring here caches the biggest static block at ~0.1x re-read.
+        # Only the LAST-flagged message gets it (the vendor caps at 4 breakpoints; a 5th
+        # 400s), and we strip the internal flag from every message before send (it is not
+        # part of the API schema).
+        _bnd = max((k for k, mm in enumerate(cached_msgs) if mm.get("cache_boundary")),
+                   default=None)
+        if _bnd is not None and _bnd != _rb:
+            cached_msgs[_bnd] = _mark_cache(cached_msgs[_bnd])
+        cached_msgs = [{k: v for k, v in mm.items() if k != "cache_boundary"}
+                       for mm in cached_msgs]
+
+        payload = {
+            "model":      cur_model,
+            "max_tokens": max_out,
+            "stream":     True,
+            "messages":   cached_msgs,
+        }
+        if sys_blocks:   payload["system"] = sys_blocks
+        if cached_tools: payload["tools"]  = cached_tools
+
+        _can_think  = minfo.get("can_think",    False)
+        _can_effort = minfo.get("can_effort",   False)
+        _can_ctx    = minfo.get("can_ctx_mgmt", False)
+        _thinking   = self.cfg.setting("thinking") or "off"
+        _effort     = _api_effort(self.cfg.setting("effort"))
+        if _can_think and _thinking == "adaptive":
+            payload["thinking"] = {"type": "adaptive"}
+            if _can_ctx:
+                payload["context_management"] = {"edits": [{"type": "clear_thinking_20251015", "keep": {"type": "thinking_turns", "value": 1}}]}
+        elif _can_think and _thinking == "max":
+            if _has_max(cur_model):
+                # Adaptive-capable model: budget_tokens is deprecated there; max
+                # thinking = adaptive + effort max.
+                payload["thinking"] = {"type": "adaptive"}
+                _effort = "max"
+            else:
+                payload["thinking"] = {"type": "enabled", "budget_tokens": 16000}
+            if _can_ctx:
+                payload["context_management"] = {"edits": [{"type": "clear_thinking_20251015", "keep": {"type": "thinking_turns", "value": 1}}]}
+        if _can_effort:
+            payload["output_config"] = {"effort": _effort}
+
+        try:
+            result = self._send_retrying_empty(key, payload, should_abort)
+        except RuntimeError as e:
+            if getattr(e, "status", None) == 429:
+                self._on_error(key, payload, should_abort)   # always raises
+            raise
+        self._sess_cache_read  += self.last_cache_read
+        self._sess_cache_write += self.last_cache_write
+        self._sess_cache_write_1h += self.last_cache_write_1h
+        return result
+
+
+def _make_client(cfg):
+    return _ApiKeyClient(cfg)
+
+
+# ----------------------------------------------------------------------------
+# Provider hooks
+# ----------------------------------------------------------------------------
+
+def _available():
+    return bool(_api_key())
+
+
+def _autostart():
+    return bool(_api_key()) and _cred_data().get("active", False)
+
+
+def _on_activate(agent, cfg):
+    _ensure_models(force=True)
+    info = _ensure_models().get(cfg.active_model(), {})
+    if cfg.setting("thinking") is None and info.get("can_think"):
+        cfg.set_setting("thinking", "adaptive")
+    if cfg.setting("effort") is None and info.get("can_effort"):
+        cfg.set_setting("effort", "low")
+    if _SHOW_BANNER:
+        key     = _api_key()
+        masked  = f"{key[:12]}...{key[-4:]}" if key and len(key) > 16 else "(env)"
+        print(_lc["dim"](f"  API key auth  {masked}"))
+        print(_privacy_note())
+    d = _cred_data()
+    d["active"] = True
+    if d.get("key") or _cred_path().is_file():
+        _save_cred(d)
+
+
+def _on_deactivate(agent, cfg):
+    d = _cred_data()
+    d["active"] = False
+    if d.get("key"):
+        _save_cred(d)
+
+
+def _login(agent, cfg):
+    key = _api_key()
+    if not key:
+        print(_lc["dim"]("Paste your API key (sk-ant-api03-...) and press Enter:"))
+        try:
+            raw = getpass.getpass(prompt="").strip()
+        except (EOFError, KeyboardInterrupt):
+            return False
+        m = re.search(r"sk-ant-\S+", raw)  # sweep-ok - extract key from any surrounding noise
+        key = m.group(0) if m else raw
+        if not key.startswith("sk-ant-"):  # sweep-ok
+            print(_lc["red"]("[!] does not look like an API key"))
+            return False
+        _save_cred({"key": key, "active": True})
+        print(_lc["dim"](f"  saved to {_cred_path()}"))
+    else:
+        d = _cred_data()
+        d["active"] = True
+        if d.get("key"):
+            _save_cred(d)
+    return True
+
+
+def _clear(agent, cfg):
+    _clear_cred()
+
+
+def _usage(agent, cfg):
+    return None
+
+
+def _detail(agent, cfg):
+    bold = _lc["bold"]
+    dim  = _lc["dim"]
+    red  = _lc["red"]
+
+    def _co(s, pct):
+        if pct >= 90: return _lc["red"](s)
+        if pct >= 50: return _lc["yellow"](s)
+        return _lc["dim"](_lc["blue"](s))      # colour helpers: plain off a TTY
+
+    cur_model  = cfg.active_model()
+    cur_think  = cfg.setting("thinking") or "off"
+    cur_effort = cfg.setting("effort")   or "low"
+    lines = [bold(cur_model) + dim(f"   thinking: {cur_think}   effort: {cur_effort}")]
+
+    si = getattr(agent, "session_in",  0) or 0
+    so = getattr(agent, "session_out", 0) or 0
+    cr = getattr(agent.client, "_sess_cache_read",  0) or 0
+    cw = getattr(agent.client, "_sess_cache_write", 0) or 0
+    cw1h = getattr(agent.client, "_sess_cache_write_1h", 0) or 0
+    w1h_s = f" (1h {_sn(cw1h)})" if cw1h else ""
+    cache_s = f"   cache r {_sn(cr)} w {_sn(cw)}{w1h_s}" if (cr or cw) else ""
+    lines.append(dim(f"\n  session   in {si:,}   out {so:,}   total {si + so:,}{cache_s}"))
+
+    # Last-turn cache breakdown + hit ratio: the fast read of whether the prompt cache
+    # is working. read = prefix served at ~0.1x; write = prefix (re)cached at 1.25x
+    # (a MISS - new session, a prefix change, or a >1h TTL expiry); fresh = uncached
+    # input_tokens (the tail: env/plan + this turn). A healthy repeat turn is nearly all
+    # read with tiny fresh and zero write; a big write with no read is a full cache miss.
+    lr  = getattr(agent.client, "last_cache_read",   0) or 0
+    lw  = getattr(agent.client, "last_cache_write",  0) or 0
+    lf  = getattr(agent.client, "last_input_tokens", 0) or 0
+    if lr or lw or lf:
+        cached = lr + lw
+        total  = cached + lf
+        hit    = (lr / cached * 100) if cached else 0
+        miss_flag = red("  MISS (full re-cache)") if (lw and not lr) else ""
+        lines.append(dim(
+            f"  last turn read {_sn(lr)}  write {_sn(lw)}  fresh {_sn(lf)}"
+            f"  ({hit:.0f}% cache hit of {_sn(total)} in){miss_flag}"))
+
+    rl = getattr(agent.client, "_last_rl", {})
+    if rl:
+        lines.append("")
+        for label, lim_key, rem_key, rst_key in (
+            ("requests",     "anthropic-ratelimit-requests-limit",      # sweep-ok
+                             "anthropic-ratelimit-requests-remaining",  # sweep-ok
+                             "anthropic-ratelimit-requests-reset"),     # sweep-ok
+            ("input tok",    "anthropic-ratelimit-input-tokens-limit",    # sweep-ok
+                             "anthropic-ratelimit-input-tokens-remaining",# sweep-ok
+                             "anthropic-ratelimit-input-tokens-reset"),   # sweep-ok
+            ("output tok",   "anthropic-ratelimit-output-tokens-limit",   # sweep-ok
+                             "anthropic-ratelimit-output-tokens-remaining",# sweep-ok
+                             "anthropic-ratelimit-output-tokens-reset"),  # sweep-ok
+        ):
+            lim = rl.get(lim_key, "")
+            rem = rl.get(rem_key, "")
+            rst = rl.get(rst_key, "")
+            if lim and rem:
+                try:
+                    lv, rv = int(lim), int(rem)
+                    pct    = max(0, (lv - rv) / lv * 100) if lv else 0
+                    rst_s  = f"  resets {_fmt_reset(rst)}" if rst else ""
+                    lines.append(
+                        f"  {dim(f'{label:<12}')}  {_co(_bar(pct), pct)}"
+                        f"  {_co(f'{pct:>3.0f}%', pct)}"
+                        f"  {dim(f'{_sn(rv)}/{_sn(lv)} remaining{rst_s}')}"
+                    )
+                except (ValueError, ZeroDivisionError):
+                    _dbg_swallow()
+
+    if not rl:
+        lines.append(dim("\n  (rate limit data available after first inference)"))
+
+    lines.append("\n" + _privacy_note())
+    return "\n".join(lines)
+
+
+# ----------------------------------------------------------------------------
+# Registration
+# ----------------------------------------------------------------------------
+
+PROVIDER = {
+    "name":           _PROVIDER,
+    "description":    "Anthropic API key (direct; any tier)",  # sweep-ok
+    "make_client":    _make_client,
+    "list_models":    _list_models,
+    "context_window": _context_window,
+    "capabilities":   _capabilities,
+    "available":      _available,
+    "autostart":      _autostart,
+    "on_activate":    _on_activate,
+    "on_deactivate":  _on_deactivate,
+    "usage":          _usage,
+    "login":          _login,
+    "clear":          _clear,
+    "detail":         _detail,
+    "tag":            "api",
+}
+
+
+def setup(lc, cfg):
+    global _CONFIG_DIR
+    _lc.update(lc)
+    _CONFIG_DIR = lc.get("CONFIG_DIR")

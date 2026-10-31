@@ -1,0 +1,689 @@
+import getpass
+import json
+import os
+import re
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+
+def _dbg_swallow():
+    """Debug bucket shim: hands a swallowed exception to lean-coder's _dbg_swallow
+    (a no-op unless LEANCODER_DEBUG=1). Never raises."""
+    for _m in ("__main__", "lean_coder"):
+        _f = getattr(sys.modules.get(_m), "_dbg_swallow", None)
+        if _f and _f is not _dbg_swallow:
+            try:
+                _f(2)
+            except Exception:
+                pass
+            return
+
+
+# OpenAI - the reference OpenAI-compatible chat API. docs:
+# https://platform.openai.com/docs/api-reference/chat  # sweep-ok
+# Auth is a Bearer key (sk-... / sk-proj-...). Wire format is the OpenAI
+# /chat/completions shape, so conversion from lean-coder's internal format is
+# nearly an identity - this file is the Groq provider with OpenAI's endpoint,
+# key prefix and model set. NOTE: OpenAI has no free tier (a payment method is
+# required); this is here for users who already have a paid key.  # sweep-ok
+_API_BASE    = "https://api.openai.com/v1"  # sweep-ok
+_MAX_TOKENS  = 16_384      # fallback max output for an unmapped model
+_CTX_DEFAULT = 128_000
+_PROVIDER    = "openai"  # sweep-ok
+
+_CONFIG_DIR = None
+_MODEL_DATA = {}
+_lc         = {}
+
+_UA = "lean-coder"  # sweep-ok
+
+# Privacy posture shown at the point of use (on connect + in /usage).
+_PRIVACY    = "API prompts are not used for training by default (opt-in only)"
+_PRIVACY_HI = False   # low risk -> dim, not a warning
+# Show the on-activate identity + privacy banner? Off by default (the core
+# 'provider: <name>  model: <model>' line already announces the backend).
+_SHOW_BANNER = False
+
+# Non-chat model families the /models endpoint returns (embeddings, audio,
+# image, moderation, realtime, search). They can't drive a coding agent, so
+# they're kept out of the picker.  # sweep-ok
+_SKIP_KEYS = (
+    "embedding", "whisper", "tts", "audio", "realtime", "transcribe",
+    "dall-e", "image", "moderation", "search", "codex", "davinci", "babbage",
+    "-pro", "deep-research", "o1-mini", "o1-preview",
+)  # sweep-ok
+
+# Reasoning-effort-capable families (accept reasoning_effort low/med/high).
+# The o-series and gpt-5 line reason; the gpt-4 line does not.  # sweep-ok
+_REASON_KEYS = ("gpt-5", "o1", "o3", "o4")  # sweep-ok
+_NON_REASON_KEYS = ("-chat",)   # gpt-5-chat-latest is a non-reasoning chat model  # sweep-ok
+
+
+def _is_reasoning(low):
+    return any(k in low for k in _REASON_KEYS) and not any(k in low for k in _NON_REASON_KEYS)
+
+# Known context windows (the /models endpoint doesn't report them). Matched by
+# substring; the longest matching prefix wins. Falls back to _CTX_DEFAULT.  # sweep-ok
+_CTX_MAP = {
+    "gpt-5":       400_000,
+    "gpt-4.1":     1_047_576,
+    "gpt-4o":      128_000,
+    "gpt-4-turbo": 128_000,
+    "gpt-4":       8_192,
+    "gpt-3.5":     16_385,
+    "o1":          200_000,
+    "o3":          200_000,
+    "o4":          200_000,
+}
+
+# Known max OUTPUT tokens per family (the /models endpoint doesn't report them
+# either). Same longest-prefix match as _CTX_MAP; falls back to _MAX_TOKENS.  # sweep-ok
+_OUT_MAP = {
+    "gpt-5":       128_000,
+    "gpt-4.1":     32_768,
+    "gpt-4o":      16_384,
+    "gpt-4-turbo": 4_096,
+    "gpt-4":       8_192,
+    "gpt-3.5":     4_096,
+    "o1":          100_000,
+    "o3":          100_000,
+    "o4":          100_000,
+}
+
+
+# ----------------------------------------------------------------------------
+# Credentials: ~/.config/leancoder/openai.json  {"key": "sk-...", "active": false}
+# Key resolution order: OPENAI_API_KEY > keyfile  # sweep-ok
+# ----------------------------------------------------------------------------
+
+def _cred_path():
+    return (_CONFIG_DIR or Path.home() / ".config" / "leancoder") / "openai.json"  # sweep-ok
+
+def _models_cache_path():
+    return (_CONFIG_DIR or Path.home() / ".config" / "leancoder") / "model-cache-openai.json"
+
+def _api_key():
+    v = os.environ.get("OPENAI_API_KEY", "")  # sweep-ok
+    if v:
+        return v
+    try:
+        return json.loads(_cred_path().read_text()).get("key", "")
+    except Exception:
+        return ""
+
+def _cred_data():
+    try:
+        return json.loads(_cred_path().read_text())
+    except Exception:
+        return {}
+
+def _save_cred(data):
+    _cred_path().parent.mkdir(parents=True, exist_ok=True)
+    _cred_path().write_text(json.dumps(data, indent=2))
+    try:
+        _cred_path().chmod(0o600)
+    except OSError:
+        _dbg_swallow()
+
+def _clear_cred():
+    if _cred_path().is_file():
+        _cred_path().unlink()
+
+
+# ----------------------------------------------------------------------------
+# Transient-error retry (same shape as the other providers)
+# ----------------------------------------------------------------------------
+
+_MAX_RETRIES = 3
+_MAX_WAIT    = 75
+_RETRY_CODES = (429, 502, 503, 504)   # 429 retried only with a delay hint; 5xx via backoff
+
+
+def _retry_after_secs(headers, body):
+    ra = headers.get("Retry-After") or headers.get("retry-after")
+    if ra:
+        try:
+            return float(ra)
+        except (TypeError, ValueError):
+            _dbg_swallow()
+    try:                                   # OpenAI embeds "try again in 7.66s" in the message
+        msg = json.loads(body).get("error", {}).get("message", "")
+        m = re.search(r"in ([\d.]+)s", msg)  # sweep-ok
+        if m:
+            return float(m.group(1))
+    except Exception:
+        _dbg_swallow()
+    return None
+
+
+def _backoff(attempt):
+    return min(2.0 * (2 ** attempt), _MAX_WAIT)
+
+
+def _interruptible_sleep(secs, should_abort):
+    waited = 0.0
+    while waited < secs:
+        if should_abort and should_abort():
+            return False
+        chunk = min(0.5, secs - waited)
+        time.sleep(chunk)
+        waited += chunk
+    return True
+
+
+# ----------------------------------------------------------------------------
+# Model cache
+# ----------------------------------------------------------------------------
+
+def _load_models_cache():
+    try:
+        return json.loads(_models_cache_path().read_text()).get("models", [])
+    except Exception:
+        return []
+
+
+def _map_for(mid, table, default):
+    low  = mid.lower()  # sweep-ok
+    best = None
+    for key, val in table.items():
+        if key in low and (best is None or len(key) > len(best[0])):
+            best = (key, val)
+    return best[1] if best else default
+
+
+def _ctx_for(mid):
+    return _map_for(mid, _CTX_MAP, _CTX_DEFAULT)
+
+
+def _out_for(mid):
+    return _map_for(mid, _OUT_MAP, _MAX_TOKENS)
+
+
+def _fetch_models(key):
+    """GET /models (OpenAI-shaped). The endpoint returns ids only, so keep the
+    gpt/o-series chat models and drop embedding/audio/image/moderation families
+    that can't drive a coding agent. Context windows come from _CTX_MAP."""
+    try:
+        req = urllib.request.Request(
+            f"{_API_BASE}/models",
+            headers={"Authorization": f"Bearer {key}", "User-Agent": _UA},  # sweep-ok
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read())
+        out = []
+        for m in data.get("data", []):
+            mid = m.get("id", "")
+            if not mid:
+                continue
+            low = mid.lower()  # sweep-ok
+            if any(k in low for k in _SKIP_KEYS):
+                continue
+            if not (low.startswith("gpt-") or re.match(r"o[1-9]", low)):  # sweep-ok
+                continue
+            out.append({
+                "id":               mid,
+                "max_input_tokens": _ctx_for(mid),
+                "max_tokens":       _out_for(mid),
+                "reason":           _is_reasoning(low),
+            })
+        if out:
+            out.sort(key=lambda m: m["id"])
+            try:
+                _models_cache_path().parent.mkdir(parents=True, exist_ok=True)
+                _models_cache_path().write_text(json.dumps({"models": out}))
+            except Exception:
+                _dbg_swallow()
+            return out
+    except Exception:
+        _dbg_swallow()
+    return _load_models_cache()
+
+
+def _ensure_models(force=False):
+    global _MODEL_DATA
+    if _MODEL_DATA and not force:
+        return _MODEL_DATA
+    key    = _api_key()
+    models = _fetch_models(key) if key else _load_models_cache()
+    _MODEL_DATA = {m["id"]: m for m in models}
+    return _MODEL_DATA
+
+
+def _list_models():
+    return list(_ensure_models())
+
+
+def _context_window(model):
+    return _ensure_models().get(model, {}).get("max_input_tokens", _CTX_DEFAULT)
+
+
+def _capabilities(model):
+    caps = {}
+    if _ensure_models().get(model, {}).get("reason"):
+        caps["effort"] = ["low", "med", "high"]
+        if "gpt-5" in model.lower():          # gpt-5 family also accepts "minimal"
+            caps["effort"] = ["minimal"] + caps["effort"]
+    return caps
+
+
+# ----------------------------------------------------------------------------
+# Display helpers
+# ----------------------------------------------------------------------------
+
+def _sn(n):
+    try:
+        n = int(n)
+        if n >= 1_000_000: return f"{n/1_000_000:.1f}M"
+        if n >= 1_000:     return f"{n/1_000:.0f}k"
+        return str(n)
+    except Exception:
+        return str(n)
+
+
+def _privacy_note():
+    if _PRIVACY_HI:
+        paint = _lc.get("yellow") or _lc.get("dim") or (lambda s: s)
+    else:
+        paint = _lc.get("dim") or (lambda s: s)
+    return paint("  privacy: " + _PRIVACY)
+
+
+# ----------------------------------------------------------------------------
+# Message / tool conversion (lean-coder internal -> OpenAI; near identity)
+# ----------------------------------------------------------------------------
+
+def _cvt_tools(tools):
+    out = []
+    for t in tools:
+        fn = t.get("function", {})
+        out.append({
+            "type": "function",
+            "function": {
+                "name":        fn["name"],
+                "description": fn.get("description", ""),
+                "parameters":  fn.get("parameters", {"type": "object", "properties": {}}),
+            },
+        })
+    return out
+
+
+# OpenAI vision-capable model families (accept image_url input). A text-only
+# model 400s on an image, so images are gated on this - unlike Anthropic where
+# every model is multimodal. Substring match against the model id.
+_VISION_FAMILIES = ("gpt-4o", "gpt-4.1", "gpt-4-turbo", "gpt-4-vision",
+                    "o1", "o3", "o4", "gpt-5", "chatgpt-4o")
+
+
+_NO_VISION = ("o1-mini", "o3-mini")   # text-only minis (o4-mini does see images)
+
+
+def _model_supports_vision(model_id):
+    m = (model_id or "").lower()
+    if any(f in m for f in _NO_VISION):
+        return False
+    return any(f in m for f in _VISION_FAMILIES)
+
+
+def _cvt_messages(messages, vision=False):
+    out = []
+    i   = 0
+    while i < len(messages):
+        m    = messages[i]
+        role = m.get("role")
+        if role in ("system", "user"):
+            out.append({"role": role, "content": m.get("content", "")})
+            i += 1
+        elif role == "assistant":
+            msg = {"role": "assistant", "content": m.get("content", "") or ""}
+            tcs = []
+            for tc in (m.get("tool_calls") or []):
+                fn   = tc.get("function", {})
+                args = fn.get("arguments", {})
+                if not isinstance(args, str):
+                    args = json.dumps(args)
+                tcs.append({
+                    "id":       tc.get("id", ""),
+                    "type":     "function",
+                    "function": {"name": fn.get("name", ""), "arguments": args},
+                })
+            if tcs:
+                msg["tool_calls"] = tcs
+                if not msg["content"]:
+                    msg["content"] = None
+            out.append(msg)
+            i += 1
+        elif role == "tool":
+            # lean-coder tool results carry `tool_name`, not `tool_call_id`; OpenAI
+            # needs the id, so correlate positionally to the preceding assistant's
+            # tool_calls (their ids round-tripped from our streamed response).
+            prev_calls = []
+            for prev in reversed(out):
+                if prev.get("role") == "assistant":
+                    prev_calls = prev.get("tool_calls") or []
+                    break
+            ci = 0
+            pending_images = []   # (data-uri) to emit AFTER the tool batch
+            while i < len(messages) and messages[i].get("role") == "tool":
+                r    = messages[i]
+                tcid = r.get("tool_call_id", "")
+                if not tcid and ci < len(prev_calls):
+                    tcid = prev_calls[ci].get("id", "")
+                out.append({
+                    "role":         "tool",
+                    "tool_call_id": tcid,
+                    "content":      r.get("content", ""),
+                })
+                # /chat/completions: a tool message is string-only, so an image
+                # can't ride inside it. On a vision model, defer it to a synthetic
+                # user message emitted right after the tool batch (below). This is
+                # built ONLY in this transient conversion - history (self.messages)
+                # keeps image_path as a sibling key and is never mutated, so the
+                # pairing guard + compaction are untouched.
+                if vision and r.get("image_path"):
+                    enc = _lc.get("encode_image_block")
+                    got = enc(r["image_path"]) if enc else None
+                    if got:
+                        media, data = got
+                        pending_images.append(f"data:{media};base64,{data}")
+                ci += 1
+                i  += 1
+            if pending_images:
+                out.append({
+                    "role": "user",
+                    "content": [{"type": "image_url",
+                                 "image_url": {"url": uri}}
+                                for uri in pending_images],
+                })
+        else:
+            i += 1
+    return out
+
+
+# ----------------------------------------------------------------------------
+# Client
+# ----------------------------------------------------------------------------
+
+class _OpenAIClient:
+    uncapped_ctx = True
+
+    def __init__(self, cfg):
+        self.cfg               = cfg
+        self.last_out_tokens   = None
+        self.last_cache_read   = 0
+        self.last_cache_write  = 0
+        self._sess_cache_read  = 0
+        self._sess_cache_write = 0
+
+    def _model(self):
+        return self.cfg.active_model()
+
+    def list_models(self):
+        return _list_models()
+
+    def running_models(self):
+        return []
+
+    def detect_num_ctx(self):
+        return _context_window(self._model())
+
+    def _consume(self, resp, should_abort):
+        """Read the streamed reply with core's shared OpenAI-style reader. Provider
+        extras: a delta.refusal marks the turn a refusal; prompt-cache hits
+        (prompt_tokens_details.cached_tokens) are split out of the prompt count.
+        Native tool calls only (no text-encoded fallback), and no <think> splitting:
+        GPT models never send inline think tags, so literal tags in prose stay as text."""
+        extra = {"cached": 0, "refusal": False}
+
+        def on_obj(obj, st):
+            for ch in obj.get("choices") or []:
+                if (ch.get("delta") or {}).get("refusal"):
+                    extra["refusal"] = True
+            um = obj.get("usage")
+            if um:
+                det = um.get("prompt_tokens_details") or {}
+                extra["cached"] = det.get("cached_tokens", extra["cached"]) or 0
+
+        def on_done(st):
+            if extra["refusal"]:
+                st["finish"] = "refusal"
+            # prompt_tokens includes any cache hit; core sums prompt_eval + cache, so
+            # return only the uncached part.
+            if st["prompt_total"] is not None:
+                st["prompt_total"] = max(st["prompt_total"] - extra["cached"], 0)
+
+        self.last_cache_read, self.last_cache_write = 0, 0
+        out = _lc["consume_openai_stream"](self, resp, should_abort, None,
+                                           on_obj=on_obj, on_done=on_done,
+                                           text_fallback=False, split_think=False)
+        self.last_cache_read = extra["cached"]
+        return out
+
+    def _send(self, key, payload, should_abort):
+        data    = json.dumps(payload).encode()
+        model   = payload.get("model", "")
+        attempt = 0
+        while True:
+            req = urllib.request.Request(
+                f"{_API_BASE}/chat/completions",
+                data=data, method="POST",
+                headers={"Content-Type": "application/json",
+                         "Authorization": f"Bearer {key}",
+                         "User-Agent": _UA},  # sweep-ok
+            )
+            try:
+                with urllib.request.urlopen(
+                        req,
+                        timeout=(getattr(self.cfg, "gen_connect_timeout", None) or 600)) as resp:
+                    return self._consume(resp, should_abort)
+            except urllib.error.HTTPError as e:
+                body = e.read().decode(errors="replace")
+                if e.code in _RETRY_CODES and attempt < _MAX_RETRIES:
+                    hint = _retry_after_secs(e.headers or {}, body)
+                    if e.code == 429:
+                        wait = (hint + 1) if hint is not None else None
+                    else:
+                        wait = (hint + 1) if hint is not None else _backoff(attempt)
+                    if wait is not None and wait <= _MAX_WAIT:
+                        attempt += 1
+                        reason = "rate limited" if e.code == 429 else f"unavailable ({e.code})"
+                        print(_lc["red"](f"[!] {model} {reason} - retry {attempt}/{_MAX_RETRIES} "
+                                         f"in {wait:.0f}s"))
+                        if not _interruptible_sleep(wait, should_abort):
+                            raise RuntimeError("aborted during retry wait") from None
+                        continue
+                if e.code == 401:
+                    raise RuntimeError(
+                        "API 401: invalid or missing OpenAI key - use /provider login"
+                    ) from None
+                # 429 insufficient_quota is a billing wall, NOT a transient rate limit -
+                # OpenAI has no free tier, so a key with no credits/billing 429s here (it
+                # can still list models, which is why /provider login + discovery worked).
+                # Don't retry; surface a clear, actionable message.
+                if e.code == 429 and '"insufficient_quota"' in body:
+                    raise RuntimeError(
+                        "OpenAI quota exhausted - this key has no credit/billing. "
+                        "Add billing at platform.openai.com/settings/organization/billing "
+                        "(OpenAI has no free tier)."
+                    ) from None
+                raise RuntimeError(f"API {e.code}: {body[:400]}") from None
+            except (urllib.error.URLError, ConnectionError, OSError) as e:
+                # Transport failure (dropped connection, TLS reset, DNS blip) - no
+                # HTTP status. Retry with backoff; a bad message never surfaces empty.
+                if attempt < _MAX_RETRIES:
+                    wait = _backoff(attempt)
+                    attempt += 1
+                    detail = str(getattr(e, "reason", None) or e) or type(e).__name__
+                    print(_lc["red"](f"[!] {model} connection error ({detail[:80]}) - "
+                                     f"retry {attempt}/{_MAX_RETRIES} in {wait:.0f}s"))
+                    if not _interruptible_sleep(wait, should_abort):
+                        raise RuntimeError("aborted during retry wait") from None
+                    continue
+                raise RuntimeError(
+                    f"request failed: {str(getattr(e, 'reason', None) or e) or type(e).__name__}"
+                ) from None
+
+    def chat(self, messages, tools, should_abort=None):
+        key = _api_key()
+        if not key:
+            raise RuntimeError("no API key - use /provider login")
+
+        cur_model = self._model()
+        minfo     = _ensure_models().get(cur_model, {})
+        # Never cap below the model's real output limit (a cut reply wastes the turn).
+        max_out   = minfo.get("max_tokens") or _MAX_TOKENS
+        max_in    = minfo.get("max_input_tokens", _CTX_DEFAULT)
+        _mt       = _lc.get("messages_tokens")
+        _est_toks = _mt(messages, tools) if _mt else len(json.dumps(messages)) // 4
+        if _mt is None and tools:
+            _est_toks += len(json.dumps(tools)) // 4
+        max_out = min(max_out, max_in - _est_toks)
+        if max_out < 1024:
+            raise RuntimeError(
+                f"context too large for {cur_model} "
+                f"(~{_est_toks:,} of {max_in:,} tokens used, no room to reply) - run /compact first"
+            )
+
+        payload = {
+            "model":                 cur_model,
+            "messages":              _cvt_messages(messages, vision=_model_supports_vision(cur_model)),
+            # Newer models (gpt-5, o-series) require max_completion_tokens and
+            # reject the legacy max_tokens; it's accepted by all current models.
+            "max_completion_tokens": max_out,
+            "stream":                True,
+            "stream_options":        {"include_usage": True},
+        }
+        if tools:
+            payload["tools"] = _cvt_tools(tools)
+
+        if minfo.get("reason"):
+            eff = self.cfg.setting("effort")
+            if eff:
+                payload["reasoning_effort"] = "medium" if eff == "med" else eff
+
+        result = self._send(key, payload, should_abort)
+        self._sess_cache_read  += self.last_cache_read
+        self._sess_cache_write += self.last_cache_write
+        return result
+
+
+def _make_client(cfg):
+    return _OpenAIClient(cfg)
+
+
+# ----------------------------------------------------------------------------
+# Provider hooks
+# ----------------------------------------------------------------------------
+
+def _available():
+    return bool(_api_key())
+
+
+def _autostart():
+    return bool(_api_key()) and _cred_data().get("active", False)
+
+
+def _on_activate(agent, cfg):
+    _ensure_models(force=True)
+    if cfg.setting("effort") is None and _ensure_models().get(cfg.active_model(), {}).get("reason"):
+        cfg.set_setting("effort", "med")
+    if _SHOW_BANNER:
+        key    = _api_key()
+        masked = f"{key[:8]}...{key[-4:]}" if key and len(key) > 12 else "(set)" if key else "(none)"
+        if key and os.environ.get("OPENAI_API_KEY", "") == key:  # sweep-ok
+            masked += " (env)"
+        print(_lc["dim"](f"  OpenAI API key  {masked}"))
+        print(_privacy_note())
+    d = _cred_data()
+    d["active"] = True
+    if d.get("key") or _cred_path().is_file():
+        _save_cred(d)
+
+
+def _on_deactivate(agent, cfg):
+    d = _cred_data()
+    d["active"] = False
+    if d.get("key"):
+        _save_cred(d)
+
+
+def _login(agent, cfg):
+    key = _api_key()
+    if not key:
+        print(_lc["dim"]("Paste your OpenAI API key (sk-...) and press Enter:"))
+        try:
+            raw = getpass.getpass(prompt="").strip()
+        except (EOFError, KeyboardInterrupt):
+            return False
+        m   = re.search(r"sk-\S+", raw)  # sweep-ok - extract key from surrounding noise
+        key = m.group(0) if m else raw
+        if not key.startswith("sk-"):  # sweep-ok
+            print(_lc["red"]("[!] does not look like an OpenAI key"))
+            return False
+        _save_cred({"key": key, "active": True})
+        print(_lc["dim"](f"  saved to {_cred_path()}"))
+    else:
+        d = _cred_data()
+        d["active"] = True
+        if d.get("key"):
+            _save_cred(d)
+    return True
+
+
+def _clear(agent, cfg):
+    _clear_cred()
+
+
+def _usage(agent, cfg):
+    return None
+
+
+def _detail(agent, cfg, arg=""):
+    bold = _lc["bold"]
+    dim  = _lc["dim"]
+
+    cur_model = cfg.active_model()
+    can_eff   = _ensure_models().get(cur_model, {}).get("reason")
+    cur_eff   = cfg.setting("effort") or ("med" if can_eff else "na")
+    lines = [bold(cur_model) + dim(f"   effort: {cur_eff}")]
+
+    si = getattr(agent, "session_in",  0) or 0
+    so = getattr(agent, "session_out", 0) or 0
+    cr = getattr(agent.client, "_sess_cache_read",  0) or 0
+    cw = getattr(agent.client, "_sess_cache_write", 0) or 0
+    cache_s = f"   cache r {_sn(cr)} w {_sn(cw)}" if (cr or cw) else ""
+    lines.append(dim(f"\n  session   in {si:,}   out {so:,}   total {si + so:,}{cache_s}"))
+    lines.append("\n" + _privacy_note())
+    lines.append(dim("  (OpenAI - see platform.openai.com/usage for billing)"))  # sweep-ok
+    return "\n".join(lines)
+
+
+# ----------------------------------------------------------------------------
+# Registration
+# ----------------------------------------------------------------------------
+
+PROVIDER = {
+    "name":           _PROVIDER,
+    "description":    "OpenAI (gpt / o-series; API key, paid)",  # sweep-ok
+    "make_client":    _make_client,
+    "list_models":    _list_models,
+    "context_window": _context_window,
+    "capabilities":   _capabilities,
+    "available":      _available,
+    "autostart":      _autostart,
+    "on_activate":    _on_activate,
+    "on_deactivate":  _on_deactivate,
+    "usage":          _usage,
+    "login":          _login,
+    "clear":          _clear,
+    "detail":         _detail,
+    "tag":            "openai",
+}
+
+
+def setup(lc, cfg):
+    global _CONFIG_DIR
+    _lc.update(lc)
+    _CONFIG_DIR = lc.get("CONFIG_DIR")

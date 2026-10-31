@@ -1,0 +1,25 @@
+#!/bin/sh
+# Refuse to commit anything under the never-ship / local-only trees.
+# These are gitignored, but this hook is the mechanical backstop for the case
+# where a file was force-added or is already tracked. Bypass (never should):
+#   git commit --no-verify
+set -eu
+
+# Anchored prefixes that must NEVER enter a commit.
+BLOCKED='^(model-eval/|docs/|lean-cli/|plugin-dev/|scripts/|\.mcp-ref/)'
+
+staged=$(git diff --cached --name-only --diff-filter=ACMR)
+[ -z "$staged" ] && exit 0
+
+bad=$(printf '%s\n' "$staged" | grep -E "$BLOCKED" || true)
+
+if [ -n "$bad" ]; then
+	echo "pre-commit: BLOCKED - these paths must never be committed:" >&2
+	printf '  %s\n' $bad >&2
+	echo "" >&2
+	echo "They live under a never-ship/local-only tree (see .gitignore)." >&2
+	echo "If a path is already tracked, untrack it: git rm -r --cached <path>" >&2
+	exit 1
+fi
+
+exit 0
