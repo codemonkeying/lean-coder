@@ -4,12 +4,6 @@ A small terminal coding agent: stdlib-only Python core, minimal context overhead
 
 ![lean-coder auditing and fixing a real bug on a local model](demos/demo.gif)
 
-<!-- overhead-gate: tests/_smoketest.py reads these two numbers; they are the pass/fail limits -->
-| Surface | Max tokens |
-|---|---|
-| Always-on (core tools) | 2500 |
-| Every bundled lean-tool enabled | 6500 |
-
 ## Install
 
 Requires Python 3.11+ and `curl` or `git`.
@@ -47,9 +41,31 @@ lean_coder                                  # start in the current project
 lean_coder --host http://HOST:11434         # remote Ollama
 ```
 
-Inside: `/provider` picks a backend, `/model` a model, `/leash` and `/approve` set
-tool access and confirmation, `/connect` works on a remote box over SSH, `/help` lists
-everything. Config lives in `~/.config/leancoder/config.toml`.
+Inside: `/provider` picks a backend, `/model` a model, `/leash` sets what the agent may
+do (read only, edit, or edit and run commands), `/approve` sets which actions ask you first,
+`/connect` works on a remote box over SSH, `/help` lists everything. Config lives in
+`~/.config/leancoder/config.toml`.
+
+Providers: Ollama, llama.cpp and MLX (local), plus OpenAI, Anthropic API, Gemini, Groq,
+OpenRouter, Kilo and OVH (API key). Add your own with a small plugin file.
+
+## Extending
+
+- **Lean-tools**: optional tools (web fetch, SSH, view, ...) you switch on with `/tools`;
+  each one adds its schema to the prompt only when enabled.
+- **MCP**: connect external tool servers that speak the Model Context Protocol.
+- **Workers**: the agent can start background sub-agents for side tasks and coordinate
+  them on a task board.
+
+## Context overhead
+
+Tokens the tool definitions add to every request (the test suite enforces these limits):
+
+<!-- overhead-gate: tests/_smoketest.py reads these two numbers; they are the pass/fail limits -->
+| Surface | Max tokens |
+|---|---|
+| Always-on (core tools) | 2500 |
+| Every bundled lean-tool enabled | 6500 |
 
 ## Reference
 
