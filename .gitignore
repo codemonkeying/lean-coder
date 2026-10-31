@@ -7,41 +7,18 @@ __pycache__/
 .pre-sync.bak/
 *.pre-sync.bak/
 
-# Internal dev notes, handovers, design docs, backlog - never public.
-/docs/
-NOTES.md
-
-# Model-evaluation harness + results - local research, not shipped.
-/model-eval/
-
-# Internal helper-CLI usage docs (eval/lmg/lpve/ltmile/lwrt) - not public.
-/lean-cli/
-
-# Internal-only: plugin/dev scaffolding, MCP reference scratch, dev scripts.
-# (NB: /tools/ is intentionally NOT ignored - it ships gen_section_index.py, which the
-# smoketest's FILE MAP drift gate depends on. Keep dev-only scratch in /scripts/.)
-/plugin-dev/
-/.mcp-ref/
-/scripts/
-
-# Test suite: ship the offline gates (referenced by CONTRIBUTING), but NEVER the
-# live network test - it hardcodes real infra. Ignore the dir, whitelist the safe files.
+# Test suite: ship the offline gates (referenced by CONTRIBUTING). Ignore the dir,
+# whitelist the shipped files.
 /tests/*
 /tests/fixtures/*
 !/tests/_smoketest.py
 !/tests/_mocktest.py
-# _smoketest_local.py is deliberately NOT published: it tests unpublished providers.
-# _smoketest.py exec()s it when present.
+# _smoketest.py also exec()s an optional local _smoketest_local.py when present.
 !/tests/_sweep.sh
 !/tests/_isolate.py
 !/tests/_debugrun.sh
 !/tests/fixtures/
 !/tests/fixtures/echo_mcp_server.py
-
-# Internal dev handover + import tooling - not public.
-/LEAN_TOOL_DEV_HANDOVER.md
-/import_lc.sh
-/.last_import.sha256
 
 # Live lean-tools working dir (point lean_tools_dir here to a separate one if you
 # want an isolated working set). We ignore the CONTENTS (leading slash anchors to the
@@ -68,9 +45,6 @@ NOTES.md
 # Live providers working dir. Same pattern: ignore the contents, re-include the
 # bundled providers that ship enabled/available out of the box. Your own local
 # provider drop-ins (which may carry credentials) stay untracked automatically.
-# Unpublished providers are covered
-# by the /providers/* ignore below and are deliberately NOT on the re-include
-# allowlist - keep it that way so they can never be committed.
 /providers/*
 !/providers/README.md
 !/providers/ollama.py

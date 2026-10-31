@@ -316,8 +316,17 @@ LINK="$BIN/lean_coder"
 # ---- uninstall --------------------------------------------------------------
 if [ "$UNINSTALL" = 1 ]; then
   say "Uninstalling lean-coder"
+  if [ -x "$SCRIPT_DIR/uninstall.sh" ]; then
+    ua=(--keep-config); [ "$DRY" = 1 ] && ua+=(--dry-run); [ "${ASSUME_YES:-0}" = 1 ] && ua+=(--yes)
+    exec "$SCRIPT_DIR/uninstall.sh" "${ua[@]}"
+  fi
   run "rm -f '$LINK'";       ok "removed symlink $LINK"
-  run "rm -rf '$DIR'";       ok "removed install dir $DIR"
+  case "$DIR" in
+    ""|/|"$HOME"|"$HOME/") warn "refusing to delete $DIR";;
+    *) if [ "$DIR" = "$SCRIPT_DIR" ] || [ -d "$DIR/.git" ]; then
+         warn "kept $DIR (it is a source checkout)"
+       else run "rm -rf '$DIR'"; ok "removed install dir $DIR"; fi;;
+  esac
   warn "left your config ($CONFIG) and Ollama untouched."
   exit 0
 fi

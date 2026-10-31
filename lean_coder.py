@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L2138   Lean-tools (plugin tools: discovery, manager)
-  L2541   MCP client (connection, manager, OAuth, discovery)
-  L2995   Providers (backend plugin registry)
-  L3272   Interactive pickers + menus (raw-mode UI engine)
-  L3647   Terminal styling (colors, formatting helpers)
-  L3945   Streaming + markdown render (model output)
-  L4714   Composer (pinned input line, editor, stdin)
-  L5704   Token accounting (calibrated context meter)
-  L5957   Config (dataclass, field registry, load/save)
-  L10123  Tool execution + text tool-call parsing
-  L10750  Remote workspace (executor client, /connect)
-  L13128  Context meter
-  L13223  Agent (turn loop, context mgmt, tool dispatch)
-  L21227  Slash-command handlers + dispatch table
-  L21369  REPL (interactive loop, session resume)
-  L21871  Worker agent (headless --agent-run)
-  L22816  Entry (CLI arg parsing, main)
+  L2143   Lean-tools (plugin tools: discovery, manager)
+  L2546   MCP client (connection, manager, OAuth, discovery)
+  L3000   Providers (backend plugin registry)
+  L3277   Interactive pickers + menus (raw-mode UI engine)
+  L3652   Terminal styling (colors, formatting helpers)
+  L3950   Streaming + markdown render (model output)
+  L4719   Composer (pinned input line, editor, stdin)
+  L5709   Token accounting (calibrated context meter)
+  L5962   Config (dataclass, field registry, load/save)
+  L10128  Tool execution + text tool-call parsing
+  L10755  Remote workspace (executor client, /connect)
+  L13133  Context meter
+  L13228  Agent (turn loop, context mgmt, tool dispatch)
+  L21232  Slash-command handlers + dispatch table
+  L21374  REPL (interactive loop, session resume)
+  L21876  Worker agent (headless --agent-run)
+  L22821  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -158,7 +158,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.10.126"
+__version__ = "0.10.127"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -166,6 +166,11 @@ __version__ = "0.10.126"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.10.127": [
+        "install.sh --uninstall hands off to uninstall.sh and never deletes your home folder or a source checkout.",
+        "Smoketest no longer crashes when playwright is not installed.",
+        "README: uninstall notes and the PATH line the installer adds.",
+    ],
     "0.10.126": [
         "Added a LICENSE file stating all rights reserved.",
     ],

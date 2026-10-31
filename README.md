@@ -24,8 +24,14 @@ Android / Termux:
 pkg install -y python curl && curl -fsSL https://raw.githubusercontent.com/codemonkeying/lean-coder/main/install.sh | bash
 ```
 
-Options: `--with-ollama --pull` (local Ollama on Linux), `--dry-run`. `./uninstall.sh`
-removes everything. Update with `lean_coder --update` or `/update`.
+Options: `--with-ollama --pull` (local Ollama on Linux), `--dry-run`. The installer adds
+`~/.local/bin` to PATH in your shell rc if it isn't there. Update with `lean_coder --update`
+or `/update`.
+
+Uninstall: `~/lean-coder/uninstall.sh` (or `./uninstall.sh` in a clone) lists what it will
+remove and asks first. By default that includes `~/.config/leancoder` - settings, sessions and
+auth tokens; pass `--keep-config` to keep them. `install.sh --uninstall` does the same with
+`--keep-config`.
 
 From a clone:
 
