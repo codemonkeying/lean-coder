@@ -1,0 +1,21 @@
+name: pr-review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+concurrency:
+  group: pr-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  review:
+    uses: codemonkeying/review-bot/.github/workflows/review.yml@main
+    secrets:
+      KILO_API_KEY: ${{ secrets.KILO_API_KEY }}
+    # with:
+    #   model: some/model:free     # optional; else .github/review.toml, else default
