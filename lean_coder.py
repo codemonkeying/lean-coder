@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L2146   Lean-tools (plugin tools: discovery, manager)
-  L2549   MCP client (connection, manager, OAuth, discovery)
-  L3003   Providers (backend plugin registry)
-  L3280   Interactive pickers + menus (raw-mode UI engine)
-  L3655   Terminal styling (colors, formatting helpers)
-  L3953   Streaming + markdown render (model output)
-  L4722   Composer (pinned input line, editor, stdin)
-  L5712   Token accounting (calibrated context meter)
-  L5965   Config (dataclass, field registry, load/save)
-  L10131  Tool execution + text tool-call parsing
-  L10758  Remote workspace (executor client, /connect)
-  L13136  Context meter
-  L13231  Agent (turn loop, context mgmt, tool dispatch)
-  L21235  Slash-command handlers + dispatch table
-  L21377  REPL (interactive loop, session resume)
-  L21879  Worker agent (headless --agent-run)
-  L22824  Entry (CLI arg parsing, main)
+  L2154   Lean-tools (plugin tools: discovery, manager)
+  L2557   MCP client (connection, manager, OAuth, discovery)
+  L3011   Providers (backend plugin registry)
+  L3288   Interactive pickers + menus (raw-mode UI engine)
+  L3663   Terminal styling (colors, formatting helpers)
+  L3961   Streaming + markdown render (model output)
+  L4730   Composer (pinned input line, editor, stdin)
+  L5720   Token accounting (calibrated context meter)
+  L5973   Config (dataclass, field registry, load/save)
+  L10139  Tool execution + text tool-call parsing
+  L10766  Remote workspace (executor client, /connect)
+  L13160  Context meter
+  L13255  Agent (turn loop, context mgmt, tool dispatch)
+  L21287  Slash-command handlers + dispatch table
+  L21429  REPL (interactive loop, session resume)
+  L21931  Worker agent (headless --agent-run)
+  L22876  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -158,7 +158,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.10.128"
+__version__ = "0.10.129"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -166,6 +166,13 @@ __version__ = "0.10.128"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.10.129": [
+        "Message timestamps include the weekday; the last turn's end time shows in the status bar (session_time).",
+        "Clearer, coloured prompt when the model asks you to run a command.",
+        "/session delete works again.",
+        "Remote background-task count in the status bar updates at turn end.",
+        "Headless runs no longer offer ask_user_to_run.",
+    ],
     "0.10.128": [
         "README: Quick start comes first; providers listed; lean-tools, MCP, workers and /leash explained.",
     ],
@@ -2009,7 +2016,8 @@ def active_tools(cfg, remote=False, lean_tool_schemas=(), model_tools=True,
                  "description": t["function"]["description"].format(
                      command_timeout=getattr(cfg, "command_timeout", 300))}}
         tools.append(t)
-    if cfg.ask_user_to_run and allow_exec and _named(ASK_USER_TOOL["function"]["name"]):
+    if cfg.ask_user_to_run and allow_exec and not getattr(cfg, "worker_run", False) \
+            and _named(ASK_USER_TOOL["function"]["name"]):
         tools.append(ASK_USER_TOOL)            # a handoff to RUN a command -> exec tier
     # A lean-tool must not shadow a core tool name (or another lean-tool): duplicate
     # tool names make the API 400 ("Tool names must be unique"). Core wins - a
@@ -7394,7 +7402,7 @@ def _remote_now(ready):
 def _dtg(now=None):
     """Local time as a military date-time group: DDHHMM + zone letter + MON + YYYY,
     e.g. 271834KOCT2026 (K = UTC+10). Zone letters cover whole-hour offsets; anything
-    else gets the numeric offset instead. Plus the zone name for readability."""
+    else gets the numeric offset instead. Plus the zone name for readability, weekday first: (Fri, AEST, UTC+10:00)."""
     t = now or datetime.datetime.now().astimezone()
     off = t.utcoffset() or datetime.timedelta(0)
     h, rem = divmod(int(off.total_seconds()), 3600)
@@ -7404,7 +7412,7 @@ def _dtg(now=None):
     sign = "+" if off >= datetime.timedelta(0) else "-"
     a = abs(int(off.total_seconds()))
     utc = f"UTC{sign}{a // 3600:02d}:{a % 3600 // 60:02d}"
-    return (f"{t:%d%H%M}{zone}{t:%b}".upper() + f"{t:%Y} ({t.tzname() or utc}, {utc})")
+    return (f"{t:%d%H%M}{zone}{t:%b}".upper() + f"{t:%Y} ({t:%a}, {t.tzname() or utc}, {utc})")
 
 
 class _HostRef:
@@ -11691,6 +11699,18 @@ class RemoteWorkspace:
             return []
         return obj.get("result") or [] if obj.get("ok") else []
 
+    def refresh_live_counts(self):
+        """Re-read the executor's running bg count via the side-effect-free BG_LIST, so a
+        task started or killed MID-turn shows in the status bar at turn end (BG_POLL only
+        runs before inference). Keeps the old count on any error."""
+        try:
+            obj = self.client.request(BG_LIST, deadline=time.monotonic() + 3)
+        except (ConnectionError, OSError, TimeoutError, AttributeError):
+            return
+        if obj.get("ok"):
+            self.live_counts = {"bg": sum(1 for r in (obj.get("result") or [])
+                                          if r.get("state") == "running")}
+
     def reload(self, lean_tool_paths=()):
         """Re-push current code + lean-tools and relaunch the executor over the
         SAME ssh master (no re-auth, connection preserved)."""
@@ -12905,12 +12925,16 @@ def run_direct_command(cfg, cmd: str, reason: str = None, remote=None,
     operator to confirm/edit - right for the model-proposed ask_user_to_run
     path. `/sh` passes editable=False: the operator already typed it, so just
     label it and run on a single Enter (no second prompt, no re-edit)."""
-    if reason:
-        print(dim(f"  (model asks the operator to run this: {reason})"))
     if _active_spinner:
         _active_spinner.stop()
+    if requested:
+        print(yellow("  >> The model is asking YOU to run this command"))
+        if reason:
+            print(yellow(f"     why: {reason}"))
+    elif reason:
+        print(dim(f"  (model asks the operator to run this: {reason})"))
     if editable:
-        print(dim("  Enter to run (edit first if you like); empty line or ^C to decline."))
+        print(yellow("     Enter = run it   ") + dim("|  type to edit first  |  empty line or ^C = decline"))
         prompt = _direct_prompt(cfg, remote)
         timeout = int(getattr(cfg, "ask_timeout", 300) or 0) if requested and timed else 0
         if timeout > 0 and sys.stdin.isatty():
@@ -14356,12 +14380,16 @@ class Agent:
         if getattr(self.cfg, "session_time", True):
             # The time zone of the box the tools run on: a /connect remote reports its
             # zone in the executor handshake; older executors don't -> driver's zone.
-            rdy = getattr(getattr(self.remote, "client", None), "ready", None) if self.remote else None
-            now = None
-            now = _remote_now(rdy)
-            when = f"time: {_dtg(now)}\n"
+            when = f"time: {_dtg(self._tool_now())}\n"
         return (f"\n\n{self._ENV_HDR}\nhost: {host}\ncwd: {cwd}\n"
                 f"shell: {self._shell_family()}\n{when}{self._ENV_FTR}")
+
+    def _tool_now(self):
+        """Aware 'now' in the zone of the box the tools run on (a /connect remote reports
+        its zone in the executor handshake; older executors don't -> driver's zone)."""
+        r = getattr(self, "remote", None)
+        rdy = getattr(getattr(r, "client", None), "ready", None) if r else None
+        return _remote_now(rdy) or datetime.datetime.now().astimezone()
 
     def _with_plan_reminder(self, msgs):
         """Return a COPY of the sent slice with the uncached session tail (live env +
@@ -15473,6 +15501,8 @@ class Agent:
         bg_note = self._bg_finished_note()   # long-run bg tasks that finished since last turn
         if bg_note:
             user_input = user_input + "\n\n[" + bg_note + "]"
+        if getattr(self.cfg, "session_time", True):   # fixed at write time: cache-safe
+            user_input = f"[{_dtg(self._tool_now())}]\n{user_input}"
         self.messages.append({"role": "user", "content": user_input})
         self.tools.changed_files.clear()
         self._compact_capture = None    # clear any prior /compact trigger (loop guard)
@@ -15486,6 +15516,11 @@ class Agent:
         self.messages = repair_tool_pairs(self.messages)
         self._maybe_auto_trim()        # cheap programmatic strip at token intervals (first)
         self._maybe_compact()            # then the agentic compaction (hard/emergency)
+        if not getattr(self.cfg, "worker_run", False):
+            self._turn_ended = datetime.datetime.now()
+        _rw = getattr(self, "remote", None)
+        if _rw is not None and hasattr(_rw, "refresh_live_counts"):
+            _rw.refresh_live_counts()   # bg started/killed mid-turn -> bar is current
 
     def record_tool_call(self, name, args):
         """Store a tool call's FULL args in the ring and return its monotonic id.
@@ -16071,6 +16106,8 @@ class Agent:
         """The ask_user_to_run tool. pending='run' re-fires the command the operator
         approved via /user_to_run (y); pending='skip' drops it. With nothing approved,
         pending='run' is just a normal ask of `cmd`."""
+        if getattr(self.cfg, "worker_run", False):
+            return "no operator in a headless run; report it in your finish"
         pending = (args.get("pending") or "").strip().lower()
         offer, self._pending_offer = self._pending_offer, None
         if pending == "skip":
@@ -18216,6 +18253,9 @@ def _status_rows(agent, cfg):
         s = [agent.autosave_name]
     else:
         s = ["amnesic"]
+    _te = getattr(agent, "_turn_ended", None)
+    if _te and getattr(cfg, "session_time", True):
+        s.append(dim(f"{_te:%H:%M}"))         # when the last turn ended (24h, local)
     s += _activity_counts(agent)              # ! usr  ⚑ wkr  ◷ bgd  ▤ brd (only when > 0),
                                               # right after the session name: a fixed spot
     s.append(model_at)                        # turn count lives in /info (context line)
@@ -19161,6 +19201,18 @@ def handle_session_command(agent, cfg, arg):
             print(dim(f"  ({hidden} pre-compact snapshot(s) hidden; "
                       f"/set show_snapshots true to show)"))
         return
+
+    if sub == "delete":
+        if not rest:
+            rest = _session_picker("delete session:")
+            if not rest:
+                return
+        print(green(f"deleted session '{rest}'.") if delete_session(rest)
+              else red(f"no such session: {rest}"))
+        return
+
+    print(dim("usage: /session list | delete <name>   (save -> /save, load -> /load)"))
+
 
 def _remote_alive(ws) -> bool:
     """Best-effort: is this pooled connection still usable? A rebooted/dropped box
