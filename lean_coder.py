@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L2154   Lean-tools (plugin tools: discovery, manager)
-  L2557   MCP client (connection, manager, OAuth, discovery)
-  L3011   Providers (backend plugin registry)
-  L3288   Interactive pickers + menus (raw-mode UI engine)
-  L3663   Terminal styling (colors, formatting helpers)
-  L3961   Streaming + markdown render (model output)
-  L4730   Composer (pinned input line, editor, stdin)
-  L5720   Token accounting (calibrated context meter)
-  L5973   Config (dataclass, field registry, load/save)
-  L10139  Tool execution + text tool-call parsing
-  L10766  Remote workspace (executor client, /connect)
-  L13160  Context meter
-  L13255  Agent (turn loop, context mgmt, tool dispatch)
-  L21287  Slash-command handlers + dispatch table
-  L21429  REPL (interactive loop, session resume)
-  L21931  Worker agent (headless --agent-run)
-  L22876  Entry (CLI arg parsing, main)
+  L2161   Lean-tools (plugin tools: discovery, manager)
+  L2564   MCP client (connection, manager, OAuth, discovery)
+  L3018   Providers (backend plugin registry)
+  L3295   Interactive pickers + menus (raw-mode UI engine)
+  L3670   Terminal styling (colors, formatting helpers)
+  L3968   Streaming + markdown render (model output)
+  L4741   Composer (pinned input line, editor, stdin)
+  L5734   Token accounting (calibrated context meter)
+  L5987   Config (dataclass, field registry, load/save)
+  L10153  Tool execution + text tool-call parsing
+  L10780  Remote workspace (executor client, /connect)
+  L13174  Context meter
+  L13269  Agent (turn loop, context mgmt, tool dispatch)
+  L21301  Slash-command handlers + dispatch table
+  L21443  REPL (interactive loop, session resume)
+  L21947  Worker agent (headless --agent-run)
+  L22892  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -158,7 +158,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.10.129"
+__version__ = "0.10.130"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -166,6 +166,11 @@ __version__ = "0.10.129"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.10.130": [
+        "Inline code is never split by output_wrap, so a copied command stays on one line.",
+        "The model is told to put commands and copy-me text in backticks or code blocks.",
+        "Keys typed just as a turn ends are no longer dropped.",
+    ],
     "0.10.129": [
         "Message timestamps include the weekday; the last turn's end time shows in the status bar (session_time).",
         "Clearer, coloured prompt when the model asks you to run a command.",
@@ -1286,6 +1291,8 @@ DEFAULT_IGNORES = [
 SYSTEM_PROMPT = (
     "You are a precise coding assistant. Be concise; don't explain unless asked. "
     "Use a plain hyphen '-' instead of em or en dashes. "
+    "Put commands, paths and identifiers in `backticks`, and multi-line or copy-me text "
+    "in a fenced code block. "
     "The operator sees your prose and a one-line preview of each tool result, not the "
     "full output, so relay the parts they ask about. "
     # Diagnose-before-switching + escape hatch to the operator.
@@ -4456,7 +4463,11 @@ class MarkdownStream:
             # a list item's wrapped lines hang under its text, not under the '- '
             lm = _MD_LIST.match(line)
             hang = len(lm.group(1)) if lm else 0
-            pieces = _wrap_styled(style_md_line(line), max(20, self._wrap - 1 - self._lead - hang))
+            # an `inline code` span is one unbreakable token (like a URL): its spaces are
+            # masked with NUL through styling+wrap, so copying it always gives one line
+            masked = re.sub(r"`[^`]+`", lambda m: m.group(0).replace(" ", "\0"), line)
+            pieces = [x.replace("\0", " ") for x in
+                      _wrap_styled(style_md_line(masked), max(20, self._wrap - 1 - self._lead - hang))]
             for i, p in enumerate(pieces):
                 last = (i == len(pieces) - 1)
                 pad = "" if (self._first or not p.strip()) else " " * (self._lead + (hang if i else 0))
@@ -5201,6 +5212,9 @@ class Composer:
             self._out.write("\n" * reserve + f"\033[1;{self._rows - reserve}r")
             self._out.write(f"\033[{self._rows - reserve};1H\0337")  # park output pos
             self._out.write("\033[?2004h")                     # bracketed paste on
+            # tty's default TCSAFLUSH is deliberate: it drops anything typed while the
+            # composer was suspended (pinentry/ssh/ask_user_to_run), so a passphrase typed
+            # after a prompt closed can never land in the input box and be sent.
             tty.setcbreak(self._fd)                            # non-canonical; ISIG kept (^C works)
             # tty.setcbreak only clears ECHO on Python 3.12+. On older versions the
             # terminal echoes each keystroke on top of the line we render ourselves
@@ -21887,7 +21901,9 @@ def repl(cfg: Config, resume=None):
                           + ", ".join(c.split()[0] for c in cmds)))
             autosave_session(agent, cfg)  # crash-safe: persist after every turn
             _lock_set_state("idle")       # saved first, THEN idle (a waiter may claim now)
-            flush_stdin()                # drop any stray typeahead left in the tty
+            # No flush_stdin here: the idle composer reads whatever was typed in the gap
+            # since this turn's composer let go (it only submits on Enter, and pastes
+            # are bracketed) - flushing silently ate those keys.
         else:
             interrupted = False
             try:
