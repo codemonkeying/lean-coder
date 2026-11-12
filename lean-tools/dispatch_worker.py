@@ -2001,14 +2001,18 @@ def _worker_cmd(agent, cfg, arg):
                     print(_fit(_H["dim"]("        " + "  ".join(bits)), ellipsis=True))
 
 
-def _worker_completer(agent, cfg):
-    """Tab-completion for /worker's first argument: the subcommand verbs plus every
-    live worker pid (so `cancel <Tab>` / a bare `<Tab>` offers real pids). Matches the
-    menu contract of other multi-verb commands (e.g. /mcp)."""
-    opts = ["status", "result", "transcript", "cancel", "pause", "pause_all", "stop_all",
-            "resume", "resume_all", "inject", "set_plan", "add_note", "board", "models"]
-    opts += [str(pid) for pid in _H.get("workers", {})]
-    return opts
+def _worker_completer(agent, cfg, sub=None):
+    """Tab-completion for /worker: first level = verbs + live pids (`/worker <pid>` shows
+    one); after a verb that takes a pid (`cancel <Tab>`) = the live pids only."""
+    verbs = ["status", "result", "transcript", "cancel", "pause", "pause_all", "stop_all",
+             "resume", "resume_all", "inject", "set_plan", "add_note", "board", "models"]
+    pids = [str(pid) for pid in _H.get("workers", {})]
+    if sub is None:
+        return verbs + pids                  # `/worker <pid>` shows that worker
+    if sub in ("status", "result", "transcript", "cancel", "pause", "resume",
+               "inject", "set_plan", "add_note"):
+        return pids
+    return []
 
 
 def _prompt_names_into(tool):

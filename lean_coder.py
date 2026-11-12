@@ -6,23 +6,23 @@ Design priority: lean context usage. Small system prompt, one-line tool
 schemas, truncated tool results. See README.md.
 
 === FILE MAP (regen: tools/gen_section_index.py) ===
-  L2161   Lean-tools (plugin tools: discovery, manager)
-  L2564   MCP client (connection, manager, OAuth, discovery)
-  L3018   Providers (backend plugin registry)
-  L3295   Interactive pickers + menus (raw-mode UI engine)
-  L3670   Terminal styling (colors, formatting helpers)
-  L3968   Streaming + markdown render (model output)
-  L4741   Composer (pinned input line, editor, stdin)
-  L5734   Token accounting (calibrated context meter)
-  L5987   Config (dataclass, field registry, load/save)
-  L10153  Tool execution + text tool-call parsing
-  L10780  Remote workspace (executor client, /connect)
-  L13174  Context meter
-  L13269  Agent (turn loop, context mgmt, tool dispatch)
-  L21301  Slash-command handlers + dispatch table
-  L21443  REPL (interactive loop, session resume)
-  L21947  Worker agent (headless --agent-run)
-  L22892  Entry (CLI arg parsing, main)
+  L2165   Lean-tools (plugin tools: discovery, manager)
+  L2568   MCP client (connection, manager, OAuth, discovery)
+  L3022   Providers (backend plugin registry)
+  L3299   Interactive pickers + menus (raw-mode UI engine)
+  L3674   Terminal styling (colors, formatting helpers)
+  L3972   Streaming + markdown render (model output)
+  L4745   Composer (pinned input line, editor, stdin)
+  L5738   Token accounting (calibrated context meter)
+  L5991   Config (dataclass, field registry, load/save)
+  L10157  Tool execution + text tool-call parsing
+  L10784  Remote workspace (executor client, /connect)
+  L13178  Context meter
+  L13273  Agent (turn loop, context mgmt, tool dispatch)
+  L21339  Slash-command handlers + dispatch table
+  L21481  REPL (interactive loop, session resume)
+  L21985  Worker agent (headless --agent-run)
+  L22930  Entry (CLI arg parsing, main)
 === END FILE MAP ===
 """
 
@@ -158,7 +158,7 @@ def _precompact_name(origin: str, existing) -> str:
 # it has LOWER precedence than the same core release (1.2.0), per SemVer. source_hash()
 # (below) is the exact-content fingerprint /connect uses to skip a redundant re-push -
 # a different axis (any byte change), so the two are intentionally separate.
-__version__ = "0.10.130"
+__version__ = "0.10.131"
 
 # Release notes shown once after an update (see _release_notes_since / repl startup).
 # Keyed by version string; each value is a short list of user-facing highlights. Kept
@@ -166,6 +166,10 @@ __version__ = "0.10.130"
 # whenever __version__ bumps with a change worth surfacing; omit purely internal releases.
 # Newest first is not required (we sort by version), but keep it tidy that way anyway.
 RELEASE_NOTES = {
+    "0.10.131": [
+        "Tab completion fixed at every level: /bg kill <Tab> offers running pids, /worker cancel <Tab> offers worker pids, and a finished argument no longer re-offers the earlier choices.",
+        "Command aliases (/brd, /bgd, /providers...) complete like their main command.",
+    ],
     "0.10.130": [
         "Inline code is never split by output_wrap, so a copied command stays on one line.",
         "The model is told to put commands and copy-me text in backticks or code blocks.",
@@ -18465,6 +18469,8 @@ def _arg_completions(agent, cfg, cmd):
     if cmd in ("/provider", "/providers"):
         return (["off", "on", "login", "clear", "list", "enable", "disable", "set"]
                 + provider_names())
+    if cmd in ("/provider login", "/provider clear", "/provider enable", "/provider disable"):
+        return provider_names()
     if cmd in ("/think", "/effort"):
         key = "thinking" if cmd == "/think" else "effort"
         default = ["off", "adaptive", "max"] if key == "thinking" else ["low", "med", "high"]
@@ -18482,6 +18488,8 @@ def _arg_completions(agent, cfg, cmd):
         return list(LEASH_LEVELS)
     if cmd in ("/bg", "/background", "/bgd"):
         return ["kill"]
+    if cmd in ("/bg kill", "/background kill", "/bgd kill"):   # running pids, then all
+        return _bg_running_pids(agent) + ["all"]
     if cmd == "/rewind":
         # Offer the turn counts that actually exist, so Tab shows the depth available
         # (bare /rewind = 1). Capped: past a handful you want /clear, not a long list.
@@ -18561,7 +18569,35 @@ def _arg_completions(agent, cfg, cmd):
             return list(_lean_tool_completers[cmd](agent, cfg))
         except Exception:
             return []
+    head, _, sub = cmd.partition(" ")         # deeper level: completer(agent, cfg, sub)
+    if sub and head in _lean_tool_completers:
+        try:
+            return list(_lean_tool_completers[head](agent, cfg, sub))
+        except TypeError:                     # a completer that only does the first level
+            return []
+        except Exception:
+            return []
     return []
+
+
+def _canonical_command(name: str) -> str:
+    """The first-registered name sharing `name`'s handler (/brd -> /board), so aliases
+    get every completion level their canonical command has. Unknown -> unchanged."""
+    h = _BUILTIN_COMMANDS_TABLE.get(name)
+    if h is None:
+        return name
+    return next((k for k, v in _BUILTIN_COMMANDS_TABLE.items() if v is h), name)
+
+
+def _bg_running_pids(agent) -> list:
+    """Pids of this session's RUNNING background tasks (remote executor's when
+    connected), for `/bg kill <Tab>`. [] on any error."""
+    try:
+        remote = getattr(agent, "remote", None)
+        rows = remote.bg_list() if remote is not None else _bg_status_items(os.getpid())
+        return [str(r.get("pid")) for r in rows if r.get("state") == "running"]
+    except Exception:
+        return []
 
 
 def _completion_options(agent, cfg, left):
@@ -18575,10 +18611,12 @@ def _completion_options(agent, cfg, left):
     # the "path" is every token already entered before the one being typed
     path = tokens if (buf and buf[-1].isspace()) else tokens[:-1]
     if path:                                 # past the command -> complete this arg,
-        key = " ".join(path)                 # keyed on the full command path
+        # an alias completes exactly like its canonical command (/brd delete = /board delete)
+        key = " ".join([_canonical_command(path[0])] + path[1:])
         opts = _arg_completions(agent, cfg, key)
-        if not opts and len(path) > 1:       # fall back to the bare command
-            opts = _arg_completions(agent, cfg, path[0])
+        # No fallback to the bare command's list: after `/bg kill ` that re-offered
+        # `kill`, after a full session name it re-offered every name. A level with no
+        # completer of its own offers nothing.
         # `?` is a universal first-arg on every command (per-command help), so offer it
         # alongside a command's own completions when the cursor is on its first argument.
         if len(path) == 1 and path[0] != "/help":

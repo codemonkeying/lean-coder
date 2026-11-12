@@ -14,7 +14,10 @@ name is in `HELP_COMMANDS`.
 
 `_arg_completions(agent, cfg, cmd)`: `cmd == "/name"` returns subcommands;
 `cmd == "/name sub"` returns that subcommand's argument values. `?` is appended
-automatically. Read live state.
+automatically. Read live state. Every level that takes a value completes it (`/bg kill <Tab>`
+offers running pids, then narrows as you type). A level with no completer offers nothing;
+it never falls back to the parent's list. Aliases complete like their canonical command.
+A lean-tool `completer(agent, cfg, sub=None)` gets `sub` for the deeper level.
 
 ## 3. Handlers
 
